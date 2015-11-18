@@ -19,6 +19,7 @@ package org.apache.spark
 
 import java.io.{ByteArrayInputStream, File, FileInputStream, FileOutputStream}
 import java.net.{URI, URL}
+import java.nio.charset.StandardCharsets
 import java.util.jar.{JarEntry, JarOutputStream}
 
 import scala.collection.JavaConversions._
@@ -152,5 +153,15 @@ private[spark] object TestUtils {
       "public class " + className + extendsText + " implements java.io.Serializable {" +
       "  @Override public String toString() { return \"" + toStringValue + "\"; }}")
     createCompiledClass(className, destDir, sourceFile, classpathUrls)
+  }
+
+  def createResource(
+      resourceName: String,
+      destDir: File,
+      fileContent: String = "test"): File = {
+    val out: File = new File(destDir, resourceName)
+    Files.write(fileContent.getBytes(StandardCharsets.UTF_8), out)
+    assert(out.exists(), "Resource file is not written: " + out.getAbsolutePath())
+    out
   }
 }
