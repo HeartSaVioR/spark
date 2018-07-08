@@ -19,6 +19,7 @@ package org.apache.spark.sql.execution.streaming.state
 
 import java.io._
 import java.util.Locale
+import java.util.concurrent.atomic.LongAdder
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -164,7 +165,8 @@ private[state] class HDFSBackedStateStoreProvider extends StateStoreProvider wit
     }
 
     override def metrics: StateStoreMetrics = {
-      StateStoreMetrics(mapToUpdate.size(), SizeEstimator.estimate(mapToUpdate), Map.empty)
+      StateStoreMetrics(mapToUpdate.size(), SizeEstimator.estimate(mapToUpdate),
+        getCustomMetricsForProvider())
     }
 
     /**
@@ -177,6 +179,13 @@ private[state] class HDFSBackedStateStoreProvider extends StateStoreProvider wit
     override def toString(): String = {
       s"HDFSStateStore[id=(op=${id.operatorId},part=${id.partitionId}),dir=$baseDir]"
     }
+  }
+
+  def getCustomMetricsForProvider(): Map[StateStoreCustomMetric, Long] = synchronized {
+    Map(metricProviderLoaderMapSizeBytes -> SizeEstimator.estimate(loadedMaps),
+      metricProviderLoaderCountOfVersionsInMap -> loadedMaps.size,
+      metricLoadedMapCacheHit -> loadedMapCacheHitCount.sum(),
+      metricLoadedMapCacheMiss -> loadedMapCacheMissCount.sum())
   }
 
   /** Get the state store for making updates to create a new `version` of the store. */
@@ -224,7 +233,8 @@ private[state] class HDFSBackedStateStoreProvider extends StateStoreProvider wit
   }
 
   override def supportedCustomMetrics: Seq[StateStoreCustomMetric] = {
-    Nil
+    metricProviderLoaderMapSizeBytes :: metricProviderLoaderCountOfVersionsInMap ::
+      metricLoadedMapCacheHit :: metricLoadedMapCacheMiss :: Nil
   }
 
   override def toString(): String = {
@@ -244,6 +254,25 @@ private[state] class HDFSBackedStateStoreProvider extends StateStoreProvider wit
   private lazy val baseDir = stateStoreId.storeCheckpointLocation()
   private lazy val fm = CheckpointFileManager.create(baseDir, hadoopConf)
   private lazy val sparkConf = Option(SparkEnv.get).map(_.conf).getOrElse(new SparkConf)
+
+  private val loadedMapCacheHitCount: LongAdder = new LongAdder
+  private val loadedMapCacheMissCount: LongAdder = new LongAdder
+
+  private lazy val metricProviderLoaderMapSizeBytes: StateStoreCustomSizeMetric =
+    StateStoreCustomSizeMetric("providerLoadedMapSizeBytes",
+      "estimated size of states cache in provider")
+
+  private lazy val metricProviderLoaderCountOfVersionsInMap: StateStoreCustomAverageMetric =
+    StateStoreCustomAverageMetric("providerLoadedMapCountOfVersions",
+      "count of versions in states cache in provider")
+
+  private lazy val metricLoadedMapCacheHit: StateStoreCustomMetric =
+    StateStoreCustomSumMetric("loadedMapCacheHitCount",
+      "count of cache hit on states cache in provider")
+
+  private lazy val metricLoadedMapCacheMiss: StateStoreCustomMetric =
+    StateStoreCustomSumMetric("loadedMapCacheMissCount",
+      "count of cache miss on states cache in provider")
 
   private case class StoreFile(version: Long, path: Path, isSnapshot: Boolean)
 
@@ -276,12 +305,15 @@ private[state] class HDFSBackedStateStoreProvider extends StateStoreProvider wit
     // Shortcut if the map for this version is already there to avoid a redundant put.
     val loadedCurrentVersionMap = synchronized { loadedMaps.get(version) }
     if (loadedCurrentVersionMap.isDefined) {
+      loadedMapCacheHitCount.increment()
       return loadedCurrentVersionMap.get
     }
 
     logWarning(s"The state for version $version doesn't exist in loadedMaps. " +
       "Reading snapshot file and delta files if needed..." +
       "Note that this is normal for the first batch of starting query.")
+
+    loadedMapCacheMissCount.increment()
 
     val (result, elapsedMs) = Utils.timeTakenMs {
       val snapshotCurrentVersionMap = readSnapshotFile(version)
