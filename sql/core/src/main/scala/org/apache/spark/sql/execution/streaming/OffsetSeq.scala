@@ -22,7 +22,8 @@ import org.json4s.jackson.Serialization
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.RuntimeConfig
-import org.apache.spark.sql.internal.SQLConf.{SHUFFLE_PARTITIONS, STATE_STORE_PROVIDER_CLASS}
+import org.apache.spark.sql.internal.SQLConf.{ADVANCED_REMOVE_REDUNDANT_IN_STATEFUL_AGGREGATION,
+  SHUFFLE_PARTITIONS, STATE_STORE_PROVIDER_CLASS}
 
 /**
  * An ordered collection of offsets, used to track the progress of processing data from one or more
@@ -86,7 +87,8 @@ case class OffsetSeqMetadata(
 
 object OffsetSeqMetadata extends Logging {
   private implicit val format = Serialization.formats(NoTypeHints)
-  private val relevantSQLConfs = Seq(SHUFFLE_PARTITIONS, STATE_STORE_PROVIDER_CLASS)
+  private val relevantSQLConfs = Seq(SHUFFLE_PARTITIONS, STATE_STORE_PROVIDER_CLASS,
+    ADVANCED_REMOVE_REDUNDANT_IN_STATEFUL_AGGREGATION)
 
   def apply(json: String): OffsetSeqMetadata = Serialization.read[OffsetSeqMetadata](json)
 
