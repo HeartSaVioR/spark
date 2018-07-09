@@ -36,6 +36,7 @@ import org.apache.spark.io.LZ4CompressionCodec
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
 import org.apache.spark.sql.execution.streaming.CheckpointFileManager
 import org.apache.spark.sql.execution.streaming.CheckpointFileManager.CancellableFSDataOutputStream
+import org.apache.spark.sql.streaming.state.BoundedSortedMap
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.{SizeEstimator, Utils}
 
@@ -212,6 +213,9 @@ private[state] class HDFSBackedStateStoreProvider extends StateStoreProvider wit
     this.valueSchema = valueSchema
     this.storeConf = storeConf
     this.hadoopConf = hadoopConf
+    this.numberOfVersionsToRetainInMemory = storeConf.maxVersionsToRetainInMemory
+    this.loadedMaps = new BoundedSortedMap[Long, MapType](Ordering[Long].reverse,
+      numberOfVersionsToRetainInMemory)
     fm.mkdirs(baseDir)
   }
 
@@ -229,7 +233,7 @@ private[state] class HDFSBackedStateStoreProvider extends StateStoreProvider wit
   }
 
   override def close(): Unit = {
-    loadedMaps.values.foreach(_.clear())
+    loadedMaps.values.asScala.foreach(_.clear())
   }
 
   override def supportedCustomMetrics: Seq[StateStoreCustomMetric] = {
@@ -250,7 +254,10 @@ private[state] class HDFSBackedStateStoreProvider extends StateStoreProvider wit
   @volatile private var storeConf: StateStoreConf = _
   @volatile private var hadoopConf: Configuration = _
 
-  private lazy val loadedMaps = new mutable.HashMap[Long, MapType]
+  // taking default value first: this will be updated by init method with configuration
+  @volatile private var numberOfVersionsToRetainInMemory: Int = 2
+  @volatile private var loadedMaps = new BoundedSortedMap[Long, MapType](Ordering[Long].reverse,
+    numberOfVersionsToRetainInMemory)
   private lazy val baseDir = stateStoreId.storeCheckpointLocation()
   private lazy val fm = CheckpointFileManager.create(baseDir, hadoopConf)
   private lazy val sparkConf = Option(SparkEnv.get).map(_.conf).getOrElse(new SparkConf)
@@ -289,7 +296,7 @@ private[state] class HDFSBackedStateStoreProvider extends StateStoreProvider wit
    */
   private[state] def latestIterator(): Iterator[UnsafeRowPair] = synchronized {
     val versionsInFiles = fetchFiles().map(_.version).toSet
-    val versionsLoaded = loadedMaps.keySet
+    val versionsLoaded = loadedMaps.keySet.asScala
     val allKnownVersions = versionsInFiles ++ versionsLoaded
     val unsafeRowTuple = new UnsafeRowPair()
     if (allKnownVersions.nonEmpty) {
@@ -303,7 +310,7 @@ private[state] class HDFSBackedStateStoreProvider extends StateStoreProvider wit
   private def loadMap(version: Long): MapType = {
 
     // Shortcut if the map for this version is already there to avoid a redundant put.
-    val loadedCurrentVersionMap = synchronized { loadedMaps.get(version) }
+    val loadedCurrentVersionMap = synchronized { Option(loadedMaps.get(version)) }
     if (loadedCurrentVersionMap.isDefined) {
       loadedMapCacheHitCount.increment()
       return loadedCurrentVersionMap.get
@@ -334,7 +341,7 @@ private[state] class HDFSBackedStateStoreProvider extends StateStoreProvider wit
           lastAvailableMap = Some(new MapType)
         } else {
           lastAvailableMap =
-            synchronized { loadedMaps.get(lastAvailableVersion) }
+            synchronized { Option(loadedMaps.get(lastAvailableVersion)) }
               .orElse(readSnapshotFile(lastAvailableVersion))
         }
       }
@@ -538,7 +545,7 @@ private[state] class HDFSBackedStateStoreProvider extends StateStoreProvider wit
         val lastVersion = files.last.version
         val deltaFilesForLastVersion =
           filesForVersion(files, lastVersion).filter(_.isSnapshot == false)
-        synchronized { loadedMaps.get(lastVersion) } match {
+        synchronized { Option(loadedMaps.get(lastVersion)) } match {
           case Some(map) =>
             if (deltaFilesForLastVersion.size > storeConf.minDeltasForSnapshot) {
               val (_, e2) = Utils.timeTakenMs(writeSnapshotFile(lastVersion, map))
@@ -568,10 +575,6 @@ private[state] class HDFSBackedStateStoreProvider extends StateStoreProvider wit
         val earliestVersionToRetain = files.last.version - storeConf.minVersionsToRetain
         if (earliestVersionToRetain > 0) {
           val earliestFileToRetain = filesForVersion(files, earliestVersionToRetain).head
-          synchronized {
-            val mapsToRemove = loadedMaps.keys.filter(_ < earliestVersionToRetain).toSeq
-            mapsToRemove.foreach(loadedMaps.remove)
-          }
           val filesToDelete = files.filter(_.version < earliestFileToRetain.version)
           val (_, e2) = Utils.timeTakenMs {
             filesToDelete.foreach { f =>
