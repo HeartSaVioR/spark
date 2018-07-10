@@ -516,6 +516,8 @@ class MicroBatchExecution(
       lastExecution.executedPlan // Force the lazy generation of execution plan
     }
 
+    // FIXME: we can get the plan we want from here...
+
     val nextBatch =
       new Dataset(sparkSessionToRunBatch, lastExecution, RowEncoder(lastExecution.analyzed.schema))
 
