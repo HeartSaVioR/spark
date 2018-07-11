@@ -232,6 +232,27 @@ private[state] class HDFSBackedStateStoreProvider extends StateStoreProvider wit
       s"id = (op=${stateStoreId.operatorId},part=${stateStoreId.partitionId}),dir = $baseDir]"
   }
 
+  override def supportWriteDirectSnapshot(): Boolean = true
+  override def writeDirectSnapshot(version: Long, state: Map[UnsafeRow, UnsafeRow]): Unit = {
+    // FIXME: temporary...
+    classOf[HDFSBackedStateStoreProvider].synchronized {
+      val fw = new FileWriter("/tmp/test-direct-snapshot-log.log", true)
+      fw.write(s"START: ===== op ${stateStoreId.operatorId} / part ${stateStoreId.partitionId} / " +
+        s"storename: ${stateStoreId.storeName} / version: $version =====\n")
+      state.foreach {
+        case (key, value) => fw.write(s"key: ${key.toString}, value: ${value.toString}\n")
+      }
+      fw.write(s"END: ===== op ${stateStoreId.operatorId} / part ${stateStoreId.partitionId} / " +
+        s"storename: ${stateStoreId.storeName} / version: $version =====\n")
+      fw.close()
+      /*
+      val newMap = new MapType()
+      newMap.putAll(state.asJava)
+      writeSnapshotFile(version, newMap)
+      */
+    }
+  }
+
   /* Internal fields and methods */
 
   @volatile private var stateStoreId_ : StateStoreId = _

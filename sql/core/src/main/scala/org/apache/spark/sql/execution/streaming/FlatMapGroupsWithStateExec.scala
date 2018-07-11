@@ -64,7 +64,7 @@ case class FlatMapGroupsWithStateExec(
   private val isTimeoutEnabled = timeoutConf != NoTimeout
   private val timestampTimeoutAttribute =
     AttributeReference("timeoutTimestamp", dataType = IntegerType, nullable = false)()
-  private val stateAttributes: Seq[Attribute] = {
+  private[spark] val stateAttributes: Seq[Attribute] = {
     val encSchemaAttribs = stateEncoder.schema.toAttributes
     if (isTimeoutEnabled) encSchemaAttribs :+ timestampTimeoutAttribute else encSchemaAttribs
   }

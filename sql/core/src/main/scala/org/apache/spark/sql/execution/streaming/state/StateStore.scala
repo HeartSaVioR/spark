@@ -202,6 +202,14 @@ trait StateStoreProvider {
    * (specifically, same names) through `StateStore.metrics`.
    */
   def supportedCustomMetrics: Seq[StateStoreCustomMetric] = Nil
+
+  // FIXME: mixin?
+  def supportWriteDirectSnapshot(): Boolean = false
+
+  // FIXME: add javadoc description!
+  def writeDirectSnapshot(version: Long, state: Map[UnsafeRow, UnsafeRow]): Unit =
+    throw new UnsupportedOperationException("This provider doesn't support writing snapshot " +
+      "directly.")
 }
 
 object StateStoreProvider {

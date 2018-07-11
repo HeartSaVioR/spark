@@ -19,16 +19,21 @@ package org.apache.spark.sql.execution.streaming
 
 import java.util.Optional
 
+import scala.collection.mutable
 import scala.collection.JavaConverters._
 import scala.collection.mutable.{Map => MutableMap}
 
 import org.apache.spark.sql.{Dataset, SparkSession}
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.encoders.RowEncoder
-import org.apache.spark.sql.catalyst.expressions.{Alias, CurrentBatchTimestamp, CurrentDate, CurrentTimestamp}
+import org.apache.spark.sql.catalyst.expressions.{Alias, CurrentBatchTimestamp, CurrentDate, CurrentTimestamp, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.plans.logical.{LocalRelation, LogicalPlan, Project}
+import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, SinglePartition}
 import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.datasources.v2.{StreamingDataSourceV2Relation, WriteToDataSourceV2}
 import org.apache.spark.sql.execution.streaming.sources.{InternalRowMicroBatchWriter, MicroBatchWriter}
+import org.apache.spark.sql.execution.streaming.state.{StateStore, StateStoreConf, StateStoreId, StateStoreProvider}
+import org.apache.spark.sql.internal.SQLConf.SHUFFLE_PARTITIONS
 import org.apache.spark.sql.sources.v2.{DataSourceOptions, DataSourceV2, MicroBatchReadSupport, StreamWriteSupport}
 import org.apache.spark.sql.sources.v2.reader.streaming.{MicroBatchReader, Offset => OffsetV2}
 import org.apache.spark.sql.sources.v2.writer.SupportsWriteInternalRow
@@ -516,7 +521,7 @@ class MicroBatchExecution(
       lastExecution.executedPlan // Force the lazy generation of execution plan
     }
 
-    // FIXME: we can get the plan we want from here...
+    runStateRepartitionIfNeeded(sparkSessionToRunBatch)
 
     val nextBatch =
       new Dataset(sparkSessionToRunBatch, lastExecution, RowEncoder(lastExecution.analyzed.schema))
@@ -539,6 +544,107 @@ class MicroBatchExecution(
     }
     watermarkTracker.updateWatermark(lastExecution.executedPlan)
     logDebug(s"Completed batch ${currentBatchId}")
+  }
+
+  private def runStateRepartitionIfNeeded(sparkSessionToRunBatch: SparkSession) = {
+    println(s"executedPlan: ${lastExecution.executedPlan.toJSON}")
+    // FIXME: we are now addressing operators which have only one state... no multiple distributions
+    // FIXME: this can be fixed by letting operator to push pairs of (state info, distribution)
+    // FIXME: we may add some methods to stateful operator to get necessary information
+    val groupedStateOperatorInfos = lastExecution.executedPlan.collect {
+      case s: StateStoreSaveExec if s.stateInfo.isDefined =>
+        (s.keyExpressions, s.child.output, s.stateInfo.get, s.requiredChildDistribution.last)
+      case r: StateStoreRestoreExec if r.stateInfo.isDefined =>
+        (r.keyExpressions, r.child.output, r.stateInfo.get, r.requiredChildDistribution.last)
+      case d: StreamingDeduplicateExec if d.stateInfo.isDefined =>
+        (d.keyExpressions, d.child.output, d.stateInfo.get, d.requiredChildDistribution.last)
+      case m: FlatMapGroupsWithStateExec if m.stateInfo.isDefined =>
+        (m.keyExpressions, m.stateAttributes, m.stateInfo.get, m.requiredChildDistribution.last)
+      case _: StreamingSymmetricHashJoinExec =>
+        throw new UnsupportedOperationException("Repartition with stream-stream join " +
+          "is not supported yet.")
+    }.groupBy(_._3.operatorId)
+
+    // FIXME: this should've been passed from somewhere...
+    // FIXME: for now set it to same for verifying...
+    val prevNumPartitionsForState = sparkSessionToRunBatch.conf
+      .getOption(SHUFFLE_PARTITIONS.key).get.toInt
+    val state = sparkSessionToRunBatch.sqlContext.sessionState
+    val storeConf = new StateStoreConf(state.conf)
+    val hadoopConf = state.newHadoopConf()
+
+    var checkedSupportWriteSnapshot = false
+    groupedStateOperatorInfos.foreach {
+      case (opId, opInfos) =>
+        // all elements in opInfos should be same
+        val (keyAttrs, valueAttrs, opStateInfo, distribution) = opInfos.last
+
+        val partitionerFunc: InternalRow => Int = distribution.createPartitioning(
+          opStateInfo.numPartitions) match {
+          case h: HashPartitioning =>
+            // FIXME: must confirm this again...
+            val projection = UnsafeProjection.create(h.partitionIdExpression :: Nil,
+              keyAttrs)
+            row => projection(row).getInt(0)
+          case s if s == SinglePartition =>
+            _ => 0
+          case _ => throw new IllegalStateException("State should be partitioned " +
+            "by hash or single!")
+        }
+
+        // FIXME: this should be replaced before submitting!
+        // FIXME: check whether checkpointLocation is right
+        val newPartIdToKeyAndValueMap = new mutable.HashMap[Int,
+          mutable.HashMap[UnsafeRow, UnsafeRow]]()
+
+        for (partId <- 0 until prevNumPartitionsForState) {
+          val stateStoreId = new StateStoreId(opStateInfo.checkpointLocation,
+            opStateInfo.operatorId, partId)
+
+          val stateStoreProvider = StateStoreProvider.createAndInit(stateStoreId,
+            keyAttrs.toStructType, valueAttrs.toStructType, None, storeConf, hadoopConf)
+
+          if (!checkedSupportWriteSnapshot) {
+            if (!stateStoreProvider.supportWriteDirectSnapshot()) {
+              // FIXME: need to have better description?
+              // FIXME: replace "state repartition option" to actual config key once we have it
+              throw new UnsupportedOperationException("The provider doesn't support " +
+                "state repartition. Please turn off state repartition option to start " +
+                "without error.")
+            }
+            checkedSupportWriteSnapshot = true
+          }
+
+          val stateStore = stateStoreProvider.getStore(opStateInfo.storeVersion)
+          stateStore.iterator().foreach(rowPair => {
+            // FIXME: must confirm this again...
+            val newPartitionId = partitionerFunc(rowPair.key)
+
+            val stateRowsInPartition = newPartIdToKeyAndValueMap.getOrElseUpdate(newPartitionId,
+              new mutable.HashMap[UnsafeRow, UnsafeRow]())
+
+            stateRowsInPartition.put(rowPair.key, rowPair.value)
+
+            // FIXME: write to temporary file?
+            // FIXME: where is storeName??
+          })
+        }
+
+        for ((newPartId, stateRowsMap) <- newPartIdToKeyAndValueMap) {
+          // FIXME: temporary checkpoint location
+          val stateStoreId = new StateStoreId(opStateInfo.checkpointLocation,
+            opStateInfo.operatorId, newPartId)
+          val provider = StateStoreProvider.createAndInit(stateStoreId, keyAttrs.toStructType,
+            valueAttrs.toStructType, None, storeConf, hadoopConf)
+
+          provider.writeDirectSnapshot(opStateInfo.storeVersion, stateRowsMap.toMap)
+        }
+    }
+
+    // FIXME: replace checkpoint with updated!
+
+    // FIXME: update offsetseqmetadata and write!
+
   }
 
   /** Execute a function while locking the stream from making an progress */
