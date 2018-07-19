@@ -21,6 +21,7 @@ import java.util.Random
 import java.util.function.Supplier
 
 import org.apache.spark._
+import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.serializer.Serializer
 import org.apache.spark.shuffle.sort.SortShuffleManager
@@ -42,7 +43,12 @@ import org.apache.spark.util.collection.unsafe.sort.{PrefixComparators, RecordCo
 case class ShuffleExchangeExec(
     var newPartitioning: Partitioning,
     child: SparkPlan,
-    @transient coordinator: Option[ExchangeCoordinator]) extends Exchange {
+    // @transient coordinator: Option[ExchangeCoordinator]) extends Exchange {
+    // FIXME: revert this after experimenting
+    @transient coordinator: Option[ExchangeCoordinator]) extends Exchange with Logging {
+
+  log.warn(s"[DEBUG] ShuffleExchangeExec created: newPartitioning: $newPartitioning / " +
+    s"child: $child")
 
   // NOTE: coordinator can be null after serialization/deserialization,
   //       e.g. it can be null on the Executor side

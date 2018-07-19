@@ -19,8 +19,8 @@ package org.apache.spark.sql.execution.streaming
 
 import java.util.Optional
 
-import scala.collection.mutable
 import scala.collection.JavaConverters._
+import scala.collection.mutable
 import scala.collection.mutable.{Map => MutableMap}
 
 import org.apache.spark.sql.{Dataset, SparkSession}
@@ -547,10 +547,12 @@ class MicroBatchExecution(
   }
 
   private def runStateRepartitionIfNeeded(sparkSessionToRunBatch: SparkSession) = {
-    println(s"executedPlan: ${lastExecution.executedPlan.toJSON}")
+    log.warn(s"[DEBUG] executedPlan: ${lastExecution.executedPlan.toJSON}")
+
     // FIXME: we are now addressing operators which have only one state... no multiple distributions
     // FIXME: this can be fixed by letting operator to push pairs of (state info, distribution)
     // FIXME: we may add some methods to stateful operator to get necessary information
+    /*
     val groupedStateOperatorInfos = lastExecution.executedPlan.collect {
       case s: StateStoreSaveExec if s.stateInfo.isDefined =>
         (s.keyExpressions, s.child.output, s.stateInfo.get, s.requiredChildDistribution.last)
@@ -645,6 +647,7 @@ class MicroBatchExecution(
 
     // FIXME: update offsetseqmetadata and write!
 
+    */
   }
 
   /** Execute a function while locking the stream from making an progress */
