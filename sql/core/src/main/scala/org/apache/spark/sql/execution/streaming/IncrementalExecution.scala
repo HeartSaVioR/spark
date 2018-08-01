@@ -63,9 +63,14 @@ class IncrementalExecution(
       StreamingGlobalLimitStrategy(outputMode) :: Nil
   }
 
-  private[sql] val numStateStores = offsetSeqMetadata.conf.get(SQLConf.SHUFFLE_PARTITIONS.key)
+  private[sql] val numShufflePartitions = offsetSeqMetadata.conf
+    .get(SQLConf.SHUFFLE_PARTITIONS.key)
     .map(SQLConf.SHUFFLE_PARTITIONS.valueConverter)
     .getOrElse(sparkSession.sessionState.conf.numShufflePartitions)
+
+  private[sql] val numStateStores = offsetSeqMetadata.conf.get(SQLConf.STATE_KEY_GROUPS_COUNT.key)
+    .map(SQLConf.STATE_KEY_GROUPS_COUNT.valueConverter)
+    .getOrElse(sparkSession.sessionState.conf.numStateKeyGroups)
 
   /**
    * See [SPARK-18339]
@@ -93,6 +98,7 @@ class IncrementalExecution(
       runId,
       statefulOperatorId.getAndIncrement(),
       currentBatchId,
+      numShufflePartitions,
       numStateStores)
   }
 

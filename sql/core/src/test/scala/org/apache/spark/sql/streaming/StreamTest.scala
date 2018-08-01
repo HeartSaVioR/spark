@@ -480,7 +480,8 @@ trait StreamTest extends QueryTest with SharedSQLContext with TimeLimits with Be
         // Verify if stateful operators have correct metadata and distribution
         // This can often catch hard to debug errors when developing stateful operators
         lastExecution.executedPlan.collect { case s: StatefulOperator => s }.foreach { s =>
-          assert(s.stateInfo.map(_.numPartitions).contains(lastExecution.numStateStores))
+          assert(s.stateInfo.map(_.numPartitions).contains(lastExecution.numShufflePartitions))
+          assert(s.stateInfo.map(_.numStateKeyGroups).contains(lastExecution.numStateStores))
           s.requiredChildDistribution.foreach { d =>
             withClue(s"$s specifies incorrect # partitions in requiredChildDistribution $d") {
               assert(d.requiredNumPartitions.isDefined)

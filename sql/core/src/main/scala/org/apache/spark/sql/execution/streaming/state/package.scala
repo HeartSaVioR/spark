@@ -22,6 +22,7 @@ import scala.reflect.ClassTag
 import org.apache.spark.TaskContext
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SQLContext
+import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression}
 import org.apache.spark.sql.internal.SessionState
 import org.apache.spark.sql.types.StructType
 
@@ -33,30 +34,35 @@ package object state {
     def mapPartitionsWithStateStore[U: ClassTag](
         sqlContext: SQLContext,
         stateInfo: StatefulOperatorStateInfo,
+        stateKeyGroupExpression: Option[(Seq[Attribute], Expression)],
         keySchema: StructType,
         valueSchema: StructType,
         indexOrdinal: Option[Int])(
-        storeUpdateFunction: (StateStore, Iterator[T]) => Iterator[U]): StateStoreRDD[T, U] = {
+        storeUpdateFunction: (StateStore, Iterator[T]) => Iterator[U])(
+        storeCompletionFunction: StateStore => Any): StateStoreRDD[T, U] = {
 
       mapPartitionsWithStateStore(
         stateInfo,
+        stateKeyGroupExpression,
         keySchema,
         valueSchema,
         indexOrdinal,
         sqlContext.sessionState,
         Some(sqlContext.streams.stateStoreCoordinator))(
-        storeUpdateFunction)
+        storeUpdateFunction)(storeCompletionFunction)
     }
 
     /** Map each partition of an RDD along with data in a [[StateStore]]. */
     private[streaming] def mapPartitionsWithStateStore[U: ClassTag](
         stateInfo: StatefulOperatorStateInfo,
+        stateKeyGroupExpression: Option[(Seq[Attribute], Expression)],
         keySchema: StructType,
         valueSchema: StructType,
         indexOrdinal: Option[Int],
         sessionState: SessionState,
         storeCoordinator: Option[StateStoreCoordinatorRef])(
-        storeUpdateFunction: (StateStore, Iterator[T]) => Iterator[U]): StateStoreRDD[T, U] = {
+        storeUpdateFunction: (StateStore, Iterator[T]) => Iterator[U])(
+        storeCompletionFunction: StateStore => Any): StateStoreRDD[T, U] = {
 
       val cleanedF = dataRDD.sparkContext.clean(storeUpdateFunction)
       val wrappedF = (store: StateStore, iter: Iterator[T]) => {
@@ -67,13 +73,18 @@ package object state {
         cleanedF(store, iter)
       }
 
+      val completionCleanedF = dataRDD.sparkContext.clean(storeCompletionFunction)
+
       new StateStoreRDD(
         dataRDD,
         wrappedF,
+        completionCleanedF,
         stateInfo.checkpointLocation,
         stateInfo.queryRunId,
         stateInfo.operatorId,
         stateInfo.storeVersion,
+        stateInfo.numStateKeyGroups,
+        stateKeyGroupExpression,
         keySchema,
         valueSchema,
         indexOrdinal,

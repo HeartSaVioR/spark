@@ -28,9 +28,10 @@ import org.apache.spark.sql.catalyst.errors._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.{GenerateUnsafeProjection, Predicate}
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
-import org.apache.spark.sql.catalyst.plans.physical.{AllTuples, ClusteredDistribution, Distribution, Partitioning}
+import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes._
 import org.apache.spark.sql.execution._
+import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.execution.streaming.state._
 import org.apache.spark.sql.streaming.{OutputMode, StateOperatorProgress}
@@ -44,10 +45,12 @@ case class StatefulOperatorStateInfo(
     queryRunId: UUID,
     operatorId: Long,
     storeVersion: Long,
-    numPartitions: Int) {
+    numPartitions: Int,
+    numStateKeyGroups: Int) {
   override def toString(): String = {
     s"state info [ checkpoint = $checkpointLocation, runId = $queryRunId, " +
-      s"opId = $operatorId, ver = $storeVersion, numPartitions = $numPartitions]"
+      s"opId = $operatorId, ver = $storeVersion, numPartitions = $numPartitions, " +
+      s"numStateKeyGroups = $numStateKeyGroups]"
   }
 }
 
@@ -63,6 +66,25 @@ trait StatefulOperator extends SparkPlan {
     stateInfo.getOrElse {
       throw new IllegalStateException("State location not present for execution")
     }
+  }
+
+  protected def getStateKeyGroupExpression(keyExpressions: Seq[Attribute])
+    : Option[(Seq[Attribute], Expression)] = attachTree(this) {
+
+    collectFirst {
+      case ShuffleExchangeExec(h: HashPartitioning, _, _)
+        if h.expressions.zip(keyExpressions.map(_.canonicalized))
+          .forall { case (ep, ek) => ep.semanticEquals(ek) } => (keyExpressions, h)
+    }.map { case (exprs, part) =>
+      require(part.expressions.length == 1, "partitioning should have only one expression " +
+        "regarding state key group distribution.")
+      (exprs, part.expressions.head)
+    }
+  }
+
+  protected def getStateKeyGroupAwareHashDistributeExpression(keyExpressions: Seq[Attribute])
+    : Seq[Expression] = attachTree(this) {
+    Pmod(new Murmur3Hash(expressions), Literal(getStateInfo.numStateKeyGroups)) :: Nil
   }
 }
 
@@ -209,6 +231,7 @@ case class StateStoreRestoreExec(
 
     child.execute().mapPartitionsWithStateStore(
       getStateInfo,
+      getStateKeyGroupExpression(keyExpressions),
       keyExpressions.toStructType,
       child.output.toStructType,
       indexOrdinal = None,
@@ -230,6 +253,8 @@ case class StateStoreRestoreExec(
             Option(savedState).toSeq :+ row
           }
         }
+    }{ _ =>
+      // do nothing
     }
   }
 
@@ -241,7 +266,17 @@ case class StateStoreRestoreExec(
     if (keyExpressions.isEmpty) {
       AllTuples :: Nil
     } else {
-      ClusteredDistribution(keyExpressions, stateInfo.map(_.numPartitions)) :: Nil
+      ClusteredDistribution(getStateKeyGroupAwareHashDistributeExpression(keyExpressions),
+        stateInfo.map(_.numPartitions)) :: Nil
+    }
+  }
+
+  /** Ordering needed for using GroupingIterator */
+  override def requiredChildOrdering: Seq[Seq[SortOrder]] = {
+    if (keyExpressions.isEmpty) {
+      super.requiredChildOrdering
+    } else {
+      Seq(keyExpressions.map(SortOrder(_, Ascending)))
     }
   }
 }
@@ -264,6 +299,7 @@ case class StateStoreSaveExec(
 
     child.execute().mapPartitionsWithStateStore(
       getStateInfo,
+      getStateKeyGroupExpression(keyExpressions),
       keyExpressions.toStructType,
       child.output.toStructType,
       indexOrdinal = None,
@@ -274,7 +310,6 @@ case class StateStoreSaveExec(
         val numUpdatedStateRows = longMetric("numUpdatedStateRows")
         val allUpdatesTimeMs = longMetric("allUpdatesTimeMs")
         val allRemovalsTimeMs = longMetric("allRemovalsTimeMs")
-        val commitTimeMs = longMetric("commitTimeMs")
 
         outputMode match {
           // Update and output all rows in the StateStore.
@@ -287,11 +322,8 @@ case class StateStoreSaveExec(
                 numUpdatedStateRows += 1
               }
             }
-            allRemovalsTimeMs += 0
-            commitTimeMs += timeTakenMs {
-              store.commit()
-            }
-            setStoreMetrics(store)
+
+            // it is safe to iterate state store which is still UPDATED state
             store.iterator().map { rowPair =>
               numOutputRows += 1
               rowPair.value
@@ -333,8 +365,6 @@ case class StateStoreSaveExec(
 
               override protected def close(): Unit = {
                 allRemovalsTimeMs += NANOSECONDS.toMillis(System.nanoTime - removalStartTimeNs)
-                commitTimeMs += timeTakenMs { store.commit() }
-                setStoreMetrics(store)
               }
             }
 
@@ -365,16 +395,35 @@ case class StateStoreSaveExec(
 
               override protected def close(): Unit = {
                 allUpdatesTimeMs += NANOSECONDS.toMillis(System.nanoTime - updatesStartTimeNs)
-
-                // Remove old aggregates if watermark specified
-                allRemovalsTimeMs += timeTakenMs { removeKeysOlderThanWatermark(store) }
-                commitTimeMs += timeTakenMs { store.commit() }
-                setStoreMetrics(store)
               }
             }
 
           case _ => throw new UnsupportedOperationException(s"Invalid output mode: $outputMode")
         }
+    } { store =>
+      val allRemovalsTimeMs = longMetric("allRemovalsTimeMs")
+      val commitTimeMs = longMetric("commitTimeMs")
+
+      outputMode match {
+        case Some(Complete) =>
+          allRemovalsTimeMs += 0
+          commitTimeMs += timeTakenMs {
+            store.commit()
+          }
+          setStoreMetrics(store)
+
+        case Some(Append) =>
+          commitTimeMs += timeTakenMs { store.commit() }
+          setStoreMetrics(store)
+
+        case Some(Update) =>
+          // Remove old aggregates if watermark specified
+          allRemovalsTimeMs += timeTakenMs { removeKeysOlderThanWatermark(store) }
+          commitTimeMs += timeTakenMs { store.commit() }
+          setStoreMetrics(store)
+
+        case _ => throw new UnsupportedOperationException(s"Invalid output mode: $outputMode")
+      }
     }
   }
 
@@ -386,7 +435,17 @@ case class StateStoreSaveExec(
     if (keyExpressions.isEmpty) {
       AllTuples :: Nil
     } else {
-      ClusteredDistribution(keyExpressions, stateInfo.map(_.numPartitions)) :: Nil
+      ClusteredDistribution(getStateKeyGroupAwareHashDistributeExpression(keyExpressions),
+        stateInfo.map(_.numPartitions)) :: Nil
+    }
+  }
+
+  /** Ordering needed for using GroupingIterator */
+  override def requiredChildOrdering: Seq[Seq[SortOrder]] = {
+    if (keyExpressions.isEmpty) {
+      super.requiredChildOrdering
+    } else {
+      Seq(keyExpressions.map(SortOrder(_, Ascending)))
     }
   }
 
@@ -407,13 +466,24 @@ case class StreamingDeduplicateExec(
 
   /** Distribute by grouping attributes */
   override def requiredChildDistribution: Seq[Distribution] =
-    ClusteredDistribution(keyExpressions, stateInfo.map(_.numPartitions)) :: Nil
+    ClusteredDistribution(getStateKeyGroupAwareHashDistributeExpression(keyExpressions),
+      stateInfo.map(_.numPartitions)) :: Nil
+
+  /** Ordering needed for using GroupingIterator */
+  override def requiredChildOrdering: Seq[Seq[SortOrder]] = {
+    if (keyExpressions.isEmpty) {
+      super.requiredChildOrdering
+    } else {
+      Seq(keyExpressions.map(SortOrder(_, Ascending)))
+    }
+  }
 
   override protected def doExecute(): RDD[InternalRow] = {
     metrics // force lazy init at driver
 
     child.execute().mapPartitionsWithStateStore(
       getStateInfo,
+      getStateKeyGroupExpression(keyExpressions),
       keyExpressions.toStructType,
       child.output.toStructType,
       indexOrdinal = None,
@@ -421,11 +491,8 @@ case class StreamingDeduplicateExec(
       Some(sqlContext.streams.stateStoreCoordinator)) { (store, iter) =>
       val getKey = GenerateUnsafeProjection.generate(keyExpressions, child.output)
       val numOutputRows = longMetric("numOutputRows")
-      val numTotalStateRows = longMetric("numTotalStateRows")
       val numUpdatedStateRows = longMetric("numUpdatedStateRows")
       val allUpdatesTimeMs = longMetric("allUpdatesTimeMs")
-      val allRemovalsTimeMs = longMetric("allRemovalsTimeMs")
-      val commitTimeMs = longMetric("commitTimeMs")
 
       val baseIterator = watermarkPredicateForData match {
         case Some(predicate) => iter.filter(row => !predicate.eval(row))
@@ -451,10 +518,13 @@ case class StreamingDeduplicateExec(
 
       CompletionIterator[InternalRow, Iterator[InternalRow]](result, {
         allUpdatesTimeMs += NANOSECONDS.toMillis(System.nanoTime - updatesStartTimeNs)
-        allRemovalsTimeMs += timeTakenMs { removeKeysOlderThanWatermark(store) }
-        commitTimeMs += timeTakenMs { store.commit() }
-        setStoreMetrics(store)
       })
+    } { store =>
+      val allRemovalsTimeMs = longMetric("allRemovalsTimeMs")
+      val commitTimeMs = longMetric("commitTimeMs")
+      allRemovalsTimeMs += timeTakenMs { removeKeysOlderThanWatermark(store) }
+      commitTimeMs += timeTakenMs { store.commit() }
+      setStoreMetrics(store)
     }
   }
 

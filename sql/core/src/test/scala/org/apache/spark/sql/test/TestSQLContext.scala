@@ -61,7 +61,9 @@ private[sql] object TestSQLContext {
   val overrideConfs: Map[String, String] =
     Map(
       // Fewer shuffle partitions to speed up testing.
-      SQLConf.SHUFFLE_PARTITIONS.key -> "5")
+      SQLConf.SHUFFLE_PARTITIONS.key -> "5",
+      SQLConf.STATE_KEY_GROUPS_COUNT.key -> "5"
+    )
 }
 
 private[sql] class TestSQLSessionStateBuilder(

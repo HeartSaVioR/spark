@@ -130,7 +130,9 @@ private[state] class HDFSBackedStateStoreProvider extends StateStoreProvider wit
       try {
         commitUpdates(newVersion, mapToUpdate, compressedStream)
         state = COMMITTED
-        logInfo(s"Committed version $newVersion for $this to file $finalDeltaFile")
+        // logInfo(s"Committed version $newVersion for $this to file $finalDeltaFile")
+        // FIXME: debug
+        logWarning(s"DEBUG Committed version $newVersion for $this to file $finalDeltaFile")
         newVersion
       } catch {
         case NonFatal(e) =>
@@ -183,6 +185,8 @@ private[state] class HDFSBackedStateStoreProvider extends StateStoreProvider wit
   /** Get the state store for making updates to create a new `version` of the store. */
   override def getStore(version: Long): StateStore = synchronized {
     require(version >= 0, "Version cannot be less than 0")
+    // FIXME: debug
+    logWarning(s"DEBUG: Retrieving version $version of ${HDFSBackedStateStoreProvider.this}")
     val newMap = new MapType()
     if (version > 0) {
       newMap.putAll(loadMap(version))

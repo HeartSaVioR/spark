@@ -88,8 +88,8 @@ case class OffsetSeqMetadata(
 object OffsetSeqMetadata extends Logging {
   private implicit val format = Serialization.formats(NoTypeHints)
   private val relevantSQLConfs = Seq(
-    SHUFFLE_PARTITIONS, STATE_STORE_PROVIDER_CLASS, STREAMING_MULTIPLE_WATERMARK_POLICY,
-    FLATMAPGROUPSWITHSTATE_STATE_FORMAT_VERSION)
+    STATE_STORE_PROVIDER_CLASS, STREAMING_MULTIPLE_WATERMARK_POLICY,
+    FLATMAPGROUPSWITHSTATE_STATE_FORMAT_VERSION, STATE_KEY_GROUPS_COUNT)
 
   /**
    * Default values of relevant configurations that are used for backward compatibility.
@@ -105,6 +105,10 @@ object OffsetSeqMetadata extends Logging {
     STREAMING_MULTIPLE_WATERMARK_POLICY.key -> MultipleWatermarkPolicy.DEFAULT_POLICY_NAME,
     FLATMAPGROUPSWITHSTATE_STATE_FORMAT_VERSION.key ->
       FlatMapGroupsWithStateExecHelper.legacyVersion.toString
+  )
+
+  private val relevantSQLConfDefaultValuesFromOtherConf = Map[String, String](
+    STATE_KEY_GROUPS_COUNT.key -> SHUFFLE_PARTITIONS.key
   )
 
   def apply(json: String): OffsetSeqMetadata = Serialization.read[OffsetSeqMetadata](json)
@@ -137,11 +141,28 @@ object OffsetSeqMetadata extends Logging {
           // then either inject a default value (if specified in `relevantSQLConfDefaultValues`) or
           // let the existing conf value in SparkSession prevail.
           relevantSQLConfDefaultValues.get(confKey) match {
-
             case Some(defaultValue) =>
               sessionConf.set(confKey, defaultValue)
               logWarning(s"Conf '$confKey' was not found in the offset log, " +
                 s"using default value '$defaultValue'")
+
+            case None =>
+              // do nothing, since we will also check with relevantSQLConfDefaultValuesFromOtherConf
+          }
+
+          // For backward compatibility, if a config was not recorded in the offset log,
+          // then either inject a value from other config
+          // (if specified in `relevantSQLConfDefaultValuesFromOtherConf`) or
+          // let the existing conf value in SparkSession prevail.
+          relevantSQLConfDefaultValuesFromOtherConf.get(confKey) match {
+            case Some(otherConf) =>
+              // NOTE: the value for other configuration must be exist between in metadata conf
+              // or in session conf.
+              val valueFromOtherConf = metadata.conf.getOrElse(otherConf,
+                sessionConf.getOption(otherConf).get)
+              sessionConf.set(confKey, valueFromOtherConf)
+              logWarning(s"Conf '$confKey' was not found in the offset log, " +
+                s"using value of conf '$otherConf', $valueFromOtherConf")
 
             case None =>
               val valueStr = sessionConf.getOption(confKey).map { v =>

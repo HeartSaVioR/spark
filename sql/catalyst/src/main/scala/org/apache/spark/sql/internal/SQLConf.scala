@@ -237,9 +237,22 @@ object SQLConf {
     .createWithDefault(Long.MaxValue)
 
   val SHUFFLE_PARTITIONS = buildConf("spark.sql.shuffle.partitions")
-    .doc("The default number of partitions to use when shuffling data for joins or aggregations.")
+    .doc("The default number of partitions to use when shuffling data for joins or aggregations." +
+      "NOTE: modification of `spark.sql.shuffle.partitions` during query run is not supported.")
     .intConf
     .createWithDefault(200)
+
+  val STATE_KEY_GROUPS_COUNT = buildConf("spark.sql.state.key.groups.count")
+    .doc("The number of state key groups. This splits all possible state keys into logical group " +
+      "which separates state operators' partition and state data's partition, hence enable to " +
+      "reconfigure `spark.sql.shuffle.partitions` during rerun of query." +
+      "This value should be equal or larger than `spark.sql.shuffle.partitions` for technical " +
+      "reason, so this also defines maximum partitions of shuffle for joins or aggregation." +
+      "This value will be fixed and shouldn't be modified once query is run at least once, " +
+      "so if you want bigger key groups, you need to set the config at startup on first " +
+      "run of query. ")
+    .intConf
+    .createWithDefault(SHUFFLE_PARTITIONS.defaultValue.get)
 
   val SHUFFLE_TARGET_POSTSHUFFLE_INPUT_SIZE =
     buildConf("spark.sql.adaptive.shuffle.targetPostShuffleInputSize")
@@ -1542,6 +1555,8 @@ class SQLConf extends Serializable with Logging {
   def cacheVectorizedReaderEnabled: Boolean = getConf(CACHE_VECTORIZED_READER_ENABLED)
 
   def numShufflePartitions: Int = getConf(SHUFFLE_PARTITIONS)
+
+  def numStateKeyGroups: Int = getConf(STATE_KEY_GROUPS_COUNT)
 
   def targetPostShuffleInputSize: Long =
     getConf(SHUFFLE_TARGET_POSTSHUFFLE_INPUT_SIZE)

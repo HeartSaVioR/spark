@@ -54,6 +54,7 @@ case class StreamingGlobalLimitExec(
 
     child.execute().mapPartitionsWithStateStore(
         getStateInfo,
+        None,
         keySchema,
         valueSchema,
         indexOrdinal = None,
@@ -63,7 +64,6 @@ case class StreamingGlobalLimitExec(
       val numOutputRows = longMetric("numOutputRows")
       val numUpdatedStateRows = longMetric("numUpdatedStateRows")
       val allUpdatesTimeMs = longMetric("allUpdatesTimeMs")
-      val commitTimeMs = longMetric("commitTimeMs")
       val updatesStartTimeNs = System.nanoTime
 
       val preBatchRowCount: Long = Option(store.get(key)).map(_.getLong(0)).getOrElse(0L)
@@ -84,9 +84,11 @@ case class StreamingGlobalLimitExec(
           store.put(key, getValueRow(cumulativeRowCount))
         }
         allUpdatesTimeMs += NANOSECONDS.toMillis(System.nanoTime - updatesStartTimeNs)
-        commitTimeMs += timeTakenMs { store.commit() }
-        setStoreMetrics(store)
       })
+    } { store =>
+      val commitTimeMs = longMetric("commitTimeMs")
+      commitTimeMs += timeTakenMs { store.commit() }
+      setStoreMetrics(store)
     }
   }
 
