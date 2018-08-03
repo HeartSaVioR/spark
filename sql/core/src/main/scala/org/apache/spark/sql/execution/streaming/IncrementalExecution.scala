@@ -87,12 +87,15 @@ class IncrementalExecution(
   private val statefulOperatorId = new AtomicInteger(0)
 
   /** Get the state info of the next stateful operator */
+  // FIXME: fix parameter of StatefulOperatorStateInfo to have parameter as well as state stores
+
   private def nextStatefulOperationStateInfo(): StatefulOperatorStateInfo = {
     StatefulOperatorStateInfo(
       checkpointLocation,
       runId,
       statefulOperatorId.getAndIncrement(),
       currentBatchId,
+      numStateStores,
       numStateStores)
   }
 

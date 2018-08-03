@@ -35,11 +35,12 @@ import org.apache.spark.util.SerializableConfiguration
  */
 class StateStoreRDD[T: ClassTag, U: ClassTag](
     dataRDD: RDD[T],
-    storeUpdateFunction: (StateStore, Iterator[T]) => Iterator[U],
+    storeUpdateFunction: (Map[Int, StateStore], Iterator[T]) => Iterator[U],
     checkpointLocation: String,
     queryRunId: UUID,
     operatorId: Long,
     storeVersion: Long,
+    numStateKeyGroups: Int,
     keySchema: StructType,
     valueSchema: StructType,
     indexOrdinal: Option[Int],
@@ -67,11 +68,6 @@ class StateStoreRDD[T: ClassTag, U: ClassTag](
   }
 
   override def compute(partition: Partition, ctxt: TaskContext): Iterator[U] = {
-    var store: StateStore = null
-    val storeProviderId = StateStoreProviderId(
-      StateStoreId(checkpointLocation, operatorId, partition.index),
-      queryRunId)
-
     // If we're in continuous processing mode, we should get the store version for the current
     // epoch rather than the one at planning time.
     val currentVersion = EpochTracker.getCurrentEpoch match {
@@ -79,10 +75,24 @@ class StateStoreRDD[T: ClassTag, U: ClassTag](
       case Some(value) => value
     }
 
-    store = StateStore.get(
-      storeProviderId, keySchema, valueSchema, indexOrdinal, currentVersion,
-      storeConf, hadoopConfBroadcast.value.value)
+    require(numStateKeyGroups >= partitions.length)
+
     val inputIter = dataRDD.iterator(partition, ctxt)
-    storeUpdateFunction(store, inputIter)
+    val stateKeyGroupsToCover = (0 until numStateKeyGroups).filter { keyGroupIndex =>
+      keyGroupIndex % partitions.length == partition.index
+    }
+    val stateKeyGroupIdToStateStore = stateKeyGroupsToCover.map { keyGroupId =>
+      val storeProviderId = StateStoreProviderId(
+        StateStoreId(checkpointLocation, operatorId, keyGroupId),
+        queryRunId)
+
+      val stateStore = StateStore.get(
+        storeProviderId, keySchema, valueSchema, indexOrdinal, currentVersion,
+        storeConf, hadoopConfBroadcast.value.value)
+
+      keyGroupId -> stateStore
+    }.toMap
+
+    storeUpdateFunction(stateKeyGroupIdToStateStore, inputIter)
   }
 }

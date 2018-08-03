@@ -28,9 +28,10 @@ import org.apache.spark.sql.catalyst.errors._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.{GenerateUnsafeProjection, Predicate}
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
-import org.apache.spark.sql.catalyst.plans.physical.{AllTuples, ClusteredDistribution, Distribution, Partitioning}
+import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes._
 import org.apache.spark.sql.execution._
+import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.execution.streaming.state._
 import org.apache.spark.sql.streaming.{OutputMode, StateOperatorProgress}
@@ -44,10 +45,12 @@ case class StatefulOperatorStateInfo(
     queryRunId: UUID,
     operatorId: Long,
     storeVersion: Long,
-    numPartitions: Int) {
+    numPartitions: Int,
+    numStateKeyGroups: Int) {
   override def toString(): String = {
     s"state info [ checkpoint = $checkpointLocation, runId = $queryRunId, " +
-      s"opId = $operatorId, ver = $storeVersion, numPartitions = $numPartitions]"
+      s"opId = $operatorId, ver = $storeVersion, numPartitions = $numPartitions, " +
+      s"numStateKeyGroups = $numStateKeyGroups]"
   }
 }
 
@@ -63,6 +66,18 @@ trait StatefulOperator extends SparkPlan {
     stateInfo.getOrElse {
       throw new IllegalStateException("State location not present for execution")
     }
+  }
+
+  protected def getStateKeyGroupExpression(keyExpressions: Seq[Attribute])
+    : Expression = attachTree(this) {
+
+    val partitioning = collectFirst {
+      case ShuffleExchangeExec(h: HashPartitioning, _, _)
+        if h.expressions.zip(keyExpressions.map(_.canonicalized))
+          .forall { case (ep, ek) => ep.semanticEquals(ek) } => h
+    }.getOrElse(throw new IllegalStateException("Cannot find relevant partitioning for state"))
+
+    partitioning.copy(numPartitions = getStateInfo.numStateKeyGroups).partitionIdExpression
   }
 }
 
@@ -207,13 +222,15 @@ case class StateStoreRestoreExec(
   override protected def doExecute(): RDD[InternalRow] = {
     val numOutputRows = longMetric("numOutputRows")
 
+    val stateKeyGroupExpression = getStateKeyGroupExpression(keyExpressions)
+
     child.execute().mapPartitionsWithStateStore(
       getStateInfo,
       keyExpressions.toStructType,
       child.output.toStructType,
       indexOrdinal = None,
       sqlContext.sessionState,
-      Some(sqlContext.streams.stateStoreCoordinator)) { case (store, iter) =>
+      Some(sqlContext.streams.stateStoreCoordinator)) { case (storeGroup, iter) =>
         val getKey = GenerateUnsafeProjection.generate(keyExpressions, child.output)
         val hasInput = iter.hasNext
         if (!hasInput && keyExpressions.isEmpty) {
@@ -221,9 +238,16 @@ case class StateStoreRestoreExec(
           // the `HashAggregateExec` will output a 0 value for the partial merge. We need to
           // restore the value, so that we don't overwrite our state with a 0 value, but rather
           // merge the 0 with existing state.
-          store.iterator().map(_.value)
+          storeGroup.values
+            .map(store => store.iterator().map(_.value))
+            .reduce(_ ++ _)
         } else {
           iter.flatMap { row =>
+            val keyGroupId = stateKeyGroupExpression.eval(row).asInstanceOf[Int]
+            val store = storeGroup.get(keyGroupId)
+              // FIXME: write proper message here
+              .getOrElse(throw new IllegalStateException(s"Unknown key group id ${keyGroupId} " +
+              s"Known group ids are ${storeGroup.keys}"))
             val key = getKey(row)
             val savedState = store.get(key)
             numOutputRows += 1
@@ -257,6 +281,8 @@ case class StateStoreSaveExec(
     child: SparkPlan)
   extends UnaryExecNode with StateStoreWriter with WatermarkSupport {
 
+  val stateKeyGroupExpression = getStateKeyGroupExpression(keyExpressions)
+
   override protected def doExecute(): RDD[InternalRow] = {
     metrics // force lazy init at driver
     assert(outputMode.nonEmpty,
@@ -268,13 +294,22 @@ case class StateStoreSaveExec(
       child.output.toStructType,
       indexOrdinal = None,
       sqlContext.sessionState,
-      Some(sqlContext.streams.stateStoreCoordinator)) { (store, iter) =>
+      Some(sqlContext.streams.stateStoreCoordinator)) { (storeGroup, iter) =>
         val getKey = GenerateUnsafeProjection.generate(keyExpressions, child.output)
         val numOutputRows = longMetric("numOutputRows")
         val numUpdatedStateRows = longMetric("numUpdatedStateRows")
         val allUpdatesTimeMs = longMetric("allUpdatesTimeMs")
         val allRemovalsTimeMs = longMetric("allRemovalsTimeMs")
         val commitTimeMs = longMetric("commitTimeMs")
+
+        def getStateStore(row: InternalRow): StateStore = {
+          val keyGroupId = stateKeyGroupExpression.eval(row).asInstanceOf[Int]
+          val store = storeGroup.get(keyGroupId)
+            // FIXME: write proper message here
+            .getOrElse(throw new IllegalStateException(s"Unknown key group id ${keyGroupId} " +
+            s"Known group ids are ${storeGroup.keys}"))
+          store
+        }
 
         outputMode match {
           // Update and output all rows in the StateStore.
@@ -283,19 +318,22 @@ case class StateStoreSaveExec(
               while (iter.hasNext) {
                 val row = iter.next().asInstanceOf[UnsafeRow]
                 val key = getKey(row)
-                store.put(key, row)
+                getStateStore(row).put(key, row)
                 numUpdatedStateRows += 1
               }
             }
             allRemovalsTimeMs += 0
             commitTimeMs += timeTakenMs {
-              store.commit()
+              storeGroup.values.foreach(_.commit())
             }
-            setStoreMetrics(store)
-            store.iterator().map { rowPair =>
-              numOutputRows += 1
-              rowPair.value
-            }
+            storeGroup.values.foreach(setStoreMetrics)
+
+            storeGroup.values
+              .map(store => store.iterator().map { rowPair =>
+                numOutputRows += 1
+                rowPair.value
+              })
+              .reduce(_ ++ _)
 
           // Update and output only rows being evicted from the StateStore
           // Assumption: watermark predicates must be non-empty if append mode is allowed
@@ -305,19 +343,23 @@ case class StateStoreSaveExec(
               while (filteredIter.hasNext) {
                 val row = filteredIter.next().asInstanceOf[UnsafeRow]
                 val key = getKey(row)
-                store.put(key, row)
+                getStateStore(row).put(key, row)
                 numUpdatedStateRows += 1
               }
             }
 
             val removalStartTimeNs = System.nanoTime
-            val rangeIter = store.getRange(None, None)
+            val rangeIter = storeGroup.values.map { store =>
+              store.getRange(None, None).map(rowPair => (store, rowPair))
+            }.reduce(_ ++ _)
 
             new NextIterator[InternalRow] {
               override protected def getNext(): InternalRow = {
                 var removedValueRow: InternalRow = null
                 while(rangeIter.hasNext && removedValueRow == null) {
-                  val rowPair = rangeIter.next()
+                  val stateToRowPair = rangeIter.next()
+                  val store = stateToRowPair._1
+                  val rowPair = stateToRowPair._2
                   if (watermarkPredicateForKeys.get.eval(rowPair.key)) {
                     store.remove(rowPair.key)
                     removedValueRow = rowPair.value
@@ -333,8 +375,10 @@ case class StateStoreSaveExec(
 
               override protected def close(): Unit = {
                 allRemovalsTimeMs += NANOSECONDS.toMillis(System.nanoTime - removalStartTimeNs)
-                commitTimeMs += timeTakenMs { store.commit() }
-                setStoreMetrics(store)
+                commitTimeMs += timeTakenMs {
+                  storeGroup.values.foreach(_.commit())
+                }
+                storeGroup.values.foreach(setStoreMetrics)
               }
             }
 
@@ -353,7 +397,7 @@ case class StateStoreSaveExec(
                 if (baseIterator.hasNext) {
                   val row = baseIterator.next().asInstanceOf[UnsafeRow]
                   val key = getKey(row)
-                  store.put(key, row)
+                  getStateStore(row).put(key, row)
                   numOutputRows += 1
                   numUpdatedStateRows += 1
                   row
@@ -367,9 +411,13 @@ case class StateStoreSaveExec(
                 allUpdatesTimeMs += NANOSECONDS.toMillis(System.nanoTime - updatesStartTimeNs)
 
                 // Remove old aggregates if watermark specified
-                allRemovalsTimeMs += timeTakenMs { removeKeysOlderThanWatermark(store) }
-                commitTimeMs += timeTakenMs { store.commit() }
-                setStoreMetrics(store)
+                allRemovalsTimeMs += timeTakenMs {
+                  storeGroup.values.foreach(removeKeysOlderThanWatermark)
+                }
+                commitTimeMs += timeTakenMs {
+                  storeGroup.values.foreach(_.commit())
+                }
+                storeGroup.values.foreach(setStoreMetrics)
               }
             }
 
@@ -405,6 +453,8 @@ case class StreamingDeduplicateExec(
     eventTimeWatermark: Option[Long] = None)
   extends UnaryExecNode with StateStoreWriter with WatermarkSupport {
 
+  val stateKeyGroupExpression = getStateKeyGroupExpression(keyExpressions)
+
   /** Distribute by grouping attributes */
   override def requiredChildDistribution: Seq[Distribution] =
     ClusteredDistribution(keyExpressions, stateInfo.map(_.numPartitions)) :: Nil
@@ -418,7 +468,7 @@ case class StreamingDeduplicateExec(
       child.output.toStructType,
       indexOrdinal = None,
       sqlContext.sessionState,
-      Some(sqlContext.streams.stateStoreCoordinator)) { (store, iter) =>
+      Some(sqlContext.streams.stateStoreCoordinator)) { (storeGroup, iter) =>
       val getKey = GenerateUnsafeProjection.generate(keyExpressions, child.output)
       val numOutputRows = longMetric("numOutputRows")
       val numTotalStateRows = longMetric("numTotalStateRows")
@@ -426,6 +476,15 @@ case class StreamingDeduplicateExec(
       val allUpdatesTimeMs = longMetric("allUpdatesTimeMs")
       val allRemovalsTimeMs = longMetric("allRemovalsTimeMs")
       val commitTimeMs = longMetric("commitTimeMs")
+
+      def getStateStore(row: InternalRow): StateStore = {
+        val keyGroupId = stateKeyGroupExpression.eval(row).asInstanceOf[Int]
+        val store = storeGroup.get(keyGroupId)
+          // FIXME: write proper message here
+          .getOrElse(throw new IllegalStateException(s"Unknown key group id ${keyGroupId} " +
+          s"Known group ids are ${storeGroup.keys}"))
+        store
+      }
 
       val baseIterator = watermarkPredicateForData match {
         case Some(predicate) => iter.filter(row => !predicate.eval(row))
@@ -437,6 +496,7 @@ case class StreamingDeduplicateExec(
       val result = baseIterator.filter { r =>
         val row = r.asInstanceOf[UnsafeRow]
         val key = getKey(row)
+        val store = getStateStore(row)
         val value = store.get(key)
         if (value == null) {
           store.put(key, StreamingDeduplicateExec.EMPTY_ROW)
@@ -451,9 +511,15 @@ case class StreamingDeduplicateExec(
 
       CompletionIterator[InternalRow, Iterator[InternalRow]](result, {
         allUpdatesTimeMs += NANOSECONDS.toMillis(System.nanoTime - updatesStartTimeNs)
-        allRemovalsTimeMs += timeTakenMs { removeKeysOlderThanWatermark(store) }
-        commitTimeMs += timeTakenMs { store.commit() }
-        setStoreMetrics(store)
+
+        // Remove old aggregates if watermark specified
+        allRemovalsTimeMs += timeTakenMs {
+          storeGroup.values.foreach(removeKeysOlderThanWatermark)
+        }
+        commitTimeMs += timeTakenMs {
+          storeGroup.values.foreach(_.commit())
+        }
+        storeGroup.values.foreach(setStoreMetrics)
       })
     }
   }

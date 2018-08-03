@@ -91,6 +91,8 @@ case class FlatMapGroupsWithStateExec(
     }
   }
 
+  val stateKeyGroupExpression = getStateKeyGroupExpression(keyExpressions)
+
   override protected def doExecute(): RDD[InternalRow] = {
     metrics // force lazy init at driver
 
@@ -110,8 +112,8 @@ case class FlatMapGroupsWithStateExec(
       stateManager.stateSchema,
       indexOrdinal = None,
       sqlContext.sessionState,
-      Some(sqlContext.streams.stateStoreCoordinator)) { case (store, iter) =>
-        val processor = new InputProcessor(store)
+      Some(sqlContext.streams.stateStoreCoordinator)) { case (storeGroup, iter) =>
+        val processor = new InputProcessor(storeGroup)
 
         // If timeout is based on event time, then filter late data based on watermark
         val filteredIter = watermarkPredicateForData match {
@@ -140,7 +142,7 @@ case class FlatMapGroupsWithStateExec(
   }
 
   /** Helper class to update the state store */
-  class InputProcessor(store: StateStore) {
+  class InputProcessor(storeGroup: Map[Int, StateStore]) {
 
     // Converters for translating input keys, values, output data between rows and Java objects
     private val getKeyObj =
@@ -153,6 +155,15 @@ case class FlatMapGroupsWithStateExec(
     private val numUpdatedStateRows = longMetric("numUpdatedStateRows")
     private val numOutputRows = longMetric("numOutputRows")
 
+    def getStateStore(row: InternalRow): StateStore = {
+      val keyGroupId = stateKeyGroupExpression.eval(row).asInstanceOf[Int]
+      val store = storeGroup.get(keyGroupId)
+        // FIXME: write proper message here
+        .getOrElse(throw new IllegalStateException(s"Unknown key group id ${keyGroupId} " +
+        s"Known group ids are ${storeGroup.keys}"))
+      store
+    }
+
     /**
      * For every group, get the key, values and corresponding state and call the function,
      * and return an iterator of rows
@@ -161,8 +172,9 @@ case class FlatMapGroupsWithStateExec(
       val groupedIter = GroupedIterator(dataIter, groupingAttributes, child.output)
       groupedIter.flatMap { case (keyRow, valueRowIter) =>
         val keyUnsafeRow = keyRow.asInstanceOf[UnsafeRow]
+        val stateStore = getStateStore(keyRow)
         callFunctionAndUpdateState(
-          stateManager.getState(store, keyUnsafeRow),
+          stateManager.getState(stateStore, keyUnsafeRow),
           valueRowIter,
           hasTimedOut = false)
       }
@@ -178,9 +190,11 @@ case class FlatMapGroupsWithStateExec(
             throw new IllegalStateException(
               s"Cannot filter timed out keys for $timeoutConf")
         }
-        val timingOutPairs = stateManager.getAllState(store).filter { state =>
-          state.timeoutTimestamp != NO_TIMESTAMP && state.timeoutTimestamp < timeoutThreshold
-        }
+        val timingOutPairs = storeGroup.values.map(stateManager.getAllState)
+          .reduce(_ ++ _)
+          .filter { state =>
+            state.timeoutTimestamp != NO_TIMESTAMP && state.timeoutTimestamp < timeoutThreshold
+          }
         timingOutPairs.flatMap { stateData =>
           callFunctionAndUpdateState(stateData, Iterator.empty, hasTimedOut = true)
         }

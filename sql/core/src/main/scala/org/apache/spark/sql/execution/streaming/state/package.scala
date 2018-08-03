@@ -36,7 +36,8 @@ package object state {
         keySchema: StructType,
         valueSchema: StructType,
         indexOrdinal: Option[Int])(
-        storeUpdateFunction: (StateStore, Iterator[T]) => Iterator[U]): StateStoreRDD[T, U] = {
+        storeUpdateFunction: (Map[Int, StateStore], Iterator[T]) => Iterator[U])
+      : StateStoreRDD[T, U] = {
 
       mapPartitionsWithStateStore(
         stateInfo,
@@ -56,15 +57,18 @@ package object state {
         indexOrdinal: Option[Int],
         sessionState: SessionState,
         storeCoordinator: Option[StateStoreCoordinatorRef])(
-        storeUpdateFunction: (StateStore, Iterator[T]) => Iterator[U]): StateStoreRDD[T, U] = {
+        storeUpdateFunction: (Map[Int, StateStore], Iterator[T]) => Iterator[U])
+      : StateStoreRDD[T, U] = {
 
       val cleanedF = dataRDD.sparkContext.clean(storeUpdateFunction)
-      val wrappedF = (store: StateStore, iter: Iterator[T]) => {
+      val wrappedF = (storeGroup: Map[Int, StateStore], iter: Iterator[T]) => {
         // Abort the state store in case of error
         TaskContext.get().addTaskCompletionListener(_ => {
-          if (!store.hasCommitted) store.abort()
+          storeGroup.values.foreach { store =>
+            if (!store.hasCommitted) store.abort()
+          }
         })
-        cleanedF(store, iter)
+        cleanedF(storeGroup, iter)
       }
 
       new StateStoreRDD(
@@ -74,6 +78,7 @@ package object state {
         stateInfo.queryRunId,
         stateInfo.operatorId,
         stateInfo.storeVersion,
+        stateInfo.numStateKeyGroups,
         keySchema,
         valueSchema,
         indexOrdinal,
