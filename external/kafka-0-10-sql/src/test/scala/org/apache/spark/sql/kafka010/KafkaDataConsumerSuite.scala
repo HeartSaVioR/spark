@@ -20,8 +20,6 @@ package org.apache.spark.sql.kafka010
 import java.util.concurrent.{Executors, TimeUnit}
 
 import scala.collection.JavaConverters._
-import scala.concurrent.{ExecutionContext, Future}
-import scala.concurrent.duration.Duration
 import scala.util.Random
 
 import org.apache.kafka.clients.consumer.ConsumerConfig
@@ -31,7 +29,6 @@ import org.scalatest.PrivateMethodTester
 
 import org.apache.spark.{TaskContext, TaskContextImpl}
 import org.apache.spark.sql.test.SharedSQLContext
-import org.apache.spark.util.ThreadUtils
 
 class KafkaDataConsumerSuite extends SharedSQLContext with PrivateMethodTester {
 
