@@ -133,8 +133,8 @@ private[kafka010] class InternalKafkaConsumerPool(objectFactory: ObjectFactory,
 private[kafka010] object InternalKafkaConsumerPool {
 
   /**
-    * Builds the pool for [[InternalKafkaConsumer]]. The pool instance is created per each call.
-    */
+   * Builds the pool for [[InternalKafkaConsumer]]. The pool instance is created per each call.
+   */
   def build: InternalKafkaConsumerPool = {
     val objFactory = new ObjectFactory
     val poolConfig = new PoolConfig

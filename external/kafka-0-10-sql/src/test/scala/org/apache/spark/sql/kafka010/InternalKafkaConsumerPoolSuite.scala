@@ -225,9 +225,9 @@ class InternalKafkaConsumerPoolSuite extends SharedSQLContext {
   ).asJava
 
   private def borrowObjectsPerKey(
-                                   pool: InternalKafkaConsumerPool,
-                                   kafkaParams: ju.Map[String, Object],
-                                   keys: List[CacheKey]): Seq[(CacheKey, InternalKafkaConsumer)] = {
+      pool: InternalKafkaConsumerPool,
+      kafkaParams: ju.Map[String, Object],
+      keys: List[CacheKey]): Seq[(CacheKey, InternalKafkaConsumer)] = {
     keys.map { key =>
       val numActiveBeforeBorrowing = pool.getNumActive
       val numIdleBeforeBorrowing = pool.getNumIdle
