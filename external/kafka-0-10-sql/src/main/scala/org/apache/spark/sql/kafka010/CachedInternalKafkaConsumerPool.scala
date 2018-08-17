@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.spark.sql.kafka010.v2
+package org.apache.spark.sql.kafka010
 
 import java.{util => ju}
 import java.util.concurrent.ConcurrentHashMap
@@ -25,12 +25,11 @@ import org.apache.commons.pool2.impl.{DefaultPooledObject, GenericKeyedObjectPoo
 
 import org.apache.spark.SparkEnv
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.kafka010.v2.{CachedInternalKafkaConsumerPool => ConsumerPool}
-import org.apache.spark.sql.kafka010.v2.CachedInternalKafkaConsumerPool.CustomSwallowedExceptionListener
-import org.apache.spark.sql.kafka010.v2.KafkaDataConsumer._
+import org.apache.spark.sql.kafka010.CachedInternalKafkaConsumerPool._
+import org.apache.spark.sql.kafka010.KafkaDataConsumer._
 
-private[kafka010] class CachedInternalKafkaConsumerPool(objectFactory: ConsumerPool.ObjectFactory,
-                                                        poolConfig: ConsumerPool.PoolConfig) {
+private[kafka010] class CachedInternalKafkaConsumerPool(objectFactory: ObjectFactory,
+                                                        poolConfig: PoolConfig) {
 
   private lazy val pool = {
     val internalPool = new GenericKeyedObjectPool[CacheKey, InternalKafkaConsumer](
@@ -53,9 +52,26 @@ private[kafka010] class CachedInternalKafkaConsumerPool(objectFactory: ConsumerP
     // invalidate all idle consumers for the key
     pool.clear(key)
 
+    pool.getNumActive()
     // set invalidate timestamp to let active objects being destroyed when returning to pool
     objectFactory.keyToLastInvalidatedTimestamp.put(key, System.currentTimeMillis())
   }
+
+  def close(): Unit = {
+    pool.close()
+  }
+
+  def getNumIdle: Int = pool.getNumIdle
+
+  def getNumIdle(key: CacheKey): Int = pool.getNumIdle(key)
+
+  def getNumActive: Int = pool.getNumActive
+
+  def getNumActive(key: CacheKey): Int = pool.getNumActive(key)
+
+  def getTotal: Int = getNumIdle + getNumActive
+
+  def getTotal(key: CacheKey): Int = getNumIdle(key) + getNumActive(key)
 
   private def updateKafkaParamForKey(key: CacheKey, kafkaParams: ju.Map[String, Object]): Unit = {
     // We can assume that kafkaParam should not be different for same cache key,
@@ -94,7 +110,10 @@ private[kafka010] object CachedInternalKafkaConsumerPool {
     init()
 
     def init(): Unit = {
-      val capacity = SparkEnv.get.conf.getInt("spark.sql.kafkaConsumerCache.capacity", 64)
+      val conf = SparkEnv.get.conf
+      val capacity = conf.getInt("spark.sql.kafkaConsumerCache.capacity", 64)
+      val jmxEnabled = conf.getBoolean("spark.sql.kafkaConsumerCache.jmx.enable",
+        defaultValue = false)
 
       // 1. Set min idle objects per key to 0 to avoid creating unnecessary object.
       // 2. Set max idle objects per key to 1 but set total objects per key to infinite
@@ -114,6 +133,9 @@ private[kafka010] object CachedInternalKafkaConsumerPool {
 
       // Immediately fail on exhausted pool while borrowing
       setBlockWhenExhausted(false)
+
+      setJmxEnabled(jmxEnabled)
+      setJmxNamePrefix("kafka010-cached-kafka-consumer-pool")
     }
   }
 

@@ -25,7 +25,7 @@ import scala.collection.JavaConverters._
 import org.apache.kafka.clients.consumer.{ConsumerConfig, ConsumerRecord, KafkaConsumer, OffsetOutOfRangeException}
 import org.apache.kafka.common.TopicPartition
 
-import org.apache.spark.{SparkEnv, SparkException, TaskContext}
+import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.kafka010.KafkaDataConsumer.AvailableOffsetRange
 import org.apache.spark.sql.kafka010.KafkaSourceProvider._
@@ -83,12 +83,6 @@ private[kafka010] case class InternalKafkaConsumer(
   private val groupId = kafkaParams.get(ConsumerConfig.GROUP_ID_CONFIG).asInstanceOf[String]
 
   @volatile private var consumer = createConsumer
-
-  /** indicates whether this consumer is in use or not */
-  @volatile var inUse = true
-
-  /** indicate whether this consumer is going to be stopped in the next release */
-  @volatile var markedForClose = false
 
   /** Iterator to the already fetch data */
   @volatile private var fetchedData =
@@ -354,14 +348,12 @@ private[kafka010] case class InternalKafkaConsumer(
   }
 }
 
-
 private[kafka010] object KafkaDataConsumer extends Logging {
 
   case class AvailableOffsetRange(earliest: Long, latest: Long)
 
   private case class CachedKafkaDataConsumer(internalConsumer: InternalKafkaConsumer)
     extends KafkaDataConsumer {
-    assert(internalConsumer.inUse) // make sure this has been set to true
     override def release(): Unit = { KafkaDataConsumer.release(internalConsumer) }
   }
 
@@ -370,48 +362,12 @@ private[kafka010] object KafkaDataConsumer extends Logging {
     override def release(): Unit = { internalConsumer.close() }
   }
 
-  private case class CacheKey(groupId: String, topicPartition: TopicPartition) {
+  case class CacheKey(groupId: String, topicPartition: TopicPartition) {
     def this(topicPartition: TopicPartition, kafkaParams: ju.Map[String, Object]) =
       this(kafkaParams.get(ConsumerConfig.GROUP_ID_CONFIG).asInstanceOf[String], topicPartition)
   }
 
-  // This cache has the following important properties.
-  // - We make a best-effort attempt to maintain the max size of the cache as configured capacity.
-  //   The capacity is not guaranteed to be maintained, especially when there are more active
-  //   tasks simultaneously using consumers than the capacity.
-  private lazy val cache = {
-    val conf = SparkEnv.get.conf
-    val capacity = conf.getInt("spark.sql.kafkaConsumerCache.capacity", 64)
-    new ju.LinkedHashMap[CacheKey, InternalKafkaConsumer](capacity, 0.75f, true) {
-      override def removeEldestEntry(
-        entry: ju.Map.Entry[CacheKey, InternalKafkaConsumer]): Boolean = {
-
-        // Try to remove the least-used entry if its currently not in use.
-        //
-        // If you cannot remove it, then the cache will keep growing. In the worst case,
-        // the cache will grow to the max number of concurrent tasks that can run in the executor,
-        // (that is, number of tasks slots) after which it will never reduce. This is unlikely to
-        // be a serious problem because an executor with more than 64 (default) tasks slots is
-        // likely running on a beefy machine that can handle a large number of simultaneously
-        // active consumers.
-
-        if (!entry.getValue.inUse && this.size > capacity) {
-          logWarning(
-            s"KafkaConsumer cache hitting max capacity of $capacity, " +
-              s"removing consumer for ${entry.getKey}")
-          try {
-            entry.getValue.close()
-          } catch {
-            case e: SparkException =>
-              logError(s"Error closing earliest Kafka consumer for ${entry.getKey}", e)
-          }
-          true
-        } else {
-          false
-        }
-      }
-    }
-  }
+  private lazy val pool = CachedInternalKafkaConsumerPool.build
 
   /**
    * Get a cached consumer for groupId, assigned to topic and partition.
@@ -425,70 +381,36 @@ private[kafka010] object KafkaDataConsumer extends Logging {
   def acquire(
       topicPartition: TopicPartition,
       kafkaParams: ju.Map[String, Object],
-      useCache: Boolean): KafkaDataConsumer = synchronized {
-    val key = new CacheKey(topicPartition, kafkaParams)
-    val existingInternalConsumer = cache.get(key)
+      useCache: Boolean): KafkaDataConsumer = {
 
-    lazy val newInternalConsumer = new InternalKafkaConsumer(topicPartition, kafkaParams)
+    if (!useCache) {
+      return NonCachedKafkaDataConsumer(new InternalKafkaConsumer(topicPartition, kafkaParams))
+    }
+
+    val key = new CacheKey(topicPartition, kafkaParams)
 
     if (TaskContext.get != null && TaskContext.get.attemptNumber >= 1) {
-      // If this is reattempt at running the task, then invalidate cached consumer if any and
-      // start with a new one.
-      if (existingInternalConsumer != null) {
-        // Consumer exists in cache. If its in use, mark it for closing later, or close it now.
-        if (existingInternalConsumer.inUse) {
-          existingInternalConsumer.markedForClose = true
-        } else {
-          existingInternalConsumer.close()
-        }
-      }
-      cache.remove(key)  // Invalidate the cache in any case
-      NonCachedKafkaDataConsumer(newInternalConsumer)
+      // If this is reattempt at running the task, then invalidate cached consumer if any.
 
-    } else if (!useCache) {
-      // If planner asks to not reuse consumers, then do not use it, return a new consumer
-      NonCachedKafkaDataConsumer(newInternalConsumer)
+      // invalidate all idle consumers for the key
+      pool.invalidateKey(key)
 
-    } else if (existingInternalConsumer == null) {
-      // If consumer is not already cached, then put a new in the cache and return it
-      cache.put(key, newInternalConsumer)
-      newInternalConsumer.inUse = true
-      CachedKafkaDataConsumer(newInternalConsumer)
+      // borrow a consumer from pool even in this case
+    }
 
-    } else if (existingInternalConsumer.inUse) {
-      // If consumer is already cached but is currently in use, then return a new consumer
-      NonCachedKafkaDataConsumer(newInternalConsumer)
-
-    } else {
-      // If consumer is already cached and is currently not in use, then return that consumer
-      existingInternalConsumer.inUse = true
-      CachedKafkaDataConsumer(existingInternalConsumer)
+    try {
+      CachedKafkaDataConsumer(pool.borrowObject(key, kafkaParams))
+    } catch { case _: NoSuchElementException =>
+      // There's neither idle object to clean up nor available space in pool:
+      // fail back to create non-cached consumer
+      NonCachedKafkaDataConsumer(new InternalKafkaConsumer(topicPartition, kafkaParams))
     }
   }
 
   private def release(intConsumer: InternalKafkaConsumer): Unit = {
-    synchronized {
-
-      // Clear the consumer from the cache if this is indeed the consumer present in the cache
-      val key = new CacheKey(intConsumer.topicPartition, intConsumer.kafkaParams)
-      val cachedIntConsumer = cache.get(key)
-      if (intConsumer.eq(cachedIntConsumer)) {
-        // The released consumer is the same object as the cached one.
-        if (intConsumer.markedForClose) {
-          intConsumer.close()
-          cache.remove(key)
-        } else {
-          intConsumer.inUse = false
-        }
-      } else {
-        // The released consumer is either not the same one as in the cache, or not in the cache
-        // at all. This may happen if the cache was invalidate while this consumer was being used.
-        // Just close this consumer.
-        intConsumer.close()
-        logInfo(s"Released a supposedly cached consumer that was not found in the cache")
-      }
-    }
+    pool.returnObject(intConsumer)
   }
+
 }
 
 private[kafka010] object InternalKafkaConsumer extends Logging {
