@@ -26,10 +26,13 @@ import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.serialization.ByteArrayDeserializer
 
 import org.apache.spark.SparkEnv
+import org.apache.spark.sql.kafka010.InternalKafkaConsumerPool.PoolConfig
 import org.apache.spark.sql.kafka010.KafkaDataConsumer.CacheKey
 import org.apache.spark.sql.test.SharedSQLContext
 
 class InternalKafkaConsumerPoolSuite extends SharedSQLContext {
+
+  import PoolConfig._
 
   test("basic multiple borrows and returns for single key") {
     val pool = InternalKafkaConsumerPool.build
@@ -92,12 +95,8 @@ class InternalKafkaConsumerPoolSuite extends SharedSQLContext {
   }
 
   test("borrow more than capacity from pool, and free up idle objects automatically") {
-    val conf = SparkEnv.get.conf
     val capacity = 16
-    val prevKafkaConsumerCacheCapacity = conf.get("spark.sql.kafkaConsumerCache.capacity", "64")
-    try {
-      conf.set("spark.sql.kafkaConsumerCache.capacity", capacity.toString)
-
+    withSparkConf(Seq(CONFIG_NAME_CAPACITY -> capacity.toString): _*) {
       val pool = InternalKafkaConsumerPool.build
 
       val kafkaParams = getTestKafkaParams
@@ -146,8 +145,6 @@ class InternalKafkaConsumerPoolSuite extends SharedSQLContext {
       assert(pool.getNumActive === keyToPooledObjectPairs.length - numToReturn + 1)
       // total objects should be more than number of active + 1 but can't expect exact number
       assert(pool.getTotal > keyToPooledObjectPairs.length - numToReturn + 1)
-    } finally {
-      conf.set("spark.sql.kafkaConsumerCache.capacity", prevKafkaConsumerCacheCapacity)
     }
   }
 
@@ -190,6 +187,43 @@ class InternalKafkaConsumerPoolSuite extends SharedSQLContext {
     // this object should be kept idle since it is not a target of invalidation
     assertPoolStateForKey(pool, key, numIdle = 1, numActive = 0, numTotal = 1)
     assertPoolState(pool, numIdle = 1, numActive = 0, numTotal = 1)
+  }
+
+  test("evicting idle objects on background") {
+    import org.scalatest.time.SpanSugar._
+
+    val minEvictableIdleTimeMillis = 3 * 1000 // 3 seconds
+    val evictorThreadRunIntervalMillis = 500 // triggering multiple evictions by intention
+
+    val newConf = Seq(
+      CONFIG_NAME_MIN_EVICTABLE_IDLE_TIME_MILLIS -> minEvictableIdleTimeMillis.toString,
+      CONFIG_NAME_EVICTOR_THREAD_RUN_INTERVAL_MILLIS -> evictorThreadRunIntervalMillis.toString)
+
+    withSparkConf(newConf: _*) {
+      val pool = InternalKafkaConsumerPool.build
+
+      val kafkaParams = getTestKafkaParams
+      val topicPartitions: List[TopicPartition] = for (
+        partitionId <- (0 until 10).toList
+      ) yield new TopicPartition("topic", partitionId)
+
+      val keys: List[CacheKey] = topicPartitions.map { part =>
+        new CacheKey(part, kafkaParams)
+      }
+
+      // borrow and return some consumers to ensure some partitions are being idle
+      // this test covers the use cases: rebalance / topic removal happens while running query
+      val keyToPooledObjectPairs = borrowObjectsPerKey(pool, kafkaParams, keys)
+      val objectsToReturn = keyToPooledObjectPairs.filter(_._1.topicPartition.partition() % 2 == 0)
+      returnObjects(pool, objectsToReturn)
+
+      // wait up to twice than minEvictableIdleTimeMillis to ensure evictor thread to clear up
+      // idle objects
+      eventually(timeout((minEvictableIdleTimeMillis.toLong * 2).seconds),
+        interval(evictorThreadRunIntervalMillis.milliseconds)) {
+        assertPoolState(pool, numIdle = 0, numActive = 5, numTotal = 5)
+      }
+    }
   }
 
   private def assertPooledObject(
@@ -256,6 +290,28 @@ class InternalKafkaConsumerPoolSuite extends SharedSQLContext {
       assertPoolStateForKey(pool, key, numIdle = 1, numActive = 0, numTotal = 1)
       assertPoolState(pool, numIdle = numIdleBeforeReturning + 1,
         numActive = numActiveBeforeReturning - 1, numTotal = numTotalBeforeReturning)
+    }
+  }
+
+  private def withSparkConf(pairs: (String, String)*)(f: => Unit): Unit = {
+    val conf = SparkEnv.get.conf
+
+    val (keys, values) = pairs.unzip
+    val currentValues = keys.map { key =>
+      if (conf.contains(key)) {
+        Some(conf.get(key))
+      } else {
+        None
+      }
+    }
+
+    (keys, values).zipped.foreach { conf.set }
+
+    try f finally {
+      keys.zip(currentValues).foreach {
+        case (key, Some(value)) => conf.set(key, value)
+        case (key, None) => conf.remove(key)
+      }
     }
   }
 }

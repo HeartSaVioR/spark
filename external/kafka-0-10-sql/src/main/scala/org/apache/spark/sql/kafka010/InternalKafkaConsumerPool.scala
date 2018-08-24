@@ -21,7 +21,7 @@ import java.{util => ju}
 import java.util.concurrent.ConcurrentHashMap
 
 import org.apache.commons.pool2.{BaseKeyedPooledObjectFactory, PooledObject, SwallowedExceptionListener}
-import org.apache.commons.pool2.impl.{DefaultPooledObject, GenericKeyedObjectPool, GenericKeyedObjectPoolConfig}
+import org.apache.commons.pool2.impl.{DefaultEvictionPolicy, DefaultPooledObject, GenericKeyedObjectPool, GenericKeyedObjectPoolConfig}
 
 import org.apache.spark.SparkEnv
 import org.apache.spark.internal.Logging
@@ -156,16 +156,20 @@ private[kafka010] object InternalKafkaConsumerPool {
   }
 
   class PoolConfig extends GenericKeyedObjectPoolConfig[InternalKafkaConsumer] {
-
-    final val minEvictableIdleTimeMillis = 5 * 60 * 1000 // 5 minutes
-
     init()
 
     def init(): Unit = {
+      import PoolConfig._
+
       val conf = SparkEnv.get.conf
-      val capacity = conf.getInt("spark.sql.kafkaConsumerCache.capacity", 64)
-      val jmxEnabled = conf.getBoolean("spark.sql.kafkaConsumerCache.jmx.enable",
-        defaultValue = false)
+      val capacity = conf.getInt(CONFIG_NAME_CAPACITY, DEFAULT_VALUE_CAPACITY)
+      val jmxEnabled = conf.getBoolean(CONFIG_NAME_JMX_ENABLED,
+        defaultValue = DEFAULT_VALUE_JMX_ENABLED)
+      val minEvictableIdleTimeMillis = conf.getLong(CONFIG_NAME_MIN_EVICTABLE_IDLE_TIME_MILLIS,
+        DEFAULT_VALUE_MIN_EVICTABLE_IDLE_TIME_MILLIS)
+      val evictorThreadRunIntervalMillis = conf.getLong(
+        CONFIG_NAME_EVICTOR_THREAD_RUN_INTERVAL_MILLIS,
+        DEFAULT_VALUE_EVICTOR_THREAD_RUN_INTERVAL_MILLIS)
 
       // NOTE: Below lines define the behavior of CachedInternalKafkaConsumerPool, so do not modify
       // unless you know what you are doing, and update the doc of CachedInternalKafkaConsumerPool
@@ -183,9 +187,16 @@ private[kafka010] object InternalKafkaConsumerPool {
       setMaxTotalPerKey(-1)
       setMaxTotal(capacity)
 
-      // Set minimum evictable idle time which will be referred from evict thread
+      // Set minimum evictable idle time which will be referred from evictor thread
       setMinEvictableIdleTimeMillis(minEvictableIdleTimeMillis)
       setSoftMinEvictableIdleTimeMillis(-1)
+
+      // evictor thread will run test with all idle objects
+      // this should not be an issue because we assume the number of idle objects is small enough
+      // and interval of running evict test would be at least couple of minutes
+      setTimeBetweenEvictionRunsMillis(evictorThreadRunIntervalMillis)
+      setNumTestsPerEvictionRun(Int.MaxValue)
+      setEvictionPolicy(new DefaultEvictionPolicy[InternalKafkaConsumer]())
 
       // Immediately fail on exhausted pool while borrowing
       setBlockWhenExhausted(false)
@@ -193,6 +204,21 @@ private[kafka010] object InternalKafkaConsumerPool {
       setJmxEnabled(jmxEnabled)
       setJmxNamePrefix("kafka010-cached-kafka-consumer-pool")
     }
+  }
+
+  object PoolConfig {
+    val CONFIG_NAME_PREFIX = "spark.sql.kafkaConsumerCache."
+    val CONFIG_NAME_CAPACITY = CONFIG_NAME_PREFIX + "capacity"
+    val CONFIG_NAME_JMX_ENABLED = CONFIG_NAME_PREFIX + "jmx.enable"
+    val CONFIG_NAME_MIN_EVICTABLE_IDLE_TIME_MILLIS = CONFIG_NAME_PREFIX +
+      "minEvictableIdleTimeMillis"
+    val CONFIG_NAME_EVICTOR_THREAD_RUN_INTERVAL_MILLIS = CONFIG_NAME_PREFIX +
+      "evictorThreadRunIntervalMillis"
+
+    val DEFAULT_VALUE_CAPACITY = 64
+    val DEFAULT_VALUE_JMX_ENABLED = false
+    val DEFAULT_VALUE_MIN_EVICTABLE_IDLE_TIME_MILLIS = 5 * 60 * 1000 // 5 minutes
+    val DEFAULT_VALUE_EVICTOR_THREAD_RUN_INTERVAL_MILLIS = 3 * 60 * 1000 // 3 minutes
   }
 
   class ObjectFactory extends BaseKeyedPooledObjectFactory[CacheKey, InternalKafkaConsumer]
