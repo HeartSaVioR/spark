@@ -26,7 +26,7 @@ import org.apache.commons.pool2.impl.{DefaultEvictionPolicy, DefaultPooledObject
 import org.apache.spark.SparkEnv
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.kafka010.InternalKafkaConsumerPool._
-import org.apache.spark.sql.kafka010.KafkaDataConsumer._
+import org.apache.spark.sql.kafka010.KafkaDataConsumer.CacheKey
 
 /**
  * Provides object pool for [[InternalKafkaConsumer]] which is grouped by [[CacheKey]].
@@ -36,15 +36,21 @@ import org.apache.spark.sql.kafka010.KafkaDataConsumer._
  * returnObject() if the object is healthy to return to pool, or invalidateObject() if the object
  * should be destroyed.
  *
- * The capacity of pool is determined by "spark.sql.kafkaConsumerCache.capacity" config value, and
- * the pool will have reasonable default value if the value is not provided.
+ * The soft capacity of pool is determined by "spark.sql.kafkaConsumerCache.capacity" config value,
+ * and the pool will have reasonable default value if the value is not provided.
+ * (The instance will do its best effort to respect soft capacity but it can exceed when there's
+ * a borrowing request and there's neither free space nor idle object to clear.)
  *
  * This class guarantees that no caller will get pooled object once the object is borrowed and
  * not yet returned, hence provide thread-safety usage of non-thread-safe [[InternalKafkaConsumer]]
  * unless caller shares the object to multiple threads.
  */
-private[kafka010] class InternalKafkaConsumerPool(objectFactory: ObjectFactory,
-                                                  poolConfig: PoolConfig) {
+private[kafka010] class InternalKafkaConsumerPool(
+    objectFactory: ObjectFactory,
+    poolConfig: PoolConfig) {
+
+  // the class is intended to have only soft capacity
+  assert(poolConfig.getMaxTotal < 0)
 
   private lazy val pool = {
     val internalPool = new GenericKeyedObjectPool[CacheKey, InternalKafkaConsumer](
@@ -57,41 +63,35 @@ private[kafka010] class InternalKafkaConsumerPool(objectFactory: ObjectFactory,
    * Borrows [[InternalKafkaConsumer]] object from the pool. If there's no idle object for the key,
    * the pool will create the [[InternalKafkaConsumer]] object.
    *
-   * If the pool doesn't have idle object for the key and also exceeds the capacity, pool will try
-   * to clear some of idle objects. If it doesn't help getting empty space to create new object,
-   * it will throw [[NoSuchElementException]] immediately.
+   * If the pool doesn't have idle object for the key and also exceeds the soft capacity,
+   * pool will try to clear some of idle objects.
    *
    * Borrowed object must be returned by either calling returnObject or invalidateObject, otherwise
    * the object will be kept in pool as active object.
    */
   def borrowObject(key: CacheKey, kafkaParams: ju.Map[String, Object]): InternalKafkaConsumer = {
     updateKafkaParamForKey(key, kafkaParams)
+
+    if (getTotal == poolConfig.getSoftMaxTotal()) {
+      pool.clearOldest()
+    }
+
     pool.borrowObject(key)
   }
 
   /** Returns borrowed object to the pool. */
-  def returnObject(intConsumer: InternalKafkaConsumer): Unit = {
-    pool.returnObject(extractCacheKey(intConsumer), intConsumer)
+  def returnObject(consumer: InternalKafkaConsumer): Unit = {
+    pool.returnObject(extractCacheKey(consumer), consumer)
   }
 
   /** Invalidates (destroy) borrowed object to the pool. */
-  def invalidateObject(intConsumer: InternalKafkaConsumer): Unit = {
-    pool.invalidateObject(extractCacheKey(intConsumer), intConsumer)
+  def invalidateObject(consumer: InternalKafkaConsumer): Unit = {
+    pool.invalidateObject(extractCacheKey(consumer), consumer)
   }
 
-  /**
-   * Invalidates current idle and active (borrowed) objects for the key. It ensure no invalidated
-   * object will be provided again via borrowObject.
-   *
-   * It doesn't mean the key will not be available: valid objects will be available via calling
-   * borrowObject afterwards.
-   */
+  /** Invalidates all idle consumers for the key */
   def invalidateKey(key: CacheKey): Unit = {
-    // invalidate all idle consumers for the key
     pool.clear(key)
-
-    // set invalidate timestamp to let active objects being destroyed when returning to pool
-    objectFactory.keyToLastInvalidatedTimestamp.put(key, System.currentTimeMillis())
   }
 
   /**
@@ -124,8 +124,8 @@ private[kafka010] class InternalKafkaConsumerPool(objectFactory: ObjectFactory,
     objectFactory.keyToKafkaParams.putIfAbsent(key, kafkaParams)
   }
 
-  private def extractCacheKey(intConsumer: InternalKafkaConsumer): CacheKey = {
-    new CacheKey(intConsumer.topicPartition, intConsumer.kafkaParams)
+  private def extractCacheKey(consumer: InternalKafkaConsumer): CacheKey = {
+    new CacheKey(consumer.topicPartition, consumer.kafkaParams)
   }
 }
 
@@ -144,24 +144,25 @@ private[kafka010] object InternalKafkaConsumerPool {
                                      lastBorrowedTime: Long) extends RuntimeException
 
   object CustomSwallowedExceptionListener extends SwallowedExceptionListener with Logging {
-    override def onSwallowException(e: Exception): Unit = e match {
-      case e1: PooledObjectInvalidated =>
-        logDebug("Pool for key was invalidated after cached object was borrowed. " +
-          s"Invalidating cached object - key: ${e1.key} / borrowed timestamp: " +
-          s"${e1.lastBorrowedTime} / invalidated timestamp for key: ${e1.lastInvalidatedTimestamp}")
-
-      case _ => logError(s"Error closing Kafka consumer", e)
+    override def onSwallowException(e: Exception): Unit = {
+      logError(s"Error closing Kafka consumer", e)
     }
   }
 
   class PoolConfig extends GenericKeyedObjectPoolConfig[InternalKafkaConsumer] {
+    private var softMaxTotal = Int.MaxValue
+
+    def getSoftMaxTotal(): Int = softMaxTotal
+
     init()
 
     def init(): Unit = {
       import PoolConfig._
 
       val conf = SparkEnv.get.conf
-      val capacity = conf.getInt(CONFIG_NAME_CAPACITY, DEFAULT_VALUE_CAPACITY)
+
+      softMaxTotal = conf.getInt(CONFIG_NAME_CAPACITY, DEFAULT_VALUE_CAPACITY)
+
       val jmxEnabled = conf.getBoolean(CONFIG_NAME_JMX_ENABLED,
         defaultValue = DEFAULT_VALUE_JMX_ENABLED)
       val minEvictableIdleTimeMillis = conf.getLong(CONFIG_NAME_MIN_EVICTABLE_IDLE_TIME_MILLIS,
@@ -174,33 +175,28 @@ private[kafka010] object InternalKafkaConsumerPool {
       // doing, and update the class doc accordingly if necessary when you modify.
 
       // 1. Set min idle objects per key to 0 to avoid creating unnecessary object.
-      // 2. Set max idle objects per key to 1 but set total objects per key to infinite
-      // which ensures borrowing per key is not restricted (though it can be restricted in
-      // total objects).
-      // 3. Set max total objects to the capacity users set to the configuration.
-      // This will prevent having active objects more than capacity. Fail-back approach should be
-      // provided when the pool exceeds the capacity.
+      // 2. Set max idle objects per key to 3 but set total objects per key to infinite
+      // which ensures borrowing per key is not restricted.
+      // 3. Set max total objects to infinite which ensures all objects are managed in this pool.
       setMinIdlePerKey(0)
-      setMaxIdlePerKey(1)
+      setMaxIdlePerKey(3)
       setMaxTotalPerKey(-1)
-      setMaxTotal(capacity)
+      setMaxTotal(-1)
 
       // Set minimum evictable idle time which will be referred from evictor thread
       setMinEvictableIdleTimeMillis(minEvictableIdleTimeMillis)
       setSoftMinEvictableIdleTimeMillis(-1)
 
-      // evictor thread will run test with all idle objects
-      // this should not be an issue because we assume the number of idle objects is small enough
-      // and interval of running evict test would be at least couple of minutes
+      // evictor thread will run test with ten idle objects
       setTimeBetweenEvictionRunsMillis(evictorThreadRunIntervalMillis)
-      setNumTestsPerEvictionRun(Int.MaxValue)
+      setNumTestsPerEvictionRun(10)
       setEvictionPolicy(new DefaultEvictionPolicy[InternalKafkaConsumer]())
 
       // Immediately fail on exhausted pool while borrowing
       setBlockWhenExhausted(false)
 
       setJmxEnabled(jmxEnabled)
-      setJmxNamePrefix("kafka010-cached-kafka-consumer-pool")
+      setJmxNamePrefix("kafka010-cached-simple-kafka-consumer-pool")
     }
   }
 
@@ -222,11 +218,8 @@ private[kafka010] object InternalKafkaConsumerPool {
   class ObjectFactory extends BaseKeyedPooledObjectFactory[CacheKey, InternalKafkaConsumer]
     with Logging {
 
-    lazy val keyToKafkaParams: ConcurrentHashMap[CacheKey, ju.Map[String, Object]] =
+    val keyToKafkaParams: ConcurrentHashMap[CacheKey, ju.Map[String, Object]] =
       new ConcurrentHashMap[CacheKey, ju.Map[String, Object]]()
-
-    lazy val keyToLastInvalidatedTimestamp: ConcurrentHashMap[CacheKey, Long] =
-      new ConcurrentHashMap[CacheKey, Long]()
 
     override def create(key: CacheKey): InternalKafkaConsumer = {
       val kafkaParams = keyToKafkaParams.get(key)
@@ -240,19 +233,9 @@ private[kafka010] object InternalKafkaConsumerPool {
       new DefaultPooledObject[InternalKafkaConsumer](value)
     }
 
-    override def passivateObject(key: CacheKey, p: PooledObject[InternalKafkaConsumer]): Unit = {
-      Option(keyToLastInvalidatedTimestamp.get(key)) match {
-        // If the object is borrowed before than key pool being invalidated,
-        // throw exception to invalidate pooled object while returning to pool.
-        case Some(lastInvalidatedTimestamp) if lastInvalidatedTimestamp > p.getLastBorrowTime =>
-          throw PooledObjectInvalidated(key, lastInvalidatedTimestamp,
-            p.getLastBorrowTime)
-        case _ =>
-      }
-    }
-
     override def destroyObject(key: CacheKey, p: PooledObject[InternalKafkaConsumer]): Unit = {
       p.getObject.close()
     }
   }
 }
+

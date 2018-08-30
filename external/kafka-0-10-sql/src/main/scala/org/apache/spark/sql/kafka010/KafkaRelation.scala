@@ -105,7 +105,7 @@ private[kafka010] class KafkaRelation(
       KafkaSourceProvider.kafkaParamsForExecutors(specifiedKafkaParams, uniqueGroupId)
     val rdd = new KafkaSourceRDD(
       sqlContext.sparkContext, executorKafkaParams, offsetRanges,
-      pollTimeoutMs, failOnDataLoss, reuseKafkaConsumer = false).map { cr =>
+      pollTimeoutMs, failOnDataLoss).map { cr =>
       InternalRow(
         cr.key,
         cr.value,

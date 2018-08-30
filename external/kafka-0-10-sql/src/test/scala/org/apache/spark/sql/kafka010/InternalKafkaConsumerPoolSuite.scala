@@ -26,13 +26,11 @@ import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.serialization.ByteArrayDeserializer
 
 import org.apache.spark.SparkEnv
-import org.apache.spark.sql.kafka010.InternalKafkaConsumerPool.PoolConfig
 import org.apache.spark.sql.kafka010.KafkaDataConsumer.CacheKey
 import org.apache.spark.sql.test.SharedSQLContext
 
 class InternalKafkaConsumerPoolSuite extends SharedSQLContext {
-
-  import PoolConfig._
+  import org.apache.spark.sql.kafka010.InternalKafkaConsumerPool.PoolConfig._
 
   test("basic multiple borrows and returns for single key") {
     val pool = InternalKafkaConsumerPool.build
@@ -44,29 +42,34 @@ class InternalKafkaConsumerPoolSuite extends SharedSQLContext {
     val kafkaParams: ju.Map[String, Object] = getTestKafkaParams
 
     val key = new CacheKey(topicPartition, kafkaParams)
-    val pooledObject = pool.borrowObject(key, kafkaParams)
 
-    assertPooledObject(pooledObject, topicPartition, kafkaParams)
-    assertPoolStateForKey(pool, key, numIdle = 0, numActive = 1, numTotal = 1)
-    assertPoolState(pool, numIdle = 0, numActive = 1, numTotal = 1)
+    val pooledObjects = (0 to 2).map { _ =>
+      val pooledObject = pool.borrowObject(key, kafkaParams)
+      assertPooledObject(pooledObject, topicPartition, kafkaParams)
+      pooledObject
+    }
 
-    // it doesn't still exceed total pool size
+    assertPoolStateForKey(pool, key, numIdle = 0, numActive = 3, numTotal = 3)
+    assertPoolState(pool, numIdle = 0, numActive = 3, numTotal = 3)
+
     val pooledObject2 = pool.borrowObject(key, kafkaParams)
 
     assertPooledObject(pooledObject2, topicPartition, kafkaParams)
-    assertPoolStateForKey(pool, key, numIdle = 0, numActive = 2, numTotal = 2)
-    assertPoolState(pool, numIdle = 0, numActive = 2, numTotal = 2)
+    assertPoolStateForKey(pool, key, numIdle = 0, numActive = 4, numTotal = 4)
+    assertPoolState(pool, numIdle = 0, numActive = 4, numTotal = 4)
 
-    // we only allow one idle object per key
-    pool.returnObject(pooledObject)
+    pooledObjects.foreach(pool.returnObject)
 
-    assertPoolStateForKey(pool, key, numIdle = 1, numActive = 1, numTotal = 2)
-    assertPoolState(pool, numIdle = 1, numActive = 1, numTotal = 2)
+    assertPoolStateForKey(pool, key, numIdle = 3, numActive = 1, numTotal = 4)
+    assertPoolState(pool, numIdle = 3, numActive = 1, numTotal = 4)
 
     pool.returnObject(pooledObject2)
 
-    assertPoolStateForKey(pool, key, numIdle = 1, numActive = 0, numTotal = 1)
-    assertPoolState(pool, numIdle = 1, numActive = 0, numTotal = 1)
+    // we only allow three idle objects per key
+    assertPoolStateForKey(pool, key, numIdle = 3, numActive = 0, numTotal = 3)
+    assertPoolState(pool, numIdle = 3, numActive = 0, numTotal = 3)
+
+    pool.close()
   }
 
   test("basic borrow and return for multiple keys") {
@@ -92,11 +95,19 @@ class InternalKafkaConsumerPoolSuite extends SharedSQLContext {
 
     assertPoolState(pool, numIdle = keyToPooledObjectPairs.length, numActive = 0,
       numTotal = keyToPooledObjectPairs.length)
+
+    pool.close()
   }
 
-  test("borrow more than capacity from pool, and free up idle objects automatically") {
+  test("borrow more than soft max capacity from pool which is neither free space nor idle object") {
     val capacity = 16
-    withSparkConf(Seq(CONFIG_NAME_CAPACITY -> capacity.toString): _*) {
+
+    val newConf = Seq(
+      CONFIG_NAME_CAPACITY -> capacity.toString,
+      CONFIG_NAME_MIN_EVICTABLE_IDLE_TIME_MILLIS -> (-1).toString,
+      CONFIG_NAME_EVICTOR_THREAD_RUN_INTERVAL_MILLIS -> (-1).toString)
+
+    withSparkConf(newConf: _*) {
       val pool = InternalKafkaConsumerPool.build
 
       val kafkaParams = getTestKafkaParams
@@ -108,23 +119,45 @@ class InternalKafkaConsumerPoolSuite extends SharedSQLContext {
         new CacheKey(part, kafkaParams)
       }
 
-      // while in loop pool doesn't still exceed total pool size
+      // while in loop pool doesn't still exceed soft max pool size
       val keyToPooledObjectPairs = borrowObjectsPerKey(pool, kafkaParams, keys)
 
       val moreTopicPartition = new TopicPartition("topic2", 0)
       val newCacheKey = new CacheKey(moreTopicPartition, kafkaParams)
 
-      assertPoolState(pool, numIdle = 0, numActive = keyToPooledObjectPairs.length,
-        numTotal = keyToPooledObjectPairs.length)
+      // exceeds soft max pool size, and also no idle object for cleaning up
+      // but pool will borrow a new object
+      pool.borrowObject(newCacheKey, kafkaParams)
 
-      // already exceed limit on pool, and no idle object
-      intercept[NoSuchElementException] {
-        pool.borrowObject(newCacheKey, kafkaParams)
+      assertPoolState(pool, numIdle = 0, numActive = keyToPooledObjectPairs.length + 1,
+        numTotal = keyToPooledObjectPairs.length + 1)
+
+      pool.close()
+    }
+  }
+
+  test("borrow more than soft max capacity from pool frees up idle objects automatically") {
+    val capacity = 16
+
+    val newConf = Seq(
+      CONFIG_NAME_CAPACITY -> capacity.toString,
+      CONFIG_NAME_MIN_EVICTABLE_IDLE_TIME_MILLIS -> (-1).toString,
+      CONFIG_NAME_EVICTOR_THREAD_RUN_INTERVAL_MILLIS -> (-1).toString)
+
+    withSparkConf(newConf: _*) {
+      val pool = InternalKafkaConsumerPool.build
+
+      val kafkaParams = getTestKafkaParams
+      val topicPartitions: List[TopicPartition] = for (
+        partitionId <- (0 until capacity).toList
+      ) yield new TopicPartition("topic", partitionId)
+
+      val keys: List[CacheKey] = topicPartitions.map { part =>
+        new CacheKey(part, kafkaParams)
       }
 
-      // no change on pool
-      assertPoolState(pool, numIdle = 0, numActive = keyToPooledObjectPairs.length,
-        numTotal = keyToPooledObjectPairs.length)
+      // borrow objects which makes pool reaching soft capacity
+      val keyToPooledObjectPairs = borrowObjectsPerKey(pool, kafkaParams, keys)
 
       // return 20% of objects to ensure there're some idle objects to free up later
       val numToReturn = (keyToPooledObjectPairs.length * 0.2).toInt
@@ -134,7 +167,10 @@ class InternalKafkaConsumerPoolSuite extends SharedSQLContext {
         numActive = keyToPooledObjectPairs.length - numToReturn,
         numTotal = keyToPooledObjectPairs.length)
 
-      // borrow it again: pool will clean up some of idle objects to add new object
+      // borrow a new object: there should be some idle objects to clean up
+      val moreTopicPartition = new TopicPartition("topic2", 0)
+      val newCacheKey = new CacheKey(moreTopicPartition, kafkaParams)
+
       val newObject = pool.borrowObject(newCacheKey, kafkaParams)
       assertPooledObject(newObject, moreTopicPartition, kafkaParams)
       assertPoolStateForKey(pool, newCacheKey, numIdle = 0, numActive = 1, numTotal = 1)
@@ -145,48 +181,9 @@ class InternalKafkaConsumerPoolSuite extends SharedSQLContext {
       assert(pool.getNumActive === keyToPooledObjectPairs.length - numToReturn + 1)
       // total objects should be more than number of active + 1 but can't expect exact number
       assert(pool.getTotal > keyToPooledObjectPairs.length - numToReturn + 1)
+
+      pool.close()
     }
-  }
-
-  test("invalidate key after borrowing consumer for the key") {
-    val pool = InternalKafkaConsumerPool.build
-
-    val topic = "topic"
-    val partitionId = 0
-    val topicPartition = new TopicPartition(topic, partitionId)
-
-    val kafkaParams: ju.Map[String, Object] = getTestKafkaParams
-
-    val key = new CacheKey(topicPartition, kafkaParams)
-    val pooledObject = pool.borrowObject(key, kafkaParams)
-
-    assertPooledObject(pooledObject, topicPartition, kafkaParams)
-    assertPoolStateForKey(pool, key, numIdle = 0, numActive = 1, numTotal = 1)
-    assertPoolState(pool, numIdle = 0, numActive = 1, numTotal = 1)
-
-    // put 10 ms sleep to ensure invalidated timestamp is not same as borrowed timestamp
-    Thread.sleep(10)
-
-    pool.invalidateKey(key)
-
-    pool.returnObject(pooledObject)
-
-    // borrowed object before invalidating key should be invalidated instead of being idle
-    assertPoolStateForKey(pool, key, numIdle = 0, numActive = 0, numTotal = 0)
-    assertPoolState(pool, numIdle = 0, numActive = 0, numTotal = 0)
-
-    // borrowing new object after invalidating key
-    val pooledObject2 = pool.borrowObject(key, kafkaParams)
-
-    assertPooledObject(pooledObject2, topicPartition, kafkaParams)
-    assertPoolStateForKey(pool, key, numIdle = 0, numActive = 1, numTotal = 1)
-    assertPoolState(pool, numIdle = 0, numActive = 1, numTotal = 1)
-
-    pool.returnObject(pooledObject2)
-
-    // this object should be kept idle since it is not a target of invalidation
-    assertPoolStateForKey(pool, key, numIdle = 1, numActive = 0, numTotal = 1)
-    assertPoolState(pool, numIdle = 1, numActive = 0, numTotal = 1)
   }
 
   test("evicting idle objects on background") {
@@ -223,6 +220,8 @@ class InternalKafkaConsumerPoolSuite extends SharedSQLContext {
         interval(evictorThreadRunIntervalMillis.milliseconds)) {
         assertPoolState(pool, numIdle = 0, numActive = 5, numTotal = 5)
       }
+
+      pool.close()
     }
   }
 

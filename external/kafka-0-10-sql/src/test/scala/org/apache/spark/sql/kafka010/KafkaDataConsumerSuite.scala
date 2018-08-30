@@ -52,7 +52,7 @@ class KafkaDataConsumerSuite extends SharedSQLContext with PrivateMethodTester {
     val cause = new Exception("D'oh!")
     val reportDataLoss = PrivateMethod[Unit]('reportDataLoss0)
     val e = intercept[IllegalStateException] {
-      InternalKafkaConsumer.invokePrivate(reportDataLoss(true, "message", cause))
+      KafkaDataConsumer.invokePrivate(reportDataLoss(true, "message", cause))
     }
     assert(e.getCause === cause)
   }
@@ -80,15 +80,13 @@ class KafkaDataConsumerSuite extends SharedSQLContext with PrivateMethodTester {
     @volatile var error: Throwable = null
 
     def consume(i: Int): Unit = {
-      val useCache = Random.nextBoolean
       val taskContext = if (Random.nextBoolean) {
         new TaskContextImpl(0, 0, 0, 0, attemptNumber = Random.nextInt(2), null, null, null)
       } else {
         null
       }
       TaskContext.setTaskContext(taskContext)
-      val consumer = KafkaDataConsumer.acquire(
-        topicPartition, kafkaParams.asJava, useCache)
+      val consumer = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
       try {
         val range = consumer.getAvailableOffsetRange()
         val rcvd = range.earliest until range.latest map { offset =>

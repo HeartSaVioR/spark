@@ -149,14 +149,10 @@ private[kafka010] class KafkaMicroBatchStream(
       untilOffsets = untilOffsets,
       executorLocations = getSortedExecutorList())
 
-    // Reuse Kafka consumers only when all the offset ranges have distinct TopicPartitions,
-    // that is, concurrent tasks will not read the same TopicPartitions.
-    val reuseKafkaConsumer = offsetRanges.map(_.topicPartition).toSet.size == offsetRanges.size
-
     // Generate factories based on the offset ranges
     offsetRanges.map { range =>
       KafkaMicroBatchInputPartition(
-        range, executorKafkaParams, pollTimeoutMs, failOnDataLoss, reuseKafkaConsumer)
+        range, executorKafkaParams, pollTimeoutMs, failOnDataLoss)
     }.toArray
   }
 
@@ -317,14 +313,13 @@ private[kafka010] case class KafkaMicroBatchInputPartition(
     offsetRange: KafkaOffsetRange,
     executorKafkaParams: ju.Map[String, Object],
     pollTimeoutMs: Long,
-    failOnDataLoss: Boolean,
-    reuseKafkaConsumer: Boolean) extends InputPartition
+    failOnDataLoss: Boolean) extends InputPartition
 
 private[kafka010] object KafkaMicroBatchReaderFactory extends PartitionReaderFactory {
   override def createReader(partition: InputPartition): PartitionReader[InternalRow] = {
     val p = partition.asInstanceOf[KafkaMicroBatchInputPartition]
     KafkaMicroBatchPartitionReader(p.offsetRange, p.executorKafkaParams, p.pollTimeoutMs,
-      p.failOnDataLoss, p.reuseKafkaConsumer)
+      p.failOnDataLoss)
   }
 }
 
@@ -333,11 +328,10 @@ private[kafka010] case class KafkaMicroBatchPartitionReader(
     offsetRange: KafkaOffsetRange,
     executorKafkaParams: ju.Map[String, Object],
     pollTimeoutMs: Long,
-    failOnDataLoss: Boolean,
-    reuseKafkaConsumer: Boolean) extends PartitionReader[InternalRow] with Logging {
+    failOnDataLoss: Boolean) extends PartitionReader[InternalRow] with Logging {
 
   private val consumer = KafkaDataConsumer.acquire(
-    offsetRange.topicPartition, executorKafkaParams, reuseKafkaConsumer)
+    offsetRange.topicPartition, executorKafkaParams)
 
   private val rangeToRead = resolveRange(offsetRange)
   private val converter = new KafkaRecordToUnsafeRowConverter
