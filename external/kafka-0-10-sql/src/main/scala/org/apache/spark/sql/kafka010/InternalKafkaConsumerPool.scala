@@ -90,7 +90,6 @@ private[kafka010] class InternalKafkaConsumerPool(objectFactory: ObjectFactory,
     // invalidate all idle consumers for the key
     pool.clear(key)
 
-    pool.getNumActive()
     // set invalidate timestamp to let active objects being destroyed when returning to pool
     objectFactory.keyToLastInvalidatedTimestamp.put(key, System.currentTimeMillis())
   }
@@ -171,9 +170,8 @@ private[kafka010] object InternalKafkaConsumerPool {
         CONFIG_NAME_EVICTOR_THREAD_RUN_INTERVAL_MILLIS,
         DEFAULT_VALUE_EVICTOR_THREAD_RUN_INTERVAL_MILLIS)
 
-      // NOTE: Below lines define the behavior of CachedInternalKafkaConsumerPool, so do not modify
-      // unless you know what you are doing, and update the doc of CachedInternalKafkaConsumerPool
-      // accordingly if necessary when you modify.
+      // NOTE: Below lines define the behavior, so do not modify unless you know what you are
+      // doing, and update the class doc accordingly if necessary when you modify.
 
       // 1. Set min idle objects per key to 0 to avoid creating unnecessary object.
       // 2. Set max idle objects per key to 1 but set total objects per key to infinite
