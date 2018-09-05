@@ -21,10 +21,12 @@ import java.{util => ju}
 import java.util.concurrent.TimeUnit
 
 import scala.collection.mutable
+import scala.util.control.NonFatal
 
 import org.apache.kafka.clients.consumer.ConsumerRecord
 
 import org.apache.spark.SparkEnv
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.kafka010.KafkaDataConsumer.{CacheKey, UNKNOWN_OFFSET}
 import org.apache.spark.util.ThreadUtils
 
@@ -35,7 +37,7 @@ import org.apache.spark.util.ThreadUtils
  * may be stored from previous batch. If it can't find one to match, it will create
  * a new FetchedData.
  */
-private[kafka010] class FetchedDataPool {
+private[kafka010] class FetchedDataPool extends Logging {
   import FetchedDataPool._
 
   private[kafka010] case class CachedFetchedData(fetchedData: FetchedData) {
@@ -78,12 +80,17 @@ private[kafka010] class FetchedDataPool {
   }
 
   private val executorService = ThreadUtils.newDaemonSingleThreadScheduledExecutor(
-    "kafka-fetched-data--cache-evictor")
+    "kafka-fetched-data-cache-evictor")
 
   private def startEvictorThread(): Unit = {
-    executorService.scheduleAtFixedRate(new Runnable() {
+    executorService.scheduleAtFixedRate(new Runnable {
       override def run(): Unit = {
-        removeIdleFetchedData()
+        try {
+          removeIdleFetchedData()
+        } catch {
+          case NonFatal(e) =>
+            logWarning("Exception occurred while removing idle fetched data.", e)
+        }
       }
     }, 0, evictorThreadRunIntervalMillis, TimeUnit.MILLISECONDS)
   }
@@ -128,7 +135,8 @@ private[kafka010] class FetchedDataPool {
           cachedFetchedData.lastReleasedTimestamp = System.currentTimeMillis()
         }
 
-      case None =>
+      case None => logWarning(s"No matching data in pool for $fetchedData in key $key. " +
+        "It might be released before, or it was not a part of pool.")
     }
   }
 

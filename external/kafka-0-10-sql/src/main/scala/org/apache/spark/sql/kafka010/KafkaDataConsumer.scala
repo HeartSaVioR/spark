@@ -211,7 +211,7 @@ private[kafka010] class KafkaDataConsumer(
     topicPartition: TopicPartition,
     kafkaParams: ju.Map[String, Object],
     consumerPool: InternalKafkaConsumerPool,
-    fetchedDataCache: FetchedDataPool) extends Logging {
+    fetchedDataPool: FetchedDataPool) extends Logging {
   import KafkaDataConsumer._
 
   @volatile private var consumer: InternalKafkaConsumer = _
@@ -326,7 +326,7 @@ private[kafka010] class KafkaDataConsumer(
     }
 
     if (fetchedData != null) {
-      fetchedDataCache.release(cacheKey, fetchedData)
+      fetchedDataPool.release(cacheKey, fetchedData)
       fetchedData = null
     }
   }
@@ -497,7 +497,7 @@ private[kafka010] class KafkaDataConsumer(
 
   private def ensureFetchedDataAvailable(offset: Long): Unit = {
     if (fetchedData == null) {
-      fetchedData = fetchedDataCache.acquire(cacheKey, offset)
+      fetchedData = fetchedDataPool.acquire(cacheKey, offset)
     }
   }
 

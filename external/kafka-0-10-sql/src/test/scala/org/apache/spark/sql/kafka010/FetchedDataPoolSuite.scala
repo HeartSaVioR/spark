@@ -28,7 +28,7 @@ import org.apache.spark.SparkEnv
 import org.apache.spark.sql.kafka010.KafkaDataConsumer.CacheKey
 import org.apache.spark.sql.test.SharedSQLContext
 
-class FetchedPoolSuite extends SharedSQLContext {
+class FetchedDataPoolSuite extends SharedSQLContext {
   type Record = ConsumerRecord[Array[Byte], Array[Byte]]
 
   private val dummyBytes = "dummy".getBytes
