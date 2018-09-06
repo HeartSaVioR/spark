@@ -205,7 +205,7 @@ private[kafka010] case class FetchedRecord(
  * This class throws error when data loss is detected while reading from Kafka.
  *
  * NOTE for contributors: we need to ensure all the public methods to initialize necessary resources
- * via calling `ensureConsumerAvailable` and `ensureFetchedDataAvailable`.
+ * via calling `getOrRetrieveConsumer` and `getOrRetrieveFetchedData`.
  */
 private[kafka010] class KafkaDataConsumer(
     topicPartition: TopicPartition,
@@ -214,8 +214,8 @@ private[kafka010] class KafkaDataConsumer(
     fetchedDataPool: FetchedDataPool) extends Logging {
   import KafkaDataConsumer._
 
-  @volatile private var consumer: InternalKafkaConsumer = _
-  @volatile private var fetchedData: FetchedData = _
+  @volatile private var _consumer: Option[InternalKafkaConsumer] = None
+  @volatile private var _fetchedData: Option[FetchedData] = None
 
   private val groupId = kafkaParams.get(ConsumerConfig.GROUP_ID_CONFIG).asInstanceOf[String]
   private val cacheKey = CacheKey(groupId, topicPartition)
@@ -259,8 +259,8 @@ private[kafka010] class KafkaDataConsumer(
     require(offset < untilOffset,
       s"offset must always be less than untilOffset [offset: $offset, untilOffset: $untilOffset]")
 
-    ensureConsumerAvailable()
-    ensureFetchedDataAvailable(offset)
+    val consumer = getOrRetrieveConsumer()
+    val fetchedData = getOrRetrieveFetchedData(offset)
 
     logDebug(s"Get $groupId $topicPartition nextOffset ${fetchedData.nextOffsetInFetchedData} " +
       "requested $offset")
@@ -277,7 +277,7 @@ private[kafka010] class KafkaDataConsumer(
 
     while (toFetchOffset != UNKNOWN_OFFSET && !isFetchComplete) {
       try {
-        fetchedRecord = fetchRecord(toFetchOffset, untilOffset,
+        fetchedRecord = fetchRecord(consumer, fetchedData, toFetchOffset, untilOffset,
           pollTimeoutMs, failOnDataLoss)
         if (fetchedRecord.record != null) {
           isFetchComplete = true
@@ -294,7 +294,7 @@ private[kafka010] class KafkaDataConsumer(
         case e: OffsetOutOfRangeException =>
           reportDataLoss(topicPartition, groupId, failOnDataLoss,
             s"Cannot fetch offset $toFetchOffset", e)
-          toFetchOffset = getEarliestAvailableOffsetBetween(toFetchOffset, untilOffset)
+          toFetchOffset = getEarliestAvailableOffsetBetween(consumer, toFetchOffset, untilOffset)
       }
     }
 
@@ -311,7 +311,7 @@ private[kafka010] class KafkaDataConsumer(
    * and the latest offset.
    */
   def getAvailableOffsetRange(): AvailableOffsetRange = runUninterruptiblyIfPossible {
-    ensureConsumerAvailable()
+    val consumer = getOrRetrieveConsumer()
     consumer.getAvailableOffsetRange()
   }
 
@@ -320,14 +320,14 @@ private[kafka010] class KafkaDataConsumer(
    * must call method after using the instance to make sure resources are not leaked.
    */
   def release(): Unit = {
-    if (consumer != null) {
-      consumerPool.returnObject(consumer)
-      consumer = null
+    if (_consumer.isDefined) {
+      consumerPool.returnObject(_consumer.get)
+      _consumer = None
     }
 
-    if (fetchedData != null) {
-      fetchedDataPool.release(cacheKey, fetchedData)
-      fetchedData = null
+    if (_fetchedData.isDefined) {
+      fetchedDataPool.release(cacheKey, _fetchedData.get)
+      _fetchedData = None
     }
   }
 
@@ -336,7 +336,8 @@ private[kafka010] class KafkaDataConsumer(
    * [offset, untilOffset) are invalid (e.g., the topic is deleted and recreated), it will return
    * `UNKNOWN_OFFSET`.
    */
-  private def getEarliestAvailableOffsetBetween(offset: Long, untilOffset: Long): Long = {
+  private def getEarliestAvailableOffsetBetween(consumer: InternalKafkaConsumer, offset: Long,
+                                                untilOffset: Long): Long = {
     val range = consumer.getAvailableOffsetRange()
     logWarning(s"Some data may be lost. Recovering from the earliest offset: ${range.earliest}")
 
@@ -406,6 +407,8 @@ private[kafka010] class KafkaDataConsumer(
    * @throws TimeoutException if cannot fetch the record in `pollTimeoutMs` milliseconds.
    */
   private def fetchRecord(
+      consumer: InternalKafkaConsumer,
+      fetchedData: FetchedData,
       offset: Long,
       untilOffset: Long,
       pollTimeoutMs: Long,
@@ -413,7 +416,7 @@ private[kafka010] class KafkaDataConsumer(
     if (offset != fetchedData.nextOffsetInFetchedData) {
       // This is the first fetch, or the fetched data has been reset.
       // Fetch records from Kafka and update `fetchedData`.
-      fetchData(offset, pollTimeoutMs)
+      fetchData(consumer, fetchedData, offset, pollTimeoutMs)
     } else if (!fetchedData.hasNext) { // The last pre-fetched data has been drained.
       if (offset < fetchedData.offsetAfterPoll) {
         // Offsets in [offset, fetchedData.offsetAfterPoll) are invisible. Return a record to ask
@@ -423,7 +426,7 @@ private[kafka010] class KafkaDataConsumer(
         return fetchedRecord.withRecord(null, nextOffsetToFetch)
       } else {
         // Fetch records from Kafka and update `fetchedData`.
-        fetchData(offset, pollTimeoutMs)
+        fetchData(consumer, fetchedData, offset, pollTimeoutMs)
       }
     }
 
@@ -484,21 +487,28 @@ private[kafka010] class KafkaDataConsumer(
    * @throws TimeoutException if the consumer position is not changed after polling. It means the
    *                          consumer polls nothing before timeout.
    */
-  private def fetchData(offset: Long, pollTimeoutMs: Long): Unit = {
+  private def fetchData(consumer: InternalKafkaConsumer, fetchedData: FetchedData, offset: Long,
+                        pollTimeoutMs: Long): Unit = {
     val (records, offsetAfterPoll) = consumer.fetch(offset, pollTimeoutMs)
     fetchedData.withNewPoll(records.listIterator, offsetAfterPoll)
   }
 
-  private def ensureConsumerAvailable(): Unit = {
-    if (consumer == null) {
-      consumer = consumerPool.borrowObject(cacheKey, kafkaParams)
-    }
+  private def getOrRetrieveConsumer(): InternalKafkaConsumer = _consumer match {
+    case None =>
+      _consumer = Option(consumerPool.borrowObject(cacheKey, kafkaParams))
+      require(_consumer.isDefined, "borrowing consumer from pool must always succeed.")
+      _consumer.get
+
+    case Some(consumer) => consumer
   }
 
-  private def ensureFetchedDataAvailable(offset: Long): Unit = {
-    if (fetchedData == null) {
-      fetchedData = fetchedDataPool.acquire(cacheKey, offset)
-    }
+  private def getOrRetrieveFetchedData(offset: Long): FetchedData = _fetchedData match {
+    case None =>
+      _fetchedData = Option(fetchedDataPool.acquire(cacheKey, offset))
+      require(_fetchedData.isDefined, "acquiring fetched data from cache must always succeed.")
+      _fetchedData.get
+
+    case Some(fetchedData) => fetchedData
   }
 
   /**

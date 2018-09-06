@@ -40,31 +40,7 @@ import org.apache.spark.util.ThreadUtils
 private[kafka010] class FetchedDataPool extends Logging {
   import FetchedDataPool._
 
-  private[kafka010] case class CachedFetchedData(fetchedData: FetchedData) {
-    var lastReleasedTimestamp: Long = Long.MaxValue
-    var lastAcquiredTimestamp: Long = Long.MinValue
-    var inUse: Boolean = false
-
-    def getObject: FetchedData = fetchedData
-  }
-
-  private object CachedFetchedData {
-    def empty(): CachedFetchedData = {
-      val emptyData = FetchedData(
-        ju.Collections.emptyListIterator[ConsumerRecord[Array[Byte], Array[Byte]]],
-        UNKNOWN_OFFSET,
-        UNKNOWN_OFFSET)
-
-      CachedFetchedData(emptyData)
-    }
-  }
-
-  private type CachedFetchedDataList = mutable.ListBuffer[CachedFetchedData]
-
   private val cache: mutable.Map[CacheKey, CachedFetchedDataList] = mutable.HashMap.empty
-
-  /** Retrieve internal cache. This method is only for testing. */
-  private[kafka010] def getCache: mutable.Map[CacheKey, CachedFetchedDataList] = cache
 
   private val (minEvictableIdleTimeMillis, evictorThreadRunIntervalMillis): (Long, Long) = {
     val conf = SparkEnv.get.conf
@@ -155,6 +131,27 @@ private[kafka010] class FetchedDataPool extends Logging {
 }
 
 private[kafka010] object FetchedDataPool {
+  private[kafka010] case class CachedFetchedData(fetchedData: FetchedData) {
+    var lastReleasedTimestamp: Long = Long.MaxValue
+    var lastAcquiredTimestamp: Long = Long.MinValue
+    var inUse: Boolean = false
+
+    def getObject: FetchedData = fetchedData
+  }
+
+  private object CachedFetchedData {
+    def empty(): CachedFetchedData = {
+      val emptyData = FetchedData(
+        ju.Collections.emptyListIterator[ConsumerRecord[Array[Byte], Array[Byte]]],
+        UNKNOWN_OFFSET,
+        UNKNOWN_OFFSET)
+
+      CachedFetchedData(emptyData)
+    }
+  }
+
+  private[kafka010] type CachedFetchedDataList = mutable.ListBuffer[CachedFetchedData]
+
   val CONFIG_NAME_PREFIX = "spark.sql.kafkaFetchedDataCache."
   val CONFIG_NAME_MIN_EVICTABLE_IDLE_TIME_MILLIS = CONFIG_NAME_PREFIX +
     "minEvictableIdleTimeMillis"

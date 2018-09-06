@@ -121,7 +121,9 @@ private[kafka010] class InternalKafkaConsumerPool(
     // We can assume that kafkaParam should not be different for same cache key,
     // otherwise we can't reuse the cached object and cache key should contain kafkaParam.
     // So it should be safe to put the key/value pair only when the key doesn't exist.
-    objectFactory.keyToKafkaParams.putIfAbsent(key, kafkaParams)
+    val oldKafkaParams = objectFactory.keyToKafkaParams.putIfAbsent(key, kafkaParams)
+    require(oldKafkaParams == null || kafkaParams == oldKafkaParams, "Kafka parameters for same " +
+      s"cache key should be equal. old parameters: $oldKafkaParams new parameters: $kafkaParams")
   }
 
   private def extractCacheKey(consumer: InternalKafkaConsumer): CacheKey = {
@@ -222,11 +224,11 @@ private[kafka010] object InternalKafkaConsumerPool {
       new ConcurrentHashMap[CacheKey, ju.Map[String, Object]]()
 
     override def create(key: CacheKey): InternalKafkaConsumer = {
-      val kafkaParams = keyToKafkaParams.get(key)
-      if (kafkaParams == null) {
-        throw new IllegalStateException("Kafka params should be set before borrowing object.")
+      Option(keyToKafkaParams.get(key)) match {
+        case Some(kafkaParams) => new InternalKafkaConsumer(key.topicPartition, kafkaParams)
+        case None => throw new IllegalStateException("Kafka params should be set before " +
+          "borrowing object.")
       }
-      new InternalKafkaConsumer(key.topicPartition, kafkaParams)
     }
 
     override def wrap(value: InternalKafkaConsumer): PooledObject[InternalKafkaConsumer] = {

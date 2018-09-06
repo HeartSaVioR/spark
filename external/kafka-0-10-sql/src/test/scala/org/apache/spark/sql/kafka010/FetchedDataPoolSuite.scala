@@ -20,37 +20,48 @@ package org.apache.spark.sql.kafka010
 import java.{util => ju}
 
 import scala.collection.JavaConverters._
+import scala.collection.mutable
 
 import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.apache.kafka.common.TopicPartition
+import org.scalatest.PrivateMethodTester
 
 import org.apache.spark.SparkEnv
 import org.apache.spark.sql.kafka010.KafkaDataConsumer.CacheKey
 import org.apache.spark.sql.test.SharedSQLContext
 
-class FetchedDataPoolSuite extends SharedSQLContext {
+class FetchedDataPoolSuite extends SharedSQLContext with PrivateMethodTester {
+  import FetchedDataPool._
   type Record = ConsumerRecord[Array[Byte], Array[Byte]]
 
   private val dummyBytes = "dummy".getBytes
+
+  // Helper private method accessors for FetchedDataPool
+  private type PoolCacheType = mutable.Map[CacheKey, CachedFetchedDataList]
+  private val _cache = PrivateMethod[PoolCacheType]('cache)
+
+  def getCache(pool: FetchedDataPool): PoolCacheType = {
+    pool.invokePrivate(_cache())
+  }
 
   test("acquire fresh one") {
     val dataPool = FetchedDataPool.build
 
     val cacheKey = CacheKey("testgroup", new TopicPartition("topic", 0))
 
-    assert(dataPool.getCache.get(cacheKey).isEmpty)
+    assert(getCache(dataPool).get(cacheKey).isEmpty)
 
     val data = dataPool.acquire(cacheKey, 0)
 
-    assert(dataPool.getCache(cacheKey).size === 1)
-    assert(dataPool.getCache(cacheKey).head.inUse)
+    assert(getCache(dataPool)(cacheKey).size === 1)
+    assert(getCache(dataPool)(cacheKey).head.inUse)
 
     data.withNewPoll(testRecords(0, 5).listIterator, 5)
 
     dataPool.release(cacheKey, data)
 
-    assert(dataPool.getCache(cacheKey).size === 1)
-    assert(!dataPool.getCache(cacheKey).head.inUse)
+    assert(getCache(dataPool)(cacheKey).size === 1)
+    assert(!getCache(dataPool)(cacheKey).head.inUse)
 
     dataPool.shutdown()
   }
@@ -62,15 +73,15 @@ class FetchedDataPoolSuite extends SharedSQLContext {
       CacheKey("testgroup", new TopicPartition("topic", partId))
     }
 
-    assert(dataPool.getCache.size === 0)
-    cacheKeys.foreach { key => assert(dataPool.getCache.get(key).isEmpty) }
+    assert(getCache(dataPool).size === 0)
+    cacheKeys.foreach { key => assert(getCache(dataPool).get(key).isEmpty) }
 
     val dataList = cacheKeys.map(key => (key, dataPool.acquire(key, 0)))
 
-    assert(dataPool.getCache.size === cacheKeys.size)
+    assert(getCache(dataPool).size === cacheKeys.size)
     cacheKeys.map { key =>
-      assert(dataPool.getCache(key).size === 1)
-      assert(dataPool.getCache(key).head.inUse)
+      assert(getCache(dataPool)(key).size === 1)
+      assert(getCache(dataPool)(key).head.inUse)
     }
 
     dataList.map { case (_, data) =>
@@ -81,10 +92,10 @@ class FetchedDataPoolSuite extends SharedSQLContext {
       dataPool.release(key, data)
     }
 
-    assert(dataPool.getCache.size === cacheKeys.size)
+    assert(getCache(dataPool).size === cacheKeys.size)
     cacheKeys.map { key =>
-      assert(dataPool.getCache(key).size === 1)
-      assert(!dataPool.getCache(key).head.inUse)
+      assert(getCache(dataPool)(key).size === 1)
+      assert(!getCache(dataPool)(key).head.inUse)
     }
 
     dataPool.shutdown()
@@ -95,12 +106,12 @@ class FetchedDataPoolSuite extends SharedSQLContext {
 
     val cacheKey = CacheKey("testgroup", new TopicPartition("topic", 0))
 
-    assert(dataPool.getCache.get(cacheKey).isEmpty)
+    assert(getCache(dataPool).get(cacheKey).isEmpty)
 
     val data = dataPool.acquire(cacheKey, 0)
 
-    assert(dataPool.getCache(cacheKey).size === 1)
-    assert(dataPool.getCache(cacheKey).head.inUse)
+    assert(getCache(dataPool)(cacheKey).size === 1)
+    assert(getCache(dataPool)(cacheKey).head.inUse)
 
     data.withNewPoll(testRecords(0, 5).listIterator, 5)
 
@@ -114,13 +125,13 @@ class FetchedDataPoolSuite extends SharedSQLContext {
 
     assert(data.eq(data2))
 
-    assert(dataPool.getCache(cacheKey).size === 1)
-    assert(dataPool.getCache(cacheKey).head.inUse)
+    assert(getCache(dataPool)(cacheKey).size === 1)
+    assert(getCache(dataPool)(cacheKey).head.inUse)
 
     dataPool.release(cacheKey, data2)
 
-    assert(dataPool.getCache(cacheKey).size === 1)
-    assert(!dataPool.getCache(cacheKey).head.inUse)
+    assert(getCache(dataPool)(cacheKey).size === 1)
+    assert(!getCache(dataPool)(cacheKey).head.inUse)
 
     dataPool.shutdown()
   }
@@ -130,19 +141,19 @@ class FetchedDataPoolSuite extends SharedSQLContext {
 
     val cacheKey = CacheKey("testgroup", new TopicPartition("topic", 0))
 
-    assert(dataPool.getCache.get(cacheKey).isEmpty)
+    assert(getCache(dataPool).get(cacheKey).isEmpty)
 
     val dataFromTask1 = dataPool.acquire(cacheKey, 0)
 
-    assert(dataPool.getCache(cacheKey).size === 1)
-    assert(dataPool.getCache(cacheKey).head.inUse)
+    assert(getCache(dataPool)(cacheKey).size === 1)
+    assert(getCache(dataPool)(cacheKey).head.inUse)
 
     val dataFromTask2 = dataPool.acquire(cacheKey, 0)
 
     // it shouldn't give same object as dataFromTask1 though it asks same offset
     // it definitely works when offsets are not overlapped: skip adding test for that
-    assert(dataPool.getCache(cacheKey).size === 2)
-    assert(dataPool.getCache(cacheKey)(1).inUse)
+    assert(getCache(dataPool)(cacheKey).size === 2)
+    assert(getCache(dataPool)(cacheKey)(1).inUse)
 
     // reading from task 1
     dataFromTask1.withNewPoll(testRecords(0, 5).listIterator, 5)
@@ -162,21 +173,21 @@ class FetchedDataPoolSuite extends SharedSQLContext {
     val data2FromTask1 = dataPool.acquire(cacheKey, dataFromTask1.nextOffsetInFetchedData)
     assert(data2FromTask1.eq(dataFromTask1))
 
-    assert(dataPool.getCache(cacheKey).head.inUse)
+    assert(getCache(dataPool)(cacheKey).head.inUse)
 
     // suppose next batch for task 2
     val data2FromTask2 = dataPool.acquire(cacheKey, dataFromTask2.nextOffsetInFetchedData)
     assert(data2FromTask2.eq(dataFromTask2))
 
-    assert(dataPool.getCache(cacheKey)(1).inUse)
+    assert(getCache(dataPool)(cacheKey)(1).inUse)
 
     // release from task 2
     dataPool.release(cacheKey, data2FromTask2)
-    assert(!dataPool.getCache(cacheKey)(1).inUse)
+    assert(!getCache(dataPool)(cacheKey)(1).inUse)
 
     // release from task 1
     dataPool.release(cacheKey, data2FromTask1)
-    assert(!dataPool.getCache(cacheKey).head.inUse)
+    assert(!getCache(dataPool)(cacheKey).head.inUse)
 
     dataPool.shutdown()
   }
@@ -215,18 +226,18 @@ class FetchedDataPoolSuite extends SharedSQLContext {
         interval(evictorThreadRunIntervalMillis.milliseconds)) {
         // idle objects should be evicted
         dataToEvict.map { case (key, _) =>
-          assert(dataPool.getCache(key).isEmpty)
+          assert(getCache(dataPool)(key).isEmpty)
         }
       }
 
-      assert(dataPool.getCache.values.map(_.size).sum === dataList.size - dataToEvict.size)
+      assert(getCache(dataPool).values.map(_.size).sum === dataList.size - dataToEvict.size)
 
       dataList.takeRight(3).foreach { case (key, data) =>
         dataPool.release(key, data)
       }
 
       // ensure releasing more objects don't trigger eviction immediately
-      assert(dataPool.getCache.values.map(_.size).sum === dataList.size - dataToEvict.size)
+      assert(getCache(dataPool).values.map(_.size).sum === dataList.size - dataToEvict.size)
 
       dataPool.shutdown()
     }
@@ -247,23 +258,23 @@ class FetchedDataPoolSuite extends SharedSQLContext {
 
     dataPool.acquire(cacheKey2, 0)
 
-    assert(dataPool.getCache.size === 2)
-    assert(dataPool.getCache.get(cacheKey).size === 1)
-    assert(dataPool.getCache.get(cacheKey2).size === 1)
+    assert(getCache(dataPool).size === 2)
+    assert(getCache(dataPool).get(cacheKey).size === 1)
+    assert(getCache(dataPool).get(cacheKey2).size === 1)
 
     dataPool.invalidate(cacheKey)
 
-    assert(dataPool.getCache.size === 1)
-    assert(dataPool.getCache.get(cacheKey).isEmpty)
+    assert(getCache(dataPool).size === 1)
+    assert(getCache(dataPool).get(cacheKey).isEmpty)
 
     // it doesn't affect other keys
-    assert(dataPool.getCache.get(cacheKey2).size === 1)
+    assert(getCache(dataPool).get(cacheKey2).size === 1)
 
     dataPool.release(cacheKey, dataFromTask2)
 
     // it doesn't throw error on invalidated objects, but it doesn't cache them again
-    assert(dataPool.getCache.size === 1)
-    assert(dataPool.getCache.get(cacheKey).isEmpty)
+    assert(getCache(dataPool).size === 1)
+    assert(getCache(dataPool).get(cacheKey).isEmpty)
 
     dataPool.shutdown()
   }
