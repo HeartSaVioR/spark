@@ -222,7 +222,7 @@ class FetchedDataPoolSuite extends SharedSQLContext with PrivateMethodTester {
 
       // wait up to twice than minEvictableIdleTimeMillis to ensure evictor thread to clear up
       // idle objects
-      eventually(timeout((minEvictableIdleTimeMillis.toLong * 2).seconds),
+      eventually(timeout((minEvictableIdleTimeMillis.toLong * 2).milliseconds),
         interval(evictorThreadRunIntervalMillis.milliseconds)) {
         // idle objects should be evicted
         dataToEvict.map { case (key, _) =>
