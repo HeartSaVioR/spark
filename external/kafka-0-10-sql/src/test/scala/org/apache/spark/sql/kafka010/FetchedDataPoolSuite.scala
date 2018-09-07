@@ -53,6 +53,7 @@ class FetchedDataPoolSuite extends SharedSQLContext with PrivateMethodTester {
 
     val data = dataPool.acquire(cacheKey, 0)
 
+    assertFetchedDataPoolStatistic(dataPool, expectedNumCreated = 1, expectedNumTotal = 1)
     assert(getCache(dataPool)(cacheKey).size === 1)
     assert(getCache(dataPool)(cacheKey).head.inUse)
 
@@ -60,6 +61,7 @@ class FetchedDataPoolSuite extends SharedSQLContext with PrivateMethodTester {
 
     dataPool.release(cacheKey, data)
 
+    assertFetchedDataPoolStatistic(dataPool, expectedNumCreated = 1, expectedNumTotal = 1)
     assert(getCache(dataPool)(cacheKey).size === 1)
     assert(!getCache(dataPool)(cacheKey).head.inUse)
 
@@ -69,7 +71,7 @@ class FetchedDataPoolSuite extends SharedSQLContext with PrivateMethodTester {
   test("acquire fetched data from multiple keys") {
     val dataPool = FetchedDataPool.build
 
-    val cacheKeys = (0 to 10).map { partId =>
+    val cacheKeys = (0 until 10).map { partId =>
       CacheKey("testgroup", new TopicPartition("topic", partId))
     }
 
@@ -83,6 +85,8 @@ class FetchedDataPoolSuite extends SharedSQLContext with PrivateMethodTester {
       assert(getCache(dataPool)(key).size === 1)
       assert(getCache(dataPool)(key).head.inUse)
     }
+
+    assertFetchedDataPoolStatistic(dataPool, expectedNumCreated = 10, expectedNumTotal = 10)
 
     dataList.map { case (_, data) =>
       data.withNewPoll(testRecords(0, 5).listIterator, 5)
@@ -110,6 +114,7 @@ class FetchedDataPoolSuite extends SharedSQLContext with PrivateMethodTester {
 
     val data = dataPool.acquire(cacheKey, 0)
 
+    assertFetchedDataPoolStatistic(dataPool, expectedNumCreated = 1, expectedNumTotal = 1)
     assert(getCache(dataPool)(cacheKey).size === 1)
     assert(getCache(dataPool)(cacheKey).head.inUse)
 
@@ -125,6 +130,7 @@ class FetchedDataPoolSuite extends SharedSQLContext with PrivateMethodTester {
 
     assert(data.eq(data2))
 
+    assertFetchedDataPoolStatistic(dataPool, expectedNumCreated = 1, expectedNumTotal = 1)
     assert(getCache(dataPool)(cacheKey).size === 1)
     assert(getCache(dataPool)(cacheKey).head.inUse)
 
@@ -145,6 +151,7 @@ class FetchedDataPoolSuite extends SharedSQLContext with PrivateMethodTester {
 
     val dataFromTask1 = dataPool.acquire(cacheKey, 0)
 
+    assertFetchedDataPoolStatistic(dataPool, expectedNumCreated = 1, expectedNumTotal = 1)
     assert(getCache(dataPool)(cacheKey).size === 1)
     assert(getCache(dataPool)(cacheKey).head.inUse)
 
@@ -152,6 +159,7 @@ class FetchedDataPoolSuite extends SharedSQLContext with PrivateMethodTester {
 
     // it shouldn't give same object as dataFromTask1 though it asks same offset
     // it definitely works when offsets are not overlapped: skip adding test for that
+    assertFetchedDataPoolStatistic(dataPool, expectedNumCreated = 2, expectedNumTotal = 2)
     assert(getCache(dataPool)(cacheKey).size === 2)
     assert(getCache(dataPool)(cacheKey)(1).inUse)
 
@@ -173,12 +181,14 @@ class FetchedDataPoolSuite extends SharedSQLContext with PrivateMethodTester {
     val data2FromTask1 = dataPool.acquire(cacheKey, dataFromTask1.nextOffsetInFetchedData)
     assert(data2FromTask1.eq(dataFromTask1))
 
+    assertFetchedDataPoolStatistic(dataPool, expectedNumCreated = 2, expectedNumTotal = 2)
     assert(getCache(dataPool)(cacheKey).head.inUse)
 
     // suppose next batch for task 2
     val data2FromTask2 = dataPool.acquire(cacheKey, dataFromTask2.nextOffsetInFetchedData)
     assert(data2FromTask2.eq(dataFromTask2))
 
+    assertFetchedDataPoolStatistic(dataPool, expectedNumCreated = 2, expectedNumTotal = 2)
     assert(getCache(dataPool)(cacheKey)(1).inUse)
 
     // release from task 2
@@ -206,11 +216,14 @@ class FetchedDataPoolSuite extends SharedSQLContext with PrivateMethodTester {
     withSparkConf(newConf: _*) {
       val dataPool = FetchedDataPool.build
 
-      val cacheKeys = (0 to 10).map { partId =>
+      val cacheKeys = (0 until 10).map { partId =>
         CacheKey("testgroup", new TopicPartition("topic", partId))
       }
 
       val dataList = cacheKeys.map(key => (key, dataPool.acquire(key, 0)))
+
+      assertFetchedDataPoolStatistic(dataPool, expectedNumCreated = 10, expectedNumTotal = 10)
+
       dataList.map { case (_, data) =>
         data.withNewPoll(testRecords(0, 5).listIterator, 5)
       }
@@ -230,6 +243,7 @@ class FetchedDataPoolSuite extends SharedSQLContext with PrivateMethodTester {
         }
       }
 
+      assertFetchedDataPoolStatistic(dataPool, expectedNumCreated = 10, expectedNumTotal = 7)
       assert(getCache(dataPool).values.map(_.size).sum === dataList.size - dataToEvict.size)
 
       dataList.takeRight(3).foreach { case (key, data) =>
@@ -237,6 +251,7 @@ class FetchedDataPoolSuite extends SharedSQLContext with PrivateMethodTester {
       }
 
       // ensure releasing more objects don't trigger eviction immediately
+      assertFetchedDataPoolStatistic(dataPool, expectedNumCreated = 10, expectedNumTotal = 7)
       assert(getCache(dataPool).values.map(_.size).sum === dataList.size - dataToEvict.size)
 
       dataPool.shutdown()
@@ -251,6 +266,8 @@ class FetchedDataPoolSuite extends SharedSQLContext with PrivateMethodTester {
     val dataFromTask1 = dataPool.acquire(cacheKey, 0)
     val dataFromTask2 = dataPool.acquire(cacheKey, 0)
 
+    assertFetchedDataPoolStatistic(dataPool, expectedNumCreated = 2, expectedNumTotal = 2)
+
     // 1 idle, 1 active
     dataPool.release(cacheKey, dataFromTask1)
 
@@ -258,17 +275,19 @@ class FetchedDataPoolSuite extends SharedSQLContext with PrivateMethodTester {
 
     dataPool.acquire(cacheKey2, 0)
 
+    assertFetchedDataPoolStatistic(dataPool, expectedNumCreated = 3, expectedNumTotal = 3)
     assert(getCache(dataPool).size === 2)
-    assert(getCache(dataPool).get(cacheKey).size === 1)
-    assert(getCache(dataPool).get(cacheKey2).size === 1)
+    assert(getCache(dataPool)(cacheKey).size === 2)
+    assert(getCache(dataPool)(cacheKey2).size === 1)
 
     dataPool.invalidate(cacheKey)
 
+    assertFetchedDataPoolStatistic(dataPool, expectedNumCreated = 3, expectedNumTotal = 1)
     assert(getCache(dataPool).size === 1)
     assert(getCache(dataPool).get(cacheKey).isEmpty)
 
     // it doesn't affect other keys
-    assert(getCache(dataPool).get(cacheKey2).size === 1)
+    assert(getCache(dataPool)(cacheKey2).size === 1)
 
     dataPool.release(cacheKey, dataFromTask2)
 
@@ -306,5 +325,13 @@ class FetchedDataPoolSuite extends SharedSQLContext with PrivateMethodTester {
         case (key, None) => conf.remove(key)
       }
     }
+  }
+
+  private def assertFetchedDataPoolStatistic(
+      fetchedDataPool: FetchedDataPool,
+      expectedNumCreated: Long,
+      expectedNumTotal: Long): Unit = {
+    assert(fetchedDataPool.getNumCreated === expectedNumCreated)
+    assert(fetchedDataPool.getNumTotal === expectedNumTotal)
   }
 }

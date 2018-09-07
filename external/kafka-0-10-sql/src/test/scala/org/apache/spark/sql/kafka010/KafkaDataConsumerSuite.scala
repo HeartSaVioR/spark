@@ -265,8 +265,8 @@ class KafkaDataConsumerSuite extends SharedSQLContext with PrivateMethodTester {
       fetchedDataPool: FetchedDataPool,
       expectedNumCreated: Long,
       expectedNumTotal: Long): Unit = {
-    assert(fetchedDataPool.getNumCreated == expectedNumCreated)
-    assert(fetchedDataPool.getNumTotal == expectedNumTotal)
+    assert(fetchedDataPool.getNumCreated === expectedNumCreated)
+    assert(fetchedDataPool.getNumTotal === expectedNumTotal)
   }
 
   private def readAndGetLastOffset(consumer: KafkaDataConsumer, startOffset: Long,
