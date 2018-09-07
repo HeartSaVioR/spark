@@ -137,40 +137,39 @@ class KafkaDataConsumerSuite extends SharedSQLContext with PrivateMethodTester {
     val fetchedDataPool = KafkaDataConsumer.invokePrivate(fetchedDataPoolHack())
     fetchedDataPool.resetStatistic()
 
-    val taskContext = new TaskContextImpl(0, 0, 0, 0, 0, null, null, null)
-    TaskContext.setTaskContext(taskContext)
+    withTaskContext(TaskContext.empty()) {
+      // task A trying to fetch offset 0 to 100, and read 5 records
+      val consumer1 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
+      val lastOffsetForConsumer1 = readAndGetLastOffset(consumer1, 0, 100, 5)
+      consumer1.release()
 
-    // task A trying to fetch offset 0 to 100, and read 5 records
-    val consumer1 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
-    val lastOffsetForConsumer1 = readAndGetLastOffset(consumer1, 0, 100, 5)
-    consumer1.release()
+      assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 1, expectedNumTotal = 1)
 
-    assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 1, expectedNumTotal = 1)
+      // task B trying to fetch offset 300 to 500, and read 5 records
+      val consumer2 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
+      val lastOffsetForConsumer2 = readAndGetLastOffset(consumer2, 300, 500, 5)
+      consumer2.release()
 
-    // task B trying to fetch offset 300 to 500, and read 5 records
-    val consumer2 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
-    val lastOffsetForConsumer2 = readAndGetLastOffset(consumer2, 300, 500, 5)
-    consumer2.release()
+      assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 2, expectedNumTotal = 2)
 
-    assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 2, expectedNumTotal = 2)
+      // task A continue reading from the last offset + 1, with upper bound 100 again
+      val consumer1a = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
 
-    // task A continue reading from the last offset + 1, with upper bound 100 again
-    val consumer1a = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
+      consumer1a.get(lastOffsetForConsumer1 + 1, 100, 10000, failOnDataLoss = false)
+      consumer1a.release()
 
-    consumer1a.get(lastOffsetForConsumer1 + 1, 100, 10000, failOnDataLoss = false)
-    consumer1a.release()
+      // pool should succeed to provide cached data instead of creating one
+      assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 2, expectedNumTotal = 2)
 
-    // pool should succeed to provide cached data instead of creating one
-    assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 2, expectedNumTotal = 2)
+      // task B also continue reading from the last offset + 1, with upper bound 500 again
+      val consumer2a = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
 
-    // task B also continue reading from the last offset + 1, with upper bound 500 again
-    val consumer2a = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
+      consumer2a.get(lastOffsetForConsumer2 + 1, 500, 10000, failOnDataLoss = false)
+      consumer2a.release()
 
-    consumer2a.get(lastOffsetForConsumer2 + 1, 500, 10000, failOnDataLoss = false)
-    consumer2a.release()
-
-    // same expectation: pool should succeed to provide cached data instead of creating one
-    assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 2, expectedNumTotal = 2)
+      // same expectation: pool should succeed to provide cached data instead of creating one
+      assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 2, expectedNumTotal = 2)
+    }
   }
 
   test("SPARK-25251 Handles multiple tasks in executor fetching same (topic, partition) pair " +
@@ -194,26 +193,25 @@ class KafkaDataConsumerSuite extends SharedSQLContext with PrivateMethodTester {
     val fetchedDataPool = KafkaDataConsumer.invokePrivate(fetchedDataPoolHack())
     fetchedDataPool.resetStatistic()
 
-    val taskContext = new TaskContextImpl(0, 0, 0, 0, 0, null, null, null)
-    TaskContext.setTaskContext(taskContext)
+    withTaskContext(TaskContext.empty()) {
+      // task A trying to fetch offset 0 to 100, and read 5 records (still reading)
+      val consumer1 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
+      val lastOffsetForConsumer1 = readAndGetLastOffset(consumer1, 0, 100, 5)
 
-    // task A trying to fetch offset 0 to 100, and read 5 records (still reading)
-    val consumer1 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
-    val lastOffsetForConsumer1 = readAndGetLastOffset(consumer1, 0, 100, 5)
+      assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 1, expectedNumTotal = 1)
 
-    assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 1, expectedNumTotal = 1)
+      // task B trying to fetch offset the last offset task A is reading so far + 1 to 500
+      // this is a condition for edge case
+      val consumer2 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
+      consumer2.get(lastOffsetForConsumer1 + 1, 100, 10000, failOnDataLoss = false)
 
-    // task B trying to fetch offset the last offset task A is reading so far + 1 to 500
-    // this is a condition for edge case
-    val consumer2 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
-    consumer2.get(lastOffsetForConsumer1 + 1, 100, 10000, failOnDataLoss = false)
+      // Pool must create a new fetched data instead of returning existing on now in use even
+      // there's fetched data matching start offset.
+      assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 2, expectedNumTotal = 2)
 
-    // Pool must create a new fetched data instead of returning existing on now in use even
-    // there's fetched data matching start offset.
-    assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 2, expectedNumTotal = 2)
-
-    consumer1.release()
-    consumer2.release()
+      consumer1.release()
+      consumer2.release()
+    }
   }
 
   test("SPARK-25251 Handles multiple tasks in executor fetching same (topic, partition) pair " +
@@ -237,28 +235,28 @@ class KafkaDataConsumerSuite extends SharedSQLContext with PrivateMethodTester {
     val fetchedDataPool = KafkaDataConsumer.invokePrivate(fetchedDataPoolHack())
     fetchedDataPool.resetStatistic()
 
-    val taskContext = new TaskContextImpl(0, 0, 0, 0, 0, null, null, null)
-    TaskContext.setTaskContext(taskContext)
+    withTaskContext(TaskContext.empty()) {
+      // task A trying to fetch offset 0 to 100, and read 5 records (still reading)
+      val consumer1 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
+      val lastOffsetForConsumer1 = readAndGetLastOffset(consumer1, 0, 100, 5)
+      consumer1.release()
 
-    // task A trying to fetch offset 0 to 100, and read 5 records (still reading)
-    val consumer1 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
-    val lastOffsetForConsumer1 = readAndGetLastOffset(consumer1, 0, 100, 5)
-    consumer1.release()
+      assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 1, expectedNumTotal = 1)
 
-    assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 1, expectedNumTotal = 1)
+      // task B trying to fetch offset the last offset task A is reading so far + 1 to 500
+      // this is a condition for edge case
+      val consumer2 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
+      consumer2.get(lastOffsetForConsumer1 + 1, 100, 10000, failOnDataLoss = false)
 
-    // task B trying to fetch offset the last offset task A is reading so far + 1 to 500
-    // this is a condition for edge case
-    val consumer2 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
-    consumer2.get(lastOffsetForConsumer1 + 1, 100, 10000, failOnDataLoss = false)
+      // Pool cannot determine the origin task, so it has to just provide matching one.
+      // task A may come back and try to fetch, and cannot find previous data
+      // (or the data is in use).
+      // If then task A may have to fetch from Kafka, but we already avoided fetching from Kafka in
+      // task B, so it is not a big deal in overall.
+      assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 1, expectedNumTotal = 1)
 
-    // Pool cannot determine the origin task, so it has to just provide matching one.
-    // task A may come back and try to fetch, and cannot find previous data (or the data is in use).
-    // If then task A may have to fetch from Kafka, but we already avoided fetching from Kafka in
-    // task B, so it is not a big deal in overall.
-    assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 1, expectedNumTotal = 1)
-
-    consumer2.release()
+      consumer2.release()
+    }
   }
 
   private def assertFetchedDataPoolStatistic(
@@ -286,4 +284,14 @@ class KafkaDataConsumerSuite extends SharedSQLContext with PrivateMethodTester {
     testUtils.sendMessages(topic, data.toArray)
     data
   }
+
+  private def withTaskContext(context: TaskContext)(task: => Unit): Unit = {
+    try {
+      TaskContext.setTaskContext(context)
+      task
+    } finally {
+      TaskContext.unset()
+    }
+  }
+
 }
