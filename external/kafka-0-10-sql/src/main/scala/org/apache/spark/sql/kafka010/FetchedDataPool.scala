@@ -19,6 +19,7 @@ package org.apache.spark.sql.kafka010
 
 import java.{util => ju}
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.LongAdder
 
 import scala.collection.mutable
 import scala.util.control.NonFatal
@@ -73,6 +74,18 @@ private[kafka010] class FetchedDataPool extends Logging {
 
   startEvictorThread()
 
+  private val numCreatedFetchedData = new LongAdder()
+  private val numTotalElements = new LongAdder()
+
+  def getNumCreated: Long = numCreatedFetchedData.sum()
+  def getNumTotal: Long = numTotalElements.sum()
+
+  /** This is only intended to be used from unit tests. */
+  private[kafka010] def resetStatistic(): Unit = synchronized {
+    numCreatedFetchedData.reset()
+    numTotalElements.reset()
+  }
+
   def acquire(key: CacheKey, desiredStartOffset: Long): FetchedData = synchronized {
     val fetchedDataList = cache.getOrElseUpdate(key, new CachedFetchedDataList())
 
@@ -86,6 +99,9 @@ private[kafka010] class FetchedDataPool extends Logging {
     } else {
       cachedFetchedData = CachedFetchedData.empty()
       fetchedDataList += cachedFetchedData
+
+      numCreatedFetchedData.increment()
+      numTotalElements.increment()
     }
 
     cachedFetchedData.lastAcquiredTimestamp = System.currentTimeMillis()
@@ -95,7 +111,10 @@ private[kafka010] class FetchedDataPool extends Logging {
   }
 
   def invalidate(key: CacheKey): Unit = synchronized {
-    cache.remove(key)
+    cache.remove(key) match {
+      case Some(lst) => numTotalElements.add(-1 * lst.size)
+      case None =>
+    }
   }
 
   def release(key: CacheKey, fetchedData: FetchedData): Unit = synchronized {
@@ -125,7 +144,9 @@ private[kafka010] class FetchedDataPool extends Logging {
     val maxAllowedIdleTimestamp = timestamp - minEvictableIdleTimeMillis
     cache.values.foreach { p: CachedFetchedDataList =>
       val idles = p.filter(q => !q.inUse && q.lastReleasedTimestamp < maxAllowedIdleTimestamp)
+      val lstSize = p.size
       idles.foreach(idle => p -= idle)
+      numTotalElements.add(-1 * (lstSize - p.size))
     }
   }
 }

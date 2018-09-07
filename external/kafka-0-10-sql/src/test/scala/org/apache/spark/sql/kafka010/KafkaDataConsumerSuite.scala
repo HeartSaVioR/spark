@@ -20,6 +20,7 @@ package org.apache.spark.sql.kafka010
 import java.util.concurrent.{Executors, TimeUnit}
 
 import scala.collection.JavaConverters._
+import scala.collection.immutable
 import scala.util.Random
 
 import org.apache.kafka.clients.consumer.ConsumerConfig
@@ -59,9 +60,8 @@ class KafkaDataConsumerSuite extends SharedSQLContext with PrivateMethodTester {
 
   test("SPARK-23623: concurrent use of KafkaDataConsumer") {
     val topic = "topic" + Random.nextInt()
-    val data = (1 to 1000).map(_.toString)
-    testUtils.createTopic(topic, 1)
-    testUtils.sendMessages(topic, data.toArray)
+    val data: immutable.IndexedSeq[String] = prepareTestTopicHavingTestMessages(topic)
+
     val topicPartition = new TopicPartition(topic, 0)
 
     import ConsumerConfig._
@@ -115,5 +115,175 @@ class KafkaDataConsumerSuite extends SharedSQLContext with PrivateMethodTester {
     } finally {
       threadpool.shutdown()
     }
+  }
+
+  test("SPARK-25251 Handles multiple tasks in executor fetching same (topic, partition) pair") {
+    val topic = "topic" + Random.nextInt()
+    prepareTestTopicHavingTestMessages(topic)
+    val topicPartition = new TopicPartition(topic, 0)
+
+    import ConsumerConfig._
+    val kafkaParams = Map[String, Object](
+      GROUP_ID_CONFIG -> "groupId",
+      BOOTSTRAP_SERVERS_CONFIG -> testUtils.brokerAddress,
+      KEY_DESERIALIZER_CLASS_CONFIG -> classOf[ByteArrayDeserializer].getName,
+      VALUE_DESERIALIZER_CLASS_CONFIG -> classOf[ByteArrayDeserializer].getName,
+      AUTO_OFFSET_RESET_CONFIG -> "earliest",
+      ENABLE_AUTO_COMMIT_CONFIG -> "false"
+    )
+
+    // reset statistic in fetched data pool so that we can verify expected behavior
+    val fetchedDataPoolHack = PrivateMethod[FetchedDataPool]('fetchedDataPool)
+    val fetchedDataPool = KafkaDataConsumer.invokePrivate(fetchedDataPoolHack())
+    fetchedDataPool.resetStatistic()
+
+    val taskContext = new TaskContextImpl(0, 0, 0, 0, 0, null, null, null)
+    TaskContext.setTaskContext(taskContext)
+
+    // task A trying to fetch offset 0 to 100, and read 5 records
+    val consumer1 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
+    val lastOffsetForConsumer1 = readAndGetLastOffset(consumer1, 0, 100, 5)
+    consumer1.release()
+
+    assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 1, expectedNumTotal = 1)
+
+    // task B trying to fetch offset 300 to 500, and read 5 records
+    val consumer2 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
+    val lastOffsetForConsumer2 = readAndGetLastOffset(consumer2, 300, 500, 5)
+    consumer2.release()
+
+    assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 2, expectedNumTotal = 2)
+
+    // task A continue reading from the last offset + 1, with upper bound 100 again
+    val consumer1a = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
+
+    consumer1a.get(lastOffsetForConsumer1 + 1, 100, 10000, failOnDataLoss = false)
+    consumer1a.release()
+
+    // pool should succeed to provide cached data instead of creating one
+    assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 2, expectedNumTotal = 2)
+
+    // task B also continue reading from the last offset + 1, with upper bound 500 again
+    val consumer2a = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
+
+    consumer2a.get(lastOffsetForConsumer2 + 1, 500, 10000, failOnDataLoss = false)
+    consumer2a.release()
+
+    // same expectation: pool should succeed to provide cached data instead of creating one
+    assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 2, expectedNumTotal = 2)
+  }
+
+  test("SPARK-25251 Handles multiple tasks in executor fetching same (topic, partition) pair " +
+    "and same offset (edge-case) - data in use") {
+    val topic = "topic" + Random.nextInt()
+    prepareTestTopicHavingTestMessages(topic)
+    val topicPartition = new TopicPartition(topic, 0)
+
+    import ConsumerConfig._
+    val kafkaParams = Map[String, Object](
+      GROUP_ID_CONFIG -> "groupId",
+      BOOTSTRAP_SERVERS_CONFIG -> testUtils.brokerAddress,
+      KEY_DESERIALIZER_CLASS_CONFIG -> classOf[ByteArrayDeserializer].getName,
+      VALUE_DESERIALIZER_CLASS_CONFIG -> classOf[ByteArrayDeserializer].getName,
+      AUTO_OFFSET_RESET_CONFIG -> "earliest",
+      ENABLE_AUTO_COMMIT_CONFIG -> "false"
+    )
+
+    // reset statistic in fetched data pool so that we can verify expected behavior
+    val fetchedDataPoolHack = PrivateMethod[FetchedDataPool]('fetchedDataPool)
+    val fetchedDataPool = KafkaDataConsumer.invokePrivate(fetchedDataPoolHack())
+    fetchedDataPool.resetStatistic()
+
+    val taskContext = new TaskContextImpl(0, 0, 0, 0, 0, null, null, null)
+    TaskContext.setTaskContext(taskContext)
+
+    // task A trying to fetch offset 0 to 100, and read 5 records (still reading)
+    val consumer1 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
+    val lastOffsetForConsumer1 = readAndGetLastOffset(consumer1, 0, 100, 5)
+
+    assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 1, expectedNumTotal = 1)
+
+    // task B trying to fetch offset the last offset task A is reading so far + 1 to 500
+    // this is a condition for edge case
+    val consumer2 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
+    consumer2.get(lastOffsetForConsumer1 + 1, 100, 10000, failOnDataLoss = false)
+
+    // Pool must create a new fetched data instead of returning existing on now in use even
+    // there's fetched data matching start offset.
+    assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 2, expectedNumTotal = 2)
+
+    consumer1.release()
+    consumer2.release()
+  }
+
+  test("SPARK-25251 Handles multiple tasks in executor fetching same (topic, partition) pair " +
+    "and same offset (edge-case) - data not in use") {
+    val topic = "topic" + Random.nextInt()
+    prepareTestTopicHavingTestMessages(topic)
+    val topicPartition = new TopicPartition(topic, 0)
+
+    import ConsumerConfig._
+    val kafkaParams = Map[String, Object](
+      GROUP_ID_CONFIG -> "groupId",
+      BOOTSTRAP_SERVERS_CONFIG -> testUtils.brokerAddress,
+      KEY_DESERIALIZER_CLASS_CONFIG -> classOf[ByteArrayDeserializer].getName,
+      VALUE_DESERIALIZER_CLASS_CONFIG -> classOf[ByteArrayDeserializer].getName,
+      AUTO_OFFSET_RESET_CONFIG -> "earliest",
+      ENABLE_AUTO_COMMIT_CONFIG -> "false"
+    )
+
+    // reset statistic in fetched data pool so that we can verify expected behavior
+    val fetchedDataPoolHack = PrivateMethod[FetchedDataPool]('fetchedDataPool)
+    val fetchedDataPool = KafkaDataConsumer.invokePrivate(fetchedDataPoolHack())
+    fetchedDataPool.resetStatistic()
+
+    val taskContext = new TaskContextImpl(0, 0, 0, 0, 0, null, null, null)
+    TaskContext.setTaskContext(taskContext)
+
+    // task A trying to fetch offset 0 to 100, and read 5 records (still reading)
+    val consumer1 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
+    val lastOffsetForConsumer1 = readAndGetLastOffset(consumer1, 0, 100, 5)
+    consumer1.release()
+
+    assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 1, expectedNumTotal = 1)
+
+    // task B trying to fetch offset the last offset task A is reading so far + 1 to 500
+    // this is a condition for edge case
+    val consumer2 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
+    consumer2.get(lastOffsetForConsumer1 + 1, 100, 10000, failOnDataLoss = false)
+
+    // Pool cannot determine the origin task, so it has to just provide matching one.
+    // task A may come back and try to fetch, and cannot find previous data (or the data is in use).
+    // If then task A may have to fetch from Kafka, but we already avoided fetching from Kafka in
+    // task B, so it is not a big deal in overall.
+    assertFetchedDataPoolStatistic(fetchedDataPool, expectedNumCreated = 1, expectedNumTotal = 1)
+
+    consumer2.release()
+  }
+
+  private def assertFetchedDataPoolStatistic(
+      fetchedDataPool: FetchedDataPool,
+      expectedNumCreated: Long,
+      expectedNumTotal: Long): Unit = {
+    assert(fetchedDataPool.getNumCreated == expectedNumCreated)
+    assert(fetchedDataPool.getNumTotal == expectedNumTotal)
+  }
+
+  private def readAndGetLastOffset(consumer: KafkaDataConsumer, startOffset: Long,
+                                   untilOffset: Long, numToRead: Int): Long = {
+    var lastOffset: Long = startOffset - 1
+    (0 until 5).foreach { _ =>
+      val record = consumer.get(lastOffset + 1, untilOffset, 10000, failOnDataLoss = false)
+      // validation for fetched record is covered by other tests, so skip on validating
+      lastOffset = record.offset()
+    }
+    lastOffset
+  }
+
+  private def prepareTestTopicHavingTestMessages(topic: String) = {
+    val data = (1 to 1000).map(_.toString)
+    testUtils.createTopic(topic, 1)
+    testUtils.sendMessages(topic, data.toArray)
+    data
   }
 }
