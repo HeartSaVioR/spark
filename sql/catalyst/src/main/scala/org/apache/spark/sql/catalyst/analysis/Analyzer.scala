@@ -2656,7 +2656,11 @@ object TimeWindowing extends Rule[LogicalPlan] {
       val windowExpressions =
         p.expressions.flatMap(_.collect { case t: TimeWindow => t }).toSet
 
-      val numWindowExpr = windowExpressions.size
+      val numWindowExpr = p.expressions.flatMap(_.collect {
+        case s: SessionWindow => s
+        case t: TimeWindow => t
+      }).toSet.size
+
       // Only support a single window expression for now
       if (numWindowExpr == 1 &&
           windowExpressions.head.timeColumn.resolved &&
@@ -2726,7 +2730,7 @@ object TimeWindowing extends Rule[LogicalPlan] {
           renamedPlan.withNewChildren(substitutedPlan :: Nil)
         }
       } else if (numWindowExpr > 1) {
-        p.failAnalysis("Multiple time window expressions would result in a cartesian product " +
+        p.failAnalysis("Multiple time/session window expressions would result in a cartesian product " +
           "of rows, therefore they are currently not supported.")
       } else {
         p // Return unchanged. Analyzer will throw exception later
@@ -2749,10 +2753,13 @@ object SessionWindowing extends Rule[LogicalPlan] {
       val sessionExpressions =
         p.expressions.flatMap(_.collect { case s: SessionWindow => s }).toSet
 
-      // FIXME: we would want to also couple window and session on restriction
-      val numSessionExpr = sessionExpressions.size
+      val numWindowExpr = p.expressions.flatMap(_.collect {
+        case s: SessionWindow => s
+        case t: TimeWindow => t
+      }).toSet.size
+
       // Only support a single session expression for now
-      if (numSessionExpr == 1 &&
+      if (numWindowExpr == 1 &&
           sessionExpressions.head.timeColumn.resolved &&
           sessionExpressions.head.checkInputDataTypes().isSuccess) {
 
@@ -2789,9 +2796,9 @@ object SessionWindowing extends Rule[LogicalPlan] {
         replacedPlan.withNewChildren(
           Filter(filterExpr,
             Project(sessionStruct +: child.output, child)) :: Nil)
-      } else if (numSessionExpr > 1) {
-        p.failAnalysis("Multiple time session expressions would result in a cartesian product " +
-          "of rows, therefore they are currently not supported.")
+      } else if (numWindowExpr > 1) {
+        p.failAnalysis("Multiple time/session window expressions would result in a " +
+          "cartesian product of rows, therefore they are currently not supported.")
       } else {
         p // Return unchanged. Analyzer will throw exception later
       }
