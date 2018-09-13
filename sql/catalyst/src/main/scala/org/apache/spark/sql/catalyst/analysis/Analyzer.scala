@@ -2763,11 +2763,6 @@ object SessionWindowing extends Rule[LogicalPlan] {
           sessionExpressions.head.timeColumn.resolved &&
           sessionExpressions.head.checkInputDataTypes().isSuccess) {
 
-        // FIXME: where it needs to place the check? In UnsupportedOperationsSuite?
-        if (!p.isStreaming) {
-          p.failAnalysis("Session window is not supported for batch query as of now.")
-        }
-
         val session = sessionExpressions.head
 
         val metadata = session.timeColumn match {
@@ -2775,8 +2770,13 @@ object SessionWindowing extends Rule[LogicalPlan] {
           case _ => Metadata.empty
         }
 
+        val newMetadata = new MetadataBuilder()
+          .withMetadata(metadata)
+          .putBoolean(SessionWindow.marker, true)
+          .build()
+
         val sessionAttr = AttributeReference(
-          SESSION_COL_NAME, session.dataType, metadata = metadata)()
+          SESSION_COL_NAME, session.dataType, metadata = newMetadata)()
 
         val sessionStart = PreciseTimestampConversion(session.timeColumn, TimestampType, LongType)
         val sessionEnd = sessionStart + session.gapDuration
@@ -2789,7 +2789,7 @@ object SessionWindowing extends Rule[LogicalPlan] {
             Nil)
 
         val sessionStruct = Alias(literalSessionStruct, SESSION_COL_NAME)(
-          exprId = sessionAttr.exprId, explicitMetadata = Some(metadata))
+          exprId = sessionAttr.exprId, explicitMetadata = Some(newMetadata))
 
         val replacedPlan = p transformExpressions {
           case s: SessionWindow => sessionAttr
