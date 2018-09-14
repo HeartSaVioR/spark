@@ -313,8 +313,6 @@ class MultiValuesStateManager(
 
     def commit(): Unit = {
       stateStore.commit()
-      // FIXME: DEBUG
-      logInfo("Committed, metrics = " + stateStore.metrics)
       logDebug("Committed, metrics = " + stateStore.metrics)
     }
 
