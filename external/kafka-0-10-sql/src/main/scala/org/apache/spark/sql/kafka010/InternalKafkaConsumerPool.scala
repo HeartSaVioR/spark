@@ -142,9 +142,6 @@ private[kafka010] object InternalKafkaConsumerPool {
     new InternalKafkaConsumerPool(objFactory, poolConfig)
   }
 
-  case class PooledObjectInvalidated(key: CacheKey, lastInvalidatedTimestamp: Long,
-                                     lastBorrowedTime: Long) extends RuntimeException
-
   object CustomSwallowedExceptionListener extends SwallowedExceptionListener with Logging {
     override def onSwallowException(e: Exception): Unit = {
       logError(s"Error closing Kafka consumer", e)

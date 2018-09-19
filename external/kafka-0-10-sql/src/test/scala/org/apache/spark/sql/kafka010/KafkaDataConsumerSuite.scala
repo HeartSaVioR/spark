@@ -117,7 +117,7 @@ class KafkaDataConsumerSuite extends SharedSQLContext with PrivateMethodTester {
     }
   }
 
-  test("SPARK-25251 Handles multiple tasks in executor fetching same (topic, partition) pair") {
+  test("SPARK-25151 Handles multiple tasks in executor fetching same (topic, partition) pair") {
     val topic = "topic" + Random.nextInt()
     prepareTestTopicHavingTestMessages(topic)
     val topicPartition = new TopicPartition(topic, 0)
@@ -172,7 +172,7 @@ class KafkaDataConsumerSuite extends SharedSQLContext with PrivateMethodTester {
     }
   }
 
-  test("SPARK-25251 Handles multiple tasks in executor fetching same (topic, partition) pair " +
+  test("SPARK-25151 Handles multiple tasks in executor fetching same (topic, partition) pair " +
     "and same offset (edge-case) - data in use") {
     val topic = "topic" + Random.nextInt()
     prepareTestTopicHavingTestMessages(topic)
@@ -214,7 +214,7 @@ class KafkaDataConsumerSuite extends SharedSQLContext with PrivateMethodTester {
     }
   }
 
-  test("SPARK-25251 Handles multiple tasks in executor fetching same (topic, partition) pair " +
+  test("SPARK-25151 Handles multiple tasks in executor fetching same (topic, partition) pair " +
     "and same offset (edge-case) - data not in use") {
     val topic = "topic" + Random.nextInt()
     prepareTestTopicHavingTestMessages(topic)
@@ -270,7 +270,7 @@ class KafkaDataConsumerSuite extends SharedSQLContext with PrivateMethodTester {
   private def readAndGetLastOffset(consumer: KafkaDataConsumer, startOffset: Long,
                                    untilOffset: Long, numToRead: Int): Long = {
     var lastOffset: Long = startOffset - 1
-    (0 until 5).foreach { _ =>
+    (0 until numToRead).foreach { _ =>
       val record = consumer.get(lastOffset + 1, untilOffset, 10000, failOnDataLoss = false)
       // validation for fetched record is covered by other tests, so skip on validating
       lastOffset = record.offset()
