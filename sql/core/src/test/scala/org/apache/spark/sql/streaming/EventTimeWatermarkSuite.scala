@@ -19,6 +19,7 @@ package org.apache.spark.sql.streaming
 
 import java.{util => ju}
 import java.io.File
+import java.sql.Timestamp
 import java.text.SimpleDateFormat
 import java.util.{Calendar, Date}
 
@@ -612,6 +613,109 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
       // sessions: (25,30) / (35,45)
       // evicts: (25,30)
       CheckNewAnswer((25, 30, 1, 25))
+    )
+  }
+
+  test("comparison - update mode - flatMapGroupWithState - session window") {
+    // Implements StructuredSessionization.scala leveraging "session" function
+    // as a test, to verify the flatMapGroupWithState works with simple example
+
+    val stateFunc = (sessionId: String, events: Iterator[(String, Long)],
+                     state: GroupState[SessionInfo]) => {
+      // If timed out, then remove session and send final update
+      if (state.hasTimedOut) {
+        val finalUpdate =
+          SessionUpdate(sessionId, state.get.startTimestampMs, state.get.endTimestampMs,
+            state.get.durationMs, state.get.numEvents, expired = true)
+        state.remove()
+        finalUpdate
+      } else {
+        // Update start and end timestamps in session
+        val timestamps = events.map(_._2).toSeq
+        val updatedSession = if (state.exists) {
+          val oldSession = state.get
+          SessionInfo(
+            oldSession.numEvents + timestamps.size,
+            oldSession.startTimestampMs,
+            math.max(oldSession.endTimestampMs, timestamps.max))
+        } else {
+          SessionInfo(timestamps.size, timestamps.min, timestamps.max)
+        }
+        state.update(updatedSession)
+
+        // Set timeout such that the session will be expired if no data received for 10 seconds
+        state.setTimeoutTimestamp(timestamps.max, "10 seconds")
+        SessionUpdate(sessionId, state.get.startTimestampMs, state.get.endTimestampMs,
+          state.get.durationMs, state.get.numEvents, expired = false)
+      }
+    }
+
+    val inputData = MemoryStream[(String, Long)]
+
+    // Split the lines into words, treat words as sessionId of events
+    val sessionUpdates = inputData.toDS()
+      .flatMap { case (line, timestamp) =>
+        line.split(" ").map(word => (word, timestamp))
+      }
+      .select($"_1".as("key"), $"_2".cast("timestamp").as("eventTime"))
+      .withWatermark("eventTime", "10 seconds")
+      .as[(String, Long)]
+      .groupByKey(_._1)
+      .mapGroupsWithState[SessionInfo, SessionUpdate](GroupStateTimeout.EventTimeTimeout())(stateFunc)
+      // just add 10 seconds for comparing easily with native session window
+      .map(su => (su.id, su.startTimestampMs, su.endTimestampMs + 10, su.durationMs + 10, su.numEvents))
+
+    testStream(sessionUpdates, OutputMode.Update())(
+      AddData(inputData, ("hello world spark", 10L), ("world hello structured streaming", 11L)),
+      // Advance watermark to 1 seconds
+      // current sessions after batch:
+      // ("hello", 10, 21, 11, 2)
+      // ("world", 10, 21, 11, 2)
+      // ("spark", 10, 20, 10, 1)
+      // ("structured", 11, 21, 10, 1)
+      // ("streaming", 11, 21, 10, 1)
+      CheckNewAnswer(
+        ("hello", 10, 21, 11, 2),
+        ("world", 10, 21, 11, 2),
+        ("spark", 10, 20, 10, 1),
+        ("structured", 11, 21, 10, 1),
+        ("streaming", 11, 21, 10, 1)
+      ),
+
+      AddData(inputData, ("spark streaming", 15L)),
+      // Advance watermark to 5 seconds
+      // current sessions after batch:
+      // ("hello", 10, 21, 11, 2)
+      // ("world", 10, 21, 11, 2)
+      // ("structured", 11, 21, 10, 2)
+      // ("spark", 10, 25, 15, 2)
+      // ("streaming", 11, 25, 14, 2)
+      CheckNewAnswer(("spark", 10, 25, 15, 2), ("streaming", 11, 25, 14, 2)),
+
+      AddData(inputData, ("hello world", 25L)),
+      // Advance watermark to 15 seconds
+      // current sessions after batch (if it works correctly...):
+      // ("hello", 10, 21, 11, 2)
+      // ("world", 10, 21, 11, 2)
+      // ("structured", 11, 21, 10, 2)
+      // ("spark", 10, 25, 15, 2)
+      // ("streaming", 11, 25, 14, 2)
+      // ("hello", 25, 35, 10, 1)
+      // ("world", 25, 35, 10, 1)
+
+      // The test fail on flatMapGroupsWithState...
+      /*
+!== Correct Answer - 2 ==                        == Spark Answer - 7 ==
+!struct<_1:string,_2:int,_3:int,_4:int,_5:int>   struct<_1:string,_2:bigint,_3:bigint,_4:bigint,_5:int>
+![hello,25,35,10,1]                              [hello,10,35,25,3]
+![world,25,35,10,1]                              [hello,10,35,25,3]
+!                                                [spark,10,25,15,2]
+!                                                [streaming,11,25,14,2]
+!                                                [structured,11,21,10,1]
+!                                                [world,10,35,25,3]
+!                                                [world,10,35,25,3]
+       */
+      CheckNewAnswer(("hello", 25, 35, 10, 1), ("world", 25, 35, 10, 1))
     )
   }
 
