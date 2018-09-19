@@ -25,8 +25,8 @@ import scala.collection.mutable
 import scala.util.control.NonFatal
 
 import org.apache.kafka.clients.consumer.ConsumerRecord
-import org.apache.spark.SparkEnv
 
+import org.apache.spark.SparkEnv
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.kafka010.KafkaDataConsumer.{CacheKey, UNKNOWN_OFFSET}
 import org.apache.spark.util.ThreadUtils
