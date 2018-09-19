@@ -18,15 +18,15 @@
 package org.apache.spark.sql.kafka010
 
 import java.{util => ju}
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.{ScheduledFuture, TimeUnit}
 import java.util.concurrent.atomic.LongAdder
 
 import scala.collection.mutable
 import scala.util.control.NonFatal
 
 import org.apache.kafka.clients.consumer.ConsumerRecord
-
 import org.apache.spark.SparkEnv
+
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.kafka010.KafkaDataConsumer.{CacheKey, UNKNOWN_OFFSET}
 import org.apache.spark.util.ThreadUtils
@@ -59,7 +59,7 @@ private[kafka010] class FetchedDataPool extends Logging {
   private val executorService = ThreadUtils.newDaemonSingleThreadScheduledExecutor(
     "kafka-fetched-data-cache-evictor")
 
-  private def startEvictorThread(): Unit = {
+  private def startEvictorThread(): ScheduledFuture[_] = {
     executorService.scheduleAtFixedRate(new Runnable {
       override def run(): Unit = {
         try {
@@ -72,19 +72,13 @@ private[kafka010] class FetchedDataPool extends Logging {
     }, 0, evictorThreadRunIntervalMillis, TimeUnit.MILLISECONDS)
   }
 
-  startEvictorThread()
+  private var scheduled = startEvictorThread()
 
   private val numCreatedFetchedData = new LongAdder()
   private val numTotalElements = new LongAdder()
 
   def getNumCreated: Long = numCreatedFetchedData.sum()
   def getNumTotal: Long = numTotalElements.sum()
-
-  /** This is only intended to be used from unit tests. */
-  private[kafka010] def resetStatistic(): Unit = synchronized {
-    numCreatedFetchedData.reset()
-    numTotalElements.reset()
-  }
 
   def acquire(key: CacheKey, desiredStartOffset: Long): FetchedData = synchronized {
     val fetchedDataList = cache.getOrElseUpdate(key, new CachedFetchedDataList())
@@ -137,6 +131,16 @@ private[kafka010] class FetchedDataPool extends Logging {
 
   def shutdown(): Unit = {
     executorService.shutdownNow()
+  }
+
+  def reset(): Unit = synchronized {
+    scheduled.cancel(true)
+
+    cache.clear()
+    numTotalElements.reset()
+    numCreatedFetchedData.reset()
+
+    scheduled = startEvictorThread()
   }
 
   private def removeIdleFetchedData(): Unit = synchronized {

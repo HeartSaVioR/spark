@@ -49,6 +49,24 @@ class KafkaDataConsumerSuite extends SharedSQLContext with PrivateMethodTester {
     super.afterAll()
   }
 
+  private var fetchedDataPool: FetchedDataPool = _
+  private var consumerPool: InternalKafkaConsumerPool = _
+
+  override def beforeEach(): Unit = {
+    fetchedDataPool = {
+      val fetchedDataPoolHack = PrivateMethod[FetchedDataPool]('fetchedDataPool)
+      KafkaDataConsumer.invokePrivate(fetchedDataPoolHack())
+    }
+
+    consumerPool = {
+      val internalKafkaConsumerPoolHack = PrivateMethod[InternalKafkaConsumerPool]('consumerPool)
+      KafkaDataConsumer.invokePrivate(internalKafkaConsumerPoolHack())
+    }
+
+    fetchedDataPool.reset()
+    consumerPool.reset()
+  }
+
   test("SPARK-19886: Report error cause correctly in reportDataLoss") {
     val cause = new Exception("D'oh!")
     val reportDataLoss = PrivateMethod[Unit]('reportDataLoss0)
@@ -132,11 +150,6 @@ class KafkaDataConsumerSuite extends SharedSQLContext with PrivateMethodTester {
       ENABLE_AUTO_COMMIT_CONFIG -> "false"
     )
 
-    // reset statistic in fetched data pool so that we can verify expected behavior
-    val fetchedDataPoolHack = PrivateMethod[FetchedDataPool]('fetchedDataPool)
-    val fetchedDataPool = KafkaDataConsumer.invokePrivate(fetchedDataPoolHack())
-    fetchedDataPool.resetStatistic()
-
     withTaskContext(TaskContext.empty()) {
       // task A trying to fetch offset 0 to 100, and read 5 records
       val consumer1 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
@@ -188,11 +201,6 @@ class KafkaDataConsumerSuite extends SharedSQLContext with PrivateMethodTester {
       ENABLE_AUTO_COMMIT_CONFIG -> "false"
     )
 
-    // reset statistic in fetched data pool so that we can verify expected behavior
-    val fetchedDataPoolHack = PrivateMethod[FetchedDataPool]('fetchedDataPool)
-    val fetchedDataPool = KafkaDataConsumer.invokePrivate(fetchedDataPoolHack())
-    fetchedDataPool.resetStatistic()
-
     withTaskContext(TaskContext.empty()) {
       // task A trying to fetch offset 0 to 100, and read 5 records (still reading)
       val consumer1 = KafkaDataConsumer.acquire(topicPartition, kafkaParams.asJava)
@@ -229,11 +237,6 @@ class KafkaDataConsumerSuite extends SharedSQLContext with PrivateMethodTester {
       AUTO_OFFSET_RESET_CONFIG -> "earliest",
       ENABLE_AUTO_COMMIT_CONFIG -> "false"
     )
-
-    // reset statistic in fetched data pool so that we can verify expected behavior
-    val fetchedDataPoolHack = PrivateMethod[FetchedDataPool]('fetchedDataPool)
-    val fetchedDataPool = KafkaDataConsumer.invokePrivate(fetchedDataPoolHack())
-    fetchedDataPool.resetStatistic()
 
     withTaskContext(TaskContext.empty()) {
       // task A trying to fetch offset 0 to 100, and read 5 records (still reading)

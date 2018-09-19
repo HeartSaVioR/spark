@@ -105,6 +105,12 @@ private[kafka010] class InternalKafkaConsumerPool(
     pool.close()
   }
 
+  def reset(): Unit = {
+    // this is the best-effort of clearing up. otherwise we should close the pool and create again
+    // but we don't want to make it "var" only because of tests.
+    pool.clear()
+  }
+
   def getNumIdle: Int = pool.getNumIdle
 
   def getNumIdle(key: CacheKey): Int = pool.getNumIdle(key)
