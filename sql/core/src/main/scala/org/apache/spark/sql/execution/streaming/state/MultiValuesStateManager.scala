@@ -257,6 +257,8 @@ class MultiValuesStateManager(
     }
   }
 
+  def getAllValues: Iterator[UnsafeRow] = keyWithIndexToValue.iterator.map(_.value)
+
   /** Commit all the changes to all the state stores */
   def commit(): Unit = {
     keyToNumValues.commit()

@@ -539,6 +539,44 @@ case class SessionWindowStateStoreSaveExec(
 
       // assuming late events were dropped from MergingSortWithMultiValuesStateIterator
       outputMode match {
+        case Some(Complete) =>
+          allUpdatesTimeMs += timeTakenMs {
+            while (iter.hasNext) {
+              val row = iter.next().asInstanceOf[UnsafeRow]
+              val keys = keyProjection(row)
+
+              if (currentKey == null || !keyOrdering.equiv(currentKey, keys)) {
+                currentKey = keys
+
+                // This is necessary because MultiValuesStateManager doesn't guarantee
+                // stable ordering.
+                // The number of values for the given key is expected to be likely small,
+                // so listing it here doesn't hurt.
+                previousSessions = stateManager.get(keys).toList
+
+                stateManager.removeKey(keys)
+              }
+
+              stateManager.append(keys, row)
+
+              if (!previousSessions.exists(p => valueOrdering.equiv(row, p))) {
+                // such session is not in previous session
+                numUpdatedStateRows += 1
+              }
+            }
+          }
+
+          // Remove old aggregates if watermark specified
+          allRemovalsTimeMs += timeTakenMs {
+            // fully consume iterator to let removal take effect
+            evictSessionsByWatermark(stateManager).toList
+          }
+
+          CompletionIterator[InternalRow, Iterator[InternalRow]](stateManager.getAllValues, {
+            commitTimeMs += timeTakenMs { stateManager.commit() }
+            setStoreMetrics(stateManager)
+          })
+
         // Update and output only sessions being evicted from the MultiValuesStateManager
         // Assumption: watermark predicates must be non-empty if append mode is allowed
         case Some(Append) =>
