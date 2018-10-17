@@ -21,6 +21,7 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit._
 
 import scala.collection.JavaConverters._
+import scala.collection.mutable
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
@@ -493,6 +494,98 @@ case class SessionWindowStateStoreRestoreExec(
   }
 }
 
+class SessionsBatchUpdater(
+    stateManager: MultiValuesStateManager,
+    sessionProjection: UnsafeProjection,
+    keyOrdering: Ordering[UnsafeRow],
+    valueOrdering: Ordering[UnsafeRow]) {
+  var currentKey: UnsafeRow = _
+  var previousSessionsWithIndex: Iterator[(UnsafeRow, Int)] = _
+  var totalNumberOfCurrentSessions = 0
+  val sessionsToInsert = new mutable.MutableList[UnsafeRow]
+  val indicesToKeep = new mutable.MutableList[Int]
+
+  // it returns false when the value already exists
+  def append(key: UnsafeRow, row: UnsafeRow): Boolean = {
+    if (currentKey == null || !keyOrdering.equiv(currentKey, key)) {
+      finalizeGroup()
+      startNewGroup(key)
+      loadPreviousSessionsForKey(key)
+    }
+
+    totalNumberOfCurrentSessions += 1
+    findIndexOfMatchingSessionInPreviousSessions(previousSessionsWithIndex, row) match {
+      case Some(idx) =>
+        indicesToKeep += idx
+        false
+      case None =>
+        sessionsToInsert += row.copy()
+        true
+    }
+  }
+
+  def doFinalize(): Unit = {
+    finalizeGroup()
+  }
+
+  private def startNewGroup(newKey: UnsafeRow) = {
+    currentKey = newKey.copy()
+    sessionsToInsert.clear()
+    indicesToKeep.clear()
+    totalNumberOfCurrentSessions = 0
+  }
+
+  private def finalizeGroup(): Unit = {
+    if (totalNumberOfCurrentSessions > 0) {
+      stateManager.replaceValues(currentKey, sessionsToInsert, indicesToKeep)
+    }
+  }
+
+  private def loadPreviousSessionsForKey(key: UnsafeRow): Unit = {
+    // This is necessary because MultiValuesStateManager doesn't guarantee
+    // stable ordering.
+    // The number of values for the given key is expected to be likely small,
+    // so listing it here doesn't hurt.
+    previousSessionsWithIndex = stateManager.get(key).toList.zipWithIndex
+      .sortWith { case (r1, r2) =>
+        // here sorting is based on the fact that keys are same
+        getSessionStart(r1._1).compareTo(getSessionStart(r2._1)) < 0
+      }.iterator
+  }
+
+  private def getSessionStart(r: InternalRow): Long = {
+    val session = sessionProjection(r)
+    val sessionRow = session.getStruct(0, 2)
+    sessionRow.getLong(0)
+  }
+
+  private def findIndexOfMatchingSessionInPreviousSessions(prevSessions: Iterator[(UnsafeRow, Int)],
+                                                           session: UnsafeRow): Option[Int] = {
+    while (prevSessions.hasNext) {
+      val prevSession = prevSessions.next
+      val currentSessionStart = getSessionStart(session)
+      val prevSessionStart = getSessionStart(prevSession._1)
+
+      if (currentSessionStart < prevSessionStart) {
+        // no match
+        return None
+      } else if (currentSessionStart > prevSessionStart) {
+        // try to match with next session
+      } else {
+        // session start matched: comparing full value
+        if (valueOrdering.equiv(prevSession._1, session)) {
+          // matched!
+          return Some(prevSession._2)
+        } else {
+          return None
+        }
+      }
+    }
+
+    None
+  }
+}
+
 /**
  * For each input tuple, the key is calculated and sessions are being `put` into
  * the [[MultiValuesStateManager]].
@@ -521,6 +614,22 @@ case class SessionWindowStateStoreSaveExec(
       sqlContext.sessionState,
       Some(sqlContext.streams.stateStoreCoordinator)) { (stateManager, iter) =>
 
+      val numOutputRows = longMetric("numOutputRows")
+      val numUpdatedStateRows = longMetric("numUpdatedStateRows")
+      val allUpdatesTimeMs = longMetric("allUpdatesTimeMs")
+      val allRemovalsTimeMs = longMetric("allRemovalsTimeMs")
+      val commitTimeMs = longMetric("commitTimeMs")
+
+      val keyProjection = GenerateUnsafeProjection.generate(keyWithoutSessionExpressions,
+        child.output)
+      val sessionProjection = GenerateUnsafeProjection.generate(Seq(sessionExpression),
+        child.output)
+
+      val keyOrdering: Ordering[UnsafeRow] = TypeUtils.getInterpretedOrdering(
+        keyWithoutSessionExpressions.toStructType).asInstanceOf[Ordering[UnsafeRow]]
+      val valueOrdering: Ordering[UnsafeRow] = TypeUtils.getInterpretedOrdering(
+        child.output.toStructType).asInstanceOf[Ordering[UnsafeRow]]
+
       def evictSessionsByWatermark(manager: MultiValuesStateManager): Iterator[UnsafeRowPair] = {
         manager.removeByValueCondition { row => watermarkPredicateForData match {
             case Some(predicate) => predicate.eval(row)
@@ -529,20 +638,8 @@ case class SessionWindowStateStoreSaveExec(
         }
       }
 
-      val numOutputRows = longMetric("numOutputRows")
-      val numUpdatedStateRows = longMetric("numUpdatedStateRows")
-      val allUpdatesTimeMs = longMetric("allUpdatesTimeMs")
-      val allRemovalsTimeMs = longMetric("allRemovalsTimeMs")
-      val commitTimeMs = longMetric("commitTimeMs")
-
-      var currentKey: UnsafeRow = null
-      var previousSessions: List[UnsafeRow] = null
-
-      val keyProjection = GenerateUnsafeProjection.generate(keyWithoutSessionExpressions,
-        child.output)
-
-      val keyOrdering = TypeUtils.getInterpretedOrdering(keyWithoutSessionExpressions.toStructType)
-      val valueOrdering = TypeUtils.getInterpretedOrdering(child.output.toStructType)
+      val batchUpdater = new SessionsBatchUpdater(stateManager, sessionProjection, keyOrdering,
+        valueOrdering)
 
       // assuming late events were dropped from MergingSortWithMultiValuesStateIterator
       outputMode match {
@@ -552,25 +649,12 @@ case class SessionWindowStateStoreSaveExec(
               val row = iter.next().asInstanceOf[UnsafeRow]
               val keys = keyProjection(row)
 
-              if (currentKey == null || !keyOrdering.equiv(currentKey, keys)) {
-                currentKey = keys.copy()
-
-                // This is necessary because MultiValuesStateManager doesn't guarantee
-                // stable ordering.
-                // The number of values for the given key is expected to be likely small,
-                // so listing it here doesn't hurt.
-                previousSessions = stateManager.get(keys).toList
-
-                stateManager.removeKey(keys)
-              }
-
-              stateManager.append(keys, row)
-
-              if (!previousSessions.exists(p => valueOrdering.equiv(row, p))) {
-                // such session is not in previous session
+              if (batchUpdater.append(keys, row)) {
                 numUpdatedStateRows += 1
               }
             }
+
+            batchUpdater.doFinalize()
           }
 
           CompletionIterator[InternalRow, Iterator[InternalRow]](
@@ -587,25 +671,12 @@ case class SessionWindowStateStoreSaveExec(
               val row = iter.next().asInstanceOf[UnsafeRow]
               val keys = keyProjection(row)
 
-              if (currentKey == null || !keyOrdering.equiv(currentKey, keys)) {
-                currentKey = keys.copy()
-
-                // This is necessary because MultiValuesStateManager doesn't guarantee
-                // stable ordering.
-                // The number of values for the given key is expected to be likely small,
-                // so listing it here doesn't hurt.
-                previousSessions = stateManager.get(keys).toList
-
-                stateManager.removeKey(keys)
-              }
-
-              stateManager.append(keys, row)
-
-              if (!previousSessions.exists(p => valueOrdering.equiv(row, p))) {
-                // such session is not in previous session
+              if (batchUpdater.append(keys, row)) {
                 numUpdatedStateRows += 1
               }
             }
+
+            batchUpdater.doFinalize()
           }
 
           val removalStartTimeNs = System.nanoTime
@@ -634,22 +705,7 @@ case class SessionWindowStateStoreSaveExec(
                 val row = iter.next().asInstanceOf[UnsafeRow]
                 val keys = keyProjection(row)
 
-                if (currentKey == null || !keyOrdering.equiv(currentKey, keys)) {
-                  currentKey = keys.copy()
-
-                  // This is necessary because MultiValuesStateManager doesn't guarantee
-                  // stable ordering.
-                  // The number of values for the given key is expected to be likely small,
-                  // so listing it here doesn't hurt.
-                  previousSessions = stateManager.get(keys).toList
-
-                  stateManager.removeKey(keys)
-                }
-
-                stateManager.append(keys, row)
-
-                if (!previousSessions.exists(p => valueOrdering.equiv(row, p))) {
-                  // such session is not in previous session
+                if (batchUpdater.append(keys, row)) {
                   numUpdatedStateRows += 1
                   ret = row
                 }
@@ -668,6 +724,8 @@ case class SessionWindowStateStoreSaveExec(
             }
 
             override protected def close(): Unit = {
+              batchUpdater.doFinalize()
+
               allUpdatesTimeMs += NANOSECONDS.toMillis(System.nanoTime - updatesStartTimeNs)
 
               // Remove old aggregates if watermark specified

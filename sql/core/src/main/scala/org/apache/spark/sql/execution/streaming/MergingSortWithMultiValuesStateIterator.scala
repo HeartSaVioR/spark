@@ -132,7 +132,7 @@ class MergingSortWithMultiValuesStateIterator(
         // The number of values for the given key is expected to be likely small,
         // so sorting it here doesn't hurt.
         val unsortedIter = stateManager.get(currentRow.keys)
-        currentStateIter = unsortedIter.map(_.copy()).toList.sortWith((row1, row2) => {
+        currentStateIter = unsortedIter.toList.sortWith((row1, row2) => {
           def getSessionStart(r: InternalRow): Long = {
             val session = sessionProjection(r)
             val sessionRow = session.getStruct(0, 2)

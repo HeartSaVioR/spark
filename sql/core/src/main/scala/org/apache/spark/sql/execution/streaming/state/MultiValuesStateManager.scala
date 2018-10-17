@@ -88,6 +88,30 @@ class MultiValuesStateManager(
     keyToNumValues.put(key, numExistingValues + 1)
   }
 
+
+  def replaceValues(key: UnsafeRow, valuesToInsert: Seq[UnsafeRow],
+                    indicesToKeep: Seq[Int]): Unit = {
+    val numNewValues = valuesToInsert.length + indicesToKeep.length
+
+    // even some elements are available to be kept, sometimes they should be moved
+    // due to reduction of overall size
+    val keep = indicesToKeep.filter(_ < numNewValues)
+    val move = indicesToKeep.filterNot(_ < numNewValues)
+
+    val allValuesToInsert = valuesToInsert.iterator ++ move.map { idx =>
+      keyWithIndexToValue.get(key, idx).copy()
+    }.iterator
+
+    (0 until numNewValues).foreach { idx =>
+      if (!keep.contains(idx)) {
+        val newValue = allValuesToInsert.next()
+        keyWithIndexToValue.put(key, idx, newValue)
+      }
+    }
+
+    keyToNumValues.put(key, numNewValues)
+  }
+
   def removeKey(key: UnsafeRow): Unit = {
     val numExistingValues = keyToNumValues.get(key)
     keyToNumValues.remove(key)
