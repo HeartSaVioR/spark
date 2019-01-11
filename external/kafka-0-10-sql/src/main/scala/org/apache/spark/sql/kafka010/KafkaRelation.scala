@@ -33,9 +33,9 @@ import org.apache.spark.unsafe.types.UTF8String
 
 private[kafka010] class KafkaRelation(
     override val sqlContext: SQLContext,
-    strategy: ConsumerStrategy,
+    val strategy: ConsumerStrategy,
     sourceOptions: Map[String, String],
-    specifiedKafkaParams: Map[String, String],
+    val specifiedKafkaParams: Map[String, String],
     failOnDataLoss: Boolean,
     startingOffsets: KafkaOffsetRangeLimit,
     endingOffsets: KafkaOffsetRangeLimit)

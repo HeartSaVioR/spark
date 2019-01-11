@@ -60,7 +60,7 @@ private[kafka010] case class KafkaSourceRDDPartition(
  */
 private[kafka010] class KafkaSourceRDD(
     sc: SparkContext,
-    executorKafkaParams: ju.Map[String, Object],
+    val executorKafkaParams: ju.Map[String, Object],
     offsetRanges: Seq[KafkaSourceRDDOffsetRange],
     pollTimeoutMs: Long,
     failOnDataLoss: Boolean,
