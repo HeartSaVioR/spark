@@ -79,7 +79,7 @@ class SparkConfSuite extends SparkFunSuite with LocalSparkContext with ResetSyst
     assert(conf.get("spark.master") === "local[3]")
     assert(conf.get("spark.app.name") === "My app")
     assert(conf.get("spark.home") === "/path")
-    assert(conf.get("spark.jars") === "a.jar,b.jar")
+    assert(conf.get(JARS) === Seq("a.jar", "b.jar"))
     assert(conf.get("spark.executorEnv.VAR1") === "value1")
     assert(conf.get("spark.executorEnv.VAR2") === "value2")
     assert(conf.get("spark.executorEnv.VAR3") === "value3")
@@ -87,7 +87,7 @@ class SparkConfSuite extends SparkFunSuite with LocalSparkContext with ResetSyst
     // Test the Java-friendly versions of these too
     conf.setJars(Array("c.jar", "d.jar"))
     conf.setExecutorEnv(Array(("VAR4", "value4"), ("VAR5", "value5")))
-    assert(conf.get("spark.jars") === "c.jar,d.jar")
+    assert(conf.get(JARS) === Seq("c.jar", "d.jar"))
     assert(conf.get("spark.executorEnv.VAR4") === "value4")
     assert(conf.get("spark.executorEnv.VAR5") === "value5")
   }
