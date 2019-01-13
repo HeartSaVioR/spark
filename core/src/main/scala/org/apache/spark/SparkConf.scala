@@ -28,6 +28,7 @@ import org.apache.avro.{Schema, SchemaNormalization}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
 import org.apache.spark.internal.config.History._
+import org.apache.spark.internal.config.Kryo._
 import org.apache.spark.serializer.KryoSerializer
 import org.apache.spark.util.Utils
 
@@ -201,12 +202,12 @@ class SparkConf(loadDefaults: Boolean) extends Cloneable with Logging with Seria
    */
   def registerKryoClasses(classes: Array[Class[_]]): SparkConf = {
     val allClassNames = new LinkedHashSet[String]()
-    allClassNames ++= get("spark.kryo.classesToRegister", "").split(',').map(_.trim)
+    allClassNames ++= get(KRYO_CLASSES_TO_REGISTER).map(_.trim)
       .filter(!_.isEmpty)
     allClassNames ++= classes.map(_.getName)
 
-    set("spark.kryo.classesToRegister", allClassNames.mkString(","))
-    set("spark.serializer", classOf[KryoSerializer].getName)
+    set(KRYO_CLASSES_TO_REGISTER, allClassNames.toSeq)
+    set(SERIALIZER, classOf[KryoSerializer].getName)
     this
   }
 

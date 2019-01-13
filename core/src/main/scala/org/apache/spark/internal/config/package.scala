@@ -772,4 +772,17 @@ package object config {
   private[spark] val MASTER_UI_PORT = ConfigBuilder("spark.master.ui.port")
     .intConf
     .createWithDefault(8080)
+
+  private[spark] val SERIALIZER = ConfigBuilder("spark.serializer")
+    .stringConf
+    .createWithDefault("org.apache.spark.serializer.JavaSerializer")
+
+  private[spark] val SERIALIZER_OBJECT_STREAM_RESET =
+    ConfigBuilder("spark.serializer.objectStreamReset")
+      .intConf
+      .createWithDefault(100)
+
+  private[spark] val SERIALIZER_EXTRA_DEBUG_INFO = ConfigBuilder("spark.serializer.extraDebugInfo")
+    .booleanConf
+    .createWithDefault(true)
 }
