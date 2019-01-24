@@ -712,5 +712,110 @@ class StreamingOuterJoinSuite extends StreamTest with StateStoreMetricsTest with
       assertNumStateRows(total = 2, updated = 2)
     )
   }
+
+  test("SPARK-26187 self left outer join should not return outer nulls for already matched rows") {
+    val inputStream = MemoryStream[(Int, Long)]
+
+    val df = inputStream.toDS()
+      .select(col("_1").as("value"), col("_2").cast("timestamp").as("timestamp"))
+
+    val fooStream = df.select(col("value").as("fooId"), col("timestamp").as("fooTime"))
+
+    val barStream = df
+      // Introduce misses for ease of debugging
+      .where(col("value") % 2 === 0)
+      .select(col("value").as("barId"), col("timestamp").as("barTime"))
+
+    val query = fooStream
+      .withWatermark("fooTime", "5 seconds")
+      .join(
+        barStream.withWatermark("barTime", "5 seconds"),
+        expr("barId = fooId AND barTime >= fooTime AND barTime <= fooTime + interval 5 seconds"),
+        joinType = "leftOuter")
+      .select(col("fooId"), col("fooTime").cast("int"),
+        col("barId"), col("barTime").cast("int"))
+
+    testStream(query)(
+      AddData(inputStream, (1, 1L), (2, 2L), (3, 3L), (4, 4L), (5, 5L)),
+      // batch 1 - global watermark = 0
+      // states
+      // left: (1, 1L), (2, 2L), (3, 3L), (4, 4L), (5, 5L)
+      // right: (2, 2L), (4, 4L)
+      CheckNewAnswer((2, 2L, 2, 2L), (4, 4L, 4, 4L)),
+      assertNumStateRows(7, 7),
+
+      AddData(inputStream, (6, 6L), (7, 7L), (8, 8L), (9, 9L), (10, 10L)),
+      // batch 2 - global watermark = 5
+      // states
+      // left: (1, 1L), (2, 2L), (3, 3L), (4, 4L), (5, 5L), (6, 6L), (7, 7L), (8, 8L),
+      //       (9, 9L), (10, 10L)
+      // right: (6, 6L), (8, 8L), (10, 10L)
+      // states evicted
+      // left: nothing (it waits for 5 seconds more than watermark due to join condition)
+      // right: (2, 2L), (4, 4L)
+      // NOTE: look for evicted rows in right which are not evicted from left - they were
+      // properly joined in batch 1
+      CheckNewAnswer((6, 6L, 6, 6L), (8, 8L, 8, 8L), (10, 10L, 10, 10L)),
+      assertNumStateRows(13, 8),
+
+      AddData(inputStream, (11, 11L), (12, 12L), (13, 13L), (14, 14L), (15, 15L)),
+      // batch 3
+      // - global watermark = 9 <= min(9, 10)
+      // states
+      // left: (4, 4L), (5, 5L), (6, 6L), (7, 7L), (8, 8L), (9, 9L), (10, 10L), (11, 11L),
+      //       (12, 12L), (13, 13L), (14, 14L), (15, 15L)
+      // right: (10, 10L), (12, 12L), (14, 14L)
+      // states evicted
+      // left: (1, 1L), (2, 2L), (3, 3L)
+      // right: (6, 6L), (8, 8L)
+      CheckNewAnswer(
+        Row(12, 12L, 12, 12L), Row(14, 14L, 14, 14L),
+        Row(1, 1L, null, null), Row(3, 3L, null, null)),
+      assertNumStateRows(15, 7)
+    )
+  }
+
+  test("SPARK-26187 self right outer join should not return outer nulls for already matched rows") {
+    val inputStream = MemoryStream[(Int, Long)]
+
+    val df = inputStream.toDS()
+      .select(col("_1").as("value"), col("_2").cast("timestamp").as("timestamp"))
+
+    // we're just flipping "left" and "right" from left outer join and apply right outer join
+
+    val fooStream = df.select(col("value").as("fooId"), col("timestamp").as("fooTime"))
+
+    val barStream = df
+      // Introduce misses for ease of debugging
+      .where(col("value") % 2 === 0)
+      .select(col("value").as("barId"), col("timestamp").as("barTime"))
+
+    val query = barStream
+      .withWatermark("barTime", "5 seconds")
+      .join(
+        fooStream.withWatermark("fooTime", "5 seconds"),
+        expr("barId = fooId AND barTime >= fooTime AND barTime <= fooTime + interval 5 seconds"),
+        joinType = "rightOuter")
+      .select(col("fooId"), col("fooTime").cast("int"),
+        col("barId"), col("barTime").cast("int"))
+
+    // we can just flip left and right in the explanation of left outer query test
+    // to assume the status of right outer query, hence skip explaining here
+    testStream(query)(
+      AddData(inputStream, (1, 1L), (2, 2L), (3, 3L), (4, 4L), (5, 5L)),
+      CheckNewAnswer((2, 2L, 2, 2L), (4, 4L, 4, 4L)),
+      assertNumStateRows(7, 7),
+
+      AddData(inputStream, (6, 6L), (7, 7L), (8, 8L), (9, 9L), (10, 10L)),
+      CheckNewAnswer((6, 6L, 6, 6L), (8, 8L, 8, 8L), (10, 10L, 10, 10L)),
+      assertNumStateRows(13, 8),
+
+      AddData(inputStream, (11, 11L), (12, 12L), (13, 13L), (14, 14L), (15, 15L)),
+      CheckNewAnswer(
+        Row(12, 12L, 12, 12L), Row(14, 14L, 14, 14L),
+        Row(1, 1L, null, null), Row(3, 3L, null, null)),
+      assertNumStateRows(15, 7)
+    )
+  }
 }
 

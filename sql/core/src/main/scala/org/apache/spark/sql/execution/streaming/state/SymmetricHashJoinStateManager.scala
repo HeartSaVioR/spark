@@ -23,7 +23,8 @@ import org.apache.hadoop.conf.Configuration
 
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, Literal, SpecificInternalRow, UnsafeProjection, UnsafeRow}
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, JoinedRow, Literal, SpecificInternalRow, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.execution.streaming.{StatefulOperatorStateInfo, StreamingSymmetricHashJoinExec}
 import org.apache.spark.sql.execution.streaming.StreamingSymmetricHashJoinHelper._
 import org.apache.spark.sql.types.{LongType, StructField, StructType}
@@ -43,9 +44,10 @@ import org.apache.spark.util.NextIterator
  * @param storeConf             Configuration for the state store.
  * @param hadoopConf            Hadoop configuration for reading state data from storage
  *
- * Internally, the key -> multiple values is stored in two [[StateStore]]s.
+ * Internally, the key -> multiple values is stored in three [[StateStore]]s.
  * - Store 1 ([[KeyToNumValuesStore]]) maintains mapping between key -> number of values
  * - Store 2 ([[KeyWithIndexToValueStore]]) maintains mapping between (key, index) -> value
+ * - Store 3 ([[KeyWithIndexToMatchedStore]]) maintains mapping between (key, index) -> matched
  * - Put:   update count in KeyToNumValuesStore,
  *          insert new (key, count) -> value in KeyWithIndexToValueStore
  * - Get:   read count from KeyToNumValuesStore,
@@ -53,11 +55,13 @@ import org.apache.spark.util.NextIterator
  * - Remove state by predicate on keys:
  *          scan all keys in KeyToNumValuesStore to find keys that do match the predicate,
  *          delete from key from KeyToNumValuesStore, delete values in KeyWithIndexToValueStore
+  *         and KeyWithIndexToMatchedStore
  * - Remove state by condition on values:
  *          scan all [(key, index) -> value] in KeyWithIndexToValueStore to find values that match
  *          the predicate, delete corresponding (key, indexToDelete) from KeyWithIndexToValueStore
- *          by overwriting with the value of (key, maxIndex), and removing [(key, maxIndex),
- *          decrement corresponding num values in KeyToNumValuesStore
+  *         and KeyWithIndexToMatchedStore by overwriting with the value of (key, maxIndex),
+  *         and removing [(key, maxIndex), decrement corresponding num values in
+  *         KeyToNumValuesStore and KeyWithIndexToMatchedStore
  */
 class SymmetricHashJoinStateManager(
     val joinSide: JoinSide,
@@ -81,6 +85,26 @@ class SymmetricHashJoinStateManager(
     keyWithIndexToValue.getAll(key, numValues).map(_.value)
   }
 
+  /**
+   * Get all the matched values for given join condition, with marking matched.
+   * This method is designed to mark joined rows properly without exposing internal index of row.
+   */
+  def getJoinedRows(
+      key: UnsafeRow,
+      generateJoinedRow: InternalRow => JoinedRow,
+      predicate: JoinedRow => Boolean): Iterator[JoinedRow] = {
+    val numValues = keyToNumValues.get(key)
+    keyWithIndexToValue.getAll(key, numValues).map { keyIdxToValue =>
+      val joinedRow = generateJoinedRow(keyIdxToValue.value)
+      if (predicate(joinedRow)) {
+        keyWithIndexToMatched.put(key, keyIdxToValue.valueIndex, matched = true)
+        joinedRow
+      } else {
+        null
+      }
+    }.filter(_ != null)
+  }
+
   /** Append a new value to the key */
   def append(key: UnsafeRow, value: UnsafeRow): Unit = {
     val numExistingValues = keyToNumValues.get(key)
@@ -88,17 +112,26 @@ class SymmetricHashJoinStateManager(
     keyToNumValues.put(key, numExistingValues + 1)
   }
 
+  /** Append a new value to the key, with marking matched */
+  def append(key: UnsafeRow, value: UnsafeRow, matched: Boolean): Unit = {
+    val numExistingValues = keyToNumValues.get(key)
+    keyWithIndexToValue.put(key, numExistingValues, value)
+    keyToNumValues.put(key, numExistingValues + 1)
+    keyWithIndexToMatched.put(key, numExistingValues, matched)
+  }
+
   /**
    * Remove using a predicate on keys.
    *
-   * This produces an iterator over the (key, value) pairs satisfying condition(key), where the
-   * underlying store is updated as a side-effect of producing next.
+   * This produces an iterator over the (key, value, matched) tuples satisfying condition(key),
+   * where the underlying store is updated as a side-effect of producing next.
    *
    * This implies the iterator must be consumed fully without any other operations on this manager
    * or the underlying store being interleaved.
    */
-  def removeByKeyCondition(removalCondition: UnsafeRow => Boolean): Iterator[UnsafeRowPair] = {
-    new NextIterator[UnsafeRowPair] {
+  def removeByKeyCondition(removalCondition: UnsafeRow => Boolean)
+    : Iterator[KeyToValueAndMatched] = {
+    new NextIterator[KeyToValueAndMatched] {
 
       private val allKeyToNumValues = keyToNumValues.iterator
 
@@ -107,15 +140,17 @@ class SymmetricHashJoinStateManager(
 
       private def currentKey = currentKeyToNumValue.key
 
-      private val reusedPair = new UnsafeRowPair()
+      private val reusedTuple = new KeyToValueAndMatched()
 
-      private def getAndRemoveValue() = {
+      private def getAndRemoveValue(): KeyToValueAndMatched = {
         val keyWithIndexAndValue = currentValues.next()
+        val matched = keyWithIndexToMatched.get(currentKey, keyWithIndexAndValue.valueIndex)
         keyWithIndexToValue.remove(currentKey, keyWithIndexAndValue.valueIndex)
-        reusedPair.withRows(currentKey, keyWithIndexAndValue.value)
+        keyWithIndexToMatched.remove(currentKey, keyWithIndexAndValue.valueIndex)
+        reusedTuple.withNew(currentKey, keyWithIndexAndValue.value, matched)
       }
 
-      override def getNext(): UnsafeRowPair = {
+      override def getNext(): KeyToValueAndMatched = {
         // If there are more values for the current key, remove and return the next one.
         if (currentValues != null && currentValues.hasNext) {
           return getAndRemoveValue()
@@ -148,18 +183,19 @@ class SymmetricHashJoinStateManager(
   /**
    * Remove using a predicate on values.
    *
-   * At a high level, this produces an iterator over the (key, value) pairs such that value
-   * satisfies the predicate, where producing an element removes the value from the state store
-   * and producing all elements with a given key updates it accordingly.
+   * At a high level, this produces an iterator over the (key, (value, matched)) pairs such that
+   * value satisfies the predicate, where producing an element removes the value from the state
+   * store and producing all elements with a given key updates it accordingly.
    *
    * This implies the iterator must be consumed fully without any other operations on this manager
    * or the underlying store being interleaved.
    */
-  def removeByValueCondition(removalCondition: UnsafeRow => Boolean): Iterator[UnsafeRowPair] = {
-    new NextIterator[UnsafeRowPair] {
+  def removeByValueCondition(removalCondition: UnsafeRow => Boolean)
+    : Iterator[KeyToValueAndMatched] = {
+    new NextIterator[KeyToValueAndMatched] {
 
       // Reuse this object to avoid creation+GC overhead.
-      private val reusedPair = new UnsafeRowPair()
+      private val reusedTuple = new KeyToValueAndMatched()
 
       private val allKeyToNumValues = keyToNumValues.iterator
 
@@ -187,7 +223,7 @@ class SymmetricHashJoinStateManager(
 
       // Find the next value satisfying the condition, updating `currentKey` and `numValues` if
       // needed. Returns null when no value can be found.
-      private def findNextValueForIndex(): UnsafeRow = {
+      private def findNextValueForIndex(): (UnsafeRow, Boolean) = {
         // Loop across all values for the current key, and then all other keys, until we find a
         // value satisfying the removal condition.
         def hasMoreValuesForCurrentKey = currentKey != null && index < numValues
@@ -197,7 +233,7 @@ class SymmetricHashJoinStateManager(
             // First search the values for the current key.
             val currentValue = keyWithIndexToValue.get(currentKey, index)
             if (removalCondition(currentValue)) {
-              return currentValue
+              return (currentValue, keyWithIndexToMatched.get(currentKey, index))
             } else {
               index += 1
             }
@@ -219,7 +255,7 @@ class SymmetricHashJoinStateManager(
         return null
       }
 
-      override def getNext(): UnsafeRowPair = {
+      override def getNext(): KeyToValueAndMatched = {
         val currentValue = findNextValueForIndex()
 
         // If there's no value, clean up and finish. There aren't any more available.
@@ -236,13 +272,19 @@ class SymmetricHashJoinStateManager(
           val valueAtMaxIndex = keyWithIndexToValue.get(currentKey, numValues - 1)
           keyWithIndexToValue.put(currentKey, index, valueAtMaxIndex)
           keyWithIndexToValue.remove(currentKey, numValues - 1)
+
+          val matchedAtMaxIndex = keyWithIndexToMatched.get(currentKey, numValues - 1)
+          keyWithIndexToMatched.put(currentKey, index, matchedAtMaxIndex)
+          keyWithIndexToMatched.remove(currentKey, numValues - 1)
         } else {
           keyWithIndexToValue.remove(currentKey, 0)
+          keyWithIndexToMatched.remove(currentKey, 0)
         }
         numValues -= 1
         valueRemoved = true
 
-        return reusedPair.withRows(currentKey, currentValue)
+        val (value, matched) = currentValue
+        return reusedTuple.withNew(currentKey, value, matched)
       }
 
       override def close: Unit = {}
@@ -253,23 +295,27 @@ class SymmetricHashJoinStateManager(
   def commit(): Unit = {
     keyToNumValues.commit()
     keyWithIndexToValue.commit()
+    keyWithIndexToMatched.commit()
   }
 
   /** Abort any changes to the state stores if needed */
   def abortIfNeeded(): Unit = {
     keyToNumValues.abortIfNeeded()
     keyWithIndexToValue.abortIfNeeded()
+    keyWithIndexToMatched.abortIfNeeded()
   }
 
   /** Get the combined metrics of all the state stores */
   def metrics: StateStoreMetrics = {
     val keyToNumValuesMetrics = keyToNumValues.metrics
     val keyWithIndexToValueMetrics = keyWithIndexToValue.metrics
+    val keyWithIndexToMatchedMetrics = keyWithIndexToMatched.metrics
     def newDesc(desc: String): String = s"${joinSide.toString.toUpperCase(Locale.ROOT)}: $desc"
 
     StateStoreMetrics(
       keyWithIndexToValueMetrics.numKeys,       // represent each buffered row only once
-      keyToNumValuesMetrics.memoryUsedBytes + keyWithIndexToValueMetrics.memoryUsedBytes,
+      keyToNumValuesMetrics.memoryUsedBytes + keyWithIndexToValueMetrics.memoryUsedBytes +
+        keyWithIndexToMatchedMetrics.memoryUsedBytes,
       keyWithIndexToValueMetrics.customMetrics.map {
         case (s @ StateStoreCustomSumMetric(_, desc), value) =>
           s.copy(desc = newDesc(desc)) -> value
@@ -295,6 +341,7 @@ class SymmetricHashJoinStateManager(
   private val keyAttributes = keySchema.toAttributes
   private val keyToNumValues = new KeyToNumValuesStore()
   private val keyWithIndexToValue = new KeyWithIndexToValueStore()
+  private val keyWithIndexToMatched = new KeyWithIndexToMatchedStore()
 
   // Clean up any state store resources if necessary at the end of the task
   Option(TaskContext.get()).foreach { _.addTaskCompletionListener[Unit] { _ => abortIfNeeded() } }
@@ -473,9 +520,95 @@ class SymmetricHashJoinStateManager(
       row
     }
   }
+
+  /**
+   * Helper class for representing data returned by [[KeyWithIndexToMatchedStore]].
+   * Designed for object reuse.
+   */
+  private case class KeyWithIndexAndMatched(
+    var key: UnsafeRow = null, var valueIndex: Long = -1, var matched: Boolean = false) {
+    def withNew(newKey: UnsafeRow, newIndex: Long, newMatched: Boolean): this.type = {
+      this.key = newKey
+      this.valueIndex = newIndex
+      this.matched = newMatched
+      this
+    }
+  }
+
+  // TODO: clean up KeyWithIndexToValueStore and KeyWithIndexToMatchedStore
+
+  /** A wrapper around a [[StateStore]] that stores [(key, index) -> matched]. */
+  private class KeyWithIndexToMatchedStore extends StateStoreHandler(KeyWithIndexToMatchedType) {
+    private val keyWithIndexExprs = keyAttributes :+ Literal(1L)
+    private val keyWithIndexSchema = keySchema.add("index", LongType)
+    private val indexOrdinalInKeyWithIndexRow = keyAttributes.size
+
+    // Projection to generate (key + index) row from key row
+    private val keyWithIndexRowGenerator = UnsafeProjection.create(keyWithIndexExprs, keyAttributes)
+
+    // Projection to generate key row from (key + index) row
+    private val keyRowGenerator = UnsafeProjection.create(
+      keyAttributes, keyAttributes :+ AttributeReference("index", LongType)())
+
+    private val booleanValueSchema = new StructType().add("value", "boolean")
+    private val booleanToUnsafeRow = UnsafeProjection.create(booleanValueSchema)
+    private val valueRow = booleanToUnsafeRow(new SpecificInternalRow(booleanValueSchema))
+
+    protected val stateStore = getStateStore(keyWithIndexSchema, booleanValueSchema)
+
+    def get(key: UnsafeRow, valueIndex: Long): Boolean = {
+      val row = stateStore.get(keyWithIndexRow(key, valueIndex))
+      if (row != null) row.getBoolean(0) else false
+    }
+
+    /** Put matched for key at the given index */
+    def put(key: UnsafeRow, valueIndex: Long, matched: Boolean): Unit = {
+      val keyWithIndex = keyWithIndexRow(key, valueIndex)
+      valueRow.setBoolean(0, matched)
+      stateStore.put(keyWithIndex, valueRow)
+    }
+
+    /**
+     * Remove key and value at given index. Note that this will create a hole in
+     * (key, index) and it is upto the caller to deal with it.
+     */
+    def remove(key: UnsafeRow, valueIndex: Long): Unit = {
+      stateStore.remove(keyWithIndexRow(key, valueIndex))
+    }
+
+    /** Remove all values (i.e. all the indices) for the given key. */
+    def removeAllValues(key: UnsafeRow, numValues: Long): Unit = {
+      var index = 0
+      while (index < numValues) {
+        stateStore.remove(keyWithIndexRow(key, index))
+        index += 1
+      }
+    }
+
+    /** Generated a row using the key and index */
+    private def keyWithIndexRow(key: UnsafeRow, valueIndex: Long): UnsafeRow = {
+      val row = keyWithIndexRowGenerator(key)
+      row.setLong(indexOrdinalInKeyWithIndexRow, valueIndex)
+      row
+    }
+  }
 }
 
 object SymmetricHashJoinStateManager {
+
+  /**
+   * Helper class for representing data key to (value, matched).
+   * Designed for object reuse.
+   */
+  case class KeyToValueAndMatched(
+      var key: UnsafeRow = null, var value: UnsafeRow = null, var matched: Boolean = false) {
+    def withNew(newKey: UnsafeRow, newValue: UnsafeRow, newMatched: Boolean): this.type = {
+      this.key = newKey
+      this.value = newValue
+      this.matched = newMatched
+      this
+    }
+  }
 
   def allStateStoreNames(joinSides: JoinSide*): Seq[String] = {
     val allStateStoreTypes: Seq[StateStoreType] = Seq(KeyToNumValuesType, KeyWithIndexToValueType)
@@ -492,6 +625,10 @@ object SymmetricHashJoinStateManager {
 
   private case object KeyWithIndexToValueType extends StateStoreType {
     override def toString(): String = "keyWithIndexToValue"
+  }
+
+  private case object KeyWithIndexToMatchedType extends StateStoreType {
+    override def toString(): String = "keyWithIndexToMatched"
   }
 
   private def getStateStoreName(joinSide: JoinSide, storeType: StateStoreType): String = {
