@@ -465,16 +465,6 @@ case class StreamingSymmetricHashJoinExec(
       }
     }
 
-
-    /**
-     * Get an iterator over the values stored in this joiner's state manager for the given key.
-     *
-     * Should not be interleaved with mutations.
-     */
-//    def get(key: UnsafeRow): Iterator[UnsafeRow] = {
-//      joinStateManager.get(key)
-//    }
-
     /**
      * Builds an iterator over old state key-value pairs, removing them lazily as they're produced.
      *
