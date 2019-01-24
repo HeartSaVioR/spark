@@ -27,6 +27,7 @@ import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark._
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.execution.{BinaryExecNode, SparkPlan}
 import org.apache.spark.sql.execution.streaming.StreamingSymmetricHashJoinHelper._
+import org.apache.spark.sql.execution.streaming.state.SymmetricHashJoinStateManager.KeyToValueAndMatched
 import org.apache.spark.sql.execution.streaming.state._
 import org.apache.spark.sql.internal.SessionState
 import org.apache.spark.util.{CompletionIterator, SerializableConfiguration}
@@ -266,36 +267,14 @@ case class StreamingSymmetricHashJoinExec(
       case Inner =>
         innerOutputIter
       case LeftOuter =>
-        // We generate the outer join input by:
-        // * Getting an iterator over the rows that have aged out on the left side. These rows are
-        //   candidates for being null joined. Note that to avoid doing two passes, this iterator
-        //   removes the rows from the state manager as they're processed.
-        // * Checking whether the current row matches a key in the right side state, and that key
-        //   has any value which satisfies the filter function when joined. If it doesn't,
-        //   we know we can join with null, since there was never (including this batch) a match
-        //   within the watermark period. If it does, there must have been a match at some point, so
-        //   we know we can't join with null.
-        def matchesWithRightSideState(leftKeyValue: UnsafeRowPair) = {
-          rightSideJoiner.get(leftKeyValue.key).exists { rightValue =>
-            postJoinFilter(joinedRow.withLeft(leftKeyValue.value).withRight(rightValue))
-          }
-        }
         val removedRowIter = leftSideJoiner.removeOldState()
-        val outerOutputIter = removedRowIter
-          .filterNot(pair => matchesWithRightSideState(pair))
+        val outerOutputIter = removedRowIter.filterNot(_.matched)
           .map(pair => joinedRow.withLeft(pair.value).withRight(nullRight))
 
         innerOutputIter ++ outerOutputIter
       case RightOuter =>
-        // See comments for left outer case.
-        def matchesWithLeftSideState(rightKeyValue: UnsafeRowPair) = {
-          leftSideJoiner.get(rightKeyValue.key).exists { leftValue =>
-            postJoinFilter(joinedRow.withLeft(leftValue).withRight(rightKeyValue.value))
-          }
-        }
         val removedRowIter = rightSideJoiner.removeOldState()
-        val outerOutputIter = removedRowIter
-          .filterNot(pair => matchesWithLeftSideState(pair))
+        val outerOutputIter = removedRowIter.filterNot(_.matched)
           .map(pair => joinedRow.withLeft(nullLeft).withRight(pair.value))
 
         innerOutputIter ++ outerOutputIter
@@ -445,16 +424,23 @@ case class StreamingSymmetricHashJoinExec(
         // the case of inner join).
         if (preJoinFilter(thisRow)) {
           val key = keyGenerator(thisRow)
-          val outputIter = otherSideJoiner.joinStateManager.get(key).map { thatRow =>
-            generateJoinedRow(thisRow, thatRow)
-          }.filter(postJoinFilter)
+
+          val outputIter: Iterator[JoinedRow] = otherSideJoiner.joinStateManager
+            .getJoiningRows(key, thatRow => postJoinFilter(generateJoinedRow(thisRow, thatRow)))
+            .map(r => generateJoinedRow(thisRow, r))
+
+          // Unfortunately we need to evaluate iterator to determine whether thisRow matches
+          // to one or more rows in other side.
+          val output = outputIter.toList
+
           val shouldAddToState = // add only if both removal predicates do not match
             !stateKeyWatermarkPredicateFunc(key) && !stateValueWatermarkPredicateFunc(thisRow)
           if (shouldAddToState) {
-            joinStateManager.append(key, thisRow)
+            joinStateManager.append(key, thisRow, matched = output.nonEmpty)
             updatedStateRowsCount += 1
           }
-          outputIter
+
+          output.iterator
         } else {
           joinSide match {
             case LeftSide if joinType == LeftOuter =>
@@ -472,9 +458,9 @@ case class StreamingSymmetricHashJoinExec(
      *
      * Should not be interleaved with mutations.
      */
-    def get(key: UnsafeRow): Iterator[UnsafeRow] = {
-      joinStateManager.get(key)
-    }
+//    def get(key: UnsafeRow): Iterator[UnsafeRow] = {
+//      joinStateManager.get(key)
+//    }
 
     /**
      * Builds an iterator over old state key-value pairs, removing them lazily as they're produced.
@@ -486,7 +472,7 @@ case class StreamingSymmetricHashJoinExec(
      * We do this to avoid requiring either two passes or full materialization when
      * processing the rows for outer join.
      */
-    def removeOldState(): Iterator[UnsafeRowPair] = {
+    def removeOldState(): Iterator[KeyToValueAndMatched] = {
       stateWatermarkPredicate match {
         case Some(JoinStateKeyWatermarkPredicate(expr)) =>
           joinStateManager.removeByKeyCondition(stateKeyWatermarkPredicateFunc)

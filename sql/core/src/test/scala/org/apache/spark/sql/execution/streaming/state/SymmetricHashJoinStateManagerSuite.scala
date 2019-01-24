@@ -127,7 +127,7 @@ class SymmetricHashJoinStateManagerSuite extends StreamTest with BeforeAndAfter 
   }
 
   def get(key: Int)(implicit manager: SymmetricHashJoinStateManager): Seq[Int] = {
-    manager.get(toJoinKeyRow(key)).map(toValueInt).toSeq.sorted
+    manager.get(toJoinKeyRow(key)).map(_.value).map(toValueInt).toSeq.sorted
   }
 
   /** Remove keys (and corresponding values) where `time <= threshold` */
