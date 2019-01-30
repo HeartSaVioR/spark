@@ -97,7 +97,7 @@ class SymmetricHashJoinStateManager(
     keyWithIndexToValue.getAll(key, numValues).map { keyIdxToValue =>
       val joinedRow = generateJoinedRow(keyIdxToValue.value)
       if (predicate(joinedRow)) {
-        keyWithIndexToMatched.put(key, keyIdxToValue.valueIndex, matched = true)
+        keyWithIndexToMatched.put(key, keyIdxToValue.valueIndex, Some(true))
         joinedRow
       } else {
         null
@@ -110,7 +110,7 @@ class SymmetricHashJoinStateManager(
     val numExistingValues = keyToNumValues.get(key)
     keyWithIndexToValue.put(key, numExistingValues, value)
     keyToNumValues.put(key, numExistingValues + 1)
-    keyWithIndexToMatched.put(key, numExistingValues, matched)
+    keyWithIndexToMatched.put(key, numExistingValues, Some(matched))
   }
 
   /**
@@ -129,7 +129,7 @@ class SymmetricHashJoinStateManager(
       private val allKeyToNumValues = keyToNumValues.iterator
 
       private var currentKeyToNumValue: KeyAndNumValues = null
-      private var currentValues: Iterator[KeyWithIndexAndValue] = null
+      private var currentValues: Iterator[keyWithIndexToValue.KeyWithIndexAndValue] = null
 
       private def currentKey = currentKeyToNumValue.key
 
@@ -266,13 +266,9 @@ class SymmetricHashJoinStateManager(
           keyWithIndexToValue.put(currentKey, index, valueAtMaxIndex)
           keyWithIndexToValue.remove(currentKey, numValues - 1)
 
-          keyWithIndexToMatched.get(currentKey, numValues - 1) match {
-            case Some(matchedAtMaxIndex) =>
-              keyWithIndexToMatched.put(currentKey, index, matchedAtMaxIndex)
-              keyWithIndexToMatched.remove(currentKey, numValues - 1)
-
-            case None =>
-          }
+          val matchedAtMaxIndex = keyWithIndexToMatched.get(currentKey, numValues - 1)
+          keyWithIndexToMatched.put(currentKey, index, matchedAtMaxIndex)
+          keyWithIndexToMatched.remove(currentKey, numValues - 1)
         } else {
           keyWithIndexToValue.remove(currentKey, 0)
           keyWithIndexToMatched.remove(currentKey, 0)
@@ -337,7 +333,7 @@ class SymmetricHashJoinStateManager(
     joinKeys.zipWithIndex.map { case (k, i) => StructField(s"field$i", k.dataType, k.nullable) })
   private val keyAttributes = keySchema.toAttributes
   private val keyToNumValues = new KeyToNumValuesStore()
-  private val keyWithIndexToValue = new KeyWithIndexToValueStore()
+  private val keyWithIndexToValue = new KeyWithIndexToRowValueStore()
   private val keyWithIndexToMatched = new KeyWithIndexToMatchedStore()
 
   // Clean up any state store resources if necessary at the end of the task
@@ -387,7 +383,6 @@ class SymmetricHashJoinStateManager(
     }
   }
 
-
   /** A wrapper around a [[StateStore]] that stores [key -> number of values]. */
   private class KeyToNumValuesStore extends StateStoreHandler(KeyToNumValuesType) {
     private val longValueSchema = new StructType().add("value", "long")
@@ -420,37 +415,41 @@ class SymmetricHashJoinStateManager(
     }
   }
 
-  /**
-   * Helper class for representing data returned by [[KeyWithIndexToValueStore]].
-   * Designed for object reuse.
-   */
-  private case class KeyWithIndexAndValue(
-    var key: UnsafeRow = null, var valueIndex: Long = -1, var value: UnsafeRow = null) {
-    def withNew(newKey: UnsafeRow, newIndex: Long, newValue: UnsafeRow): this.type = {
-      this.key = newKey
-      this.valueIndex = newIndex
-      this.value = newValue
-      this
-    }
-  }
+  private abstract class KeyWithIndexToValueStore[T](
+      storeType: StateStoreType,
+      valueSchema: StructType)
+    extends StateStoreHandler(storeType) {
 
-  /** A wrapper around a [[StateStore]] that stores [(key, index) -> value]. */
-  private class KeyWithIndexToValueStore extends StateStoreHandler(KeyWithIndexToValueType) {
+    /**
+     * Helper class for representing data returned by [[KeyWithIndexToValueStore]].
+     * Designed for object reuse.
+     */
+    case class KeyWithIndexAndValue(
+        var key: UnsafeRow = null,
+        var valueIndex: Long = -1,
+        var value: T = null.asInstanceOf[T]) {
+      def withNew(newKey: UnsafeRow, newIndex: Long, newValue: T): this.type = {
+        this.key = newKey
+        this.valueIndex = newIndex
+        this.value = newValue
+        this
+      }
+    }
+
     private val keyWithIndexExprs = keyAttributes :+ Literal(1L)
     private val keyWithIndexSchema = keySchema.add("index", LongType)
     private val indexOrdinalInKeyWithIndexRow = keyAttributes.size
 
-    // Projection to generate (key + index) row from key row
     private val keyWithIndexRowGenerator = UnsafeProjection.create(keyWithIndexExprs, keyAttributes)
 
     // Projection to generate key row from (key + index) row
     private val keyRowGenerator = UnsafeProjection.create(
       keyAttributes, keyAttributes :+ AttributeReference("index", LongType)())
 
-    protected val stateStore = getStateStore(keyWithIndexSchema, inputValueAttributes.toStructType)
+    protected val stateStore = getStateStore(keyWithIndexSchema, valueSchema)
 
-    def get(key: UnsafeRow, valueIndex: Long): UnsafeRow = {
-      stateStore.get(keyWithIndexRow(key, valueIndex))
+    def get(key: UnsafeRow, valueIndex: Long): T = {
+      convertValue(stateStore.get(keyWithIndexRow(key, valueIndex)))
     }
 
     /**
@@ -468,7 +467,7 @@ class SymmetricHashJoinStateManager(
           } else {
             val keyWithIndex = keyWithIndexRow(key, index)
             val value = stateStore.get(keyWithIndex)
-            keyWithIndexAndValue.withNew(key, index, value)
+            keyWithIndexAndValue.withNew(key, index, convertValue(value))
             index += 1
             keyWithIndexAndValue
           }
@@ -479,9 +478,12 @@ class SymmetricHashJoinStateManager(
     }
 
     /** Put new value for key at the given index */
-    def put(key: UnsafeRow, valueIndex: Long, value: UnsafeRow): Unit = {
+    def put(key: UnsafeRow, valueIndex: Long, value: T): Unit = {
       val keyWithIndex = keyWithIndexRow(key, valueIndex)
-      stateStore.put(keyWithIndex, value)
+      val row = convertToValueRow(value)
+      if (row != null) {
+        stateStore.put(keyWithIndex, row)
+      }
     }
 
     /**
@@ -504,90 +506,57 @@ class SymmetricHashJoinStateManager(
     def iterator: Iterator[KeyWithIndexAndValue] = {
       val keyWithIndexAndValue = new KeyWithIndexAndValue()
       stateStore.getRange(None, None).map { pair =>
-        keyWithIndexAndValue.withNew(
-          keyRowGenerator(pair.key), pair.key.getLong(indexOrdinalInKeyWithIndexRow), pair.value)
+        keyWithIndexAndValue.withNew(keyRowGenerator(pair.key),
+          pair.key.getLong(indexOrdinalInKeyWithIndexRow), convertValue(pair.value))
         keyWithIndexAndValue
       }
     }
 
     /** Generated a row using the key and index */
-    private def keyWithIndexRow(key: UnsafeRow, valueIndex: Long): UnsafeRow = {
+    protected def keyWithIndexRow(key: UnsafeRow, valueIndex: Long): UnsafeRow = {
       val row = keyWithIndexRowGenerator(key)
       row.setLong(indexOrdinalInKeyWithIndexRow, valueIndex)
       row
     }
+
+    protected def convertValue(value: UnsafeRow): T
+    protected def convertToValueRow(value: T): UnsafeRow
   }
 
-  /**
-   * Helper class for representing data returned by [[KeyWithIndexToMatchedStore]].
-   * Designed for object reuse.
-   */
-  private case class KeyWithIndexAndMatched(
-    var key: UnsafeRow = null, var valueIndex: Long = -1, var matched: Boolean = false) {
-    def withNew(newKey: UnsafeRow, newIndex: Long, newMatched: Boolean): this.type = {
-      this.key = newKey
-      this.valueIndex = newIndex
-      this.matched = newMatched
-      this
-    }
+  /** A wrapper around a [[StateStore]] that stores [(key, index) -> value]. */
+  private class KeyWithIndexToRowValueStore
+    extends KeyWithIndexToValueStore[UnsafeRow](
+      KeyWithIndexToRowValueType,
+      inputValueAttributes.toStructType) {
+
+    override protected def convertValue(value: UnsafeRow): UnsafeRow = value
+
+    override protected def convertToValueRow(value: UnsafeRow): UnsafeRow = value
   }
 
-  // TODO: clean up KeyWithIndexToValueStore and KeyWithIndexToMatchedStore
-
-  /** A wrapper around a [[StateStore]] that stores [(key, index) -> matched]. */
-  private class KeyWithIndexToMatchedStore extends StateStoreHandler(KeyWithIndexToMatchedType) {
-    private val keyWithIndexExprs = keyAttributes :+ Literal(1L)
-    private val keyWithIndexSchema = keySchema.add("index", LongType)
-    private val indexOrdinalInKeyWithIndexRow = keyAttributes.size
-
-    // Projection to generate (key + index) row from key row
-    private val keyWithIndexRowGenerator = UnsafeProjection.create(keyWithIndexExprs, keyAttributes)
-
-    // Projection to generate key row from (key + index) row
-    private val keyRowGenerator = UnsafeProjection.create(
-      keyAttributes, keyAttributes :+ AttributeReference("index", LongType)())
+  private class KeyWithIndexToMatchedStore extends KeyWithIndexToValueStore[Option[Boolean]](
+    KeyWithIndexToMatchedType,
+    KeyWithIndexToMatchedStore.booleanValueSchema) {
 
     private val booleanValueSchema = new StructType().add("value", "boolean")
     private val booleanToUnsafeRow = UnsafeProjection.create(booleanValueSchema)
     private val valueRow = booleanToUnsafeRow(new SpecificInternalRow(booleanValueSchema))
 
-    protected val stateStore = getStateStore(keyWithIndexSchema, booleanValueSchema)
-
-    def get(key: UnsafeRow, valueIndex: Long): Option[Boolean] = {
-      val row = stateStore.get(keyWithIndexRow(key, valueIndex))
-      if (row != null) Some(row.getBoolean(0)) else None
+    override protected def convertValue(value: UnsafeRow): Option[Boolean] = {
+      if (value != null) Some(value.getBoolean(0)) else None
     }
 
-    /** Put matched for key at the given index */
-    def put(key: UnsafeRow, valueIndex: Long, matched: Boolean): Unit = {
-      val keyWithIndex = keyWithIndexRow(key, valueIndex)
-      valueRow.setBoolean(0, matched)
-      stateStore.put(keyWithIndex, valueRow)
-    }
+    override protected def convertToValueRow(value: Option[Boolean]): UnsafeRow = value match {
+      case Some(matched) =>
+        valueRow.setBoolean(0, matched)
+        valueRow
 
-    /**
-     * Remove key and value at given index. Note that this will create a hole in
-     * (key, index) and it is upto the caller to deal with it.
-     */
-    def remove(key: UnsafeRow, valueIndex: Long): Unit = {
-      stateStore.remove(keyWithIndexRow(key, valueIndex))
+      case None => null
     }
+  }
 
-    /** Remove all values (i.e. all the indices) for the given key. */
-    def removeAllValues(key: UnsafeRow, numValues: Long): Unit = {
-      var index = 0
-      while (index < numValues) {
-        stateStore.remove(keyWithIndexRow(key, index))
-        index += 1
-      }
-    }
-
-    /** Generated a row using the key and index */
-    private def keyWithIndexRow(key: UnsafeRow, valueIndex: Long): UnsafeRow = {
-      val row = keyWithIndexRowGenerator(key)
-      row.setLong(indexOrdinalInKeyWithIndexRow, valueIndex)
-      row
-    }
+  private object KeyWithIndexToMatchedStore {
+    val booleanValueSchema = new StructType().add("value", "boolean")
   }
 }
 
@@ -610,7 +579,8 @@ object SymmetricHashJoinStateManager {
   }
 
   def allStateStoreNames(joinSides: JoinSide*): Seq[String] = {
-    val allStateStoreTypes: Seq[StateStoreType] = Seq(KeyToNumValuesType, KeyWithIndexToValueType)
+    val allStateStoreTypes: Seq[StateStoreType] = Seq(KeyToNumValuesType,
+      KeyWithIndexToRowValueType, KeyWithIndexToMatchedType)
     for (joinSide <- joinSides; stateStoreType <- allStateStoreTypes) yield {
       getStateStoreName(joinSide, stateStoreType)
     }
@@ -622,8 +592,8 @@ object SymmetricHashJoinStateManager {
     override def toString(): String = "keyToNumValues"
   }
 
-  private case object KeyWithIndexToValueType extends StateStoreType {
-    override def toString(): String = "keyWithIndexToValue"
+  private case object KeyWithIndexToRowValueType extends StateStoreType {
+    override def toString(): String = "keyWithIndexToRowValue"
   }
 
   private case object KeyWithIndexToMatchedType extends StateStoreType {
