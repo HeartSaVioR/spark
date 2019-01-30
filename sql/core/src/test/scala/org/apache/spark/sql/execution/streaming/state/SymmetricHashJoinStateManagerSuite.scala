@@ -123,7 +123,7 @@ class SymmetricHashJoinStateManagerSuite extends StreamTest with BeforeAndAfter 
   def toValueInt(inputValueRow: UnsafeRow): Int = inputValueRow.getInt(0)
 
   def append(key: Int, value: Int)(implicit manager: SymmetricHashJoinStateManager): Unit = {
-    manager.append(toJoinKeyRow(key), toInputValue(value))
+    manager.append(toJoinKeyRow(key), toInputValue(value), matched = false)
   }
 
   def get(key: Int)(implicit manager: SymmetricHashJoinStateManager): Seq[Int] = {

@@ -105,13 +105,6 @@ class SymmetricHashJoinStateManager(
     }.filter(_ != null)
   }
 
-  /** Append a new value to the key */
-  def append(key: UnsafeRow, value: UnsafeRow): Unit = {
-    val numExistingValues = keyToNumValues.get(key)
-    keyWithIndexToValue.put(key, numExistingValues, value)
-    keyToNumValues.put(key, numExistingValues + 1)
-  }
-
   /** Append a new value to the key, with marking matched */
   def append(key: UnsafeRow, value: UnsafeRow, matched: Boolean): Unit = {
     val numExistingValues = keyToNumValues.get(key)
@@ -223,7 +216,7 @@ class SymmetricHashJoinStateManager(
 
       // Find the next value satisfying the condition, updating `currentKey` and `numValues` if
       // needed. Returns null when no value can be found.
-      private def findNextValueForIndex(): (UnsafeRow, Boolean) = {
+      private def findNextValueForIndex(): (UnsafeRow, Option[Boolean]) = {
         // Loop across all values for the current key, and then all other keys, until we find a
         // value satisfying the removal condition.
         def hasMoreValuesForCurrentKey = currentKey != null && index < numValues
@@ -273,9 +266,13 @@ class SymmetricHashJoinStateManager(
           keyWithIndexToValue.put(currentKey, index, valueAtMaxIndex)
           keyWithIndexToValue.remove(currentKey, numValues - 1)
 
-          val matchedAtMaxIndex = keyWithIndexToMatched.get(currentKey, numValues - 1)
-          keyWithIndexToMatched.put(currentKey, index, matchedAtMaxIndex)
-          keyWithIndexToMatched.remove(currentKey, numValues - 1)
+          keyWithIndexToMatched.get(currentKey, numValues - 1) match {
+            case Some(matchedAtMaxIndex) =>
+              keyWithIndexToMatched.put(currentKey, index, matchedAtMaxIndex)
+              keyWithIndexToMatched.remove(currentKey, numValues - 1)
+
+            case None =>
+          }
         } else {
           keyWithIndexToValue.remove(currentKey, 0)
           keyWithIndexToMatched.remove(currentKey, 0)
@@ -556,9 +553,9 @@ class SymmetricHashJoinStateManager(
 
     protected val stateStore = getStateStore(keyWithIndexSchema, booleanValueSchema)
 
-    def get(key: UnsafeRow, valueIndex: Long): Boolean = {
+    def get(key: UnsafeRow, valueIndex: Long): Option[Boolean] = {
       val row = stateStore.get(keyWithIndexRow(key, valueIndex))
-      if (row != null) row.getBoolean(0) else false
+      if (row != null) Some(row.getBoolean(0)) else None
     }
 
     /** Put matched for key at the given index */
@@ -601,8 +598,10 @@ object SymmetricHashJoinStateManager {
    * Designed for object reuse.
    */
   case class KeyToValueAndMatched(
-      var key: UnsafeRow = null, var value: UnsafeRow = null, var matched: Boolean = false) {
-    def withNew(newKey: UnsafeRow, newValue: UnsafeRow, newMatched: Boolean): this.type = {
+      var key: UnsafeRow = null,
+      var value: UnsafeRow = null,
+      var matched: Option[Boolean] = None) {
+    def withNew(newKey: UnsafeRow, newValue: UnsafeRow, newMatched: Option[Boolean]): this.type = {
       this.key = newKey
       this.value = newValue
       this.matched = newMatched

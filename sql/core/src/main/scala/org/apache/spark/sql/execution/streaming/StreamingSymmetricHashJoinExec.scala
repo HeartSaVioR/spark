@@ -266,15 +266,43 @@ case class StreamingSymmetricHashJoinExec(
       case Inner =>
         innerOutputIter
       case LeftOuter =>
+        // We generate the outer join input by:
+        // * Getting an iterator over the rows that have aged out on the left side. These rows are
+        //   candidates for being null joined. Note that to avoid doing two passes, this iterator
+        //   removes the rows from the state manager as they're processed.
+        // * Checking whether the current row matches a key in the right side state, and that key
+        //   has any value which satisfies the filter function when joined. If it doesn't,
+        //   we know we can join with null, since there was never (including this batch) a match
+        //   within the watermark period. If it does, there must have been a match at some point, so
+        //   we know we can't join with null.
+        def matchesWithRightSideState(leftKeyValue: UnsafeRowPair) = {
+          rightSideJoiner.get(leftKeyValue.key).exists { rightValue =>
+            postJoinFilter(joinedRow.withLeft(leftKeyValue.value).withRight(rightValue))
+          }
+        }
+
         val removedRowIter = leftSideJoiner.removeOldState()
-        val outerOutputIter = removedRowIter.filterNot(_.matched)
-          .map(pair => joinedRow.withLeft(pair.value).withRight(nullRight))
+        val outerOutputIter = removedRowIter.filterNot { kvAndMatched =>
+          kvAndMatched.matched.getOrElse(
+            // fail-back for previous state on SPARK-26154
+            matchesWithRightSideState(new UnsafeRowPair(kvAndMatched.key, kvAndMatched.value)))
+        }.map(pair => joinedRow.withLeft(pair.value).withRight(nullRight))
 
         innerOutputIter ++ outerOutputIter
       case RightOuter =>
+        // See comments for left outer case.
+        def matchesWithLeftSideState(rightKeyValue: UnsafeRowPair) = {
+          leftSideJoiner.get(rightKeyValue.key).exists { leftValue =>
+            postJoinFilter(joinedRow.withLeft(leftValue).withRight(rightKeyValue.value))
+          }
+        }
+
         val removedRowIter = rightSideJoiner.removeOldState()
-        val outerOutputIter = removedRowIter.filterNot(_.matched)
-          .map(pair => joinedRow.withLeft(nullLeft).withRight(pair.value))
+        val outerOutputIter = removedRowIter.filterNot { kvAndMatched =>
+          kvAndMatched.matched.getOrElse(
+            // fail-back for previous state on SPARK-26154
+            matchesWithLeftSideState(new UnsafeRowPair(kvAndMatched.key, kvAndMatched.value)))
+        }.map(pair => joinedRow.withLeft(nullLeft).withRight(pair.value))
 
         innerOutputIter ++ outerOutputIter
       case _ => throwBadJoinTypeException()
@@ -463,6 +491,15 @@ case class StreamingSymmetricHashJoinExec(
           updatedStateRowsCount += 1
         }
       }
+    }
+
+    /**
+     * Get an iterator over the values stored in this joiner's state manager for the given key.
+     *
+     * Should not be interleaved with mutations.
+     */
+    def get(key: UnsafeRow): Iterator[UnsafeRow] = {
+      joinStateManager.get(key)
     }
 
     /**
