@@ -28,7 +28,8 @@ import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.execution.{BinaryExecNode, SparkPlan}
 import org.apache.spark.sql.execution.streaming.StreamingSymmetricHashJoinHelper._
 import org.apache.spark.sql.execution.streaming.state._
-import org.apache.spark.sql.execution.streaming.state.SymmetricHashJoinStateManager.KeyToValueAndMatched
+import org.apache.spark.sql.execution.streaming.state.join.StreamingJoinStateManager
+import org.apache.spark.sql.execution.streaming.state.join.StreamingJoinStateManager._
 import org.apache.spark.sql.internal.SessionState
 import org.apache.spark.util.{CompletionIterator, SerializableConfiguration}
 
@@ -132,6 +133,7 @@ case class StreamingSymmetricHashJoinExec(
     stateInfo: Option[StatefulOperatorStateInfo],
     eventTimeWatermark: Option[Long],
     stateWatermarkPredicates: JoinStateWatermarkPredicates,
+    stateFormatVersion: Int,
     left: SparkPlan,
     right: SparkPlan) extends SparkPlan with BinaryExecNode with StateStoreWriter {
 
@@ -140,13 +142,14 @@ case class StreamingSymmetricHashJoinExec(
       rightKeys: Seq[Expression],
       joinType: JoinType,
       condition: Option[Expression],
+      stateFormatVersion: Int,
       left: SparkPlan,
       right: SparkPlan) = {
 
     this(
       leftKeys, rightKeys, joinType, JoinConditionSplitPredicates(condition, left, right),
       stateInfo = None, eventTimeWatermark = None,
-      stateWatermarkPredicates = JoinStateWatermarkPredicates(), left, right)
+      stateWatermarkPredicates = JoinStateWatermarkPredicates(), stateFormatVersion, left, right)
   }
 
   private def throwBadJoinTypeException(): Nothing = {
@@ -201,7 +204,8 @@ case class StreamingSymmetricHashJoinExec(
 
   protected override def doExecute(): RDD[InternalRow] = {
     val stateStoreCoord = sqlContext.sessionState.streamingQueryManager.stateStoreCoordinator
-    val stateStoreNames = SymmetricHashJoinStateManager.allStateStoreNames(LeftSide, RightSide)
+    val stateStoreNames = StreamingJoinStateManager.allStateStoreNames(stateFormatVersion,
+      LeftSide, RightSide)
     left.execute().stateStoreAwareZipPartitions(
       right.execute(), stateInfo.get, stateStoreNames, stateStoreCoord)(processPartitions)
   }
@@ -223,7 +227,6 @@ case class StreamingSymmetricHashJoinExec(
 
     val updateStartTimeNs = System.nanoTime
     val joinedRow = new JoinedRow
-
 
     val postJoinFilter =
       newPredicate(condition.bothSides.getOrElse(Literal(true)), left.output ++ right.output).eval _
@@ -283,9 +286,13 @@ case class StreamingSymmetricHashJoinExec(
 
         val removedRowIter = leftSideJoiner.removeOldState()
         val outerOutputIter = removedRowIter.filterNot { kvAndMatched =>
-          kvAndMatched.matched.getOrElse(
-            // fail-back for previous state on SPARK-26154
-            matchesWithRightSideState(new UnsafeRowPair(kvAndMatched.key, kvAndMatched.value)))
+          stateFormatVersion match {
+            case 1 => matchesWithRightSideState(
+              new UnsafeRowPair(kvAndMatched.key, kvAndMatched.value))
+            case 2 => kvAndMatched.matched.get
+            case _ => throw new IllegalStateException("Incorrect state format version! " +
+              s"version $stateFormatVersion")
+          }
         }.map(pair => joinedRow.withLeft(pair.value).withRight(nullRight))
 
         innerOutputIter ++ outerOutputIter
@@ -299,9 +306,13 @@ case class StreamingSymmetricHashJoinExec(
 
         val removedRowIter = rightSideJoiner.removeOldState()
         val outerOutputIter = removedRowIter.filterNot { kvAndMatched =>
-          kvAndMatched.matched.getOrElse(
-            // fail-back for previous state on SPARK-26154
-            matchesWithLeftSideState(new UnsafeRowPair(kvAndMatched.key, kvAndMatched.value)))
+          stateFormatVersion match {
+            case 1 => matchesWithLeftSideState(
+              new UnsafeRowPair(kvAndMatched.key, kvAndMatched.value))
+            case 2 => kvAndMatched.matched.get
+            case _ => throw new IllegalStateException("Incorrect state format version! " +
+              s"version $stateFormatVersion")
+          }
         }.map(pair => joinedRow.withLeft(nullLeft).withRight(pair.value))
 
         innerOutputIter ++ outerOutputIter
@@ -400,8 +411,10 @@ case class StreamingSymmetricHashJoinExec(
     val preJoinFilter =
       newPredicate(preJoinFilterExpr.getOrElse(Literal(true)), inputAttributes).eval _
 
-    private val joinStateManager = new SymmetricHashJoinStateManager(
-      joinSide, inputAttributes, joinKeys, stateInfo, storeConf, hadoopConfBcast.value.value)
+    private val joinStateManager = StreamingJoinStateManager.createStateManager(
+      joinSide, inputAttributes, joinKeys, stateInfo, storeConf, hadoopConfBcast.value.value,
+      stateFormatVersion)
+
     private[this] val keyGenerator = UnsafeProjection.create(joinKeys, inputAttributes)
 
     private[this] val stateKeyWatermarkPredicateFunc = stateWatermarkPredicate match {
