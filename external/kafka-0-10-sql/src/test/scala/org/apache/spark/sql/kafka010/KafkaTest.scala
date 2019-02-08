@@ -29,4 +29,13 @@ trait KafkaTest extends BeforeAndAfterAll {
     super.afterAll()
     CachedKafkaProducer.clear()
   }
+
+  def waitForBiggerTimestamp(curTimestamp: Long): Long = {
+    var newTimestamp: Long = 0
+    while (newTimestamp <= curTimestamp) {
+      Thread.sleep(1000)
+      newTimestamp = System.currentTimeMillis
+    }
+    newTimestamp
+  }
 }

@@ -69,8 +69,8 @@ private[kafka010] class KafkaRelation(
     // Leverage the KafkaReader to obtain the relevant partition offsets
     val (fromPartitionOffsets, untilPartitionOffsets) = {
       try {
-        (getPartitionOffsets(kafkaOffsetReader, startingOffsets),
-          getPartitionOffsets(kafkaOffsetReader, endingOffsets))
+        (getPartitionOffsets(kafkaOffsetReader, startingOffsets, startOffset = true),
+          getPartitionOffsets(kafkaOffsetReader, endingOffsets, startOffset = false))
       } finally {
         kafkaOffsetReader.close()
       }
@@ -121,7 +121,8 @@ private[kafka010] class KafkaRelation(
 
   private def getPartitionOffsets(
       kafkaReader: KafkaOffsetReader,
-      kafkaOffsets: KafkaOffsetRangeLimit): Map[TopicPartition, Long] = {
+      kafkaOffsets: KafkaOffsetRangeLimit,
+      startOffset: Boolean): Map[TopicPartition, Long] = {
     def validateTopicPartitions(partitions: Set[TopicPartition],
       partitionOffsets: Map[TopicPartition, Long]): Map[TopicPartition, Long] = {
       assert(partitions == partitionOffsets.keySet,
@@ -131,6 +132,7 @@ private[kafka010] class KafkaRelation(
       logDebug(s"Partitions assigned to consumer: $partitions. Seeking to $partitionOffsets")
       partitionOffsets
     }
+
     val partitions = kafkaReader.fetchTopicPartitions()
     // Obtain TopicPartition offsets with late binding support
     kafkaOffsets match {
@@ -142,6 +144,14 @@ private[kafka010] class KafkaRelation(
       }.toMap
       case SpecificOffsetRangeLimit(partitionOffsets) =>
         validateTopicPartitions(partitions, partitionOffsets)
+      case SpecificTimestampRangeLimit(topicTimestamps) =>
+        val defaultOffset = if (startOffset) {
+          KafkaOffsetRangeLimit.EARLIEST
+        } else {
+          KafkaOffsetRangeLimit.LATEST
+        }
+        kafkaReader.fetchSpecificTimestampBasedOffsets(topicTimestamps)
+          .partitionToOffsets
     }
   }
 

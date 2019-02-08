@@ -26,7 +26,7 @@ import scala.util.Random
 import org.apache.kafka.clients.producer.ProducerRecord
 import org.apache.kafka.common.TopicPartition
 
-import org.apache.spark.sql.QueryTest
+import org.apache.spark.sql.{DataFrameReader, QueryTest}
 import org.apache.spark.sql.test.SharedSQLContext
 import org.apache.spark.util.Utils
 
@@ -140,6 +140,117 @@ class KafkaRelationSuite extends QueryTest with SharedSQLContext with KafkaTest 
     // latest offset partition 1, should change
     testUtils.sendMessages(topic, (21 to 30).map(_.toString).toArray, Some(1))
     checkAnswer(df, (0 to 30).map(_.toString).toDF)
+  }
+
+  test("timestamp provided for starting and ending") {
+    val (topic, timestamps) = prepareTimestampRelatedUnitTest
+
+    // timestamp both presented: starting "first" ending "finalized"
+    verifyTimestampRelatedQueryResult({ df =>
+      val startTopicTimestamps = Map(topic -> timestamps.head)
+      val startingTimestamps = JsonUtils.topicTimestamps(startTopicTimestamps)
+
+      val endTopicTimestamps = Map(topic -> timestamps(3))
+      val endingTimestamps = JsonUtils.topicTimestamps(endTopicTimestamps)
+
+      df.option("startingOffsetsByTimestamp", startingTimestamps)
+        .option("endingOffsetsByTimestamp", endingTimestamps)
+    }, topic, 0 to 20)
+  }
+
+  test("timestamp provided for starting, offset provided for ending") {
+    val (topic, timestamps) = prepareTimestampRelatedUnitTest
+
+    // starting only presented as "first", and ending presented as endingOffsets
+    verifyTimestampRelatedQueryResult({ df =>
+      val startTopicTimestamps = Map(topic -> timestamps.head)
+      val startingTimestamps = JsonUtils.topicTimestamps(startTopicTimestamps)
+
+      val endPartitionOffsets = Map(
+        new TopicPartition(topic, 0) -> -1L, // -1 => latest
+        new TopicPartition(topic, 1) -> -1L,
+        new TopicPartition(topic, 2) -> 1L  // explicit offset happens to = the latest
+      )
+      val endingOffsets = JsonUtils.partitionOffsets(endPartitionOffsets)
+
+      df.option("startingOffsetsByTimestamp", startingTimestamps)
+        .option("endingOffsets", endingOffsets)
+    }, topic, 0 to 20)
+  }
+
+  test("timestamp provided for ending, offset provided for starting") {
+    val (topic, timestamps) = prepareTimestampRelatedUnitTest
+
+    // ending only presented as "third", and starting presented as startingOffsets
+    verifyTimestampRelatedQueryResult({ df =>
+      val startPartitionOffsets = Map(
+        new TopicPartition(topic, 0) -> -2L, // -2 => earliest
+        new TopicPartition(topic, 1) -> -2L,
+        new TopicPartition(topic, 2) -> 0L   // explicit earliest
+      )
+      val startingOffsets = JsonUtils.partitionOffsets(startPartitionOffsets)
+
+      val endTopicTimestamps = Map(topic -> timestamps(2))
+      val endingTimestamps = JsonUtils.topicTimestamps(endTopicTimestamps)
+
+      df.option("startingOffsets", startingOffsets)
+        .option("endingOffsetsByTimestamp", endingTimestamps)
+    }, topic, 0 to 19)
+  }
+
+  test("timestamp provided for starting, ending not provided") {
+    val (topic, timestamps) = prepareTimestampRelatedUnitTest
+
+    // starting only presented as "second", and ending not presented
+    verifyTimestampRelatedQueryResult({ df =>
+      val startTopicTimestamps = Map(topic -> timestamps(1))
+      val startingTimestamps = JsonUtils.topicTimestamps(startTopicTimestamps)
+
+      df.option("startingOffsetsByTimestamp", startingTimestamps)
+    }, topic, 10 to 20)
+  }
+
+  test("timestamp provided for ending, starting not provided") {
+    val (topic, timestamps) = prepareTimestampRelatedUnitTest
+
+    // ending only presented as "third", and starting not presented
+    verifyTimestampRelatedQueryResult({ df =>
+      val endTopicTimestamps = Map(topic -> timestamps(2))
+      val endingTimestamps = JsonUtils.topicTimestamps(endTopicTimestamps)
+
+      df.option("endingOffsetsByTimestamp", endingTimestamps)
+    }, topic, 0 to 19)
+  }
+
+  private def prepareTimestampRelatedUnitTest: (String, Seq[Long]) = {
+    val topic = newTopic()
+    testUtils.createTopic(topic, partitions = 3)
+
+    val firstTimestamp = System.currentTimeMillis()
+    testUtils.sendMessages(topic, (0 to 9).map(_.toString).toArray, Some(0))
+
+    val secondTimestamp = waitForBiggerTimestamp(firstTimestamp)
+    testUtils.sendMessages(topic, (10 to 19).map(_.toString).toArray, Some(1))
+
+    val thirdTimestamp = waitForBiggerTimestamp(secondTimestamp)
+    testUtils.sendMessages(topic, Array("20"), Some(2))
+
+    val finalizedTimestamp = waitForBiggerTimestamp(thirdTimestamp)
+
+    (topic, Seq(firstTimestamp, secondTimestamp, thirdTimestamp, finalizedTimestamp))
+  }
+
+  private def verifyTimestampRelatedQueryResult(
+      optionFn: DataFrameReader => DataFrameReader,
+      topic: String,
+      expectation: Seq[Int]): Unit = {
+    val df = spark.read
+      .format("kafka")
+      .option("kafka.bootstrap.servers", testUtils.brokerAddress)
+      .option("subscribe", topic)
+
+    val df2 = optionFn(df).load().selectExpr("CAST(value AS STRING)")
+    checkAnswer(df2, expectation.map(_.toString).toDF)
   }
 
   test("reuse same dataframe in query") {

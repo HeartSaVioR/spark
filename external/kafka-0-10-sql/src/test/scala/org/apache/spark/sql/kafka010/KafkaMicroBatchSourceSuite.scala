@@ -1200,6 +1200,16 @@ abstract class KafkaSourceSuiteBase extends KafkaSourceTest {
         "failOnDataLoss" -> failOnDataLoss.toString)
     }
 
+    test(s"assign from specific timestamps (failOnDataLoss: $failOnDataLoss)") {
+      val topic = newTopic()
+      testFromSpecificTimestamps(
+        topic,
+        failOnDataLoss = failOnDataLoss,
+        addPartitions = false,
+        "assign" -> assignString(topic, 0 to 4),
+        "failOnDataLoss" -> failOnDataLoss.toString)
+    }
+
     test(s"subscribing topic by name from latest offsets (failOnDataLoss: $failOnDataLoss)") {
       val topic = newTopic()
       testFromLatestOffsets(
@@ -1221,6 +1231,11 @@ abstract class KafkaSourceSuiteBase extends KafkaSourceTest {
     test(s"subscribing topic by name from specific offsets (failOnDataLoss: $failOnDataLoss)") {
       val topic = newTopic()
       testFromSpecificOffsets(topic, failOnDataLoss = failOnDataLoss, "subscribe" -> topic)
+    }
+
+    test(s"subscribing topic by name from specific timestamps (failOnDataLoss: $failOnDataLoss)") {
+      val topic = newTopic()
+      testFromSpecificTimestamps(topic, failOnDataLoss = failOnDataLoss, addPartitions = true,"subscribe" -> topic)
     }
 
     test(s"subscribing topic by pattern from latest offsets (failOnDataLoss: $failOnDataLoss)") {
@@ -1251,6 +1266,17 @@ abstract class KafkaSourceSuiteBase extends KafkaSourceTest {
         failOnDataLoss = failOnDataLoss,
         "subscribePattern" -> s"$topicPrefix-.*")
     }
+
+    test(s"subscribing topic by pattern from specific timestamps " +
+      s"(failOnDataLoss: $failOnDataLoss)") {
+      val topicPrefix = newTopic()
+      val topic = topicPrefix + "-suffix"
+      testFromSpecificTimestamps(
+        topic,
+        failOnDataLoss = failOnDataLoss,
+        addPartitions = true,
+        "subscribePattern" -> s"$topicPrefix-.*")
+    }
   }
 
   test("bad source options") {
@@ -1269,6 +1295,9 @@ abstract class KafkaSourceSuiteBase extends KafkaSourceTest {
 
     // Specifying an ending offset
     testBadOptions("endingOffsets" -> "latest")("Ending offset not valid in streaming queries")
+
+    testBadOptions("subscribe" -> "t", "endingOffsetsByTimestamp" -> "{\"t\": 1000}")(
+      "Ending timestamp not valid in streaming queries")
 
     // No strategy specified
     testBadOptions()("options must be specified", "subscribe", "subscribePattern")
@@ -1317,14 +1346,15 @@ abstract class KafkaSourceSuiteBase extends KafkaSourceTest {
       (ENDING_OFFSETS_OPTION_KEY, "laTest", LatestOffsetRangeLimit),
       (STARTING_OFFSETS_OPTION_KEY, """{"topic-A":{"0":23}}""",
         SpecificOffsetRangeLimit(Map(new TopicPartition("topic-A", 0) -> 23))))) {
-      val offset = getKafkaOffsetRangeLimit(Map(optionKey -> optionValue), optionKey, answer)
+      val offset = getKafkaOffsetRangeLimit(Map(optionKey -> optionValue), "dummy", optionKey,
+        answer)
       assert(offset === answer)
     }
 
     for ((optionKey, answer) <- Seq(
       (STARTING_OFFSETS_OPTION_KEY, EarliestOffsetRangeLimit),
       (ENDING_OFFSETS_OPTION_KEY, LatestOffsetRangeLimit))) {
-      val offset = getKafkaOffsetRangeLimit(Map.empty, optionKey, answer)
+      val offset = getKafkaOffsetRangeLimit(Map.empty, "dummy", optionKey, answer)
       assert(offset === answer)
     }
   }
@@ -1385,6 +1415,73 @@ abstract class KafkaSourceSuiteBase extends KafkaSourceTest {
       CheckAnswer(-20, -21, -22, 0, 1, 2, 11, 12, 22), // Should get the data back on recovery
       AddKafkaData(Set(topic), 30, 31, 32, 33, 34)(ensureDataInMultiplePartition = true),
       CheckAnswer(-20, -21, -22, 0, 1, 2, 11, 12, 22, 30, 31, 32, 33, 34),
+      StopStream
+    )
+  }
+
+  private def testFromSpecificTimestamps(
+      topic: String,
+      failOnDataLoss: Boolean,
+      addPartitions: Boolean,
+      options: (String, String)*): Unit = {
+
+    testUtils.createTopic(topic, partitions = 5)
+
+    val firstTimestamp = System.currentTimeMillis()
+    testUtils.sendMessages(topic, Array(-20).map(_.toString), Some(0))
+    testUtils.sendMessages(topic, Array(-10).map(_.toString), Some(1))
+    testUtils.sendMessages(topic, Array(0, 1).map(_.toString), Some(2))
+    testUtils.sendMessages(topic, Array(10, 11).map(_.toString), Some(3))
+    testUtils.sendMessages(topic, Array(20, 21, 22).map(_.toString), Some(4))
+
+    val secondTimestamp = waitForBiggerTimestamp(firstTimestamp)
+    testUtils.sendMessages(topic, Array(-21, -22).map(_.toString), Some(0))
+    testUtils.sendMessages(topic, Array(-11, -12).map(_.toString), Some(1))
+    testUtils.sendMessages(topic, Array(2).map(_.toString), Some(2))
+    testUtils.sendMessages(topic, Array(12).map(_.toString), Some(3))
+    // no data after second timestamp for partition 4
+
+    require(testUtils.getLatestOffsets(Set(topic)).size === 5)
+
+    // we intentionally starts from second timestamp
+    val startTopicTimestamps = Map(topic -> secondTimestamp)
+    val startingTimestamps = JsonUtils.topicTimestamps(startTopicTimestamps)
+
+    val reader = spark
+      .readStream
+      .format("kafka")
+      .option("startingOffsetsByTimestamp", startingTimestamps)
+      .option("kafka.bootstrap.servers", testUtils.brokerAddress)
+      .option("kafka.metadata.max.age.ms", "1")
+      .option("failOnDataLoss", failOnDataLoss.toString)
+    options.foreach { case (k, v) => reader.option(k, v) }
+    val kafka = reader.load()
+      .selectExpr("CAST(key AS STRING)", "CAST(value AS STRING)")
+      .as[(String, String)]
+    val mapped: org.apache.spark.sql.Dataset[_] = kafka.map(kv => kv._2.toInt)
+
+    testStream(mapped)(
+      makeSureGetOffsetCalled,
+      Execute { q =>
+        val partitions = (0 to 4).map(new TopicPartition(topic, _))
+        // wait to reach the last offset in every partition
+        q.awaitOffset(
+          0, KafkaSourceOffset(partitions.map(tp => tp -> 3L).toMap), streamingTimeout.toMillis)
+      },
+      CheckAnswer(-21, -22, -11, -12, 2, 12),
+      StopStream,
+      StartStream(),
+      CheckAnswer(-21, -22, -11, -12, 2, 12), // Should get the data back on recovery
+      StopStream,
+      AddKafkaData(Set(topic), 30, 31, 32), // Add data when stream is stopped
+      StartStream(),
+      CheckAnswer(-21, -22, -11, -12, 2, 12, 30, 31, 32), // Should get the added data
+      AssertOnQuery("Add partitions") { query: StreamExecution =>
+        if (addPartitions) setTopicPartitions(topic, 10, query)
+        true
+      },
+      AddKafkaData(Set(topic), 40, 41, 42, 43, 44)(ensureDataInMultiplePartition = true),
+      CheckAnswer(-21, -22, -11, -12, 2, 12, 30, 31, 32, 40, 41, 42, 43, 44),
       StopStream
     )
   }

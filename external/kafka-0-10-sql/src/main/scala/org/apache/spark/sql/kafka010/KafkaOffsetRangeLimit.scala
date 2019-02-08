@@ -42,6 +42,9 @@ private[kafka010] case object LatestOffsetRangeLimit extends KafkaOffsetRangeLim
 private[kafka010] case class SpecificOffsetRangeLimit(
     partitionOffsets: Map[TopicPartition, Long]) extends KafkaOffsetRangeLimit
 
+private[kafka010] case class SpecificTimestampRangeLimit(
+    topicTimestamps: Map[String, Long]) extends KafkaOffsetRangeLimit
+
 private[kafka010] object KafkaOffsetRangeLimit {
   /**
    * Used to denote offset range limits that are resolved via Kafka

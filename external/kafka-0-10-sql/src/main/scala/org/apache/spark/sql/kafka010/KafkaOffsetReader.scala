@@ -26,7 +26,7 @@ import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.Duration
 import scala.util.control.NonFatal
 
-import org.apache.kafka.clients.consumer.{Consumer, ConsumerConfig, KafkaConsumer}
+import org.apache.kafka.clients.consumer.{Consumer, ConsumerConfig, KafkaConsumer, OffsetAndTimestamp}
 import org.apache.kafka.common.TopicPartition
 
 import org.apache.spark.internal.Logging
@@ -176,6 +176,58 @@ private[kafka010] class KafkaOffsetReader(
       case _ =>
         // no real way to check that beginning or end is reasonable
     }
+    KafkaSourceOffset(fetched)
+  }
+
+  def fetchSpecificTimestampBasedOffsets(topicTimestamps: Map[String, Long]): KafkaSourceOffset = {
+    val fetched = runUninterruptibly {
+      withRetriesWithoutInterrupt {
+        // Poll to get the latest assigned partitions
+        consumer.poll(0)
+        val partitions = consumer.assignment()
+
+        // Call `position` to wait until the potential offset request triggered by `poll(0)` is
+        // done. This is a workaround for KAFKA-7703, which an async `seekToBeginning` triggered by
+        // `poll(0)` may reset offsets that should have been set by another request.
+        partitions.asScala.map(p => p -> consumer.position(p)).foreach(_ => {})
+
+        consumer.pause(partitions)
+
+        val assignedTopics = partitions.asScala.map(_.topic())
+        assert(assignedTopics == topicTimestamps.keySet,
+          "If starting/endingOffsetsByTimestamp contains specific offsets, you must specify all " +
+            s"topics. Specified: ${topicTimestamps.keySet} Assigned: $assignedTopics")
+        logDebug(s"Partitions assigned to consumer: $partitions. Seeking to $topicTimestamps")
+
+        val partitionTimestamps: ju.Map[TopicPartition, java.lang.Long] =
+          partitions.asScala.map { topicAndPartition =>
+            topicAndPartition -> java.lang.Long.valueOf(topicTimestamps(topicAndPartition.topic()))
+          }.toMap.asJava
+
+        val offsetForTime: ju.Map[TopicPartition, OffsetAndTimestamp] =
+          consumer.offsetsForTimes(partitionTimestamps)
+
+        val partitionOffsets = offsetForTime.asScala.map { case (tp, offsetAndTimestamp) =>
+          if (offsetAndTimestamp == null) {
+            tp -> KafkaOffsetRangeLimit.LATEST
+          } else {
+            tp -> offsetAndTimestamp.offset()
+          }
+        }.toMap
+
+        partitionOffsets.foreach {
+          case (tp, KafkaOffsetRangeLimit.LATEST) =>
+            consumer.seekToEnd(ju.Arrays.asList(tp))
+          case (tp, KafkaOffsetRangeLimit.EARLIEST) =>
+            consumer.seekToBeginning(ju.Arrays.asList(tp))
+          case (tp, off) => consumer.seek(tp, off)
+        }
+        partitionOffsets.map {
+          case (tp, _) => tp -> consumer.position(tp)
+        }
+      }
+    }
+
     KafkaSourceOffset(fetched)
   }
 

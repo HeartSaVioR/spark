@@ -76,6 +76,16 @@ private object JsonUtils {
     }
   }
 
+  def topicTimestamps(str: String): Map[String, Long] = {
+    try {
+      Serialization.read[Map[String, Long]](str)
+    } catch {
+      case NonFatal(x) =>
+        throw new IllegalArgumentException(
+          s"""Expected e.g. {"topicA": 1549597128110,"topicB": 1549597120110}, got $str""")
+    }
+  }
+
   /**
    * Write per-TopicPartition offsets as json string
    */
@@ -92,6 +102,16 @@ private object JsonUtils {
         val parts = result.getOrElse(tp.topic, new HashMap[Int, Long])
         parts += tp.partition -> off
         result += tp.topic -> parts
+    }
+    Serialization.write(result)
+  }
+
+  def topicTimestamps(topicTimestamps: Map[String, Long]): String = {
+    val result = new HashMap[String, Long]()
+    val topics = topicTimestamps.keySet.toSeq.sorted  // sort for more determinism
+    topics.foreach { topic =>
+        val timestamp = topicTimestamps(topic)
+        result += topic -> timestamp
     }
     Serialization.write(result)
   }

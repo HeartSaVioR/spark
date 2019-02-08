@@ -199,6 +199,8 @@ private[kafka010] class KafkaMicroBatchStream(
           KafkaSourceOffset(kafkaOffsetReader.fetchLatestOffsets(None))
         case SpecificOffsetRangeLimit(p) =>
           kafkaOffsetReader.fetchSpecificOffsets(p, reportDataLoss)
+        case SpecificTimestampRangeLimit(p) =>
+          kafkaOffsetReader.fetchSpecificTimestampBasedOffsets(p)
       }
       metadataLog.add(0, offsets)
       logInfo(s"Initial offsets: $offsets")
