@@ -272,7 +272,7 @@ class FileStreamSource(
           validFileEntities.foreach(sourceCleaner.archive)
 
         case CleanSourceMode.DELETE =>
-          validFileEntities.foreach(sourceCleaner.remove)
+          validFileEntities.foreach(sourceCleaner.delete)
 
         case _ =>
       }
@@ -376,7 +376,7 @@ object FileStreamSource {
       }
     }
 
-    def remove(entry: FileEntry): Unit = {
+    def delete(entry: FileEntry): Unit = {
       val curPath = new Path(new URI(entry.path))
       try {
         logDebug(s"Removing completed file $curPath")
