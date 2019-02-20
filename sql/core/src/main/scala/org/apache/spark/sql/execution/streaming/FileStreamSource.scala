@@ -267,15 +267,18 @@ class FileStreamSource(
       val files = metadataLog.get(Some(logOffset), Some(logOffset)).flatMap(_._2)
       val validFileEntities = files.filter(_.batchId == logOffset)
       logDebug(s"completed file entries: ${validFileEntities.mkString(",")}")
-      sourceOptions.cleanSource match {
+      val obsoleteEntries: Seq[FileEntry] = sourceOptions.cleanSource match {
         case CleanSourceMode.ARCHIVE =>
-          validFileEntities.foreach(sourceCleaner.archive)
+          validFileEntities.filter(sourceCleaner.archive)
 
         case CleanSourceMode.DELETE =>
-          validFileEntities.foreach(sourceCleaner.delete)
+          validFileEntities.filter(sourceCleaner.delete)
 
-        case _ =>
+        case _ => Seq.empty[FileEntry]
       }
+
+      metadataLog.addObsoleteEntries(obsoleteEntries)
+      obsoleteEntries.foreach(entry => seenFiles.remove(entry.path, entry.timestamp))
     } else {
       // No-op for now; FileStreamSource currently garbage-collects files based on timestamp
       // and the value of the maxFileAge parameter.
@@ -323,6 +326,17 @@ object FileStreamSource {
       }
     }
 
+    /** Remove file in the map if the timestamp matches (avoid deleting wrong file). */
+    def remove(path: String, timestamp: Timestamp): Boolean = {
+      val strippedPath = stripPathIfNecessary(path)
+      if (map.containsKey(strippedPath) && map.get(strippedPath) == timestamp) {
+        map.remove(path)
+        true
+      } else {
+        false
+      }
+    }
+
     /**
      * Returns true if we should consider this file a new file. The file is only considered "new"
      * if it is new enough that we are still tracking, and we have not seen it before.
@@ -360,7 +374,7 @@ object FileStreamSource {
 
     private val baseArchivePath: Option[Path] = baseArchivePathString.map(new Path(_))
 
-    def archive(entry: FileEntry): Unit = {
+    def archive(entry: FileEntry): Boolean = {
       require(baseArchivePath.isDefined)
 
       val curPath = new Path(new URI(entry.path))
@@ -371,23 +385,27 @@ object FileStreamSource {
       if (isArchiveFileMatchedAgainstSourcePattern(newPath)) {
         logWarning(s"Fail to move $curPath to $newPath - destination matches " +
           s"to source path/pattern. Skip moving file.")
+        false
       } else {
         doArchive(curPath, newPath)
       }
     }
 
-    def delete(entry: FileEntry): Unit = {
+    def delete(entry: FileEntry): Boolean = {
       val curPath = new Path(new URI(entry.path))
       try {
         logDebug(s"Removing completed file $curPath")
 
-        if (!fileSystem.delete(curPath, false)) {
+        val ret = fileSystem.delete(curPath, false)
+        if (!ret) {
           logWarning(s"Fail to remove $curPath / skip removing file.")
         }
+        ret
       } catch {
         case NonFatal(e) =>
           // Log to error but swallow exception to avoid process being stopped
           logWarning(s"Fail to remove $curPath / skip removing file.", e)
+          false
       }
     }
 
@@ -457,7 +475,7 @@ object FileStreamSource {
       matched
     }
 
-    private def doArchive(sourcePath: Path, archivePath: Path): Unit = {
+    private def doArchive(sourcePath: Path, archivePath: Path): Boolean = {
       try {
         logDebug(s"Creating directory if it doesn't exist ${archivePath.getParent}")
         if (!fileSystem.exists(archivePath.getParent)) {
@@ -465,12 +483,15 @@ object FileStreamSource {
         }
 
         logDebug(s"Archiving completed file $sourcePath to $archivePath")
-        if (!fileSystem.rename(sourcePath, archivePath)) {
+        val ret = fileSystem.rename(sourcePath, archivePath)
+        if (!ret) {
           logWarning(s"Fail to move $sourcePath to $archivePath / skip moving file.")
         }
+        ret
       } catch {
         case NonFatal(e) =>
           logWarning(s"Fail to move $sourcePath to $archivePath / skip moving file.", e)
+          false
       }
     }
 

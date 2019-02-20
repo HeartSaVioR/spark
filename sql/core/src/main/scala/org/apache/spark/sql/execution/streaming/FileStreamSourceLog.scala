@@ -52,6 +52,8 @@ class FileStreamSourceLog(
 
   private implicit val formats = Serialization.formats(NoTypeHints)
 
+  private val obsoleteEntries = mutable.HashSet[FileEntry]()
+
   // A fixed size log entry cache to cache the file entries belong to the compaction batch. It is
   // used to avoid scanning the compacted log file to retrieve it's own batch data.
   private val cacheSize = compactInterval
@@ -61,8 +63,22 @@ class FileStreamSourceLog(
     }
   }
 
+  def addObsoleteEntries(entries: Seq[FileEntry]): Unit = {
+    obsoleteEntries ++= entries
+  }
+
   def compactLogs(logs: Seq[FileEntry]): Seq[FileEntry] = {
-    logs
+    val logsWithoutObsolete = logs.filterNot(obsoleteEntries.contains)
+
+    // We can't remove obsolete entries immediately because `compactLogs` is called in both
+    // `compact` (which filters out obsolete entries in metadata) and `allFiles` (which filters
+    // out obsolete entries in view but not applied to metadata).
+    // We can finally remove if obsolete entities are not appeared in logs parameter, since
+    // this represents metadata is no longer having these entities.
+    val obsoleteEntriesSafeToRemove = obsoleteEntries.filterNot(logs.contains)
+    obsoleteEntries --= obsoleteEntriesSafeToRemove
+
+    logsWithoutObsolete
   }
 
   override def add(batchId: Long, logs: Array[FileEntry]): Boolean = {

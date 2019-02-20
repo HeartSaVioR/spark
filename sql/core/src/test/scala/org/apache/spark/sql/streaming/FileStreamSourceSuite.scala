@@ -32,7 +32,7 @@ import org.scalatest.time.SpanSugar._
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.util._
 import org.apache.spark.sql.execution.streaming._
-import org.apache.spark.sql.execution.streaming.FileStreamSource.{FileEntry, FileStreamSourceCleaner, SeenFilesMap}
+import org.apache.spark.sql.execution.streaming.FileStreamSource.{FileEntry, FileStreamSourceCleaner, SeenFilesMap, Timestamp}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.ExistsThrowsExceptionFileSystem._
 import org.apache.spark.sql.streaming.util.StreamManualClock
@@ -97,6 +97,18 @@ abstract class FileStreamSourceTest
     override def addData(source: FileStreamSource): Unit = {
       val tempFile = Utils.tempFileWith(new File(tmp, tmpFilePrefix))
       val finalFile = new File(src, tempFile.getName)
+      src.mkdirs()
+      require(stringToFile(tempFile, content).renameTo(finalFile))
+      logInfo(s"Written text '$content' to file $finalFile")
+    }
+  }
+
+  case class AddTextFileDataToSpecificFile(content: String, src: File, tmp: File, fileName: String)
+    extends AddFileData {
+
+    override def addData(source: FileStreamSource): Unit = {
+      val tempFile = Utils.tempFileWith(new File(tmp, fileName))
+      val finalFile = new File(src, fileName)
       src.mkdirs()
       require(stringToFile(tempFile, content).renameTo(finalFile))
       logInfo(s"Written text '$content' to file $finalFile")
@@ -1598,33 +1610,101 @@ class FileStreamSourceSuite extends FileStreamSourceTest {
         val filtered = fileStream.filter($"value" contains "keep")
 
         testStream(filtered)(
-          AddTextFileData("keep1", src, tmp, tmpFilePrefix = "keep1"),
+          // batch 0
+          // Here we use specific file name to test whether the new file with same path can be
+          // re-read if the source file got archived.
+          AddTextFileDataToSpecificFile("keep1", src, tmp, fileName = "keep1"),
           CheckAnswer("keep1"),
           AssertOnQuery("input file removed") { _: StreamExecution =>
             // it doesn't rename any file yet
             assertFileIsNotRemoved(src.list(), "keep1")
             true
           },
+
+          // batch 1 (compaction batch)
           AddTextFileData("keep2", src, tmp, tmpFilePrefix = "ke ep2 %"),
           CheckAnswer("keep1", "keep2"),
           AssertOnQuery("input file removed") { _: StreamExecution =>
             val files = src.list()
-
-            // it renames input file for first batch, but not for second batch yet
+            // it renames input file for batch 0, but not for batch 1 yet
             assertFileIsRemoved(files, "keep1")
             assertFileIsNotRemoved(files, "ke ep2 %")
-
             true
           },
+          // Here metadata log is compacted, but `compact` is called earlier than
+          // `FileStreamSource.commit` so obsolete files in batch 1 is not reflected in compacted
+          // batch. (same applies on further compaction batches) We have to check it in batch 3.
+          AssertOnQuery("verify removed files from metadata") { execution: StreamExecution =>
+            verifyObsoleteEntries(execution, Seq("keep1"), Seq.empty)
+            verifySeenFilesEntries(execution, Seq("ke%20ep2%20%25"), Seq("keep1"))
+            true
+          },
+
+          // batch 2
           AddTextFileData("keep3", src, tmp, tmpFilePrefix = "keep3"),
           CheckAnswer("keep1", "keep2", "keep3"),
           AssertOnQuery("input file renamed") { _: StreamExecution =>
             val files = src.list()
-
-            // it renames input file for second batch, but not third batch yet
+            // it renames input file for batch 1, but not batch 2 yet
             assertFileIsRemoved(files, "ke ep2 %")
             assertFileIsNotRemoved(files, "keep3")
+            true
+          },
+          AssertOnQuery("verify removed files from metadata") { execution: StreamExecution =>
+            // have to escape the file prefix cause path in FileEntry is escaped
+            verifyObsoleteEntries(execution, Seq("ke%20ep2%20%25"), Seq.empty)
+            verifySeenFilesEntries(execution, Seq("keep3"), Seq("keep1", "ke%20ep2%20%25"))
+            true
+          },
 
+          // batch 3 (compaction batch)
+          AddTextFileData("keep4", src, tmp, tmpFilePrefix = "keep4"),
+          CheckAnswer("keep1", "keep2", "keep3", "keep4"),
+          AssertOnQuery("input file archived") { _: StreamExecution =>
+            val files = src.list()
+            // it removes input file for batch 2, but not for batch 3 yet
+            assertFileIsRemoved(files, "keep3")
+            assertFileIsNotRemoved(files, "keep4")
+            true
+          },
+          AssertOnQuery("verify removed files from metadata") { execution: StreamExecution =>
+            verifyCompactedMetadataLog(execution, 3L, 2, Seq("keep3", "keep4"))
+            verifyObsoleteEntries(execution, Seq("keep3"), Seq.empty)
+            verifySeenFilesEntries(execution, Seq("keep4"), Seq("keep1", "ke%20ep2%20%25", "keep3"))
+            true
+          },
+
+          // let's skip verifying the result starting from batch 4 - we know it will work
+          // batch 4
+          AddTextFileData("keep5", src, tmp, tmpFilePrefix = "keep5"),
+          CheckAnswer("keep1", "keep2", "keep3", "keep4", "keep5"),
+          AssertOnQuery("verify removed files from metadata") { execution: StreamExecution =>
+            verifyObsoleteEntries(execution, Seq("keep4"), Seq.empty)
+            verifySeenFilesEntries(execution, Seq("keep5"),
+              Seq("keep1", "ke%20ep2%20%25", "keep3", "keep4"))
+            true
+          },
+
+          // batch 5 (compaction batch)
+          AddTextFileData("keep6", src, tmp, tmpFilePrefix = "keep6"),
+          CheckAnswer("keep1", "keep2", "keep3", "keep4", "keep5", "keep6"),
+          AssertOnQuery("verify removed files from metadata") { execution: StreamExecution =>
+            verifyCompactedMetadataLog(execution, 5L, 2, Seq("keep5", "keep6"))
+            // have to escape the file prefix cause path in FileEntry is escaped
+            verifyObsoleteEntries(execution, Seq("keep5"), Seq("keep1", "ke%20ep2%20%25"))
+            verifySeenFilesEntries(execution, Seq("keep6"),
+              Seq("keep1", "ke%20ep2%20%25", "keep3", "keep4", "keep5"))
+            true
+          },
+
+          // batch 6
+          // Note that we add new file which path is same as archived file, and see whether
+          // the file is picked as new source
+          AddTextFileDataToSpecificFile("keep1-revised", src, tmp, fileName = "keep1"),
+          CheckAnswer("keep1", "keep2", "keep3", "keep4", "keep5", "keep6", "keep1-revised"),
+          AssertOnQuery("verify removed files from metadata") { execution: StreamExecution =>
+            verifySeenFilesEntries(execution, Seq("keep1"),
+              Seq("ke%20ep2%20%25", "keep3", "keep4", "keep5", "keep6"))
             true
           }
         )
@@ -1662,41 +1742,178 @@ class FileStreamSourceSuite extends FileStreamSourceTest {
         val expectedMovedDir3 = new File(archiveDir.getAbsolutePath + dirForKeep3.toURI.getPath)
 
         testStream(filtered)(
-          AddTextFileData("keep1", dirForKeep1, tmp, tmpFilePrefix = "keep1"),
+          // batch 0
+          // Here we use specific file name to test whether the new file with same path can be
+          // re-read if the source file got archived.
+          AddTextFileDataToSpecificFile("keep1", dirForKeep1, tmp, fileName = "keep1"),
           CheckAnswer("keep1"),
           AssertOnQuery("input file archived") { _: StreamExecution =>
             // it doesn't rename any file yet
             assertFileIsNotMoved(dirForKeep1, expectedMovedDir1, "keep1")
             true
           },
+
+          // batch 1 (compaction batch)
           AddTextFileData("keep2", dirForKeep2, tmp, tmpFilePrefix = "keep2 %"),
           CheckAnswer("keep1", "keep2"),
           AssertOnQuery("input file archived") { _: StreamExecution =>
-            // it renames input file for first batch, but not for second batch yet
+            // it renames input file for batch 0, but not for batch 1 yet
             assertFileIsMoved(dirForKeep1, expectedMovedDir1, "keep1")
             assertFileIsNotMoved(dirForKeep2, expectedMovedDir2, "keep2 %")
             true
           },
+          // Here metadata log is compacted, but `compact` is called earlier than
+          // `FileStreamSource.commit` so obsolete files in batch 1 is not reflected in compacted
+          // batch. (same applies on further compaction batches) We have to check it in batch 3.
+          AssertOnQuery("verify moved files from metadata") { execution: StreamExecution =>
+            verifyObsoleteEntries(execution, Seq("keep1"), Seq.empty)
+            verifySeenFilesEntries(execution, Seq("keep2"), Seq("keep1"))
+            true
+          },
+
+          // batch 2
           AddTextFileData("keep3", dirForKeep3, tmp, tmpFilePrefix = "keep3"),
           CheckAnswer("keep1", "keep2", "keep3"),
           AssertOnQuery("input file archived") { _: StreamExecution =>
-            // it renames input file for second batch, but not third batch yet
+            // it renames input file for batch 1, but not for batch 2 yet
             assertFileIsMoved(dirForKeep2, expectedMovedDir2, "keep2 %")
             assertFileIsNotMoved(dirForKeep3, expectedMovedDir3, "keep3")
-
             true
           },
+          AssertOnQuery("verify moved files from metadata") { execution: StreamExecution =>
+            verifyObsoleteEntries(execution, Seq("keep2"), Seq.empty)
+            verifySeenFilesEntries(execution, Seq("keep3"), Seq("keep1", "keep2"))
+            true
+          },
+
+          // batch 3 (compaction batch)
           AddTextFileData("keep4", dirForKeep3, tmp, tmpFilePrefix = "keep4"),
           CheckAnswer("keep1", "keep2", "keep3", "keep4"),
           AssertOnQuery("input file archived") { _: StreamExecution =>
-            // it renames input file for third batch, but not fourth batch yet
+            // it renames input file for batch 2, but not for batch 3 yet
             assertFileIsMoved(dirForKeep3, expectedMovedDir3, "keep3")
             assertFileIsNotMoved(dirForKeep3, expectedMovedDir3, "keep4")
 
             true
+          },
+          AssertOnQuery("verify moved files from metadata") { execution: StreamExecution =>
+            verifyCompactedMetadataLog(execution, 3L, 2, Seq("keep3", "keep4"))
+            verifyObsoleteEntries(execution, Seq("keep3"), Seq.empty)
+            verifySeenFilesEntries(execution, Seq("keep4"), Seq("keep1", "keep2", "keep3"))
+            true
+          },
+
+          // let's skip verifying the result starting from batch 4 - we know it will work
+          // batch 4
+          AddTextFileData("keep5", dirForKeep3, tmp, tmpFilePrefix = "keep5"),
+          CheckAnswer("keep1", "keep2", "keep3", "keep4", "keep5"),
+          AssertOnQuery("verify moved files from metadata") { execution: StreamExecution =>
+            verifyObsoleteEntries(execution, Seq("keep4"), Seq.empty)
+            verifySeenFilesEntries(execution, Seq("keep5"),
+              Seq("keep1", "keep2", "keep3", "keep4"))
+            true
+          },
+
+          // batch 5 (compaction batch)
+          AddTextFileData("keep6", dirForKeep3, tmp, tmpFilePrefix = "keep6"),
+          CheckAnswer("keep1", "keep2", "keep3", "keep4", "keep5", "keep6"),
+          AssertOnQuery("verify moved files from metadata") { execution: StreamExecution =>
+            verifyCompactedMetadataLog(execution, 5L, 2, Seq("keep5", "keep6"))
+            verifyObsoleteEntries(execution, Seq("keep5"), Seq("keep1", "keep2"))
+            verifySeenFilesEntries(execution, Seq("keep6"),
+              Seq("keep1", "keep2", "keep3", "keep4", "keep5"))
+            true
+          },
+
+          // batch 6
+          // We write a new file which has same path being processed at batch 0 - we will test
+          // whether the file is picked as new source file
+          AddTextFileDataToSpecificFile("keep1-newfile", dirForKeep1, tmp, fileName = "keep1"),
+          CheckAnswer("keep1", "keep2", "keep3", "keep4", "keep5", "keep6", "keep1-newfile"),
+          AssertOnQuery("verify moved files from metadata") { execution: StreamExecution =>
+            verifySeenFilesEntries(execution, Seq("keep1"),
+              Seq("keep2", "keep3", "keep4", "keep5", "keep6"))
+            true
           }
         )
       }
+    }
+  }
+
+  private def verifyCompactedMetadataLog(
+      execution: StreamExecution,
+      batchId: Long,
+      expectedCompactInterval: Int,
+      expectedFilePrefixesInCompacted: Seq[String]): Unit = {
+    import CompactibleFileStreamLog._
+
+    val _metadataLog = PrivateMethod[FileStreamSourceLog]('metadataLog)
+
+    val fileSource = getSourcesFromStreamingQuery(execution).head
+    val metadataLog = fileSource invokePrivate _metadataLog()
+
+    // this batch (batchId = 5) is expected to be a compaction batch
+    assert(isCompactionBatch(batchId, expectedCompactInterval))
+
+    val path = metadataLog.batchIdToPath(batchId)
+
+    // Assert path name should be ended with compact suffix.
+    assert(path.getName.endsWith(COMPACT_FILE_SUFFIX),
+      "path does not end with compact file suffix")
+
+    val entries = metadataLog.get(batchId)
+    assert(entries.isDefined)
+
+    assert(entries.get.length === expectedFilePrefixesInCompacted.size)
+    expectedFilePrefixesInCompacted.foreach { prefix =>
+      assert(entries.get.exists(_.path.contains(prefix)))
+    }
+  }
+
+  private def verifyObsoleteEntries(
+      execution: StreamExecution,
+      expectedFilePrefixesInObsoleteEntries: Seq[String],
+      expectedFilePrefixesNotInObsoleteEntries: Seq[String]): Unit = {
+    val _metadataLog = PrivateMethod[FileStreamSourceLog]('metadataLog)
+    val _obsoleteEntries = PrivateMethod[mutable.HashSet[FileEntry]]('obsoleteEntries)
+
+    val fileSource = getSourcesFromStreamingQuery(execution).head
+    val metadataLog = fileSource invokePrivate _metadataLog()
+    val obsoleteEntities = metadataLog invokePrivate _obsoleteEntries()
+
+    // Now it is guaranteed for some entries to be removed in obsoleteEntities, cause it is
+    // excluded in all logs even without filtering out in compactLogs.
+    // This assertion represents the size of `obsoleteEntities` is not monotonically increasing.
+    expectedFilePrefixesNotInObsoleteEntries.foreach { prefix =>
+      assert(!obsoleteEntities.exists(_.path.contains(prefix)))
+    }
+
+    // Though it is not deterministic for some entries to be included or removed in obsoleteEntries,
+    // (so we can't check entries in obsoleteEntries are same as what we expect)
+    // but it is guaranteed for some other entries to be included in obsoleteEntities so that
+    // it can be removed in next compaction.
+    expectedFilePrefixesInObsoleteEntries.foreach { prefix =>
+      assert(obsoleteEntities.exists(_.path.contains(prefix)))
+    }
+  }
+
+  private def verifySeenFilesEntries(
+      execution: StreamExecution,
+      expectedFilePrefixesInSeenFiles: Seq[String],
+      expectedFilePrefixesNotInSeenFiles: Seq[String]): Unit = {
+    import scala.collection.JavaConverters._
+
+    val _map = PrivateMethod[java.util.HashMap[String, Timestamp]]('map)
+
+    val fileSource = getSourcesFromStreamingQuery(execution).head
+    val seenFilesInternalMap = fileSource.seenFiles invokePrivate _map()
+    val seenFilesKeys = seenFilesInternalMap.keySet().asScala
+
+    expectedFilePrefixesInSeenFiles.foreach { prefix =>
+      assert(seenFilesKeys.exists(_.contains(prefix)))
+    }
+    expectedFilePrefixesNotInSeenFiles.foreach { prefix =>
+      assert(!seenFilesKeys.exists(_.contains(prefix)))
     }
   }
 
