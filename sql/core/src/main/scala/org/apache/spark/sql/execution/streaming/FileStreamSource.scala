@@ -259,6 +259,8 @@ class FileStreamSource(
   override def commit(end: Offset): Unit = {
     // No-op for now; FileStreamSource currently garbage-collects files based on timestamp
     // and the value of the maxFileAge parameter.
+    val logOffset = FileStreamSourceOffset(end).logOffset
+    metadataLog.updateCommittedBatchId(logOffset)
   }
 
   override def stop() {}

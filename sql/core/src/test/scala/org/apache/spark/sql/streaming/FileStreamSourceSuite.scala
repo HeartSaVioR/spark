@@ -1214,14 +1214,23 @@ class FileStreamSourceSuite extends FileStreamSourceTest {
       if (isCompactionBatch(batchId, expectedCompactInterval)) {
         val path = metadataLog.batchIdToPath(batchId)
 
+        // assuming (batchId - 2) is committed, and (batchId - 1) is not yet committed
+        val prevBatches = getValidBatchesBeforeCompactionBatch(batchId, expectedCompactInterval)
+          .filterNot(_ == batchId - 1)
+        val prevEntries = prevBatches.flatMap(batch => metadataLog.get(batch).get)
+
         // Assert path name should be ended with compact suffix.
         assert(path.getName.endsWith(COMPACT_FILE_SUFFIX),
           "path does not end with compact file suffix")
 
-        // Compacted batch should include all entries from start.
+        // Compacted batch as well as allFiles() should not have committed entries.
         val entries = metadataLog.get(batchId)
         assert(entries.isDefined, "Entries not defined")
-        assert(entries.get.length === metadataLog.allFiles().length, "clean up check")
+        assert(entries.get.toSet.diff(prevEntries.toSet) == entries.get.toSet,
+          "Compacted batch should not have committed entries.")
+        // FIXME: find a valid condition
+//        assert(metadataLog.allFiles().toSet.diff(prevEntries.toSet) == entries.get.toSet,
+//          "allFiles() should not have committed entries.")
         assert(metadataLog.get(None, Some(batchId)).flatMap(_._2).length ===
           entries.get.length, "Length check")
       }
@@ -1246,6 +1255,7 @@ class FileStreamSourceSuite extends FileStreamSourceTest {
           CheckAnswer("keep2", "keep3"),
           AssertOnQuery(verify(_, 0L, 1, 2)),
           AddTextFileData("drop4\nkeep5\nkeep6", src, tmp),
+          // FIXME: Now it is broken - keep2 and keep3 are re-read in this batch
           CheckAnswer("keep2", "keep3", "keep5", "keep6"),
           AssertOnQuery(verify(_, 1L, 2, 2)),
           AddTextFileData("drop7\nkeep8\nkeep9", src, tmp),

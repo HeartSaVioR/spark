@@ -52,6 +52,8 @@ class FileStreamSourceLog(
 
   private implicit val formats = Serialization.formats(NoTypeHints)
 
+  private var committedBatchId: Long = -1
+
   // A fixed size log entry cache to cache the file entries belong to the compaction batch. It is
   // used to avoid scanning the compacted log file to retrieve it's own batch data.
   private val cacheSize = compactInterval
@@ -61,14 +63,25 @@ class FileStreamSourceLog(
     }
   }
 
+  def updateCommittedBatchId(batchId: Long): Unit = {
+    committedBatchId = batchId
+  }
+
   def compactLogs(logs: Seq[FileEntry]): Seq[FileEntry] = {
-    logs
+    if (committedBatchId < 0) {
+      logs
+    } else {
+      // Remove entities which Spark will never access later
+      val files = get(None, Some(committedBatchId)).flatMap(_._2).toSet
+      logs.filterNot(files.contains)
+    }
   }
 
   override def add(batchId: Long, logs: Array[FileEntry]): Boolean = {
     if (super.add(batchId, logs)) {
       if (isCompactionBatch(batchId, compactInterval)) {
-        fileEntryCache.put(batchId, logs)
+        // it should store compacted logs
+        fileEntryCache.put(batchId, get(batchId).get)
       }
       true
     } else {
