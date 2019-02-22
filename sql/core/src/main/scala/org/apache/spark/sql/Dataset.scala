@@ -2962,7 +2962,9 @@ class Dataset[T] private[sql](
   // Represents the `QueryExecution` used to produce the content of the Dataset as an `RDD`.
   @transient private lazy val rddQueryExecution: QueryExecution = {
     val deserialized = CatalystSerde.deserialize[T](logicalPlan)
-    sparkSession.sessionState.executePlan(deserialized)
+    val castInjectedDeserialized = deserialized.copy(
+      child = mayCreateCastsForDeserialization(logicalPlan))
+    sparkSession.sessionState.executePlan(castInjectedDeserialized)
   }
 
   /**
@@ -3357,8 +3359,9 @@ class Dataset[T] private[sql](
   private def collectFromPlan(plan: SparkPlan): Array[T] = {
     // This projection writes output to a `InternalRow`, which means applying this projection is not
     // thread-safe. Here we create the projection inside this method to make `Dataset` thread-safe.
+    val newPlan = mayCreateCastsForDeserialization(plan)
     val objProj = GenerateSafeProjection.generate(deserializer :: Nil)
-    plan.executeCollect().map { row =>
+    newPlan.executeCollect().map { row =>
       // The row returned by SafeProjection is `SpecificInternalRow`, which ignore the data type
       // parameter of its `get` method, so it's safe to use null here.
       objProj(row).get(0, null).asInstanceOf[T]
@@ -3415,4 +3418,40 @@ class Dataset[T] private[sql](
   private[sql] def toArrowBatchRdd: RDD[Array[Byte]] = {
     toArrowBatchRdd(queryExecution.executedPlan)
   }
+
+  private def mayCreateCastsForDeserialization(plan: LogicalPlan): LogicalPlan = {
+    val enc = encoderFor[T]
+    if (plan.schema.equals(enc.schema)) {
+      plan
+    } else {
+      val desireTypeTable = enc.schema.map(field => field.name -> field).toMap
+      val timezone = plan.conf.sessionLocalTimeZone
+      Project(mayApplyCasts(plan.output, desireTypeTable, timezone), plan)
+    }
+  }
+
+  private def mayCreateCastsForDeserialization(plan: SparkPlan): SparkPlan = {
+    val enc = encoderFor[T]
+    if (plan.schema.equals(enc.schema)) {
+      plan
+    } else {
+      val desireTypeTable = enc.schema.map(field => field.name -> field).toMap
+      val timezone = plan.conf.sessionLocalTimeZone
+      ProjectExec(mayApplyCasts(plan.output, desireTypeTable, timezone), plan)
+    }
+  }
+
+  private def mayApplyCasts(
+      attrs: Seq[Attribute],
+      desireTypeTable: Map[String, StructField],
+      timezone: String): Seq[NamedExpression] = attrs.map { attr =>
+    desireTypeTable.get(attr.name) match {
+      case Some(field) =>
+        Alias(Cast(attr, field.dataType, Some(timezone)), attr.name)(
+          exprId = attr.exprId, qualifier = attr.qualifier,
+          explicitMetadata = Some(attr.metadata))
+      case None => attr
+    }
+  }
+
 }
