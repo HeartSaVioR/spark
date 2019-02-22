@@ -62,16 +62,7 @@ import org.apache.spark.util.Utils
 
 private[sql] object Dataset {
   def apply[T: Encoder](sparkSession: SparkSession, logicalPlan: LogicalPlan): Dataset[T] = {
-    val dataset = new Dataset(sparkSession, logicalPlan, implicitly[Encoder[T]])
-    // Eagerly bind the encoder so we verify that the encoder matches the underlying
-    // schema. The user will get an error if this is not the case.
-    // optimization: it is guaranteed that [[InternalRow]] can be converted to [[Row]] so
-    // do not do this check in that case. this check can be expensive since it requires running
-    // the whole [[Analyzer]] to resolve the deserializer
-    if (dataset.exprEnc.clsTag.runtimeClass != classOf[Row]) {
-      dataset.deserializer
-    }
-    dataset
+    new Dataset(sparkSession, logicalPlan, implicitly[Encoder[T]])
   }
 
   def ofRows(sparkSession: SparkSession, logicalPlan: LogicalPlan): DataFrame = {
@@ -215,11 +206,6 @@ class Dataset[T] private[sql](
    * possibly resolved to a different schema).
    */
   private[sql] implicit val exprEnc: ExpressionEncoder[T] = encoderFor(encoder)
-
-  // The deserializer expression which can be used to build a projection and turn rows to objects
-  // of type T, after collecting rows to the driver side.
-  private lazy val deserializer =
-    exprEnc.resolveAndBind(logicalPlan.output, sparkSession.sessionState.analyzer).deserializer
 
   private implicit def classTag = exprEnc.clsTag
 
@@ -2737,16 +2723,27 @@ class Dataset[T] private[sql](
    */
   def toLocalIterator(): java.util.Iterator[T] = {
     withAction("toLocalIterator", queryExecution) { plan =>
-      // This projection writes output to a `InternalRow`, which means applying this projection is
-      // not thread-safe. Here we create the projection inside this method to make `Dataset`
-      // thread-safe.
-      val objProj = GenerateSafeProjection.generate(deserializer :: Nil)
-      plan.executeToIterator().map { row =>
-        // The row returned by SafeProjection is `SpecificInternalRow`, which ignore the data type
-        // parameter of its `get` method, so it's safe to use null here.
-        objProj(row).get(0, null).asInstanceOf[T]
-      }.asJava
+      withApplyingDeserializer(plan, (newPlan, objProj) => {
+        newPlan.executeToIterator().map { row =>
+          // The row returned by SafeProjection is `SpecificInternalRow`, which ignore
+          // the data type parameter of its `get` method, so it's safe to use null here.
+          objProj(row).get(0, null).asInstanceOf[T]
+        }.asJava
+      })
     }
+  }
+
+  private def withApplyingDeserializer[R](
+      plan: SparkPlan,
+      func: (SparkPlan, Projection) => R): R = {
+    val newPlan = mayCreateCastsForDeserialization(plan)
+    val newDeserializer = exprEnc.resolveAndBind(newPlan.output,
+      sparkSession.sessionState.analyzer).deserializer
+    // This projection writes output to a `InternalRow`, which means applying this projection is
+    // not thread-safe. Here we create the projection inside this method to make `Dataset`
+    // thread-safe.
+    val objProj = GenerateSafeProjection.generate(newDeserializer :: Nil)
+    func(newPlan, objProj)
   }
 
   /**
@@ -2961,10 +2958,9 @@ class Dataset[T] private[sql](
 
   // Represents the `QueryExecution` used to produce the content of the Dataset as an `RDD`.
   @transient private lazy val rddQueryExecution: QueryExecution = {
-    val deserialized = CatalystSerde.deserialize[T](logicalPlan)
-    val castInjectedDeserialized = deserialized.copy(
-      child = mayCreateCastsForDeserialization(logicalPlan))
-    sparkSession.sessionState.executePlan(castInjectedDeserialized)
+    val newPlan = mayCreateCastsForDeserialization(logicalPlan)
+    val deserialized = CatalystSerde.deserialize[T](newPlan)
+    sparkSession.sessionState.executePlan(deserialized)
   }
 
   /**
@@ -3357,15 +3353,13 @@ class Dataset[T] private[sql](
    * Collect all elements from a spark plan.
    */
   private def collectFromPlan(plan: SparkPlan): Array[T] = {
-    // This projection writes output to a `InternalRow`, which means applying this projection is not
-    // thread-safe. Here we create the projection inside this method to make `Dataset` thread-safe.
-    val newPlan = mayCreateCastsForDeserialization(plan)
-    val objProj = GenerateSafeProjection.generate(deserializer :: Nil)
-    newPlan.executeCollect().map { row =>
-      // The row returned by SafeProjection is `SpecificInternalRow`, which ignore the data type
-      // parameter of its `get` method, so it's safe to use null here.
-      objProj(row).get(0, null).asInstanceOf[T]
-    }
+    withApplyingDeserializer(plan, (newPlan, objProj) => {
+      newPlan.executeCollect().map { row =>
+        // The row returned by SafeProjection is `SpecificInternalRow`, which ignore the data type
+        // parameter of its `get` method, so it's safe to use null here.
+        objProj(row).get(0, null).asInstanceOf[T]
+      }
+    })
   }
 
   private def sortInternal(global: Boolean, sortExprs: Seq[Column]): Dataset[T] = {
@@ -3445,12 +3439,21 @@ class Dataset[T] private[sql](
       attrs: Seq[Attribute],
       desireTypeTable: Map[String, StructField],
       timezone: String): Seq[NamedExpression] = attrs.map { attr =>
+    // To simplify the logic, we only handle AtomicType here: if we look for container/struct types
+    // we should also deal with other issues like order of columns which would really matter.
+    def canCastSafely(attrType: DataType, fieldType: DataType): Boolean = {
+      (attrType.isInstanceOf[AtomicType] && fieldType.isInstanceOf[AtomicType]) &&
+        Cast.canSafeCast(attrType.asInstanceOf[AtomicType], fieldType.asInstanceOf[AtomicType])
+    }
+
     desireTypeTable.get(attr.name) match {
-      case Some(field) =>
+      case Some(field)
+        if (!attr.dataType.sameType(field.dataType)) &&
+          canCastSafely(attr.dataType, field.dataType) =>
         Alias(Cast(attr, field.dataType, Some(timezone)), attr.name)(
           exprId = attr.exprId, qualifier = attr.qualifier,
           explicitMetadata = Some(attr.metadata))
-      case None => attr
+      case _ => attr
     }
   }
 

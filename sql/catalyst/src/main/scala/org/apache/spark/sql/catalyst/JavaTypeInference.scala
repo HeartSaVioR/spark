@@ -211,8 +211,7 @@ object JavaTypeInference {
                 c == classOf[java.lang.Double] ||
                 c == classOf[java.lang.Float] ||
                 c == classOf[java.lang.Byte] ||
-                c == classOf[java.lang.Boolean] ||
-                c == classOf[java.lang.String] =>
+                c == classOf[java.lang.Boolean] =>
         StaticInvoke(
           c,
           ObjectType(c),
@@ -235,6 +234,9 @@ object JavaTypeInference {
           "toJavaTimestamp",
           path :: Nil,
           returnNullable = false)
+
+      case c if c == classOf[java.lang.String] =>
+        Invoke(path, "toString", ObjectType(classOf[String]))
 
       case c if c == classOf[java.math.BigDecimal] =>
         Invoke(path, "toJavaBigDecimal", ObjectType(classOf[java.math.BigDecimal]))
