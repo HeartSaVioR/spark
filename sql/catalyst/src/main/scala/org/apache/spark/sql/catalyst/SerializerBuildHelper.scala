@@ -17,9 +17,10 @@
 
 package org.apache.spark.sql.catalyst
 
-import org.apache.spark.sql.catalyst.expressions.{CreateNamedStruct, Expression, IsNull, UnsafeArrayData}
+import org.apache.spark.sql.catalyst.DeserializerBuildHelper.expressionForNullableExpr
+import org.apache.spark.sql.catalyst.expressions.{CheckOverflow, CreateNamedStruct, Expression, If, IsNull, Literal, UnsafeArrayData}
 import org.apache.spark.sql.catalyst.expressions.objects._
-import org.apache.spark.sql.catalyst.util.{DateTimeUtils, GenericArrayData}
+import org.apache.spark.sql.catalyst.util.{ArrayData, DateTimeUtils, GenericArrayData}
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 
@@ -111,6 +112,17 @@ object SerializerBuildHelper {
     createSerializerForJavaBigDecimal(inputObject)
   }
 
+  def createSerializerForDecimalType(
+      inputObject: Expression,
+      decimalType: DecimalType): Expression = {
+    CheckOverflow(StaticInvoke(
+      Decimal.getClass,
+      decimalType,
+      "fromDecimal",
+      inputObject :: Nil,
+      returnNullable = false), decimalType)
+  }
+
   def createSerializerForJavaBigInteger(inputObject: Expression): Expression = {
     StaticInvoke(
       Decimal.getClass,
@@ -131,6 +143,17 @@ object SerializerBuildHelper {
       classOf[UnsafeArrayData],
       ArrayType(dataType, false),
       "fromPrimitiveArray",
+      inputObject :: Nil,
+      returnNullable = false)
+  }
+
+  def createSerializerForPrimitiveArrayViaArrayData(
+      inputObject: Expression,
+      arrayType: ArrayType): Expression = {
+    StaticInvoke(
+      classOf[ArrayData],
+      arrayType,
+      "toArrayData",
       inputObject :: Nil,
       returnNullable = false)
   }
@@ -172,6 +195,24 @@ object SerializerBuildHelper {
     )
   }
 
+  def convertKeysInMapToSeq(inputObject: Expression): Expression = {
+    convertIteratorInMapToSeq(inputObject, "keysIterator")
+  }
+
+  def convertValuesInMapToSeq(inputObject: Expression): Expression = {
+    convertIteratorInMapToSeq(inputObject, "valuesIterator")
+  }
+
+  private def convertIteratorInMapToSeq(
+      inputObject: Expression,
+      methodNameForIterator: String): Expression = {
+    Invoke(
+      Invoke(inputObject, methodNameForIterator, ObjectType(classOf[scala.collection.Iterator[_]]),
+        returnNullable = false),
+      "toSeq",
+      ObjectType(classOf[scala.collection.Seq[_]]), returnNullable = false)
+  }
+
   private def argumentsForFieldSerializer(
       fieldName: String,
       serializerForFieldValue: Expression): Seq[Expression] = {
@@ -188,11 +229,45 @@ object SerializerBuildHelper {
     expressions.If(IsNull(inputObject), nullOutput, nonNullOutput)
   }
 
+  def createSerializerForExternalRow(
+      inputObject: Expression,
+      fields: Array[StructField],
+      fnSerializerFor: (Expression, DataType) => Expression): Expression = {
+    val nonNullOutput = CreateNamedStruct(fields.zipWithIndex.flatMap { case (field, index) =>
+      val fieldValue = fnSerializerFor(
+        ValidateExternalType(
+          GetExternalRowField(inputObject, index, field.name),
+          field.dataType),
+        field.dataType)
+      val convertedField = if (field.nullable) {
+        If(
+          Invoke(inputObject, "isNullAt", BooleanType, Literal(index) :: Nil),
+          // Because we strip UDTs, `field.dataType` can be different from `fieldValue.dataType`.
+          // We should use `fieldValue.dataType` here.
+          Literal.create(null, fieldValue.dataType),
+          fieldValue
+        )
+      } else {
+        fieldValue
+      }
+      Literal(field.name) :: convertedField :: Nil
+    })
+
+    if (inputObject.nullable) {
+      expressionForNullableExpr(inputObject, nonNullOutput.dataType, nonNullOutput)
+    } else {
+      nonNullOutput
+    }
+  }
+
   def createSerializerForUserDefinedType(
       inputObject: Expression,
       udt: UserDefinedType[_],
-      udtClass: Class[_]): Expression = {
-    val obj = NewInstance(udtClass, Nil, dataType = ObjectType(udtClass))
-    Invoke(obj, "serialize", udt, inputObject :: Nil)
+      udtClass: Class[_],
+      propagateNull: Boolean = true,
+      returnNullable: Boolean = true): Expression = {
+    val obj = NewInstance(udtClass, Nil, dataType = ObjectType(udtClass),
+      propagateNull = propagateNull)
+    Invoke(obj, "serialize", udt, inputObject :: Nil, returnNullable = returnNullable)
   }
 }

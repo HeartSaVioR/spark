@@ -17,10 +17,12 @@
 
 package org.apache.spark.sql.catalyst
 
+import scala.collection.Map
+
 import org.apache.spark.sql.catalyst.analysis.UnresolvedExtractValue
-import org.apache.spark.sql.catalyst.expressions.{Expression, GetStructField, UpCast}
-import org.apache.spark.sql.catalyst.expressions.objects.{AssertNotNull, Invoke, StaticInvoke}
-import org.apache.spark.sql.catalyst.util.DateTimeUtils
+import org.apache.spark.sql.catalyst.expressions.{Expression, GetStructField, If, IsNull, Literal, UpCast}
+import org.apache.spark.sql.catalyst.expressions.objects._
+import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, DateTimeUtils}
 import org.apache.spark.sql.types._
 
 object DeserializerBuildHelper {
@@ -53,6 +55,13 @@ object DeserializerBuildHelper {
     val casted = upCastToExpectedType(expr, dataType, walkedTypePath)
     expressionWithNullSafety(funcForCreatingDeserializer(casted, walkedTypePath),
       nullable, walkedTypePath)
+  }
+
+  def expressionForNullableExpr(
+      expr: Expression,
+      dataType: DataType,
+      newExprWhenNotNull: Expression): Expression = {
+    If(IsNull(expr), Literal.create(null, dataType), newExprWhenNotNull)
   }
 
   def expressionWithNullSafety(
@@ -141,6 +150,32 @@ object DeserializerBuildHelper {
   def createDeserializerForScalaBigInt(path: Expression): Expression = {
     Invoke(path, "toScalaBigInt", ObjectType(classOf[scala.math.BigInt]),
       returnNullable = false)
+  }
+
+  def createDeserializerForScalaArray(arrayData: Expression): Expression = {
+    StaticInvoke(
+      scala.collection.mutable.WrappedArray.getClass,
+      ObjectType(classOf[Seq[_]]),
+      "make",
+      arrayData :: Nil,
+      returnNullable = false)
+  }
+
+  def createDeserializerForScalaMap(keyData: Expression, valueData: Expression): Expression = {
+    StaticInvoke(
+      ArrayBasedMapData.getClass,
+      ObjectType(classOf[Map[_, _]]),
+      "toScalaMap",
+      keyData :: valueData :: Nil,
+      returnNullable = false)
+  }
+
+  def createDeserializerForUserDefinedType(
+      inputObject: Expression,
+      udt: UserDefinedType[_],
+      udtClass: Class[_]): Expression = {
+    val obj = NewInstance(udtClass, Nil, dataType = ObjectType(udtClass))
+    Invoke(obj, "deserialize", ObjectType(udt.userClass), inputObject :: Nil)
   }
 
   /**
