@@ -27,6 +27,7 @@ import org.apache.spark.SparkEnv
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.kafka010.InternalKafkaConsumerPool._
 import org.apache.spark.sql.kafka010.KafkaDataConsumer.CacheKey
+import org.apache.spark.util.Utils
 
 /**
  * Provides object pool for [[InternalKafkaConsumer]] which is grouped by [[CacheKey]].
@@ -47,7 +48,7 @@ import org.apache.spark.sql.kafka010.KafkaDataConsumer.CacheKey
  */
 private[kafka010] class InternalKafkaConsumerPool(
     objectFactory: ObjectFactory,
-    poolConfig: PoolConfig) {
+    poolConfig: PoolConfig) extends Logging {
 
   // the class is intended to have only soft capacity
   assert(poolConfig.getMaxTotal < 0)
@@ -70,28 +71,50 @@ private[kafka010] class InternalKafkaConsumerPool(
    * the object will be kept in pool as active object.
    */
   def borrowObject(key: CacheKey, kafkaParams: ju.Map[String, Object]): InternalKafkaConsumer = {
-    updateKafkaParamForKey(key, kafkaParams)
+    val (ret, elapsed) = Utils.timeTakenMs {
+      updateKafkaParamForKey(key, kafkaParams)
 
-    if (getTotal == poolConfig.getSoftMaxTotal()) {
-      pool.clearOldest()
+      val softMaxCapacity = poolConfig.getSoftMaxTotal()
+      if (getTotal == softMaxCapacity) {
+        logWarning(s"KafkaConsumer cache hitting max capacity of $softMaxCapacity, " +
+          s"removing oldest consumer.")
+        pool.clearOldest()
+      }
+
+      logWarning(s"DEBUG: borrowing object for key $key ...")
+      pool.borrowObject(key)
     }
 
-    pool.borrowObject(key)
+    logWarning(s"DEBUG: borrowObject elapsed: $elapsed ms")
+
+    ret
   }
 
   /** Returns borrowed object to the pool. */
   def returnObject(consumer: InternalKafkaConsumer): Unit = {
-    pool.returnObject(extractCacheKey(consumer), consumer)
+    val (_, elapsed) = Utils.timeTakenMs {
+      pool.returnObject(extractCacheKey(consumer), consumer)
+    }
+
+    logWarning(s"DEBUG: returnObject elapsed: $elapsed ms")
   }
 
   /** Invalidates (destroy) borrowed object to the pool. */
   def invalidateObject(consumer: InternalKafkaConsumer): Unit = {
-    pool.invalidateObject(extractCacheKey(consumer), consumer)
+    val (_, elapsed) = Utils.timeTakenMs {
+      pool.invalidateObject(extractCacheKey(consumer), consumer)
+    }
+
+    logWarning(s"DEBUG: invalidateObject elapsed: $elapsed ms")
   }
 
   /** Invalidates all idle consumers for the key */
   def invalidateKey(key: CacheKey): Unit = {
-    pool.clear(key)
+    val (_, elapsed) = Utils.timeTakenMs {
+      pool.clear(key)
+    }
+
+    logWarning(s"DEBUG: invalidateKey elapsed: $elapsed ms")
   }
 
   /**

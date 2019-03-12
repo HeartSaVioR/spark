@@ -29,7 +29,7 @@ import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.apache.spark.SparkEnv
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.kafka010.KafkaDataConsumer.{CacheKey, UNKNOWN_OFFSET}
-import org.apache.spark.util.ThreadUtils
+import org.apache.spark.util.{ThreadUtils, Utils}
 
 /**
  * Provides object pool for [[FetchedData]] which is grouped by [[CacheKey]].
@@ -81,52 +81,71 @@ private[kafka010] class FetchedDataPool extends Logging {
   def getNumTotal: Long = numTotalElements.sum()
 
   def acquire(key: CacheKey, desiredStartOffset: Long): FetchedData = synchronized {
-    val fetchedDataList = cache.getOrElseUpdate(key, new CachedFetchedDataList())
+    val (ret, elapsed) = Utils.timeTakenMs {
+      val fetchedDataList = cache.getOrElseUpdate(key, new CachedFetchedDataList())
 
-    val cachedFetchedDataOption = fetchedDataList.find { p =>
-      !p.inUse && p.getObject.nextOffsetInFetchedData == desiredStartOffset
+      val cachedFetchedDataOption = fetchedDataList.find { p =>
+        !p.inUse && p.getObject.nextOffsetInFetchedData == desiredStartOffset
+      }
+
+      var cachedFetchedData: CachedFetchedData = null
+      if (cachedFetchedDataOption.isDefined) {
+        logWarning(s"DEBUG: cache hit on fetch for key $key and offset $desiredStartOffset")
+
+        cachedFetchedData = cachedFetchedDataOption.get
+      } else {
+        logWarning(s"DEBUG: cache miss on fetch for key $key and offset $desiredStartOffset")
+
+        cachedFetchedData = CachedFetchedData.empty()
+        fetchedDataList += cachedFetchedData
+
+        numCreatedFetchedData.increment()
+        numTotalElements.increment()
+      }
+
+      cachedFetchedData.lastAcquiredTimestamp = System.currentTimeMillis()
+      cachedFetchedData.inUse = true
+
+      cachedFetchedData.getObject
     }
 
-    var cachedFetchedData: CachedFetchedData = null
-    if (cachedFetchedDataOption.isDefined) {
-      cachedFetchedData = cachedFetchedDataOption.get
-    } else {
-      cachedFetchedData = CachedFetchedData.empty()
-      fetchedDataList += cachedFetchedData
+    logWarning(s"DEBUG: acquire fetched data from key $key and offset $desiredStartOffset " +
+      s"took $elapsed ms")
 
-      numCreatedFetchedData.increment()
-      numTotalElements.increment()
-    }
-
-    cachedFetchedData.lastAcquiredTimestamp = System.currentTimeMillis()
-    cachedFetchedData.inUse = true
-
-    cachedFetchedData.getObject
+    ret
   }
 
   def invalidate(key: CacheKey): Unit = synchronized {
-    cache.remove(key) match {
-      case Some(lst) => numTotalElements.add(-1 * lst.size)
-      case None =>
+    val (_, elapsed) = Utils.timeTakenMs {
+      cache.remove(key) match {
+        case Some(lst) => numTotalElements.add(-1 * lst.size)
+        case None =>
+      }
     }
+
+    logWarning(s"DEBUG: invalidate for key $key took $elapsed ms")
   }
 
   def release(key: CacheKey, fetchedData: FetchedData): Unit = synchronized {
-    cache.get(key) match {
-      case Some(fetchedDataList) =>
-        val cachedFetchedDataOption = fetchedDataList.find { p =>
-          p.inUse && p.getObject == fetchedData
-        }
+    val (_, elapsed) = Utils.timeTakenMs {
+      cache.get(key) match {
+        case Some(fetchedDataList) =>
+          val cachedFetchedDataOption = fetchedDataList.find { p =>
+            p.inUse && p.getObject == fetchedData
+          }
 
-        if (cachedFetchedDataOption.isDefined) {
-          val cachedFetchedData = cachedFetchedDataOption.get
-          cachedFetchedData.inUse = false
-          cachedFetchedData.lastReleasedTimestamp = System.currentTimeMillis()
-        }
+          if (cachedFetchedDataOption.isDefined) {
+            val cachedFetchedData = cachedFetchedDataOption.get
+            cachedFetchedData.inUse = false
+            cachedFetchedData.lastReleasedTimestamp = System.currentTimeMillis()
+          }
 
-      case None => logWarning(s"No matching data in pool for $fetchedData in key $key. " +
-        "It might be released before, or it was not a part of pool.")
+        case None => logWarning(s"No matching data in pool for $fetchedData in key $key. " +
+          "It might be released before, or it was not a part of pool.")
+      }
     }
+
+    logWarning(s"DEBUG: release for key $key and fetchData $fetchedData took $elapsed ms")
   }
 
   def shutdown(): Unit = {
@@ -144,14 +163,18 @@ private[kafka010] class FetchedDataPool extends Logging {
   }
 
   private def removeIdleFetchedData(): Unit = synchronized {
-    val timestamp = System.currentTimeMillis()
-    val maxAllowedIdleTimestamp = timestamp - minEvictableIdleTimeMillis
-    cache.values.foreach { p: CachedFetchedDataList =>
-      val idles = p.filter(q => !q.inUse && q.lastReleasedTimestamp < maxAllowedIdleTimestamp)
-      val lstSize = p.size
-      idles.foreach(idle => p -= idle)
-      numTotalElements.add(-1 * (lstSize - p.size))
+    val (_, elapsed) = Utils.timeTakenMs {
+      val timestamp = System.currentTimeMillis()
+      val maxAllowedIdleTimestamp = timestamp - minEvictableIdleTimeMillis
+      cache.values.foreach { p: CachedFetchedDataList =>
+        val idles = p.filter(q => !q.inUse && q.lastReleasedTimestamp < maxAllowedIdleTimestamp)
+        val lstSize = p.size
+        idles.foreach(idle => p -= idle)
+        numTotalElements.add(-1 * (lstSize - p.size))
+      }
     }
+
+    logWarning(s"DEBUG: removing idle fetched data took $elapsed ms")
   }
 }
 
