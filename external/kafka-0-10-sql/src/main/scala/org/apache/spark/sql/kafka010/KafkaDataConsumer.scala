@@ -574,67 +574,77 @@ private[kafka010] object KafkaDataConsumer extends Logging {
       topicPartition: TopicPartition,
       kafkaParams: ju.Map[String, Object],
       useCache: Boolean): KafkaDataConsumer = synchronized {
-    val key = new CacheKey(topicPartition, kafkaParams)
-    val existingInternalConsumer = cache.get(key)
+    val (ret, elapsed) = Utils.timeTakenMs {
+      val key = new CacheKey(topicPartition, kafkaParams)
+      val existingInternalConsumer = cache.get(key)
 
-    lazy val newInternalConsumer = new InternalKafkaConsumer(topicPartition, kafkaParams)
+      lazy val newInternalConsumer = new InternalKafkaConsumer(topicPartition, kafkaParams)
 
-    if (TaskContext.get != null && TaskContext.get.attemptNumber >= 1) {
-      // If this is reattempt at running the task, then invalidate cached consumer if any and
-      // start with a new one.
-      if (existingInternalConsumer != null) {
-        // Consumer exists in cache. If its in use, mark it for closing later, or close it now.
-        if (existingInternalConsumer.inUse) {
-          existingInternalConsumer.markedForClose = true
-        } else {
-          existingInternalConsumer.close()
+      if (TaskContext.get != null && TaskContext.get.attemptNumber >= 1) {
+        // If this is reattempt at running the task, then invalidate cached consumer if any and
+        // start with a new one.
+        if (existingInternalConsumer != null) {
+          // Consumer exists in cache. If its in use, mark it for closing later, or close it now.
+          if (existingInternalConsumer.inUse) {
+            existingInternalConsumer.markedForClose = true
+          } else {
+            existingInternalConsumer.close()
+          }
         }
+        cache.remove(key)  // Invalidate the cache in any case
+        NonCachedKafkaDataConsumer(newInternalConsumer)
+
+      } else if (!useCache) {
+        // If planner asks to not reuse consumers, then do not use it, return a new consumer
+        NonCachedKafkaDataConsumer(newInternalConsumer)
+
+      } else if (existingInternalConsumer == null) {
+        // If consumer is not already cached, then put a new in the cache and return it
+        cache.put(key, newInternalConsumer)
+        newInternalConsumer.inUse = true
+        CachedKafkaDataConsumer(newInternalConsumer)
+
+      } else if (existingInternalConsumer.inUse) {
+        // If consumer is already cached but is currently in use, then return a new consumer
+        NonCachedKafkaDataConsumer(newInternalConsumer)
+
+      } else {
+        // If consumer is already cached and is currently not in use, then return that consumer
+        existingInternalConsumer.inUse = true
+        CachedKafkaDataConsumer(existingInternalConsumer)
       }
-      cache.remove(key)  // Invalidate the cache in any case
-      NonCachedKafkaDataConsumer(newInternalConsumer)
-
-    } else if (!useCache) {
-      // If planner asks to not reuse consumers, then do not use it, return a new consumer
-      NonCachedKafkaDataConsumer(newInternalConsumer)
-
-    } else if (existingInternalConsumer == null) {
-      // If consumer is not already cached, then put a new in the cache and return it
-      cache.put(key, newInternalConsumer)
-      newInternalConsumer.inUse = true
-      CachedKafkaDataConsumer(newInternalConsumer)
-
-    } else if (existingInternalConsumer.inUse) {
-      // If consumer is already cached but is currently in use, then return a new consumer
-      NonCachedKafkaDataConsumer(newInternalConsumer)
-
-    } else {
-      // If consumer is already cached and is currently not in use, then return that consumer
-      existingInternalConsumer.inUse = true
-      CachedKafkaDataConsumer(existingInternalConsumer)
     }
+
+    logWarning(s"DEBUG: acquire for $topicPartition took $elapsed ms")
+
+    ret
   }
 
   private def release(intConsumer: InternalKafkaConsumer): Unit = {
     synchronized {
 
-      // Clear the consumer from the cache if this is indeed the consumer present in the cache
-      val key = new CacheKey(intConsumer.topicPartition, intConsumer.kafkaParams)
-      val cachedIntConsumer = cache.get(key)
-      if (intConsumer.eq(cachedIntConsumer)) {
-        // The released consumer is the same object as the cached one.
-        if (intConsumer.markedForClose) {
-          intConsumer.close()
-          cache.remove(key)
+      val (_, elapsed) = Utils.timeTakenMs {
+        // Clear the consumer from the cache if this is indeed the consumer present in the cache
+        val key = new CacheKey(intConsumer.topicPartition, intConsumer.kafkaParams)
+        val cachedIntConsumer = cache.get(key)
+        if (intConsumer.eq(cachedIntConsumer)) {
+          // The released consumer is the same object as the cached one.
+          if (intConsumer.markedForClose) {
+            intConsumer.close()
+            cache.remove(key)
+          } else {
+            intConsumer.inUse = false
+          }
         } else {
-          intConsumer.inUse = false
+          // The released consumer is either not the same one as in the cache, or not in the cache
+          // at all. This may happen if the cache was invalidate while this consumer was being used.
+          // Just close this consumer.
+          intConsumer.close()
+          logInfo(s"Released a supposedly cached consumer that was not found in the cache")
         }
-      } else {
-        // The released consumer is either not the same one as in the cache, or not in the cache
-        // at all. This may happen if the cache was invalidate while this consumer was being used.
-        // Just close this consumer.
-        intConsumer.close()
-        logInfo(s"Released a supposedly cached consumer that was not found in the cache")
       }
+
+      logWarning(s"DEBUG: release for $intConsumer took $elapsed ms")
     }
   }
 }
