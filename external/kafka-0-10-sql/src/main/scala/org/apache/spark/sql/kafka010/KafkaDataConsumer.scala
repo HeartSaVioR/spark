@@ -105,6 +105,8 @@ private[kafka010] class InternalKafkaConsumer(
 
   /** Create a KafkaConsumer to fetch records for `topicPartition` */
   private def createConsumer: KafkaConsumer[Array[Byte], Array[Byte]] = {
+    logWarning(s"DEBUG: creating new Kafka consumer for $topicPartition")
+
     val updatedKafkaParams = KafkaConfigUpdater("executor", kafkaParams.asScala.toMap)
       .setAuthenticationConfigIfNeeded()
       .build()
