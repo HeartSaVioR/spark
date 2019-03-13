@@ -31,7 +31,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.kafka010.KafkaConfigUpdater
 import org.apache.spark.sql.kafka010.KafkaDataConsumer.{AvailableOffsetRange, UNKNOWN_OFFSET}
 import org.apache.spark.sql.kafka010.KafkaSourceProvider._
-import org.apache.spark.util.{ShutdownHookManager, UninterruptibleThread}
+import org.apache.spark.util.{ShutdownHookManager, UninterruptibleThread, Utils}
 
 /**
  * This class simplifies the usages of Kafka consumer in Spark SQL Kafka connector.
@@ -489,8 +489,13 @@ private[kafka010] class KafkaDataConsumer(
    */
   private def fetchData(consumer: InternalKafkaConsumer, fetchedData: FetchedData, offset: Long,
                         pollTimeoutMs: Long): Unit = {
-    val (records, offsetAfterPoll) = consumer.fetch(offset, pollTimeoutMs)
-    fetchedData.withNewPoll(records.listIterator, offsetAfterPoll)
+    val (_, elapsedMs) = Utils.timeTakenMs {
+      val (records, offsetAfterPoll) = consumer.fetch(offset, pollTimeoutMs)
+      fetchedData.withNewPoll(records.listIterator, offsetAfterPoll)
+    }
+
+    logWarning(s"DEBUG: fetching data from Kafka consumer - partition ${consumer.topicPartition}" +
+      s" / offset $offset - took $elapsedMs ms")
   }
 
   private def getOrRetrieveConsumer(): InternalKafkaConsumer = _consumer match {
