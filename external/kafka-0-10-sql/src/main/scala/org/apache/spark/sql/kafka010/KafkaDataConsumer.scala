@@ -320,15 +320,23 @@ private[kafka010] class KafkaDataConsumer(
    * must call method after using the instance to make sure resources are not leaked.
    */
   def release(): Unit = {
-    if (_consumer.isDefined) {
-      consumerPool.returnObject(_consumer.get)
-      _consumer = None
+    val intConsumer = _consumer.orNull
+    val fetchedData = _fetchedData.orNull
+
+    val (_, elapsed) = Utils.timeTakenMs {
+      if (_consumer.isDefined) {
+        consumerPool.returnObject(_consumer.get)
+        _consumer = None
+      }
+
+      if (_fetchedData.isDefined) {
+        fetchedDataPool.release(cacheKey, _fetchedData.get)
+        _fetchedData = None
+      }
     }
 
-    if (_fetchedData.isDefined) {
-      fetchedDataPool.release(cacheKey, _fetchedData.get)
-      _fetchedData = None
-    }
+    logWarning(s"DEBUG: release for consumer $intConsumer and fetched data $fetchedData " +
+      s"took $elapsed ms")
   }
 
   /**
@@ -498,14 +506,23 @@ private[kafka010] class KafkaDataConsumer(
       s" / offset $offset - took $elapsedMs ms")
   }
 
-  private def getOrRetrieveConsumer(): InternalKafkaConsumer = _consumer match {
-    case None =>
-      _consumer = Option(consumerPool.borrowObject(cacheKey, kafkaParams))
-      require(_consumer.isDefined, "borrowing consumer from pool must always succeed.")
-      _consumer.get
+  private def getOrRetrieveConsumer(): InternalKafkaConsumer = {
+    val (ret, elapsed) = Utils.timeTakenMs {
+      _consumer match {
+        case None =>
+          _consumer = Option(consumerPool.borrowObject(cacheKey, kafkaParams))
+          require(_consumer.isDefined, "borrowing consumer from pool must always succeed.")
+          _consumer.get
 
-    case Some(consumer) => consumer
+        case Some(consumer) => consumer
+      }
+    }
+
+    logWarning(s"DEBUG: acquire for $topicPartition took $elapsed ms")
+
+    ret
   }
+
 
   private def getOrRetrieveFetchedData(offset: Long): FetchedData = _fetchedData match {
     case None =>
