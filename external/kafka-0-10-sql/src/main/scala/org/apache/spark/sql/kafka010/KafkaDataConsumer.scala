@@ -30,7 +30,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.kafka010.KafkaConfigUpdater
 import org.apache.spark.sql.kafka010.KafkaDataConsumer.AvailableOffsetRange
 import org.apache.spark.sql.kafka010.KafkaSourceProvider._
-import org.apache.spark.util.UninterruptibleThread
+import org.apache.spark.util.{UninterruptibleThread, Utils}
 
 private[kafka010] sealed trait KafkaDataConsumer {
   /**
@@ -469,30 +469,36 @@ private[kafka010] case class InternalKafkaConsumer(
    *                          consumer polls nothing before timeout.
    */
   private def fetchData(offset: Long, pollTimeoutMs: Long): Unit = {
-    // Seek to the offset because we may call seekToBeginning or seekToEnd before this.
-    seek(offset)
-    val p = consumer.poll(pollTimeoutMs)
-    val r = p.records(topicPartition)
-    logDebug(s"Polled $groupId ${p.partitions()}  ${r.size}")
-    val offsetAfterPoll = consumer.position(topicPartition)
-    logDebug(s"Offset changed from $offset to $offsetAfterPoll after polling")
-    fetchedData.withNewPoll(r.listIterator, offsetAfterPoll)
-    if (!fetchedData.hasNext) {
-      // We cannot fetch anything after `poll`. Two possible cases:
-      // - `offset` is out of range so that Kafka returns nothing. `OffsetOutOfRangeException` will
-      //   be thrown.
-      // - Cannot fetch any data before timeout. `TimeoutException` will be thrown.
-      // - Fetched something but all of them are not invisible. This is a valid case and let the
-      //   caller handles this.
-      val range = getAvailableOffsetRange()
-      if (offset < range.earliest || offset >= range.latest) {
-        throw new OffsetOutOfRangeException(
-          Map(topicPartition -> java.lang.Long.valueOf(offset)).asJava)
-      } else if (offset == offsetAfterPoll) {
-        throw new TimeoutException(
-          s"Cannot fetch record for offset $offset in $pollTimeoutMs milliseconds")
+    val (_, elapsedMs) = Utils.timeTakenMs {
+      // Seek to the offset because we may call seekToBeginning or seekToEnd before this.
+      seek(offset)
+      val p = consumer.poll(pollTimeoutMs)
+      val r = p.records(topicPartition)
+      logDebug(s"Polled $groupId ${p.partitions()}  ${r.size}")
+      val offsetAfterPoll = consumer.position(topicPartition)
+      logDebug(s"Offset changed from $offset to $offsetAfterPoll after polling")
+      fetchedData.withNewPoll(r.listIterator, offsetAfterPoll)
+      if (!fetchedData.hasNext) {
+        // We cannot fetch anything after `poll`. Two possible cases:
+        // - `offset` is out of range so that Kafka returns nothing.
+        //   `OffsetOutOfRangeException` will be thrown.
+        // - Cannot fetch any data before timeout. `TimeoutException` will be thrown.
+        // - Fetched something but all of them are not invisible. This is a valid case and let the
+        //   caller handles this.
+        val range = getAvailableOffsetRange()
+        if (offset < range.earliest || offset >= range.latest) {
+          throw new OffsetOutOfRangeException(
+            Map(topicPartition -> java.lang.Long.valueOf(offset)).asJava)
+        } else if (offset == offsetAfterPoll) {
+          throw new TimeoutException(
+            s"Cannot fetch record for offset $offset in $pollTimeoutMs milliseconds")
+        }
       }
     }
+
+    logWarning(s"DEBUG: fetching data from Kafka consumer - partition $topicPartition" +
+      s" / offset $offset - took $elapsedMs ms")
+
   }
 }
 
