@@ -18,8 +18,14 @@
 package test.org.apache.spark.sql;
 
 import java.io.Serializable;
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 
+import org.apache.spark.api.java.function.MapFunction;
+import org.apache.spark.api.java.function.ReduceFunction;
 import org.apache.spark.sql.*;
 import org.apache.spark.sql.catalyst.expressions.GenericRow;
 import org.apache.spark.sql.types.DataTypes;
@@ -27,6 +33,7 @@ import org.apache.spark.sql.types.StructType;
 import org.junit.*;
 
 import org.apache.spark.sql.test.TestSparkSession;
+import scala.Tuple2;
 
 public class JavaBeanDeserializationSuite implements Serializable {
 
@@ -215,6 +222,35 @@ public class JavaBeanDeserializationSuite implements Serializable {
     // This would figure out that null value will not become "null".
     record.setNullIntField(null);
     return record;
+  }
+
+  @Test
+  public void testSpark27050() {
+    StructType schema = StructType.fromDDL(
+        "brokerName string, order integer, serverName string, " +
+            "storages array<struct<timestamp: timestamp, storage: double>>");
+
+    List<RecordSpark27050Entity> expectedRecords = new ArrayList<>();
+    RecordSpark27050Storage nested = new RecordSpark27050Storage(
+        java.sql.Timestamp.valueOf(
+            LocalDateTime.parse("2018-10-29T23:11:44Z",
+                DateTimeFormatter.ISO_INSTANT.withZone(ZoneId.systemDefault()))),
+        12.5);
+    expectedRecords.add(
+        new RecordSpark27050Entity("A1", "S1", 1, new RecordSpark27050Storage[] { nested }));
+
+    Dataset<RecordSpark27050Entity> ds = spark.read().option("multiline", "true")
+        .schema(schema).json("src/test/resources/test-data/spark-27050.json")
+        .as(Encoders.bean(RecordSpark27050Entity.class));
+    List<RecordSpark27050Entity> records = ds
+        .groupByKey((MapFunction<RecordSpark27050Entity, String>) o -> o.getBrokerName(),
+            Encoders.STRING())
+        .reduceGroups((ReduceFunction<RecordSpark27050Entity>) (e1, e2) -> e1)
+        .map((MapFunction<Tuple2<String, RecordSpark27050Entity>, RecordSpark27050Entity>) tuple ->
+            tuple._2, Encoders.bean(RecordSpark27050Entity.class))
+        .collectAsList();
+
+    Assert.assertEquals(expectedRecords, records);
   }
 
   private static Row createRecordSpark22000FailToUpcastRow(Long index) {
@@ -507,6 +543,136 @@ public class JavaBeanDeserializationSuite implements Serializable {
 
     public void setId(Integer id) {
       this.id = id;
+    }
+  }
+
+  public static final class RecordSpark27050Entity {
+    private String brokerName;
+    private String serverName;
+    private Integer order;
+    private RecordSpark27050Storage[] storages;
+
+    public RecordSpark27050Entity() { }
+
+    public RecordSpark27050Entity(
+        String brokerName,
+        String serverName,
+        Integer order,
+        RecordSpark27050Storage[] storages) {
+      this.brokerName = brokerName;
+      this.serverName = serverName;
+      this.order = order;
+      this.storages = storages;
+    }
+
+    public String getBrokerName() {
+      return brokerName;
+    }
+
+    public void setBrokerName(String brokerName) {
+      this.brokerName = brokerName;
+    }
+
+    public String getServerName() {
+      return serverName;
+    }
+
+    public void setServerName(String serverName) {
+      this.serverName = serverName;
+    }
+
+    public Integer getOrder() {
+      return order;
+    }
+
+    public void setOrder(Integer order) {
+      this.order = order;
+    }
+
+    public RecordSpark27050Storage[] getStorages() {
+      return storages;
+    }
+
+    public void setStorages(RecordSpark27050Storage[] storages) {
+      this.storages = storages;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (o == null || getClass() != o.getClass()) return false;
+      RecordSpark27050Entity that = (RecordSpark27050Entity) o;
+      return Objects.equals(brokerName, that.brokerName) &&
+          Objects.equals(serverName, that.serverName) &&
+          Objects.equals(order, that.order) &&
+          Arrays.equals(storages, that.storages);
+    }
+
+    @Override
+    public int hashCode() {
+      int result = Objects.hash(brokerName, serverName, order);
+      result = 31 * result + Arrays.hashCode(storages);
+      return result;
+    }
+
+    @Override
+    public String toString() {
+      return com.google.common.base.Objects.toStringHelper(this)
+          .add("brokerName", brokerName)
+          .add("serverName", serverName)
+          .add("order", order)
+          .add("storages", Arrays.deepToString(storages))
+          .toString();
+    }
+  }
+
+  public static final class RecordSpark27050Storage {
+    private java.sql.Timestamp timestamp;
+    private Double storage;
+
+    public RecordSpark27050Storage() { }
+
+    public RecordSpark27050Storage(Timestamp timestamp, Double storage) {
+      this.timestamp = timestamp;
+      this.storage = storage;
+    }
+
+    public Timestamp getTimestamp() {
+      return timestamp;
+    }
+
+    public void setTimestamp(Timestamp timestamp) {
+      this.timestamp = timestamp;
+    }
+
+    public Double getStorage() {
+      return storage;
+    }
+
+    public void setStorage(Double storage) {
+      this.storage = storage;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (o == null || getClass() != o.getClass()) return false;
+      RecordSpark27050Storage that = (RecordSpark27050Storage) o;
+      return Objects.equals(timestamp, that.timestamp) &&
+          Objects.equals(storage, that.storage);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(timestamp, storage);
+    }
+
+    @Override
+    public String toString() {
+      return com.google.common.base.Objects.toStringHelper(this)
+          .add("timestamp", timestamp)
+          .add("storage", storage)
+          .toString();
     }
   }
 }
