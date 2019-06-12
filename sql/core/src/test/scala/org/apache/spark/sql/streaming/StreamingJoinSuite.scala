@@ -712,5 +712,59 @@ class StreamingOuterJoinSuite extends StreamTest with StateStoreMetricsTest with
       assertNumStateRows(total = 2, updated = 2)
     )
   }
+
+  /**
+   * Adds data to multiple memory streams such that all the data will be made visible in the
+   * same batch. This is applicable only to MicroBatchExecution, as this coordination cannot be
+   * performed at the driver in ContinuousExecutions.
+   */
+  object TripleMultiAddData {
+    def apply[A]
+    (source1: MemoryStream[A], data1: A*)(source2: MemoryStream[A], data2: A*)
+    (source3: MemoryStream[A], data3: A*): StreamAction = {
+      val actions = Seq(AddDataMemory(source1, data1), AddDataMemory(source2, data2),
+        AddDataMemory(source3, data3))
+      StreamProgressLockedActions(actions, desc = actions.mkString("[ ", " | ", " ]"))
+    }
+  }
+
+  // NOTE: This test explains the correctness issue on chained stream-stream joins
+  // due to global watermark.
+  test("chained stream-stream outer joins with append mode") {
+    def stream(prefix: String, multiplier: Int): (MemoryStream[Int], DataFrame) = {
+      val input = MemoryStream[Int]
+      val df = input.toDF
+        .select(
+          'value as s"${prefix}key",
+          'value.cast("timestamp") as s"${prefix}Time",
+          ('value * multiplier) as s"${prefix}Value")
+        .withWatermark(s"${prefix}Time", "0 seconds")
+
+      (input, df)
+    }
+
+    val (inputA, dfA) = stream("a", 2)
+    val (inputB, dfB) = stream("b", 3)
+    val (inputC, dfC) = stream("c", 5)
+
+    val firstJoin = dfA.join(dfB, expr("akey = bkey AND aTime = bTime"), "leftOuter")
+    val secondJoin = firstJoin.join(dfC, expr("akey = ckey AND aTime = cTime"), "leftOuter")
+        .select('akey, 'bkey, 'ckey)
+
+    testStream(secondJoin)(
+      TripleMultiAddData(inputA, 1, 2, 3)(inputB, 3)(inputC, 4, 5),
+      // Global watermark = 3
+
+      // Here Spark discards right-null rows in first join (1, null) and (2, null)
+      // in second join - as watermark goes to 3 => min(3, 5).
+      CheckNewAnswer((3, 3, null)),
+
+      // Just make sure watermark goes to 6, and (1, null) and (2, null) are
+      // clearly lost.
+      TripleMultiAddData(inputA, 6)(inputB, 6)(inputC, 6),
+      // Global watermark = 6
+      CheckNewAnswer((6, 6, 6))
+    )
+  }
 }
 
