@@ -2,7 +2,7 @@
 
 COUNT=0
 while true; do
-  build/sbt "sql/testOnly *ContinuousSuite -- -z \"query without test harness\"" > test-run-console.log 2>&1;
+  build/sbt -Djline.terminal=jline.UnsupportedTerminal "sql/testOnly *ContinuousSuite -- -z \"query without test harness\"" > test-run-console.log 2>&1;
   RET=$?
   grep "are not a superset of" test-run-console.log
   if [ $RET -ne 0 ]; then
