@@ -17,15 +17,14 @@
 
 package org.apache.spark.status
 
+import java.util
 import java.util.Collection
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable.{HashMap, ListBuffer}
-
 import com.google.common.util.concurrent.MoreExecutors
-
 import org.apache.spark.SparkConf
 import org.apache.spark.internal.config.Status._
 import org.apache.spark.status.ElementTrackingStore._
@@ -197,6 +196,9 @@ private[spark] class ElementTrackingStore(store: KVStore, conf: SparkConf) exten
       threshold: Long,
       action: Long => Unit)
 
+  override def metadataType(): Class[_] = store.metadataType()
+
+  override def types(): util.Set[Class[_]] = store.types()
 }
 
 private[spark] object ElementTrackingStore {

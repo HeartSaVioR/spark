@@ -84,6 +84,13 @@ private[spark] class ReplayListenerBus extends SparkListenerBus with Logging {
           currentLine = entry._1
           lineNumber = entry._2 + 1
 
+          // FIXME: DEBUG
+          if (lineNumber % 1000 == 0) {
+            // scalastyle:off println
+            println(s"DEBUG: Line number: $lineNumber")
+            // scalastyle:on println
+          }
+
           postToAll(JsonProtocol.sparkEventFromJson(parse(currentLine)))
         } catch {
           case e: ClassNotFoundException =>

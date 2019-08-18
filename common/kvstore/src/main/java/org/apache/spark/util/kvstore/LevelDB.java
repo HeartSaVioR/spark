@@ -30,6 +30,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Throwables;
 import org.fusesource.leveldbjni.JniDBFactory;
 import org.iq80.leveldb.DB;
+import org.iq80.leveldb.DBIterator;
 import org.iq80.leveldb.Options;
 import org.iq80.leveldb.WriteBatch;
 
@@ -63,6 +64,7 @@ public class LevelDB implements KVStore {
    */
   private final ConcurrentMap<String, byte[]> typeAliases;
   private final ConcurrentMap<Class<?>, LevelDBTypeInfo> types;
+  private Class<?> metadataType;
 
   public LevelDB(File path) throws Exception {
     this(path, new KVStoreSerializer());
@@ -109,8 +111,10 @@ public class LevelDB implements KVStore {
   public void setMetadata(Object value) throws Exception {
     if (value != null) {
       put(METADATA_KEY, value);
+      metadataType = value.getClass();
     } else {
       db().delete(METADATA_KEY);
+      metadataType = null;
     }
   }
 
@@ -195,6 +199,16 @@ public class LevelDB implements KVStore {
         }
       }
     };
+  }
+
+  @Override
+  public Class<?> metadataType() {
+    return metadataType;
+  }
+
+  @Override
+  public Set<Class<?>> types() {
+    return types.keySet();
   }
 
   @Override
