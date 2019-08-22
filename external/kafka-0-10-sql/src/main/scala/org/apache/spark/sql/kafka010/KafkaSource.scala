@@ -144,7 +144,9 @@ private[kafka010] class KafkaSource(
 
   private var currentPartitionOffsets: Option[Map[TopicPartition, Long]] = None
 
-  override def schema: StructType = KafkaOffsetReader.kafkaSchema(includeHeaders)
+  private val converter = new KafkaRecordToRowConverter()
+
+  override def schema: StructType = KafkaRecordToRowConverter.kafkaSchema(includeHeaders)
 
   /** Returns the maximum available offset for this source. */
   override def getOffset: Option[Offset] = {
@@ -302,12 +304,12 @@ private[kafka010] class KafkaSource(
       new KafkaSourceRDD(
       sc, executorKafkaParams, offsetRanges, pollTimeoutMs, failOnDataLoss,
       reuseKafkaConsumer = true)
-        .map(KafkaOffsetReader.toInternalRowWithHeaders)
+        .map(converter.toInternalRowWithHeaders)
     } else {
       new KafkaSourceRDD(
         sc, executorKafkaParams, offsetRanges, pollTimeoutMs, failOnDataLoss,
         reuseKafkaConsumer = true)
-        .map(KafkaOffsetReader.toInternalRowWithoutHeaders)
+        .map(converter.toInternalRowWithoutHeaders)
     }
 
     logInfo("GetBatch generating RDD of offset range: " +
