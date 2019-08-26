@@ -572,7 +572,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
 
   private[history] def shouldReloadLog(info: LogInfo, entry: FileStatus): Boolean = {
     var result = info.fileSize < entry.getLen
-    if (!result && info.logPath.endsWith(EventLoggingListener.IN_PROGRESS)) {
+    if (!result && info.logPath.endsWith(EventLogFileWriter.IN_PROGRESS)) {
       try {
         result = Utils.tryWithResource(fs.open(entry.getPath)) { in =>
           in.getWrappedStream match {
@@ -699,7 +699,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
     bus.addListener(listener)
 
     logInfo(s"Parsing $logPath for listing data...")
-    Utils.tryWithResource(EventLoggingListener.openEventLog(logPath, fs)) { in =>
+    Utils.tryWithResource(EventLogFileWriter.openEventLog(logPath, fs)) { in =>
       bus.replay(in, logPath.toString, !appCompleted, eventsFilter)
     }
 
@@ -723,7 +723,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
     // current position is, since the replay listener bus buffers data internally.
     val lookForEndEvent = shouldHalt && (appCompleted || !fastInProgressParsing)
     if (lookForEndEvent && listener.applicationInfo.isDefined) {
-      Utils.tryWithResource(EventLoggingListener.openEventLog(logPath, fs)) { in =>
+      Utils.tryWithResource(EventLogFileWriter.openEventLog(logPath, fs)) { in =>
         val target = fileStatus.getLen() - reparseChunkSize
         if (target > 0) {
           logInfo(s"Looking for end event; skipping $target bytes from $logPath...")
@@ -759,7 +759,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
         // For a finished log, remove the corresponding "in progress" entry from the listing DB if
         // the file is really gone.
         if (appCompleted) {
-          val inProgressLog = logPath.toString() + EventLoggingListener.IN_PROGRESS
+          val inProgressLog = logPath.toString() + EventLogFileWriter.IN_PROGRESS
           try {
             // Fetch the entry first to avoid an RPC when it's already removed.
             listing.read(classOf[LogInfo], inProgressLog)
@@ -968,7 +968,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
     try {
       val path = eventLog.getPath()
       logInfo(s"Parsing $path to re-build UI...")
-      Utils.tryWithResource(EventLoggingListener.openEventLog(path, fs)) { in =>
+      Utils.tryWithResource(EventLogFileWriter.openEventLog(path, fs)) { in =>
         replayBus.replay(in, path.toString(), maybeTruncated = !isCompleted(path.toString()))
       }
       trackingStore.close(false)
@@ -1064,7 +1064,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
     // At this point the disk data either does not exist or was deleted because it failed to
     // load, so the event log needs to be replayed.
     val status = fs.getFileStatus(new Path(logDir, attempt.logPath))
-    val isCompressed = EventLoggingListener.codecName(status.getPath()).flatMap { name =>
+    val isCompressed = EventLogFileWriter.codecName(status.getPath()).flatMap { name =>
       Try(CompressionCodec.getShortName(name)).toOption
     }.isDefined
     logInfo(s"Leasing disk manager space for app $appId / ${attempt.info.attemptId}...")
@@ -1118,7 +1118,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
   }
 
   private def isCompleted(name: String): Boolean = {
-    !name.endsWith(EventLoggingListener.IN_PROGRESS)
+    !name.endsWith(EventLogFileWriter.IN_PROGRESS)
   }
 
 }

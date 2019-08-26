@@ -40,6 +40,7 @@ import org.apache.spark.metrics.{ExecutorMetricType, MetricsSystem}
 import org.apache.spark.scheduler.cluster.ExecutorInfo
 import org.apache.spark.util.{JsonProtocol, Utils}
 
+// FIXME: how to run same tests with both implementations?
 
 /**
  * Test whether EventLoggingListener logs events properly.
@@ -68,13 +69,14 @@ class EventLoggingListenerSuite extends SparkFunSuite with LocalSparkContext wit
     Utils.deleteRecursively(testDir)
   }
 
+  // FIXME: this may need to be moved to new 'EventLogWritersSuite' - single log file
   test("Verify log file exist") {
     // Verify logging directory exists
     val conf = getLoggingConf(testDirPath)
     val eventLogger = new EventLoggingListener("test", None, testDirPath.toUri(), conf)
     eventLogger.start()
 
-    val logPath = new Path(eventLogger.logPath + EventLoggingListener.IN_PROGRESS)
+    val logPath = new Path(eventLogger.logPath + EventLogFileWriter.IN_PROGRESS)
     assert(fileSystem.exists(logPath))
     val logStatus = fileSystem.getFileStatus(logPath)
     assert(!logStatus.isDirectory)
@@ -88,6 +90,7 @@ class EventLoggingListenerSuite extends SparkFunSuite with LocalSparkContext wit
     testEventLogging()
   }
 
+  // FIXME: this may need to be moved to new 'EventLogWritersSuite'
   test("spark.eventLog.compression.codec overrides spark.io.compression.codec") {
     val conf = new SparkConf
     conf.set(EVENT_LOG_COMPRESS, true)
@@ -108,10 +111,12 @@ class EventLoggingListenerSuite extends SparkFunSuite with LocalSparkContext wit
     }
   }
 
+  // TODO: simply run with single log file?
   test("End-to-end event logging") {
     testApplicationEventLogging()
   }
 
+  // TODO: simply run with single log file?
   test("End-to-end event logging with compression") {
     CompressionCodec.ALL_COMPRESSION_CODECS.foreach { codec =>
       testApplicationEventLogging(compressionCodec = Some(CompressionCodec.getShortName(codec)))
@@ -131,6 +136,7 @@ class EventLoggingListenerSuite extends SparkFunSuite with LocalSparkContext wit
     assert(redactedProps(key) == "*********(redacted)")
   }
 
+  // FIXME: this may need to be moved to new 'EventLogWritersSuite'
   test("Log overwriting") {
     val logUri = EventLoggingListener.getLogPath(testDir.toURI, "test", None)
     val logPath = new Path(logUri).toUri.getPath
@@ -142,6 +148,7 @@ class EventLoggingListenerSuite extends SparkFunSuite with LocalSparkContext wit
     testEventLogging(extraConf = Map(EVENT_LOG_OVERWRITE.key -> "true"))
   }
 
+  // FIXME: this may need to be moved to new 'EventLogWritersSuite'
   test("Event log name") {
     val baseDirUri = Utils.resolveURI("/base-dir")
     // without compression

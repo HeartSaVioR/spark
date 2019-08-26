@@ -174,6 +174,18 @@ package object config {
   private[spark] val EVENT_LOG_CALLSITE_LONG_FORM =
     ConfigBuilder("spark.eventLog.longForm.enabled").booleanConf.createWithDefault(false)
 
+  private[spark] val EVENT_LOG_ENABLE_ROLLING =
+    ConfigBuilder("spark.eventLog.rollLog")
+      // FIXME: doc...
+      .booleanConf.createWithDefault(false)
+
+  private[spark] val EVENT_LOG_ROLLED_EVENT_LOG_MAX_FILE_SIZE =
+    ConfigBuilder("spark.eventLog.rollLog.maxFileSize")
+      // FIXME: doc...
+      // .doc("... , in MiB unless otherwise specified.")
+      .bytesConf(ByteUnit.MiB)
+      .createWithDefault(100)
+
   private[spark] val EXECUTOR_ID =
     ConfigBuilder("spark.executor.id").stringConf.createOptional
 

@@ -112,7 +112,7 @@ class ReplayListenerSuite extends SparkFunSuite with BeforeAndAfter with LocalSp
     replayer.addListener(eventMonster)
 
     // Verify the replay returns the events given the input maybe truncated.
-    val logData = EventLoggingListener.openEventLog(logFilePath, fileSystem)
+    val logData = EventLogFileWriter.openEventLog(logFilePath, fileSystem)
     Utils.tryWithResource(new EarlyEOFInputStream(logData, buffered.size - 10)) { failingStream =>
       replayer.replay(failingStream, logFilePath.toString, true)
 
@@ -121,7 +121,7 @@ class ReplayListenerSuite extends SparkFunSuite with BeforeAndAfter with LocalSp
     }
 
     // Verify the replay throws the EOF exception since the input may not be truncated.
-    val logData2 = EventLoggingListener.openEventLog(logFilePath, fileSystem)
+    val logData2 = EventLogFileWriter.openEventLog(logFilePath, fileSystem)
     Utils.tryWithResource(new EarlyEOFInputStream(logData2, buffered.size - 10)) { failingStream2 =>
       intercept[EOFException] {
         replayer.replay(failingStream2, logFilePath.toString, false)
@@ -206,7 +206,7 @@ class ReplayListenerSuite extends SparkFunSuite with BeforeAndAfter with LocalSp
     assert(!eventLog.isDirectory)
 
     // Replay events
-    val logData = EventLoggingListener.openEventLog(eventLog.getPath(), fileSystem)
+    val logData = EventLogFileWriter.openEventLog(eventLog.getPath(), fileSystem)
     val eventMonster = new EventMonster(conf)
     try {
       val replayer = new ReplayListenerBus()

@@ -74,7 +74,7 @@ class FsHistoryProviderSuite extends SparkFunSuite with Matchers with Logging {
       appAttemptId: Option[String],
       inProgress: Boolean,
       codec: Option[String] = None): File = {
-    val ip = if (inProgress) EventLoggingListener.IN_PROGRESS else ""
+    val ip = if (inProgress) EventLogFileWriter.IN_PROGRESS else ""
     val logUri = EventLoggingListener.getLogPath(testDir.toURI, appId, appAttemptId)
     val logPath = new Path(logUri).toUri.getPath + ip
     new File(logPath)
@@ -198,13 +198,13 @@ class FsHistoryProviderSuite extends SparkFunSuite with Matchers with Logging {
     )
     updateAndCheck(provider) { list =>
       list.size should be (1)
-      provider.getAttempt("app1", None).logPath should endWith(EventLoggingListener.IN_PROGRESS)
+      provider.getAttempt("app1", None).logPath should endWith(EventLogFileWriter.IN_PROGRESS)
     }
 
     logFile1.renameTo(newLogFile("app1", None, inProgress = false))
     updateAndCheck(provider) { list =>
       list.size should be (1)
-      provider.getAttempt("app1", None).logPath should not endWith(EventLoggingListener.IN_PROGRESS)
+      provider.getAttempt("app1", None).logPath should not endWith(EventLogFileWriter.IN_PROGRESS)
     }
   }
 
@@ -1258,7 +1258,8 @@ class FsHistoryProviderSuite extends SparkFunSuite with Matchers with Logging {
     if (isNewFormat) {
       val newFormatStream = new FileOutputStream(file)
       Utils.tryWithSafeFinally {
-        EventLoggingListener.initEventLog(newFormatStream, false, null)
+        // FIXME: ......how to replace?......
+        EventLogFileWriter.initEventLog(newFormatStream, false, null)
       } {
         newFormatStream.close()
       }

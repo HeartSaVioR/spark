@@ -24,15 +24,13 @@ import java.nio.file.{Files, Paths}
 
 import scala.collection.mutable.ArrayBuffer
 import scala.io.Source
-
 import com.google.common.io.ByteStreams
 import org.apache.commons.io.FileUtils
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileStatus, FSDataInputStream, Path}
+import org.apache.hadoop.fs.{FSDataInputStream, FileStatus, Path}
 import org.scalatest.{BeforeAndAfterEach, Matchers}
 import org.scalatest.concurrent.{Signaler, ThreadSignaler, TimeLimits}
 import org.scalatest.time.SpanSugar._
-
 import org.apache.spark._
 import org.apache.spark.TestUtils
 import org.apache.spark.TestUtils.JavaSourceFromString
@@ -43,7 +41,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
 import org.apache.spark.internal.config.UI._
 import org.apache.spark.launcher.SparkLauncher
-import org.apache.spark.scheduler.EventLoggingListener
+import org.apache.spark.scheduler.{EventLogFileWriter, EventLoggingListener}
 import org.apache.spark.util.{CommandLineUtils, ResetSystemProperties, Utils}
 
 trait TestPrematureExit {
@@ -535,7 +533,7 @@ class SparkSubmitSuite
         unusedJar.toString)
       runSparkSubmit(args)
       val listStatus = fileSystem.listStatus(testDirPath)
-      val logData = EventLoggingListener.openEventLog(listStatus.last.getPath, fileSystem)
+      val logData = EventLogFileWriter.openEventLog(listStatus.last.getPath, fileSystem)
       Source.fromInputStream(logData).getLines().foreach { line =>
         assert(!line.contains("secret_password"))
       }
