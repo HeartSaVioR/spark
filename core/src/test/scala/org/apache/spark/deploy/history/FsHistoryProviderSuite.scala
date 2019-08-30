@@ -37,7 +37,7 @@ import org.mockito.Mockito.{doThrow, mock, spy, verify, when}
 import org.scalatest.Matchers
 import org.scalatest.concurrent.Eventually._
 
-import org.apache.spark.{SecurityManager, SparkConf, SparkFunSuite}
+import org.apache.spark.{SecurityManager, SPARK_VERSION, SparkConf, SparkFunSuite}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.DRIVER_LOG_DFS_DIR
 import org.apache.spark.internal.config.History._
@@ -75,7 +75,6 @@ class FsHistoryProviderSuite extends SparkFunSuite with Matchers with Logging {
       inProgress: Boolean,
       codec: Option[String] = None): File = {
     val ip = if (inProgress) EventLogFileWriter.IN_PROGRESS else ""
-    // FIXME: SingleEventLogFileWriter?
     val logUri = SingleEventLogFileWriter.getLogPath(testDir.toURI, appId, appAttemptId, codec)
     val logPath = new Path(logUri).toUri.getPath + ip
     new File(logPath)
@@ -89,7 +88,8 @@ class FsHistoryProviderSuite extends SparkFunSuite with Matchers with Logging {
 
   private def testAppLogParsing(inMemory: Boolean) {
     val clock = new ManualClock(12345678)
-    val provider = new FsHistoryProvider(createTestConf(inMemory = inMemory), clock)
+    val conf = createTestConf(inMemory = inMemory)
+    val provider = new FsHistoryProvider(conf, clock)
 
     // Write a new-style application log.
     val newAppComplete = newLogFile("new1", None, inProgress = false)
@@ -102,7 +102,7 @@ class FsHistoryProviderSuite extends SparkFunSuite with Matchers with Logging {
     // Write a new-style application log.
     val newAppCompressedComplete = newLogFile("new1compressed", None, inProgress = false,
       Some("lzf"))
-    writeFile(newAppCompressedComplete, true, None,
+    writeFile(newAppCompressedComplete, true, Some(CompressionCodec.createCodec(conf, "lzf")),
       SparkListenerApplicationStart(newAppCompressedComplete.getName(), Some("new-complete-lzf"),
         1L, "test", None),
       SparkListenerApplicationEnd(4L))
@@ -132,7 +132,7 @@ class FsHistoryProviderSuite extends SparkFunSuite with Matchers with Logging {
         val duration = if (end > 0) end - start else 0
         new ApplicationInfo(id, name, None, None, None, None,
           List(ApplicationAttemptInfo(None, new Date(start),
-            new Date(end), new Date(lastMod), duration, user, completed, "")))
+            new Date(end), new Date(lastMod), duration, user, completed, SPARK_VERSION)))
       }
 
       // For completed files, lastUpdated would be lastModified time.
@@ -1253,20 +1253,14 @@ class FsHistoryProviderSuite extends SparkFunSuite with Matchers with Logging {
 
   private def writeFile(file: File, isNewFormat: Boolean, codec: Option[CompressionCodec],
     events: SparkListenerEvent*) = {
-    // FIXME: SingleEventLogFileWriter?
     val fstream = new FileOutputStream(file)
     val cstream = codec.map(_.compressedOutputStream(fstream)).getOrElse(fstream)
     val bstream = new BufferedOutputStream(cstream)
     if (isNewFormat) {
-      val newFormatStream = new FileOutputStream(file)
-      Utils.tryWithSafeFinally {
-        val metadata = SparkListenerLogStart(org.apache.spark.SPARK_VERSION)
-        val eventJson = JsonProtocol.logStartToJson(metadata)
-        val metadataJson = compact(eventJson) + "\n"
-        newFormatStream.write(metadataJson.getBytes(StandardCharsets.UTF_8))
-      } {
-        newFormatStream.close()
-      }
+      val metadata = SparkListenerLogStart(org.apache.spark.SPARK_VERSION)
+      val eventJson = JsonProtocol.logStartToJson(metadata)
+      val metadataJson = compact(eventJson) + "\n"
+      bstream.write(metadataJson.getBytes(StandardCharsets.UTF_8))
     }
 
     val writer = new OutputStreamWriter(bstream, StandardCharsets.UTF_8)
