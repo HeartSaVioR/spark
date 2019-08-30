@@ -59,7 +59,8 @@ private[spark] class EventLoggingListener(
     this(appId, appAttemptId, logBaseDir, sparkConf,
       SparkHadoopUtil.get.newConfiguration(sparkConf))
 
-  private val logWriter: EventLogWriter = EventLogFileWriter.createEventLogFileWriter(
+  // For testing.
+  private[scheduler] val logWriter: EventLogWriter = EventLogFileWriter.createEventLogFileWriter(
     appId, appAttemptId, logBaseDir, sparkConf, hadoopConf)
 
   // For testing. Keep track of all JSON serialized events that have been logged.
@@ -83,7 +84,7 @@ private[spark] class EventLoggingListener(
   private def initEventLog(): Unit = {
     val metadata = SparkListenerLogStart(SPARK_VERSION)
     val eventJson = JsonProtocol.logStartToJson(metadata)
-    val metadataJson = compact(eventJson) + "\n"
+    val metadataJson = compact(eventJson)
     logWriter.writeEvent(metadataJson, flushLogger = true)
     if (testing && loggedEvents != null) {
       loggedEvents += eventJson

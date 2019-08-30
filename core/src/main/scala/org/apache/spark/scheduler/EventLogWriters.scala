@@ -19,14 +19,15 @@ package org.apache.spark.scheduler
 
 import java.io._
 import java.net.URI
-import java.nio.charset.StandardCharsets
 
 import scala.collection.mutable.Map
+
 import org.apache.commons.compress.utils.CountingOutputStream
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FSDataOutputStream, FileStatus, FileSystem, Path}
+import org.apache.hadoop.fs.{FileStatus, FileSystem, FSDataOutputStream, Path}
 import org.apache.hadoop.fs.permission.FsPermission
-import org.apache.spark.{SPARK_VERSION, SparkConf}
+
+import org.apache.spark.SparkConf
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
@@ -38,11 +39,7 @@ sealed trait EventLogWriter {
   def start(): Unit
   def writeEvent(eventJson: String, flushLogger: Boolean = false): Unit
   def stop(): Unit
-  def getLogPath(
-      logBaseDir: URI,
-      appId: String,
-      appAttemptId: Option[String],
-      compressionCodecName: Option[String] = None): String
+  def logPath: String
 }
 
 abstract class EventLogFileWriter(
@@ -64,7 +61,7 @@ abstract class EventLogFileWriter(
       None
     }
 
-  protected val compressionCodecName = compressionCodec.map { c =>
+  private[scheduler] val compressionCodecName = compressionCodec.map { c =>
     CompressionCodec.getShortName(c.getClass.getName)
   }
 
@@ -74,6 +71,7 @@ abstract class EventLogFileWriter(
     }
   }
 
+  // FIXME: document that CountingOutputStream doesn't count compression in underlying stream
   protected def initLogFile(path: Path): (Option[FSDataOutputStream],
     Option[CountingOutputStream]) = {
 
@@ -117,7 +115,7 @@ abstract class EventLogFileWriter(
 
   protected def renameFile(src: Path, dest: Path, overwrite: Boolean): Unit = {
     if (fileSystem.exists(dest)) {
-      if (shouldOverwrite) {
+      if (overwrite) {
         logWarning(s"Event log $dest already exists. Overwriting...")
         if (!fileSystem.delete(dest, true)) {
           logWarning(s"Error deleting $dest")
@@ -194,8 +192,8 @@ class SingleEventLogFileWriter(
     hadoopConf: Configuration)
   extends EventLogFileWriter(appId, appAttemptId, logBaseDir, sparkConf, hadoopConf) with Logging {
 
-  private val logPath = getLogPath(logBaseDir, appId, appAttemptId,
-    compressionCodecName)
+  override val logPath: String = SingleEventLogFileWriter.getLogPath(logBaseDir, appId,
+    appAttemptId, compressionCodecName)
 
   private val inProgressPath = logPath + EventLogFileWriter.IN_PROGRESS
 
@@ -232,41 +230,33 @@ class SingleEventLogFileWriter(
     writer.foreach(_.close())
     renameFile(new Path(inProgressPath), new Path(logPath), shouldOverwrite)
   }
-
-  /**
-    * Return a file-system-safe path to the log file for the given application.
-    *
-    * Note that because we currently only create a single log file for each application,
-    * we must encode all the information needed to parse this event log in the file name
-    * instead of within the file itself. Otherwise, if the file is compressed, for instance,
-    * we won't know which codec to use to decompress the metadata needed to open the file in
-    * the first place.
-    *
-    * The log file name will identify the compression codec used for the contents, if any.
-    * For example, app_123 for an uncompressed log, app_123.lzf for an LZF-compressed log.
-    *
-    * @param logBaseDir Directory where the log file will be written.
-    * @param appId A unique app ID.
-    * @param appAttemptId A unique attempt id of appId. May be the empty string.
-    * @param compressionCodecName Name to identify the codec used to compress the contents
-    *                             of the log, or None if compression is not enabled.
-    * @return A path which consists of file-system-safe characters.
-    */
-  override def getLogPath(
-      logBaseDir: URI,
-      appId: String,
-      appAttemptId: Option[String],
-      compressionCodecName: Option[String]): String = {
-    SingleEventLogFileWriter.getLogPath(logBaseDir, appId, appAttemptId, compressionCodecName)
-  }
 }
 
 object SingleEventLogFileWriter {
+  /**
+   * Return a file-system-safe path to the log file for the given application.
+   *
+   * Note that because we currently only create a single log file for each application,
+   * we must encode all the information needed to parse this event log in the file name
+   * instead of within the file itself. Otherwise, if the file is compressed, for instance,
+   * we won't know which codec to use to decompress the metadata needed to open the file in
+   * the first place.
+   *
+   * The log file name will identify the compression codec used for the contents, if any.
+   * For example, app_123 for an uncompressed log, app_123.lzf for an LZF-compressed log.
+   *
+   * @param logBaseDir Directory where the log file will be written.
+   * @param appId A unique app ID.
+   * @param appAttemptId A unique attempt id of appId. May be the empty string.
+   * @param compressionCodecName Name to identify the codec used to compress the contents
+   *                             of the log, or None if compression is not enabled.
+   * @return A path which consists of file-system-safe characters.
+   */
   def getLogPath(
       logBaseDir: URI,
       appId: String,
       appAttemptId: Option[String],
-      compressionCodecName: Option[String]): String = {
+      compressionCodecName: Option[String] = None): String = {
     val base = new Path(logBaseDir).toString.stripSuffix("/") + "/" + Utils.sanitizeDirName(appId)
     val codec = compressionCodecName.map("." + _).getOrElse("")
     if (appAttemptId.isDefined) {
@@ -312,7 +302,7 @@ class RollingEventLogFilesWriter(
 
   import RollingEventLogFilesWriter._
 
-  private val eventFileMaxLength = sparkConf.get(EVENT_LOG_ROLLED_EVENT_LOG_MAX_FILE_SIZE)
+  private val eventFileMaxLengthKiB = sparkConf.get(EVENT_LOG_ROLLED_EVENT_LOG_MAX_FILE_SIZE)
 
   private val logDirForAppPath = getAppEventLogDirPath(logBaseDir, appId, appAttemptId)
 
@@ -321,22 +311,32 @@ class RollingEventLogFilesWriter(
   private var countingOutputStream: Option[CountingOutputStream] = None
   private var writer: Option[PrintWriter] = None
 
-  // seq and event log path will be updated soon in rollNewEventLogFile, `start` is called
+  // seq and event log path will be updated soon in rollNewEventLogFile, which `start` will call
   private var sequence: Long = 0L
   private var currentEventLogFilePath: Path = logDirForAppPath
 
   override def start(): Unit = {
     requireLogBaseDirAsDirectory()
 
-    fileSystem.mkdirs(logDirForAppPath, EventLogFileWriter.LOG_FILE_PERMISSIONS)
-    createAppStatusFile(inProgress = true)
-    rollNewEventLogFile(None)
+    if (fileSystem.exists(logDirForAppPath) && shouldOverwrite) {
+      // try to delete the directory
+      fileSystem.delete(logDirForAppPath, true)
+    }
+
+    if (fileSystem.exists(logDirForAppPath)) {
+      // we tried to delete the existing one, but failed
+      throw new IOException(s"Target log directory already exists ($logDirForAppPath)")
+    } else {
+      fileSystem.mkdirs(logDirForAppPath, EventLogFileWriter.LOG_FILE_PERMISSIONS)
+      createAppStatusFile(inProgress = true)
+      rollNewEventLogFile(None)
+    }
   }
 
   override def writeEvent(eventJson: String, flushLogger: Boolean = false): Unit = {
     writer.foreach { w =>
       val currentLen = countingOutputStream.get.getBytesWritten
-      if (currentLen + eventJson.length > eventFileMaxLength) {
+      if (currentLen + eventJson.length > eventFileMaxLengthKiB * 1024) {
         rollNewEventLogFile(Some(w))
       }
     }
@@ -375,21 +375,13 @@ class RollingEventLogFilesWriter(
     renameFile(appStatusPathIncomplete, appStatusPathComplete, overwrite = true)
   }
 
-  override def getLogPath(
-      logBaseDir: URI,
-      appId: String,
-      appAttemptId: Option[String],
-      compressionCodecName: Option[String]): String = {
-    logDirForAppPath.toString
-  }
+  override def logPath: String = logDirForAppPath.toString
 
   private def createAppStatusFile(inProgress: Boolean): Unit = {
     val appStatusPath = getAppStatusFilePath(logDirForAppPath, inProgress)
     val streams = initLogFile(appStatusPath)
     val outputStream = streams._2.get
-    // scalastyle:off println
-    outputStream.write(SPARK_VERSION.getBytes(StandardCharsets.UTF_8))
-    // scalastyle:on println
+    // we intentionally create zero-byte file to minimize the cost
     outputStream.close()
   }
 }
@@ -405,11 +397,13 @@ object RollingEventLogFilesWriter {
     new Path(new Path(logBaseDir), dirName)
   }
 
+  // FIXME: may want to have appId & appAttemptId in here
   def getAppStatusFilePath(appLogDir: Path, inProgress: Boolean): Path = {
     val name = if (inProgress) "appstatus" + EventLogFileWriter.IN_PROGRESS else "appstatus"
     new Path(appLogDir, name)
   }
 
+  // FIXME: may want to have appId & appAttemptId in here
   def getEventLogFilePath(appLogDir: Path, seq: Long, codecName: Option[String]): Path = {
     val codec = codecName.map("." + _).getOrElse("")
     new Path(appLogDir, s"events_$seq$codec")
@@ -423,6 +417,7 @@ object RollingEventLogFilesWriter {
     path.getName.startsWith("events_")
   }
 
+  // FIXME: may want to have appId & appAttemptId in here
   def getSequence(eventLogFileName: String): Long = {
     require(eventLogFileName.startsWith("events_"), "Not a event log file!")
     val seq = eventLogFileName.stripPrefix("events_").split("\\.")(0)

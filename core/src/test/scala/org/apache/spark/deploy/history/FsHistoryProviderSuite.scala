@@ -75,7 +75,8 @@ class FsHistoryProviderSuite extends SparkFunSuite with Matchers with Logging {
       inProgress: Boolean,
       codec: Option[String] = None): File = {
     val ip = if (inProgress) EventLogFileWriter.IN_PROGRESS else ""
-    val logUri = EventLoggingListener.getLogPath(testDir.toURI, appId, appAttemptId)
+    // FIXME: SingleEventLogFileWriter?
+    val logUri = SingleEventLogFileWriter.getLogPath(testDir.toURI, appId, appAttemptId, codec)
     val logPath = new Path(logUri).toUri.getPath + ip
     new File(logPath)
   }
@@ -1252,14 +1253,17 @@ class FsHistoryProviderSuite extends SparkFunSuite with Matchers with Logging {
 
   private def writeFile(file: File, isNewFormat: Boolean, codec: Option[CompressionCodec],
     events: SparkListenerEvent*) = {
+    // FIXME: SingleEventLogFileWriter?
     val fstream = new FileOutputStream(file)
     val cstream = codec.map(_.compressedOutputStream(fstream)).getOrElse(fstream)
     val bstream = new BufferedOutputStream(cstream)
     if (isNewFormat) {
       val newFormatStream = new FileOutputStream(file)
       Utils.tryWithSafeFinally {
-        // FIXME: ......how to replace?......
-        EventLogFileWriter.initEventLog(newFormatStream, false, null)
+        val metadata = SparkListenerLogStart(org.apache.spark.SPARK_VERSION)
+        val eventJson = JsonProtocol.logStartToJson(metadata)
+        val metadataJson = compact(eventJson) + "\n"
+        newFormatStream.write(metadataJson.getBytes(StandardCharsets.UTF_8))
       } {
         newFormatStream.close()
       }

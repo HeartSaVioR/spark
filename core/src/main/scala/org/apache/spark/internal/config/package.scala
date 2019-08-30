@@ -182,9 +182,9 @@ package object config {
   private[spark] val EVENT_LOG_ROLLED_EVENT_LOG_MAX_FILE_SIZE =
     ConfigBuilder("spark.eventLog.rollLog.maxFileSize")
       // FIXME: doc...
-      // .doc("... , in MiB unless otherwise specified.")
-      .bytesConf(ByteUnit.MiB)
-      .createWithDefault(100)
+      // .doc("... , in KiB unless otherwise specified.")
+      .bytesConf(ByteUnit.KiB)
+      .createWithDefaultString("100m")
 
   private[spark] val EXECUTOR_ID =
     ConfigBuilder("spark.executor.id").stringConf.createOptional
