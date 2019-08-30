@@ -670,6 +670,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
     }
   }
 
+  // FIXME: it should handle rolled event logs as well
   /**
    * Replay the given log file, saving the application in the listing db.
    */
@@ -837,6 +838,8 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
       }
     }
 
+    // FIXME: may need to check against how to deal with rolled event log files as well
+
     // If the number of files is bigger than MAX_LOG_NUM,
     // clean up all completed attempts per application one by one.
     val num = listing.view(classOf[LogInfo]).index("lastProcessed").asScala.size
@@ -862,6 +865,8 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
     clearBlacklist(CLEAN_INTERVAL_S)
   }
 
+  // FIXME: need to see whether it works against directory as well, otherwise we should look
+  //   into directory and apply same logic.
   private def deleteAttemptLogs(
       app: ApplicationInfoWrapper,
       remaining: List[AttemptInfoWrapper],
@@ -944,6 +949,8 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
     }
   }
 
+  // FIXME: may need to indicate single event log / rolling event logs, but how?
+  //   - from FileStatus? or adding more parameters?
   /**
    * Rebuilds the application state store from its event log.
    */
@@ -968,6 +975,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
     try {
       val path = eventLog.getPath()
       logInfo(s"Parsing $path to re-build UI...")
+      // FIXME: do differently based on single vs rolled event logs
       Utils.tryWithResource(EventLogFileWriter.openEventLog(path, fs)) { in =>
         replayBus.replay(in, path.toString(), maybeTruncated = !isCompleted(path.toString()))
       }
@@ -1063,6 +1071,8 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
 
     // At this point the disk data either does not exist or was deleted because it failed to
     // load, so the event log needs to be replayed.
+
+    // FIXME: this needs to be updated to handle both of single/rolling event log
     val status = fs.getFileStatus(new Path(logDir, attempt.logPath))
     val isCompressed = EventLogFileWriter.codecName(status.getPath()).flatMap { name =>
       Try(CompressionCodec.getShortName(name)).toOption
@@ -1085,6 +1095,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
 
   private def createInMemoryStore(attempt: AttemptInfoWrapper): KVStore = {
     val store = new InMemoryStore()
+    // FIXME: this needs to be updated to handle both of single/rolling event log
     val status = fs.getFileStatus(new Path(logDir, attempt.logPath))
     rebuildAppStore(store, status, attempt.info.lastUpdated.getTime())
     store
@@ -1117,6 +1128,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
     deleted
   }
 
+  // FIXME: this needs to be updated to handle both of single/rolling event log
   private def isCompleted(name: String): Boolean = {
     !name.endsWith(EventLogFileWriter.IN_PROGRESS)
   }
