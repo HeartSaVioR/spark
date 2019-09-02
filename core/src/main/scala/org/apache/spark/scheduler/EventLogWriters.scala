@@ -158,10 +158,10 @@ object EventLogFileWriter {
   }
 
   /**
-    * Opens an event log file and returns an input stream that contains the event data.
-    *
-    * @return input stream that holds one JSON record per line.
-    */
+   * Opens an event log file and returns an input stream that contains the event data.
+   *
+   * @return input stream that holds one JSON record per line.
+   */
   def openEventLog(log: Path, fs: FileSystem): InputStream = {
     val in = new BufferedInputStream(fs.open(log))
     try {
@@ -223,9 +223,9 @@ class SingleEventLogFileWriter(
   }
 
   /**
-    * Stop logging events. The event log file will be renamed so that it loses the
-    * ".inprogress" suffix.
-    */
+   * Stop logging events. The event log file will be renamed so that it loses the
+   * ".inprogress" suffix.
+   */
   override def stop(): Unit = {
     writer.foreach(_.close())
     renameFile(new Path(inProgressPath), new Path(logPath), shouldOverwrite)
@@ -273,13 +273,18 @@ We will name the directory as:
 
 eventlog_v2_appId(_<appAttemptId>)
 
-The name doesn't contain ".inprogress" suffix, as renaming directory in S3 doesn't seem to be possible. Even it would be abstracted and supported in some libraries, it may require all belonging files to be renamed as well which the time complexity of renaming is O(N) where N is the size of the file. HDFS may support it trivially but that's not feasible if we also consider S3.
+The name doesn't contain ".inprogress" suffix, as renaming directory in S3
+doesn't seem to be possible. Even it would be abstracted and supported in some
+ libraries, it may require all belonging files to be renamed as well which the
+  time complexity of renaming is O(N) where N is the size of the file. HDFS may
+   support it trivially but that's not feasible if we also consider S3.
 
 We will name the event log files as:
 
 events_<sequence>_<appId>(_<appAttemptId>)(.<codec>)
 
-which "sequence" would be monotonically increasing value. So rolled event log files will look like:
+which "sequence" would be monotonically increasing value. So rolled event log files
+ will look like:
 
 events_1_<appId>(_<appAttemptId>)(.<codec>) <<== events_1
 events_2_<appId>(_<appAttemptId>)(.<codec>)
@@ -288,9 +293,11 @@ events_3_<appId>(_<appAttemptId>)(.<codec>)
 
 appstatus_<appId>(_<appAttemptId>)(.inprogress) <<== appstatus(.inprogress)
 
-We will write dummy data (like '1', or Spark version to help diagnose?) in both files, so that it would cost very tiny to rename even in S3. The reason having two files separately is to avoid concurrent renaming, as renaming "appstatus" will happen in driver (EventLoggingListener), whereas renaming "lastsnapshot" will happen in whatever which is in charge of snapshotting.
-
-<< lastsnapshot not required
+We will write dummy data (like '1', or Spark version to help diagnose?) in both files,
+ so that it would cost very tiny to rename even in S3. The reason having two files
+  separately is to avoid concurrent renaming, as renaming "appstatus" will happen
+   in driver (EventLoggingListener), whereas renaming "lastsnapshot" will happen
+    in whatever which is in charge of snapshotting.
  */
 class RollingEventLogFilesWriter(
     appId: String,
@@ -409,12 +416,24 @@ object RollingEventLogFilesWriter {
     new Path(appLogDir, s"events_$seq$codec")
   }
 
+  def isEventLogDir(status: FileStatus): Boolean = {
+    status.isDirectory && status.getPath.getName.startsWith("eventlog_v2_")
+  }
+
   def isEventLogFile(status: FileStatus): Boolean = {
     status.isFile && isEventLogFile(status.getPath)
   }
 
   def isEventLogFile(path: Path): Boolean = {
     path.getName.startsWith("events_")
+  }
+
+  def isAppStatusFile(status: FileStatus): Boolean = {
+    status.isFile && isAppStatusFile(status.getPath)
+  }
+
+  def isAppStatusFile(path: Path): Boolean = {
+    path.getName.startsWith("appstatus")
   }
 
   // FIXME: may want to have appId & appAttemptId in here

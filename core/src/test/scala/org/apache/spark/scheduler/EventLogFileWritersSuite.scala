@@ -416,14 +416,7 @@ class RollingEventLogFilesWriterSuite extends EventLogFileWritersSuite {
   }
 
   private def listEventLogFiles(logDirPath: Path): Seq[FileStatus] = {
-    val files = fileSystem.listFiles(logDirPath, false)
-    val eventLogFiles = mutable.ArrayBuffer[FileStatus]()
-    while (files.hasNext) {
-      val status = files.next()
-      if (isEventLogFile(status)) {
-        eventLogFiles.append(status)
-      }
-    }
-    eventLogFiles.sortBy(fs => getSequence(fs.getPath.getName))
+    fileSystem.listStatus(logDirPath).filter(isEventLogFile)
+      .sortBy(fs => getSequence(fs.getPath.getName))
   }
 }
