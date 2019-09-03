@@ -31,10 +31,31 @@ import org.apache.spark.io.CompressionCodec
 import org.apache.spark.scheduler.EventLogFileWriter.codecName
 import org.apache.spark.util.Utils
 
+abstract class EventLogFileReader(
+    protected val fileSystem: FileSystem,
+    protected val rootPath: Path) {
 
-// FIXME: javadoc!!
-sealed trait EventLogFileReader {
-  def rootPath: Path
+  protected def fileSizeForDFS(path: Path): Option[Long] = {
+    Utils.tryWithResource(fileSystem.open(path)) { in =>
+      in.getWrappedStream match {
+        case dfsIn: DFSInputStream => Some(dfsIn.getFileLength)
+        case _ => None
+      }
+    }
+  }
+
+  protected def addFileAsZipEntry(
+      zipStream: ZipOutputStream,
+      path: Path,
+      entryName: String): Unit = {
+    Utils.tryWithResource(fileSystem.open(path, 1 * 1024 * 1024)) { inputStream =>
+      zipStream.putNextEntry(new ZipEntry(entryName))
+      ByteStreams.copy(inputStream, zipStream)
+      zipStream.closeEntry()
+    }
+  }
+
+  // ================ methods to be override ================
 
   def lastSequence: Option[Long]
 
@@ -95,7 +116,6 @@ object EventLogFileReader {
     }
   }
 
-
   /**
    * Opens an event log file and returns an input stream that contains the event data.
    *
@@ -130,36 +150,22 @@ object EventLogFileReader {
 
 class SingleFileEventLogFileReader(
     fs: FileSystem,
-    override val rootPath: Path) extends EventLogFileReader {
+    path: Path) extends EventLogFileReader(fs, path) {
   // TODO: get stats with constructor and only call if it's needed?
-  private lazy val stats = fs.getFileStatus(rootPath)
+  private lazy val stats = fileSystem.getFileStatus(rootPath)
 
   override def lastSequence: Option[Long] = None
 
   override def fileSizeForLastSequence: Long = stats.getLen
 
-  override def completed: Boolean = {
-    !rootPath.getName.endsWith(EventLogFileWriter.IN_PROGRESS)
-  }
+  override def completed: Boolean = !rootPath.getName.endsWith(EventLogFileWriter.IN_PROGRESS)
 
-  override def fileSizeForLastSequenceForDFS: Option[Long] = {
-    Utils.tryWithResource(fs.open(rootPath)) { in =>
-      in.getWrappedStream match {
-        case dfsIn: DFSInputStream => Some(dfsIn.getFileLength)
-        case _ => None
-      }
-    }
-  }
+  override def fileSizeForLastSequenceForDFS: Option[Long] = fileSizeForDFS(rootPath)
 
   override def modificationTime: Long = stats.getModificationTime
 
-  override def zipEventLogFiles(zipStream: ZipOutputStream): Unit = {
-    Utils.tryWithResource(fs.open(rootPath, 1 * 1024 * 1024)) { inputStream =>
-      zipStream.putNextEntry(new ZipEntry(rootPath.getName))
-      ByteStreams.copy(inputStream, zipStream)
-      zipStream.closeEntry()
-    }
-  }
+  override def zipEventLogFiles(zipStream: ZipOutputStream): Unit =
+    addFileAsZipEntry(zipStream, rootPath, rootPath.getName)
 
   override def listEventLogFiles: Seq[FileStatus] = Seq(stats)
 
@@ -170,7 +176,7 @@ class SingleFileEventLogFileReader(
 
 class RollingEventLogFilesFileReader(
     fs: FileSystem,
-    override val rootPath: Path) extends EventLogFileReader {
+    path: Path) extends EventLogFileReader(fs, path) {
   import RollingEventLogFilesWriter._
 
   private lazy val files: Seq[FileStatus] = {
@@ -195,14 +201,8 @@ class RollingEventLogFilesFileReader(
     appStatsFile.exists(!_.getPath.getName.endsWith(EventLogFileWriter.IN_PROGRESS))
   }
 
-  override def fileSizeForLastSequenceForDFS: Option[Long] = {
-    Utils.tryWithResource(fs.open(lastEventLogFile.getPath)) { in =>
-      in.getWrappedStream match {
-        case dfsIn: DFSInputStream => Some(dfsIn.getFileLength)
-        case _ => None
-      }
-    }
-  }
+  override def fileSizeForLastSequenceForDFS: Option[Long] =
+    fileSizeForDFS(lastEventLogFile.getPath)
 
   override def modificationTime: Long = lastEventLogFile.getModificationTime
 
@@ -210,25 +210,19 @@ class RollingEventLogFilesFileReader(
     val dirEntryName = rootPath.getName + "/"
     zipStream.putNextEntry(new ZipEntry(dirEntryName))
     files.foreach { file =>
-      Utils.tryWithResource(fs.open(file.getPath, 1 * 1024 * 1024)) { inputStream =>
-        zipStream.putNextEntry(new ZipEntry(dirEntryName + file.getPath.getName))
-        ByteStreams.copy(inputStream, zipStream)
-        zipStream.closeEntry()
-      }
+      addFileAsZipEntry(zipStream, file.getPath, dirEntryName + file.getPath.getName)
     }
   }
 
   override def listEventLogFiles: Seq[FileStatus] = eventLogFiles
 
-  override def compression: Option[String] = {
-    EventLogFileWriter.codecName(eventLogFiles.head.getPath)
-  }
+  override def compression: Option[String] = EventLogFileWriter.codecName(
+    eventLogFiles.head.getPath)
 
   override def allSize: Long = eventLogFiles.map(_.getLen).sum
 
-  private def eventLogFiles: Seq[FileStatus] = {
-    files.filter(isEventLogFile).sortBy(stats => getSequence(stats.getPath.getName))
-  }
+  private def eventLogFiles: Seq[FileStatus] = files.filter(isEventLogFile)
+    .sortBy(stats => getSequence(stats.getPath.getName))
 
   private def lastEventLogFile: FileStatus = eventLogFiles.reverse.head
 }
