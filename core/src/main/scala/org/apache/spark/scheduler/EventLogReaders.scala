@@ -139,7 +139,7 @@ class RollingEventLogFilesReader(
   import RollingEventLogFilesWriter._
 
   private lazy val files: Seq[FileStatus] = {
-    val ret = fs.listStatus(rootPath).asInstanceOf[Seq[FileStatus]]
+    val ret = fs.listStatus(rootPath).toSeq
     require(ret.exists(isEventLogFile), "Log directory must contain at least one event log file!")
     require(ret.exists(isAppStatusFile), "Log directory must contain an appstatus file!")
     ret
@@ -155,7 +155,9 @@ class RollingEventLogFilesReader(
   override def fileSizeForLastSequence: Long = lastEventLogFile.getLen
 
   override def completed: Boolean = {
-    files.find(isAppStatusFile).exists(_.getPath.getName.endsWith(EventLogFileWriter.IN_PROGRESS))
+    val appStatsFile = files.find(isAppStatusFile)
+    require(appStatsFile.isDefined)
+    appStatsFile.exists(!_.getPath.getName.endsWith(EventLogFileWriter.IN_PROGRESS))
   }
 
   override def fileSizeForLastSequenceForDFS: Option[Long] = {

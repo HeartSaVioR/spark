@@ -33,6 +33,7 @@ import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
 import org.apache.spark.io.CompressionCodec
+import org.apache.spark.scheduler.EventLogTestHelper._
 import org.apache.spark.util.Utils
 
 
@@ -53,8 +54,6 @@ abstract class EventLogFileWritersSuite extends SparkFunSuite with LocalSparkCon
   after {
     Utils.deleteRecursively(testDir)
   }
-
-  def getUniqueApplicationId: String = "test-" + System.currentTimeMillis
 
   test("create EventLogFileWriter with enable/disable rolling") {
     def buildWriterAndVerify(conf: SparkConf, expectedClazz: Class[_]): Unit = {
@@ -126,21 +125,6 @@ abstract class EventLogFileWritersSuite extends SparkFunSuite with LocalSparkCon
     assert(writer2.compressionCodecName.contains("zstd"))
   }
 
-  /** Get a SparkConf with event logging enabled. */
-  protected def getLoggingConf(logDir: Path, compressionCodec: Option[String] = None): SparkConf = {
-    val conf = new SparkConf
-    conf.set(EVENT_LOG_ENABLED, true)
-    conf.set(EVENT_LOG_BLOCK_UPDATES, true)
-    conf.set(EVENT_LOG_TESTING, true)
-    conf.set(EVENT_LOG_DIR, logDir.toString)
-    compressionCodec.foreach { codec =>
-      conf.set(EVENT_LOG_COMPRESS, true)
-      conf.set(EVENT_LOG_COMPRESSION_CODEC, codec)
-    }
-    conf.set(EVENT_LOG_STAGE_EXECUTOR_METRICS, true)
-    conf
-  }
-
   protected def readLinesFromEventLogFile(log: Path, fs: FileSystem): List[String] = {
     val logDataStream = EventLogFileWriter.openEventLog(log, fs)
     try {
@@ -150,7 +134,6 @@ abstract class EventLogFileWritersSuite extends SparkFunSuite with LocalSparkCon
     }
   }
 
-  // FIXME: we may need to have reader interface and implementations at all
   protected def createWriter(
       appId: String,
       appAttemptId : Option[String],
@@ -158,7 +141,6 @@ abstract class EventLogFileWritersSuite extends SparkFunSuite with LocalSparkCon
       sparkConf: SparkConf,
       hadoopConf: Configuration): EventLogFileWriter
 
-  // FIXME: return lines instead of verifying in this method? it's less flexible
   protected def verifyWriteEventLogFile(
       appId: String,
       appAttemptId : Option[String],
@@ -335,7 +317,7 @@ class RollingEventLogFilesWriterSuite extends EventLogFileWritersSuite {
       val appId = getUniqueApplicationId
       val attemptId = None
 
-      val conf = getLoggingConf(testDirPath)
+      val conf = getLoggingConf(testDirPath, codecShortName)
       conf.set(EVENT_LOG_ENABLE_ROLLING, true)
       conf.set(EVENT_LOG_ROLLED_EVENT_LOG_MAX_FILE_SIZE.key, "1k")
 
@@ -361,7 +343,7 @@ class RollingEventLogFilesWriterSuite extends EventLogFileWritersSuite {
       assertEventLogFilesSequence(eventLogFiles, 3, 1024 * 1024)
 
       verifyWriteEventLogFile(appId, attemptId, testDirPath.toUri,
-        None, isCompleted = false, expectedLines)
+        codecShortName, isCompleted = false, expectedLines)
 
       writer.stop()
 
@@ -369,7 +351,7 @@ class RollingEventLogFilesWriterSuite extends EventLogFileWritersSuite {
       assertEventLogFilesSequence(eventLogFiles2, 3, 1024 * 1024)
 
       verifyWriteEventLogFile(appId, attemptId, testDirPath.toUri,
-        None, isCompleted = true, expectedLines)
+        codecShortName, isCompleted = true, expectedLines)
     }
   }
 

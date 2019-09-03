@@ -360,9 +360,7 @@ class RollingEventLogFilesWriter(
   }
 
   private def rollNewEventLogFile(w: Option[PrintWriter]): Unit = {
-    if (w.isDefined) {
-      w.get.close()
-    }
+    writer.foreach(_.close())
 
     sequence += 1
     currentEventLogFilePath = getEventLogFilePath(logDirForAppPath, sequence, compressionCodecName)
@@ -372,6 +370,8 @@ class RollingEventLogFilesWriter(
     countingOutputStream = streams._2
     if (countingOutputStream.isDefined) {
       writer = Some(new PrintWriter(streams._2.get))
+    } else {
+      writer = None
     }
   }
 
