@@ -446,11 +446,15 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
               // that the entry is not deleted from the SHS listing. Also update the file size, in
               // case the code below decides we don't need to parse the log.
               listing.write(info.copy(lastProcessed = newLastScanTime,
-                fileSize = reader.fileSizeForLastSequence, lastSequence = reader.lastSequence))
+                fileSize = reader.fileSizeForLastSequence, lastSequence = reader.lastSequence,
+                isComplete = reader.completed))
             }
 
             if (shouldReloadLog(info, reader)) {
-              if (info.appId.isDefined && fastInProgressParsing) {
+              // ignore fastInProgressParsing when the status of application is changed from
+              // in-progress to completed, which is needed for rolling event log.
+              if (info.appId.isDefined && (info.isComplete == reader.completed) &&
+                fastInProgressParsing) {
                 // When fast in-progress parsing is on, we don't need to re-parse when the
                 // size changes, but we do need to invalidate any existing UIs.
                 // Also, we need to update the `lastUpdated time` to display the updated time in
@@ -490,7 +494,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
               // to parse it. This will allow the cleaner code to detect the file as stale later on
               // if it was not possible to parse it.
               listing.write(LogInfo(reader.rootPath.toString(), newLastScanTime, LogType.EventLogs,
-                None, None, reader.fileSizeForLastSequence, reader.lastSequence))
+                None, None, reader.fileSizeForLastSequence, reader.lastSequence, reader.completed))
               reader.fileSizeForLastSequence > 0
           }
         }
@@ -567,16 +571,26 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
   }
 
   private[history] def shouldReloadLog(info: LogInfo, reader: EventLogFileReader): Boolean = {
-    var result = info.fileSize < reader.fileSizeForLastSequence
-    if (!result && !reader.completed) {
-      try {
-        result = reader.fileSizeForLastSequenceForDFS.exists(info.fileSize < _)
-      } catch {
-        case e: Exception =>
-          logDebug(s"Failed to check the length for the file : ${info.logPath}", e)
+    if (info.isComplete != reader.completed) {
+      true
+    } else {
+      var result = if (info.lastSequence.isDefined) {
+        require(reader.lastSequence.isDefined)
+        info.lastSequence.get < reader.lastSequence.get ||
+          info.fileSize < reader.fileSizeForLastSequence
+      } else {
+        info.fileSize < reader.fileSizeForLastSequence
       }
+      if (!result && !reader.completed) {
+        try {
+          result = reader.fileSizeForLastSequenceForDFS.exists(info.fileSize < _)
+        } catch {
+          case e: Exception =>
+            logDebug(s"Failed to check the length for the file : ${info.logPath}", e)
+        }
+      }
+      result
     }
-    result
   }
 
   private[history] def shouldReloadLog(info: LogInfo, entry: FileStatus): Boolean = {
@@ -751,7 +765,8 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
         invalidateUI(app.info.id, app.attempts.head.info.attemptId)
         addListing(app)
         listing.write(LogInfo(logPath.toString(), scanTime, LogType.EventLogs, Some(app.info.id),
-          app.attempts.head.info.attemptId, reader.fileSizeForLastSequence, reader.lastSequence))
+          app.attempts.head.info.attemptId, reader.fileSizeForLastSequence, reader.lastSequence,
+          reader.completed))
 
         // For a finished log, remove the corresponding "in progress" entry from the listing DB if
         // the file is really gone.
@@ -783,7 +798,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
         // does not make progress after the configured max log age.
         listing.write(
           LogInfo(logPath.toString(), scanTime, LogType.EventLogs, None, None,
-            reader.fileSizeForLastSequence, reader.lastSequence))
+            reader.fileSizeForLastSequence, reader.lastSequence, reader.completed))
     }
   }
 
@@ -918,7 +933,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
           case e: NoSuchElementException =>
             // For every new driver log file discovered, create a new entry in listing
             listing.write(LogInfo(f.getPath().toString(), currentTime, LogType.DriverLogs, None,
-              None, f.getLen(), None))
+              None, f.getLen(), None, false))
           false
         }
       if (deleteFile) {
@@ -1160,7 +1175,8 @@ private[history] case class LogInfo(
     appId: Option[String],
     attemptId: Option[String],
     fileSize: Long,
-    lastSequence: Option[Long])
+    lastSequence: Option[Long],
+    isComplete: Boolean)
 
 private[history] class AttemptInfoWrapper(
     val info: ApplicationAttemptInfo,
