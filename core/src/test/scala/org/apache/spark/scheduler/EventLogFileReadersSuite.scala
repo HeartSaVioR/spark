@@ -26,7 +26,7 @@ import scala.collection.mutable
 
 import com.google.common.io.{ByteStreams, Files}
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
+import org.apache.hadoop.fs.Path
 import org.scalatest.BeforeAndAfter
 
 import org.apache.spark.{LocalSparkContext, SparkConf, SparkFunSuite}
@@ -37,7 +37,7 @@ import org.apache.spark.io.CompressionCodec
 import org.apache.spark.scheduler.EventLogTestHelper._
 import org.apache.spark.util.Utils
 
-abstract class EventLogReadersSuite extends SparkFunSuite with LocalSparkContext
+abstract class EventLogFileReadersSuite extends SparkFunSuite with LocalSparkContext
   with BeforeAndAfter with Logging {
 
   protected val fileSystem = Utils.getHadoopFileSystem("/",
@@ -55,15 +55,15 @@ abstract class EventLogReadersSuite extends SparkFunSuite with LocalSparkContext
     Utils.deleteRecursively(testDir)
   }
 
-  test("Retrieve EventLogReader correctly") {
+  test("Retrieve EventLogFileReader correctly") {
     def assertInstanceOfEventLogReader(
-        expectedClazz: Option[Class[_ <: EventLogReader]],
-        actual: Option[EventLogReader]): Unit = {
+        expectedClazz: Option[Class[_ <: EventLogFileReader]],
+        actual: Option[EventLogFileReader]): Unit = {
       if (expectedClazz.isEmpty) {
-        assert(actual.isEmpty, s"Expected no EventLogReader instance but was " +
+        assert(actual.isEmpty, s"Expected no EventLogFileReader instance but was " +
           s"${actual.map(_.getClass).getOrElse("<None>")}")
       } else {
-        assert(actual.isDefined, s"Expected an EventLogReader instance but was empty")
+        assert(actual.isDefined, s"Expected an EventLogFileReader instance but was empty")
         assert(expectedClazz.get.isAssignableFrom(actual.get.getClass),
           s"Expected ${expectedClazz.get} but was ${actual.get.getClass}")
       }
@@ -72,7 +72,7 @@ abstract class EventLogReadersSuite extends SparkFunSuite with LocalSparkContext
     def testForPathWithoutSeq(
         path: Path,
         isFile: Boolean,
-        expectedClazz: Option[Class[_ <: EventLogReader]]): Unit = {
+        expectedClazz: Option[Class[_ <: EventLogFileReader]]): Unit = {
       if (isFile) {
         Utils.tryWithResource(fileSystem.create(path)) { is =>
           is.writeInt(10)
@@ -81,25 +81,25 @@ abstract class EventLogReadersSuite extends SparkFunSuite with LocalSparkContext
         fileSystem.mkdirs(path)
       }
 
-      val reader = EventLogReaders.getEventLogReader(fileSystem, path)
+      val reader = EventLogFileReaders.getEventLogReader(fileSystem, path)
       assertInstanceOfEventLogReader(expectedClazz, reader)
-      val reader2 = EventLogReaders.getEventLogReader(fileSystem,
+      val reader2 = EventLogFileReaders.getEventLogReader(fileSystem,
         fileSystem.getFileStatus(path))
       assertInstanceOfEventLogReader(expectedClazz, reader)
     }
 
     // path with no last sequence - single event log
-    val reader1 = EventLogReaders.getEventLogReader(fileSystem, new Path(testDirPath, "aaa"), None)
-    assertInstanceOfEventLogReader(Some(classOf[SingleFileEventLogReader]), Some(reader1))
+    val reader1 = EventLogFileReaders.getEventLogReader(fileSystem, new Path(testDirPath, "aaa"), None)
+    assertInstanceOfEventLogReader(Some(classOf[SingleFileEventLogFileReader]), Some(reader1))
 
     // path with last sequence - rolling event log
-    val reader2 = EventLogReaders.getEventLogReader(fileSystem,
+    val reader2 = EventLogFileReaders.getEventLogReader(fileSystem,
       new Path(testDirPath, "eventlog_v2_aaa"), Some(3))
-    assertInstanceOfEventLogReader(Some(classOf[RollingEventLogFilesReader]), Some(reader2))
+    assertInstanceOfEventLogReader(Some(classOf[RollingEventLogFilesFileReader]), Some(reader2))
 
     // path - file (both path and FileStatus)
     val eventLogFile = new Path(testDirPath, "bbb")
-    testForPathWithoutSeq(eventLogFile, isFile = true, Some(classOf[SingleFileEventLogReader]))
+    testForPathWithoutSeq(eventLogFile, isFile = true, Some(classOf[SingleFileEventLogFileReader]))
 
     // path - file starting with "."
     val invalidEventLogFile = new Path(testDirPath, ".bbb")
@@ -107,7 +107,8 @@ abstract class EventLogReadersSuite extends SparkFunSuite with LocalSparkContext
 
     // path - directory with "eventlog_v2_" prefix
     val eventLogDir = new Path(testDirPath, "eventlog_v2_ccc")
-    testForPathWithoutSeq(eventLogDir, isFile = false, Some(classOf[RollingEventLogFilesReader]))
+    testForPathWithoutSeq(eventLogDir, isFile = false,
+      Some(classOf[RollingEventLogFilesFileReader]))
 
     // path - directory with no "eventlog_v2_" prefix
     val invalidEventLogDir = new Path(testDirPath, "ccc")
@@ -133,7 +134,8 @@ abstract class EventLogReadersSuite extends SparkFunSuite with LocalSparkContext
       dummyData.foreach(writer.writeEvent(_, flushLogger = true))
 
       val logPathIncompleted = getCurrentLogPath(writer.logPath, isCompleted = false)
-      val readerOpt = EventLogReaders.getEventLogReader(fileSystem, new Path(logPathIncompleted))
+      val readerOpt = EventLogFileReaders.getEventLogReader(fileSystem,
+        new Path(logPathIncompleted))
       assertAppropriateReader(readerOpt)
       val reader = readerOpt.get
 
@@ -142,7 +144,7 @@ abstract class EventLogReadersSuite extends SparkFunSuite with LocalSparkContext
       writer.stop()
 
       val logPathCompleted = getCurrentLogPath(writer.logPath, isCompleted = true)
-      val readerOpt2 = EventLogReaders.getEventLogReader(fileSystem, new Path(logPathCompleted))
+      val readerOpt2 = EventLogFileReaders.getEventLogReader(fileSystem, new Path(logPathCompleted))
       assertAppropriateReader(readerOpt2)
       val reader2 = readerOpt2.get
 
@@ -159,16 +161,16 @@ abstract class EventLogReadersSuite extends SparkFunSuite with LocalSparkContext
 
   protected def getCurrentLogPath(logPath: String, isCompleted: Boolean): String
 
-  protected def assertAppropriateReader(actualReader: Option[EventLogReader]): Unit
+  protected def assertAppropriateReader(actualReader: Option[EventLogFileReader]): Unit
 
   protected def verifyReader(
-      reader: EventLogReader,
+      reader: EventLogFileReader,
       logPath: Path,
       compressionCodecShortName: Option[String],
       isCompleted: Boolean): Unit
 }
 
-class SingleFileEventLogReaderSuite extends EventLogReadersSuite {
+class SingleFileEventLogFileReaderSuite extends EventLogFileReadersSuite {
   override protected def createWriter(
       appId: String,
       appAttemptId: Option[String],
@@ -178,9 +180,9 @@ class SingleFileEventLogReaderSuite extends EventLogReadersSuite {
     new SingleEventLogFileWriter(appId, appAttemptId, logBaseDir, sparkConf, hadoopConf)
   }
 
-  override protected def assertAppropriateReader(actualReader: Option[EventLogReader]): Unit = {
+  override protected def assertAppropriateReader(actualReader: Option[EventLogFileReader]): Unit = {
     assert(actualReader.isDefined, s"Expected an EventLogReader instance but was empty")
-    assert(actualReader.get.isInstanceOf[SingleFileEventLogReader],
+    assert(actualReader.get.isInstanceOf[SingleFileEventLogFileReader],
       s"Expected SingleFileEventLogReader but was ${actualReader.get.getClass}")
   }
 
@@ -189,7 +191,7 @@ class SingleFileEventLogReaderSuite extends EventLogReadersSuite {
   }
 
   override protected def verifyReader(
-      reader: EventLogReader,
+      reader: EventLogFileReader,
       logPath: Path,
       compressionCodecShortName: Option[String],
       isCompleted: Boolean): Unit = {
@@ -225,7 +227,7 @@ class SingleFileEventLogReaderSuite extends EventLogReadersSuite {
   }
 }
 
-class RollingEventLogFilesReaderSuite extends EventLogReadersSuite {
+class RollingEventLogFilesReaderSuite extends EventLogFileReadersSuite {
   allCodecs.foreach { codecShortName =>
     test(s"rolling event log files - codec $codecShortName") {
       val appId = getUniqueApplicationId
@@ -252,14 +254,15 @@ class RollingEventLogFilesReaderSuite extends EventLogReadersSuite {
       }
 
       val logPathIncompleted = getCurrentLogPath(writer.logPath, isCompleted = false)
-      val readerOpt = EventLogReaders.getEventLogReader(fileSystem, new Path(logPathIncompleted))
+      val readerOpt = EventLogFileReaders.getEventLogReader(fileSystem,
+        new Path(logPathIncompleted))
       verifyReader(readerOpt.get, new Path(logPathIncompleted), codecShortName, isCompleted = false)
       assert(readerOpt.get.listEventLogFiles.length === 3)
 
       writer.stop()
 
       val logPathCompleted = getCurrentLogPath(writer.logPath, isCompleted = true)
-      val readerOpt2 = EventLogReaders.getEventLogReader(fileSystem, new Path(logPathCompleted))
+      val readerOpt2 = EventLogFileReaders.getEventLogReader(fileSystem, new Path(logPathCompleted))
       verifyReader(readerOpt2.get, new Path(logPathCompleted), codecShortName, isCompleted = true)
       assert(readerOpt.get.listEventLogFiles.length === 3)
     }
@@ -274,16 +277,16 @@ class RollingEventLogFilesReaderSuite extends EventLogReadersSuite {
     new RollingEventLogFilesWriter(appId, appAttemptId, logBaseDir, sparkConf, hadoopConf)
   }
 
-  override protected def assertAppropriateReader(actualReader: Option[EventLogReader]): Unit = {
+  override protected def assertAppropriateReader(actualReader: Option[EventLogFileReader]): Unit = {
     assert(actualReader.isDefined, s"Expected an EventLogReader instance but was empty")
-    assert(actualReader.get.isInstanceOf[RollingEventLogFilesReader],
+    assert(actualReader.get.isInstanceOf[RollingEventLogFilesFileReader],
       s"Expected RollingEventLogFilesReader but was ${actualReader.get.getClass}")
   }
 
   override protected def getCurrentLogPath(logPath: String, isCompleted: Boolean): String = logPath
 
   override protected def verifyReader(
-      reader: EventLogReader,
+      reader: EventLogFileReader,
       logPath: Path,
       compressionCodecShortName: Option[String],
       isCompleted: Boolean): Unit = {

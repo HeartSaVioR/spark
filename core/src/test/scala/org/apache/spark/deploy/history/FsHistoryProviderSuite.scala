@@ -161,7 +161,7 @@ class FsHistoryProviderSuite extends SparkFunSuite with Matchers with Logging {
     class TestFsHistoryProvider extends FsHistoryProvider(createTestConf()) {
       var mergeApplicationListingCall = 0
       override protected def mergeApplicationListing(
-          reader: EventLogReader,
+          reader: EventLogFileReader,
           lastSeen: Long,
           enableSkipToEnd: Boolean): Unit = {
         super.mergeApplicationListing(reader, lastSeen, enableSkipToEnd)

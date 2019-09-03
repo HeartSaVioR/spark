@@ -26,7 +26,7 @@ import org.apache.hadoop.hdfs.DFSInputStream
 import org.apache.spark.util.Utils
 
 // FIXME: javadoc!!
-sealed trait EventLogReader {
+sealed trait EventLogFileReader {
   def rootPath: Path
 
   def lastSequence: Option[Long]
@@ -53,30 +53,33 @@ sealed trait EventLogReader {
   def allSize: Long
 }
 
-object EventLogReaders {
-  def getEventLogReader(fs: FileSystem, path: Path, lastSequence: Option[Long]): EventLogReader = {
+object EventLogFileReaders {
+  def getEventLogReader(
+      fs: FileSystem,
+      path: Path,
+      lastSequence: Option[Long]): EventLogFileReader = {
     lastSequence match {
-      case Some(_) => new RollingEventLogFilesReader(fs, path)
-      case None => new SingleFileEventLogReader(fs, path)
+      case Some(_) => new RollingEventLogFilesFileReader(fs, path)
+      case None => new SingleFileEventLogFileReader(fs, path)
     }
   }
 
-  def getEventLogReader(fs: FileSystem, path: Path): Option[EventLogReader] = {
+  def getEventLogReader(fs: FileSystem, path: Path): Option[EventLogFileReader] = {
     val status = fs.getFileStatus(path)
     if (isSingleEventLog(status)) {
-      Some(new SingleFileEventLogReader(fs, path))
+      Some(new SingleFileEventLogFileReader(fs, path))
     } else if (isRollingEventLogs(status)) {
-      Some(new RollingEventLogFilesReader(fs, path))
+      Some(new RollingEventLogFilesFileReader(fs, path))
     } else {
       None
     }
   }
 
-  def getEventLogReader(fs: FileSystem, status: FileStatus): Option[EventLogReader] = {
+  def getEventLogReader(fs: FileSystem, status: FileStatus): Option[EventLogFileReader] = {
     if (isSingleEventLog(status)) {
-      Some(new SingleFileEventLogReader(fs, status.getPath))
+      Some(new SingleFileEventLogFileReader(fs, status.getPath))
     } else if (isRollingEventLogs(status)) {
-      Some(new RollingEventLogFilesReader(fs, status.getPath))
+      Some(new RollingEventLogFilesFileReader(fs, status.getPath))
     } else {
       None
     }
@@ -95,8 +98,10 @@ object EventLogReaders {
   }
 }
 
-class SingleFileEventLogReader(fs: FileSystem, override val rootPath: Path) extends EventLogReader {
-  // FIXME: get stats with constructor and only call if it's needed?
+class SingleFileEventLogFileReader(
+    fs: FileSystem,
+    override val rootPath: Path) extends EventLogFileReader {
+  // TODO: get stats with constructor and only call if it's needed?
   private lazy val stats = fs.getFileStatus(rootPath)
 
   override def lastSequence: Option[Long] = None
@@ -133,9 +138,9 @@ class SingleFileEventLogReader(fs: FileSystem, override val rootPath: Path) exte
   override def allSize: Long = fileSizeForLastSequence
 }
 
-class RollingEventLogFilesReader(
+class RollingEventLogFilesFileReader(
     fs: FileSystem,
-    override val rootPath: Path) extends EventLogReader {
+    override val rootPath: Path) extends EventLogFileReader {
   import RollingEventLogFilesWriter._
 
   private lazy val files: Seq[FileStatus] = {

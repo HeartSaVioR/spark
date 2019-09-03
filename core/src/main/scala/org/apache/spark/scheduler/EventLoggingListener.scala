@@ -60,8 +60,9 @@ private[spark] class EventLoggingListener(
       SparkHadoopUtil.get.newConfiguration(sparkConf))
 
   // For testing.
-  private[scheduler] val logWriter: EventLogWriter = EventLogFileWriter.createEventLogFileWriter(
-    appId, appAttemptId, logBaseDir, sparkConf, hadoopConf)
+  private[scheduler] val logWriter: EventLogFileWriter =
+    EventLogFileWriter.createEventLogFileWriter(appId, appAttemptId, logBaseDir,
+      sparkConf, hadoopConf)
 
   // For testing. Keep track of all JSON serialized events that have been logged.
   private[scheduler] val loggedEvents = new ArrayBuffer[JValue]

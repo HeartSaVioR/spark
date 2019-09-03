@@ -566,7 +566,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
     }
   }
 
-  private[history] def shouldReloadLog(info: LogInfo, reader: EventLogReader): Boolean = {
+  private[history] def shouldReloadLog(info: LogInfo, reader: EventLogFileReader): Boolean = {
     var result = info.fileSize < reader.fileSizeForLastSequence
     if (!result && !reader.completed) {
       try {
@@ -684,7 +684,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
    * Replay the given log file, saving the application in the listing db.
    */
   protected def mergeApplicationListing(
-      reader: EventLogReader,
+      reader: EventLogFileReader,
       scanTime: Long,
       enableOptimizations: Boolean): Unit = {
     val eventsFilter: ReplayEventsFilter = { eventString =>
@@ -961,14 +961,12 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
     }
   }
 
-  // FIXME: may need to indicate single event log / rolling event logs, but how?
-  //   - from FileStatus? or adding more parameters?
   /**
    * Rebuilds the application state store from its event log.
    */
   private def rebuildAppStore(
       store: KVStore,
-      reader: EventLogReader,
+      reader: EventLogFileReader,
       lastUpdated: Long): Unit = {
     // Disable async updates, since they cause higher memory usage, and it's ok to take longer
     // to parse the event logs in the SHS.
@@ -1209,7 +1207,7 @@ private[history] class ApplicationInfoWrapper(
 }
 
 private[history] class AppListingListener(
-    reader: EventLogReader,
+    reader: EventLogFileReader,
     clock: Clock,
     haltEnabled: Boolean) extends SparkListener {
 

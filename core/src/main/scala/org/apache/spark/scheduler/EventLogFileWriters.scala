@@ -34,20 +34,12 @@ import org.apache.spark.internal.config._
 import org.apache.spark.io.CompressionCodec
 import org.apache.spark.util.Utils
 
-// FIXME: document it!
-sealed trait EventLogWriter {
-  def start(): Unit
-  def writeEvent(eventJson: String, flushLogger: Boolean = false): Unit
-  def stop(): Unit
-  def logPath: String
-}
-
 abstract class EventLogFileWriter(
     appId: String,
     appAttemptId : Option[String],
     logBaseDir: URI,
     sparkConf: SparkConf,
-    hadoopConf: Configuration) extends EventLogWriter with Logging {
+    hadoopConf: Configuration) extends Logging {
 
   protected val shouldCompress = sparkConf.get(EVENT_LOG_COMPRESS)
   protected val shouldOverwrite = sparkConf.get(EVENT_LOG_OVERWRITE)
@@ -133,6 +125,20 @@ abstract class EventLogFileWriter(
       case e: Exception => logDebug(s"failed to set time of $dest", e)
     }
   }
+
+  // ================ methods to be override ================
+
+  /** starts writer instance - initialize writer for event logging */
+  def start(): Unit
+
+  /** writes JSON format of event to file */
+  def writeEvent(eventJson: String, flushLogger: Boolean = false): Unit
+
+  /** stops writer - indicating the application has been completed */
+  def stop(): Unit
+
+  /** returns representative path of log */
+  def logPath: String
 }
 
 object EventLogFileWriter {
@@ -149,7 +155,7 @@ object EventLogFileWriter {
       appAttemptId: Option[String],
       logBaseDir: URI,
       sparkConf: SparkConf,
-      hadoopConf: Configuration): EventLogWriter = {
+      hadoopConf: Configuration): EventLogFileWriter = {
     if (sparkConf.get(EVENT_LOG_ENABLE_ROLLING)) {
       new RollingEventLogFilesWriter(appId, appAttemptId, logBaseDir, sparkConf, hadoopConf)
     } else {
