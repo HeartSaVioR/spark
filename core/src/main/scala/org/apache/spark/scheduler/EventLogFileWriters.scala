@@ -34,6 +34,11 @@ import org.apache.spark.internal.config._
 import org.apache.spark.io.CompressionCodec
 import org.apache.spark.util.Utils
 
+/**
+ * The base class of writer which will write event logs into file.
+ *
+ * NOTE: CountingOutputStream being returned by "initLogFile" counts "non-compressed" bytes.
+ */
 abstract class EventLogFileWriter(
     appId: String,
     appAttemptId : Option[String],
@@ -63,7 +68,6 @@ abstract class EventLogFileWriter(
     }
   }
 
-  // FIXME: document that CountingOutputStream doesn't count compression in underlying stream
   protected def initLogFile(path: Path): (Option[FSDataOutputStream],
     Option[CountingOutputStream]) = {
 
@@ -160,6 +164,15 @@ object EventLogFileWriter {
     }
   }
 
+  def nameForAppAndAttempt(appId: String, appAttemptId: Option[String]): String = {
+    val base = Utils.sanitizeDirName(appId)
+    if (appAttemptId.isDefined) {
+      base + "_" + Utils.sanitizeDirName(appAttemptId.get)
+    } else {
+      base
+    }
+  }
+
   def codecName(log: Path): Option[String] = {
     // Compression codec is encoded as an extension, e.g. app_123.lzf
     // Since we sanitize the app ID to not include periods, it is safe to split on it
@@ -168,6 +181,9 @@ object EventLogFileWriter {
   }
 }
 
+/**
+ * The writer to write event logs into single file.
+ */
 class SingleEventLogFileWriter(
     appId: String,
     appAttemptId : Option[String],
@@ -241,47 +257,28 @@ object SingleEventLogFileWriter {
       appId: String,
       appAttemptId: Option[String],
       compressionCodecName: Option[String] = None): String = {
-    val base = new Path(logBaseDir).toString.stripSuffix("/") + "/" + Utils.sanitizeDirName(appId)
     val codec = compressionCodecName.map("." + _).getOrElse("")
-    if (appAttemptId.isDefined) {
-      base + "_" + Utils.sanitizeDirName(appAttemptId.get) + codec
-    } else {
-      base + codec
-    }
+    new Path(logBaseDir).toString.stripSuffix("/") + "/" +
+      EventLogFileWriter.nameForAppAndAttempt(appId, appAttemptId) + codec
   }
 }
 
-// FIXME: document how the directory and files look like!
-/*
-We will name the directory as:
-
-eventlog_v2_appId(_<appAttemptId>)
-
-The name doesn't contain ".inprogress" suffix, as renaming directory in S3
-doesn't seem to be possible. Even it would be abstracted and supported in some
- libraries, it may require all belonging files to be renamed as well which the
-  time complexity of renaming is O(N) where N is the size of the file. HDFS may
-   support it trivially but that's not feasible if we also consider S3.
-
-We will name the event log files as:
-
-events_<sequence>_<appId>(_<appAttemptId>)(.<codec>)
-
-which "sequence" would be monotonically increasing value. So rolled event log files
- will look like:
-
-events_1_<appId>(_<appAttemptId>)(.<codec>) <<== events_1
-events_2_<appId>(_<appAttemptId>)(.<codec>)
-events_3_<appId>(_<appAttemptId>)(.<codec>)
-...
-
-appstatus_<appId>(_<appAttemptId>)(.inprogress) <<== appstatus(.inprogress)
-
-We will write dummy data (like '1', or Spark version to help diagnose?) in both files,
- so that it would cost very tiny to rename even in S3. The reason having two files
-  separately is to avoid concurrent renaming, as renaming "appstatus" will happen
-   in driver (EventLoggingListener), whereas renaming "lastsnapshot" will happen
-    in whatever which is in charge of snapshotting.
+/**
+ * The writer to write event logs into multiple log files, rolled over via configured size.
+ *
+ * The class creates each directory per application, and stores event log files as well as
+ * metadata files. The name of directory and files in the directory would follow:
+ *
+ * - The name of directory: eventlog_v2_appId(_[appAttemptId])
+ * - The prefix of name on event files: events_[sequence]_[appId](_[appAttemptId])(.[codec])
+ *   - "sequence" would be monotonically increasing value
+ * - The name of metadata (app. status) file name: appstatus_[appId](_[appAttemptId])(.inprogress)
+ *
+ * The writer will roll over the event log file when configured size is reached. Note that the
+ * writer doesn't check the size on file being open for write: the writer tracks the count of bytes
+ * being written currently.
+ *
+ * For metadata files, the class will leverage zero-byte file, as it provides minimized cost.
  */
 class RollingEventLogFilesWriter(
     appId: String,
@@ -347,7 +344,8 @@ class RollingEventLogFilesWriter(
     writer.foreach(_.close())
 
     sequence += 1
-    currentEventLogFilePath = getEventLogFilePath(logDirForAppPath, sequence, compressionCodecName)
+    currentEventLogFilePath = getEventLogFilePath(logDirForAppPath, appId, appAttemptId, sequence,
+      compressionCodecName)
 
     val streams = initLogFile(currentEventLogFilePath)
     hadoopDataStream = streams._1
@@ -361,15 +359,17 @@ class RollingEventLogFilesWriter(
 
   override def stop(): Unit = {
     writer.foreach(_.close())
-    val appStatusPathIncomplete = getAppStatusFilePath(logDirForAppPath, inProgress = true)
-    val appStatusPathComplete = getAppStatusFilePath(logDirForAppPath, inProgress = false)
+    val appStatusPathIncomplete = getAppStatusFilePath(logDirForAppPath, appId, appAttemptId,
+      inProgress = true)
+    val appStatusPathComplete = getAppStatusFilePath(logDirForAppPath, appId, appAttemptId,
+      inProgress = false)
     renameFile(appStatusPathIncomplete, appStatusPathComplete, overwrite = true)
   }
 
   override def logPath: String = logDirForAppPath.toString
 
   private def createAppStatusFile(inProgress: Boolean): Unit = {
-    val appStatusPath = getAppStatusFilePath(logDirForAppPath, inProgress)
+    val appStatusPath = getAppStatusFilePath(logDirForAppPath, appId, appAttemptId, inProgress)
     val streams = initLogFile(appStatusPath)
     val outputStream = streams._2.get
     // we intentionally create zero-byte file to minimize the cost
@@ -378,26 +378,29 @@ class RollingEventLogFilesWriter(
 }
 
 object RollingEventLogFilesWriter {
-  def getAppEventLogDirPath(logBaseDir: URI, appId: String, appAttemptId: Option[String]): Path = {
-    val base = "eventlog_v2_" + Utils.sanitizeDirName(appId)
-    val dirName = if (appAttemptId.isDefined) {
-      base + "_" + Utils.sanitizeDirName(appAttemptId.get)
-    } else {
-      base
-    }
-    new Path(new Path(logBaseDir), dirName)
-  }
+  def getAppEventLogDirPath(logBaseDir: URI, appId: String, appAttemptId: Option[String]): Path =
+    new Path(new Path(logBaseDir), "eventlog_v2_" +
+      EventLogFileWriter.nameForAppAndAttempt(appId, appAttemptId))
 
-  // FIXME: may want to have appId & appAttemptId in here
-  def getAppStatusFilePath(appLogDir: Path, inProgress: Boolean): Path = {
-    val name = if (inProgress) "appstatus" + EventLogFileWriter.IN_PROGRESS else "appstatus"
+  def getAppStatusFilePath(
+      appLogDir: Path,
+      appId: String,
+      appAttemptId: Option[String],
+      inProgress: Boolean): Path = {
+    val base = "appstatus_" + EventLogFileWriter.nameForAppAndAttempt(appId, appAttemptId)
+    val name = if (inProgress) base + EventLogFileWriter.IN_PROGRESS else base
     new Path(appLogDir, name)
   }
 
-  // FIXME: may want to have appId & appAttemptId in here
-  def getEventLogFilePath(appLogDir: Path, seq: Long, codecName: Option[String]): Path = {
+  def getEventLogFilePath(
+      appLogDir: Path,
+      appId: String,
+      appAttemptId: Option[String],
+      seq: Long,
+      codecName: Option[String]): Path = {
+    val base = s"events_${seq}_" + EventLogFileWriter.nameForAppAndAttempt(appId, appAttemptId)
     val codec = codecName.map("." + _).getOrElse("")
-    new Path(appLogDir, s"events_$seq$codec")
+    new Path(appLogDir, base + codec)
   }
 
   def isEventLogDir(status: FileStatus): Boolean = {
@@ -420,10 +423,9 @@ object RollingEventLogFilesWriter {
     path.getName.startsWith("appstatus")
   }
 
-  // FIXME: may want to have appId & appAttemptId in here
   def getSequence(eventLogFileName: String): Long = {
     require(eventLogFileName.startsWith("events_"), "Not a event log file!")
-    val seq = eventLogFileName.stripPrefix("events_").split("\\.")(0)
+    val seq = eventLogFileName.stripPrefix("events_").split("_")(0)
     seq.toLong
   }
 }

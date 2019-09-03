@@ -31,6 +31,7 @@ import org.apache.spark.io.CompressionCodec
 import org.apache.spark.scheduler.EventLogFileWriter.codecName
 import org.apache.spark.util.Utils
 
+/** The base class of reader which will read the information of event log file(s). */
 abstract class EventLogFileReader(
     protected val fileSystem: FileSystem,
     val rootPath: Path) {
@@ -57,14 +58,25 @@ abstract class EventLogFileReader(
 
   // ================ methods to be override ================
 
+  /** Returns the last sequence of event log files. None for single event log file. */
   def lastSequence: Option[Long]
 
+  /**
+   * Returns the size of file for the last sequence of event log files. Returns its size for
+   * single event log file.
+   */
   def fileSizeForLastSequence: Long
 
+  /** Returns whether the application is completed. */
   def completed: Boolean
 
+  /**
+   * Returns the size of file for the last sequence of event log files, only when
+   * underlying input stream is DFSInputStream. Otherwise returns None.
+   */
   def fileSizeForLastSequenceForDFS: Option[Long]
 
+  /** Returns the modification time for the last sequence of event log files. */
   def modificationTime: Long
 
   /**
@@ -74,10 +86,13 @@ abstract class EventLogFileReader(
    */
   def zipEventLogFiles(zipStream: ZipOutputStream): Unit
 
+  /** Returns all available event log files. */
   def listEventLogFiles: Seq[FileStatus]
 
+  /** Returns the short compression name if being used. None if it's uncompressed. */
   def compression: Option[String]
 
+  /** Returns the size of all event log files. */
   def allSize: Long
 }
 
@@ -148,6 +163,7 @@ object EventLogFileReader {
   }
 }
 
+/** The reader which will read the information of single event log file. */
 class SingleFileEventLogFileReader(
     fs: FileSystem,
     path: Path) extends EventLogFileReader(fs, path) {
@@ -174,6 +190,7 @@ class SingleFileEventLogFileReader(
   override def allSize: Long = fileSizeForLastSequence
 }
 
+/** The reader which will read the information of rolled multiple event log files. */
 class RollingEventLogFilesFileReader(
     fs: FileSystem,
     path: Path) extends EventLogFileReader(fs, path) {

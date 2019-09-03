@@ -248,32 +248,34 @@ class RollingEventLogFilesWriterSuite extends EventLogFileWritersSuite {
 
   test("Event log names") {
     val baseDirUri = Utils.resolveURI("/base-dir")
+    val appId = "app1"
+    val appAttemptId = None
 
     // happy case with app ID
-    val logDir = RollingEventLogFilesWriter.getAppEventLogDirPath(baseDirUri, "app1", None)
+    val logDir = RollingEventLogFilesWriter.getAppEventLogDirPath(baseDirUri, appId, None)
     assert(s"${baseDirUri.toString}/eventlog_v2_app1" === logDir.toString)
 
     // appstatus: inprogress or completed
-    assert(s"$logDir/appstatus.inprogress" ===
-      RollingEventLogFilesWriter.getAppStatusFilePath(logDir, inProgress = true).toString)
-    assert(s"$logDir/appstatus" ===
-      RollingEventLogFilesWriter.getAppStatusFilePath(logDir, inProgress = false).toString)
+    assert(s"$logDir/appstatus_app1.inprogress" ===
+      RollingEventLogFilesWriter.getAppStatusFilePath(logDir, appId, appAttemptId,
+        inProgress = true).toString)
+    assert(s"$logDir/appstatus_app1" ===
+      RollingEventLogFilesWriter.getAppStatusFilePath(logDir, appId, appAttemptId,
+        inProgress = false).toString)
 
     // without compression
-    assert(s"$logDir/events_1" ===
-      RollingEventLogFilesWriter.getEventLogFilePath(logDir, 1, None).toString)
+    assert(s"$logDir/events_1_app1" ===
+      RollingEventLogFilesWriter.getEventLogFilePath(logDir, appId, appAttemptId, 1, None).toString)
 
     // with compression
-    assert(s"$logDir/events_1.lzf" ===
-      RollingEventLogFilesWriter.getEventLogFilePath(logDir, 1, Some("lzf")).toString)
+    assert(s"$logDir/events_1_app1.lzf" ===
+      RollingEventLogFilesWriter.getEventLogFilePath(logDir, appId, appAttemptId,
+        1, Some("lzf")).toString)
 
     // illegal characters in app ID
     assert(s"${baseDirUri.toString}/eventlog_v2_a-fine-mind_dollar_bills__1" ===
       RollingEventLogFilesWriter.getAppEventLogDirPath(baseDirUri,
         "a fine:mind$dollar{bills}.1", None).toString)
-
-    // FIXME: we need to add more cases if we decide to add appId/appAttemptId to
-    //  events / appstatus files as well
   }
 
   test("Log overwriting") {
@@ -378,7 +380,7 @@ class RollingEventLogFilesWriterSuite extends EventLogFileWritersSuite {
 
     assert(fileSystem.exists(logDirPath) && fileSystem.isDirectory(logDirPath))
 
-    val appStatusFile = getAppStatusFilePath(logDirPath, !isCompleted)
+    val appStatusFile = getAppStatusFilePath(logDirPath, appId, appAttemptId, !isCompleted)
     assert(fileSystem.exists(appStatusFile) && fileSystem.isFile(appStatusFile))
 
     val eventLogFiles = listEventLogFiles(logDirPath)
