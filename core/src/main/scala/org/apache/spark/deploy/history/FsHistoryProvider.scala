@@ -436,7 +436,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
 
       val updated = Option(fs.listStatus(new Path(logDir))).map(_.toSeq).getOrElse(Nil)
         .filter(entry => !isBlacklisted(entry.getPath))
-        .flatMap(entry => EventLogReaders.getEventLogReader(fs, entry))
+        .flatMap(entry => EventLogFileReader.getEventLogReader(fs, entry))
         .filter { reader =>
           try {
             val info = listing.read(classOf[LogInfo], reader.rootPath.toString())

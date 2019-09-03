@@ -148,6 +148,18 @@ abstract class EventLogFileWritersSuite extends SparkFunSuite with LocalSparkCon
       compressionCodecShortName: Option[String],
       isCompleted: Boolean,
       expectedLines: Seq[String] = Seq.empty): Unit
+
+  protected def skipVerifyEventLogFile(
+      compressionCodecShortName: Option[String],
+      isCompleted: Boolean): Boolean = {
+    // Spark initializes LZ4BlockOutputStream with syncFlush=false, so we can't force
+    // pending bytes to be flushed. It's only guaranteed when stream is closed, so
+    // we only check for lz4 when isCompleted = true.
+
+    // zstd seems to have issue in reading while write stream is in progress of writing
+    !isCompleted &&
+      (compressionCodecShortName.contains("lz4") || compressionCodecShortName.contains("zstd"))
+  }
 }
 
 class SingleEventLogFileWriterSuite extends EventLogFileWritersSuite {
@@ -225,16 +237,7 @@ class SingleEventLogFileWriterSuite extends EventLogFileWritersSuite {
     }
 
     assert(fileSystem.exists(finalLogPath) && fileSystem.isFile(finalLogPath))
-
-    if (!isCompleted &&
-      (compressionCodecShortName.contains("lz4") || compressionCodecShortName.contains("zstd"))) {
-      // Spark initializes LZ4BlockOutputStream with syncFlush=false, so we can't force
-      // pending bytes to be flushed. It's only guaranteed when stream is closed, so
-      // we only check for lz4 when isCompleted = true.
-
-      // FIXME: zstd seems to have issue in reading when stream is not closed
-      //  - it got hang... not sure what's happening but may need to be fixed
-    } else {
+    if (!skipVerifyEventLogFile(compressionCodecShortName, isCompleted)) {
       assert(expectedLines === readLinesFromEventLogFile(finalLogPath, fileSystem))
     }
   }
@@ -379,15 +382,7 @@ class RollingEventLogFilesWriterSuite extends EventLogFileWritersSuite {
     assert(fileSystem.exists(appStatusFile) && fileSystem.isFile(appStatusFile))
 
     val eventLogFiles = listEventLogFiles(logDirPath)
-    if (!isCompleted &&
-      (compressionCodecShortName.contains("lz4") || compressionCodecShortName.contains("zstd"))) {
-      // Spark initializes LZ4BlockOutputStream with syncFlush=false, so we can't force
-      // pending bytes to be flushed. It's only guaranteed when stream is closed, so
-      // we only check for lz4 when isCompleted = true.
-
-      // FIXME: zstd seems to have issue in reading when stream is not closed
-      //  - not sure what's happening but may need to be fixed
-    } else {
+    if (!skipVerifyEventLogFile(compressionCodecShortName, isCompleted)) {
       val allLines = mutable.ArrayBuffer[String]()
       eventLogFiles.foreach { file =>
         allLines.appendAll(readLinesFromEventLogFile(file.getPath, fileSystem))

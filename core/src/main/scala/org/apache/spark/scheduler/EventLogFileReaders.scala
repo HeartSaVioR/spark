@@ -20,15 +20,17 @@ package org.apache.spark.scheduler
 import java.io.{BufferedInputStream, InputStream}
 import java.util.zip.{ZipEntry, ZipOutputStream}
 
+import scala.collection.mutable.Map
+
 import com.google.common.io.ByteStreams
 import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
 import org.apache.hadoop.hdfs.DFSInputStream
+
 import org.apache.spark.SparkConf
 import org.apache.spark.io.CompressionCodec
-import org.apache.spark.scheduler.EventLogFileWriter.{codecMap, codecName}
+import org.apache.spark.scheduler.EventLogFileWriter.codecName
 import org.apache.spark.util.Utils
 
-import scala.collection.mutable.Map
 
 // FIXME: javadoc!!
 sealed trait EventLogFileReader {
