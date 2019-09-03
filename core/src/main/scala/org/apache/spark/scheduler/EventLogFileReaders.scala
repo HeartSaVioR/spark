@@ -17,13 +17,18 @@
 
 package org.apache.spark.scheduler
 
+import java.io.{BufferedInputStream, InputStream}
 import java.util.zip.{ZipEntry, ZipOutputStream}
 
 import com.google.common.io.ByteStreams
 import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
 import org.apache.hadoop.hdfs.DFSInputStream
-
+import org.apache.spark.SparkConf
+import org.apache.spark.io.CompressionCodec
+import org.apache.spark.scheduler.EventLogFileWriter.{codecMap, codecName}
 import org.apache.spark.util.Utils
+
+import scala.collection.mutable.Map
 
 // FIXME: javadoc!!
 sealed trait EventLogFileReader {
@@ -53,7 +58,10 @@ sealed trait EventLogFileReader {
   def allSize: Long
 }
 
-object EventLogFileReaders {
+object EventLogFileReader {
+  // A cache for compression codecs to avoid creating the same codec many times
+  private val codecMap = Map.empty[String, CompressionCodec]
+
   def getEventLogReader(
       fs: FileSystem,
       path: Path,
@@ -82,6 +90,26 @@ object EventLogFileReaders {
       Some(new RollingEventLogFilesFileReader(fs, status.getPath))
     } else {
       None
+    }
+  }
+
+
+  /**
+   * Opens an event log file and returns an input stream that contains the event data.
+   *
+   * @return input stream that holds one JSON record per line.
+   */
+  def openEventLog(log: Path, fs: FileSystem): InputStream = {
+    val in = new BufferedInputStream(fs.open(log))
+    try {
+      val codec = codecName(log).map { c =>
+        codecMap.getOrElseUpdate(c, CompressionCodec.createCodec(new SparkConf, c))
+      }
+      codec.map(_.compressedContinuousInputStream(in)).getOrElse(in)
+    } catch {
+      case e: Throwable =>
+        in.close()
+        throw e
     }
   }
 

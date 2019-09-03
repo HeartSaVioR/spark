@@ -711,7 +711,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
     logInfo(s"Parsing $logPath for listing data...")
     val logFiles = reader.listEventLogFiles
     logFiles.foreach { file =>
-      Utils.tryWithResource(EventLogFileWriter.openEventLog(file.getPath, fs)) { in =>
+      Utils.tryWithResource(EventLogFileReader.openEventLog(file.getPath, fs)) { in =>
         bus.replay(in, file.getPath.toString, !appCompleted, eventsFilter)
       }
     }
@@ -737,7 +737,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
     val lookForEndEvent = shouldHalt && (appCompleted || !fastInProgressParsing)
     if (lookForEndEvent && listener.applicationInfo.isDefined) {
       val lastFile = logFiles.last
-      Utils.tryWithResource(EventLogFileWriter.openEventLog(lastFile.getPath, fs)) { in =>
+      Utils.tryWithResource(EventLogFileReader.openEventLog(lastFile.getPath, fs)) { in =>
         val target = lastFile.getLen - reparseChunkSize
         if (target > 0) {
           logInfo(s"Looking for end event; skipping $target bytes from $logPath...")
@@ -986,7 +986,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
       logInfo(s"Parsing ${reader.rootPath} to re-build UI...")
       val logFiles = reader.listEventLogFiles
       logFiles.foreach { file =>
-        Utils.tryWithResource(EventLogFileWriter.openEventLog(file.getPath, fs)) { in =>
+        Utils.tryWithResource(EventLogFileReader.openEventLog(file.getPath, fs)) { in =>
           replayBus.replay(in, file.getPath.toString, maybeTruncated = !reader.completed)
         }
       }

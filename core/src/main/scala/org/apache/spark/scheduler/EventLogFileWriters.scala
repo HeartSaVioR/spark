@@ -147,9 +147,6 @@ object EventLogFileWriter {
 
   val LOG_FILE_PERMISSIONS = new FsPermission(Integer.parseInt("770", 8).toShort)
 
-  // A cache for compression codecs to avoid creating the same codec many times
-  private val codecMap = Map.empty[String, CompressionCodec]
-
   def createEventLogFileWriter(
       appId: String,
       appAttemptId: Option[String],
@@ -160,25 +157,6 @@ object EventLogFileWriter {
       new RollingEventLogFilesWriter(appId, appAttemptId, logBaseDir, sparkConf, hadoopConf)
     } else {
       new SingleEventLogFileWriter(appId, appAttemptId, logBaseDir, sparkConf, hadoopConf)
-    }
-  }
-
-  /**
-   * Opens an event log file and returns an input stream that contains the event data.
-   *
-   * @return input stream that holds one JSON record per line.
-   */
-  def openEventLog(log: Path, fs: FileSystem): InputStream = {
-    val in = new BufferedInputStream(fs.open(log))
-    try {
-      val codec = codecName(log).map { c =>
-        codecMap.getOrElseUpdate(c, CompressionCodec.createCodec(new SparkConf, c))
-      }
-      codec.map(_.compressedContinuousInputStream(in)).getOrElse(in)
-    } catch {
-      case e: Throwable =>
-        in.close()
-        throw e
     }
   }
 

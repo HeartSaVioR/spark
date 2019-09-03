@@ -126,7 +126,7 @@ abstract class EventLogFileWritersSuite extends SparkFunSuite with LocalSparkCon
   }
 
   protected def readLinesFromEventLogFile(log: Path, fs: FileSystem): List[String] = {
-    val logDataStream = EventLogFileWriter.openEventLog(log, fs)
+    val logDataStream = EventLogFileReader.openEventLog(log, fs)
     try {
       Source.fromInputStream(logDataStream).getLines().toList
     } finally {
