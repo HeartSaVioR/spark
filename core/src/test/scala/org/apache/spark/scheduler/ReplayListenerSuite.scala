@@ -29,6 +29,7 @@ import org.scalatest.BeforeAndAfter
 import org.apache.spark.{LocalSparkContext, SparkConf, SparkContext, SparkFunSuite}
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.io.{CompressionCodec, LZ4CompressionCodec}
+import org.apache.spark.scheduler.EventLogTestHelper._
 import org.apache.spark.util.{JsonProtocol, JsonProtocolSuite, Utils}
 
 /**
@@ -60,7 +61,7 @@ class ReplayListenerSuite extends SparkFunSuite with BeforeAndAfter with LocalSp
       // scalastyle:on println
     }
 
-    val conf = EventLoggingListenerSuite.getLoggingConf(logFilePath)
+    val conf = getLoggingConf(logFilePath)
     val logData = fileSystem.open(logFilePath)
     val eventMonster = new EventMonster(conf)
     try {
@@ -105,7 +106,7 @@ class ReplayListenerSuite extends SparkFunSuite with BeforeAndAfter with LocalSp
     }
 
     // Read the compressed .inprogress file and verify only first event was parsed.
-    val conf = EventLoggingListenerSuite.getLoggingConf(logFilePath)
+    val conf = getLoggingConf(logFilePath)
     val replayer = new ReplayListenerBus()
 
     val eventMonster = new EventMonster(conf)
@@ -143,7 +144,7 @@ class ReplayListenerSuite extends SparkFunSuite with BeforeAndAfter with LocalSp
       // scalastyle:on println
     }
 
-    val conf = EventLoggingListenerSuite.getLoggingConf(logFilePath)
+    val conf = getLoggingConf(logFilePath)
     val logData = fileSystem.open(logFilePath)
     val eventMonster = new EventMonster(conf)
     try {
@@ -189,7 +190,7 @@ class ReplayListenerSuite extends SparkFunSuite with BeforeAndAfter with LocalSp
     val logDirPath = new Path(logDir.toURI)
     fileSystem.mkdirs(logDirPath)
 
-    val conf = EventLoggingListenerSuite.getLoggingConf(logDirPath, codecName)
+    val conf = getLoggingConf(logDirPath, codecName)
     sc = new SparkContext("local-cluster[2,1,1024]", "Test replay", conf)
 
     // Run a few jobs

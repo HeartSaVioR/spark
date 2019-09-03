@@ -34,9 +34,9 @@ import org.apache.spark._
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.executor.{ExecutorMetrics, TaskMetrics}
 import org.apache.spark.internal.Logging
-import org.apache.spark.internal.config._
 import org.apache.spark.io._
 import org.apache.spark.metrics.{ExecutorMetricType, MetricsSystem}
+import org.apache.spark.scheduler.EventLogTestHelper._
 import org.apache.spark.scheduler.cluster.ExecutorInfo
 import org.apache.spark.util.{JsonProtocol, Utils}
 
@@ -49,8 +49,6 @@ import org.apache.spark.util.{JsonProtocol, Utils}
  */
 class EventLoggingListenerSuite extends SparkFunSuite with LocalSparkContext with BeforeAndAfter
   with Logging {
-
-  import EventLoggingListenerSuite._
 
   private val fileSystem = Utils.getHadoopFileSystem("/",
     SparkHadoopUtil.get.newConfiguration(new SparkConf()))
@@ -103,8 +101,6 @@ class EventLoggingListenerSuite extends SparkFunSuite with LocalSparkContext wit
   /* ----------------- *
    * Actual test logic *
    * ----------------- */
-
-  import EventLoggingListenerSuite._
 
   /**
    * Test basic event logging functionality.
@@ -580,28 +576,4 @@ class EventLoggingListenerSuite extends SparkFunSuite with LocalSparkContext wit
     }
   }
 
-}
-
-
-object EventLoggingListenerSuite {
-
-  /**
-   * Get a SparkConf with event logging enabled. It doesn't enable rolling event logs, so caller
-   * should set it manually.
-   */
-  def getLoggingConf(logDir: Path, compressionCodec: Option[String] = None): SparkConf = {
-    val conf = new SparkConf
-    conf.set(EVENT_LOG_ENABLED, true)
-    conf.set(EVENT_LOG_BLOCK_UPDATES, true)
-    conf.set(EVENT_LOG_TESTING, true)
-    conf.set(EVENT_LOG_DIR, logDir.toString)
-    compressionCodec.foreach { codec =>
-      conf.set(EVENT_LOG_COMPRESS, true)
-      conf.set(EVENT_LOG_COMPRESSION_CODEC, codec)
-    }
-    conf.set(EVENT_LOG_STAGE_EXECUTOR_METRICS, true)
-    conf
-  }
-
-  def getUniqueApplicationId: String = "test-" + System.currentTimeMillis
 }

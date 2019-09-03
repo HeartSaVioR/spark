@@ -25,7 +25,10 @@ import org.apache.spark.internal.config.{EVENT_LOG_BLOCK_UPDATES, EVENT_LOG_COMP
 object EventLogTestHelper {
   def getUniqueApplicationId: String = "test-" + System.currentTimeMillis
 
-  /** Get a SparkConf with event logging enabled. */
+  /**
+   * Get a SparkConf with event logging enabled. It doesn't enable rolling event logs, so caller
+   * should set it manually.
+   */
   def getLoggingConf(logDir: Path, compressionCodec: Option[String] = None): SparkConf = {
     val conf = new SparkConf
     conf.set(EVENT_LOG_ENABLED, true)
