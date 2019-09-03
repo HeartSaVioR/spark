@@ -37,13 +37,12 @@ import org.apache.spark.util.{JsonProtocol, Utils}
  *
  * Event logging is specified by the following configurable parameters:
  *   spark.eventLog.enabled - Whether event logging is enabled.
- *   spark.eventLog.logBlockUpdates.enabled - Whether to log block updates
- *   spark.eventLog.compress - Whether to compress logged events
- *   spark.eventLog.compression.codec - The codec to compress logged events
- *   spark.eventLog.overwrite - Whether to overwrite any existing files.
  *   spark.eventLog.dir - Path to the directory in which events are logged.
- *   spark.eventLog.buffer.kb - Buffer size to use when writing to output streams
+ *   spark.eventLog.logBlockUpdates.enabled - Whether to log block updates
  *   spark.eventLog.logStageExecutorMetrics.enabled - Whether to log stage executor metrics
+ *
+ * Event log file writer maintains its own parameters: refer the javadoc of [[EventLogFileWriter]]
+ * and its descendant for more details.
  */
 private[spark] class EventLoggingListener(
     appId: String,

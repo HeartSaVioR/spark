@@ -37,6 +37,15 @@ import org.apache.spark.util.Utils
 /**
  * The base class of writer which will write event logs into file.
  *
+ * The following configurable parameters are available to tune the behavior of writing:
+ *   spark.eventLog.compress - Whether to compress logged events
+ *   spark.eventLog.compression.codec - The codec to compress logged events
+ *   spark.eventLog.overwrite - Whether to overwrite any existing files
+ *   spark.eventLog.buffer.kb - Buffer size to use when writing to output streams
+ *
+ * Note that descendant classes can maintain its own parameters: refer the javadoc of each class
+ * for more details.
+ *
  * NOTE: CountingOutputStream being returned by "initLogFile" counts "non-compressed" bytes.
  */
 abstract class EventLogFileWriter(
@@ -279,6 +288,10 @@ object SingleEventLogFileWriter {
  * being written currently.
  *
  * For metadata files, the class will leverage zero-byte file, as it provides minimized cost.
+ *
+ * The writer leverages the following configurable parameters:
+ *   spark.eventLog.rollLog - Whether rolling over event log files is enabled.
+ *   spark.eventLog.rollLog.maxFileSize - The max size of event log file to be rolled over.
  */
 class RollingEventLogFilesWriter(
     appId: String,

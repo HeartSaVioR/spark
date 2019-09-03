@@ -176,15 +176,14 @@ package object config {
 
   private[spark] val EVENT_LOG_ENABLE_ROLLING =
     ConfigBuilder("spark.eventLog.rollLog")
-      // FIXME: doc...
+      .doc("Whether rolling over event log files is enabled.")
       .booleanConf.createWithDefault(false)
 
   private[spark] val EVENT_LOG_ROLLED_EVENT_LOG_MAX_FILE_SIZE =
     ConfigBuilder("spark.eventLog.rollLog.maxFileSize")
-      // FIXME: doc...
-      // .doc("... , in KiB unless otherwise specified.")
+      .doc("The max size of event log file to be rolled over, in KiB unless otherwise specified.")
       .bytesConf(ByteUnit.KiB)
-      .createWithDefaultString("100m")
+      .createWithDefaultString("10m")
 
   private[spark] val EXECUTOR_ID =
     ConfigBuilder("spark.executor.id").stringConf.createOptional
