@@ -81,19 +81,20 @@ abstract class EventLogFileReadersSuite extends SparkFunSuite with LocalSparkCon
         fileSystem.mkdirs(path)
       }
 
-      val reader = EventLogFileReaders.getEventLogReader(fileSystem, path)
+      val reader = EventLogFileReader.getEventLogReader(fileSystem, path)
       assertInstanceOfEventLogReader(expectedClazz, reader)
-      val reader2 = EventLogFileReaders.getEventLogReader(fileSystem,
+      val reader2 = EventLogFileReader.getEventLogReader(fileSystem,
         fileSystem.getFileStatus(path))
       assertInstanceOfEventLogReader(expectedClazz, reader)
     }
 
     // path with no last sequence - single event log
-    val reader1 = EventLogFileReaders.getEventLogReader(fileSystem, new Path(testDirPath, "aaa"), None)
+    val reader1 = EventLogFileReader.getEventLogReader(fileSystem, new Path(testDirPath, "aaa"),
+      None)
     assertInstanceOfEventLogReader(Some(classOf[SingleFileEventLogFileReader]), Some(reader1))
 
     // path with last sequence - rolling event log
-    val reader2 = EventLogFileReaders.getEventLogReader(fileSystem,
+    val reader2 = EventLogFileReader.getEventLogReader(fileSystem,
       new Path(testDirPath, "eventlog_v2_aaa"), Some(3))
     assertInstanceOfEventLogReader(Some(classOf[RollingEventLogFilesFileReader]), Some(reader2))
 
@@ -134,7 +135,7 @@ abstract class EventLogFileReadersSuite extends SparkFunSuite with LocalSparkCon
       dummyData.foreach(writer.writeEvent(_, flushLogger = true))
 
       val logPathIncompleted = getCurrentLogPath(writer.logPath, isCompleted = false)
-      val readerOpt = EventLogFileReaders.getEventLogReader(fileSystem,
+      val readerOpt = EventLogFileReader.getEventLogReader(fileSystem,
         new Path(logPathIncompleted))
       assertAppropriateReader(readerOpt)
       val reader = readerOpt.get
@@ -144,7 +145,7 @@ abstract class EventLogFileReadersSuite extends SparkFunSuite with LocalSparkCon
       writer.stop()
 
       val logPathCompleted = getCurrentLogPath(writer.logPath, isCompleted = true)
-      val readerOpt2 = EventLogFileReaders.getEventLogReader(fileSystem, new Path(logPathCompleted))
+      val readerOpt2 = EventLogFileReader.getEventLogReader(fileSystem, new Path(logPathCompleted))
       assertAppropriateReader(readerOpt2)
       val reader2 = readerOpt2.get
 
@@ -254,7 +255,7 @@ class RollingEventLogFilesReaderSuite extends EventLogFileReadersSuite {
       }
 
       val logPathIncompleted = getCurrentLogPath(writer.logPath, isCompleted = false)
-      val readerOpt = EventLogFileReaders.getEventLogReader(fileSystem,
+      val readerOpt = EventLogFileReader.getEventLogReader(fileSystem,
         new Path(logPathIncompleted))
       verifyReader(readerOpt.get, new Path(logPathIncompleted), codecShortName, isCompleted = false)
       assert(readerOpt.get.listEventLogFiles.length === 3)
@@ -262,7 +263,7 @@ class RollingEventLogFilesReaderSuite extends EventLogFileReadersSuite {
       writer.stop()
 
       val logPathCompleted = getCurrentLogPath(writer.logPath, isCompleted = true)
-      val readerOpt2 = EventLogFileReaders.getEventLogReader(fileSystem, new Path(logPathCompleted))
+      val readerOpt2 = EventLogFileReader.getEventLogReader(fileSystem, new Path(logPathCompleted))
       verifyReader(readerOpt2.get, new Path(logPathCompleted), codecShortName, isCompleted = true)
       assert(readerOpt.get.listEventLogFiles.length === 3)
     }

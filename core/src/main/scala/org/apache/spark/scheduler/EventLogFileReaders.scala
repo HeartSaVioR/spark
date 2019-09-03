@@ -33,7 +33,7 @@ import org.apache.spark.util.Utils
 
 abstract class EventLogFileReader(
     protected val fileSystem: FileSystem,
-    protected val rootPath: Path) {
+    val rootPath: Path) {
 
   protected def fileSizeForDFS(path: Path): Option[Long] = {
     Utils.tryWithResource(fileSystem.open(path)) { in =>

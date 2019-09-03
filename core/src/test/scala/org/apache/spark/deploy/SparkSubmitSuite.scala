@@ -24,13 +24,15 @@ import java.nio.file.{Files, Paths}
 
 import scala.collection.mutable.ArrayBuffer
 import scala.io.Source
+
 import com.google.common.io.ByteStreams
 import org.apache.commons.io.FileUtils
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FSDataInputStream, FileStatus, Path}
+import org.apache.hadoop.fs.{FileStatus, FSDataInputStream, Path}
 import org.scalatest.{BeforeAndAfterEach, Matchers}
 import org.scalatest.concurrent.{Signaler, ThreadSignaler, TimeLimits}
 import org.scalatest.time.SpanSugar._
+
 import org.apache.spark._
 import org.apache.spark.TestUtils
 import org.apache.spark.TestUtils.JavaSourceFromString

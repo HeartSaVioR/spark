@@ -641,23 +641,6 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
       attemptId: Option[String],
       zipStream: ZipOutputStream): Unit = {
 
-    /**
-     * This method compresses the files passed in, and writes the compressed data out into the
-     * [[OutputStream]] passed in. Each file is written as a new [[ZipEntry]] with its name being
-     * the name of the file being compressed.
-     */
-    def zipFileToStream(file: Path, entryName: String, outputStream: ZipOutputStream): Unit = {
-      val fs = file.getFileSystem(hadoopConf)
-      val inputStream = fs.open(file, 1 * 1024 * 1024) // 1MB Buffer
-      try {
-        outputStream.putNextEntry(new ZipEntry(entryName))
-        ByteStreams.copy(inputStream, outputStream)
-        outputStream.closeEntry()
-      } finally {
-        inputStream.close()
-      }
-    }
-
     val app = try {
       load(appId)
     } catch {
@@ -671,7 +654,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
         .map { id => app.attempts.filter(_.info.attemptId == Some(id)) }
         .getOrElse(app.attempts)
         .foreach { attempt =>
-          val reader = EventLogReaders.getEventLogReader(fs, new Path(logDir, attempt.logPath),
+          val reader = EventLogFileReader.getEventLogReader(fs, new Path(logDir, attempt.logPath),
             attempt.lastSequence)
           reader.zipEventLogFiles(zipStream)
         }
@@ -1083,7 +1066,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
     // At this point the disk data either does not exist or was deleted because it failed to
     // load, so the event log needs to be replayed.
 
-    val reader = EventLogReaders.getEventLogReader(fs, new Path(logDir, attempt.logPath),
+    val reader = EventLogFileReader.getEventLogReader(fs, new Path(logDir, attempt.logPath),
       attempt.lastSequence)
     val isCompressed = reader.compression.isDefined
     logInfo(s"Leasing disk manager space for app $appId / ${attempt.info.attemptId}...")
@@ -1104,7 +1087,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
 
   private def createInMemoryStore(attempt: AttemptInfoWrapper): KVStore = {
     val store = new InMemoryStore()
-    val reader = EventLogReaders.getEventLogReader(fs, new Path(logDir, attempt.logPath),
+    val reader = EventLogFileReader.getEventLogReader(fs, new Path(logDir, attempt.logPath),
       attempt.lastSequence)
     rebuildAppStore(store, reader, attempt.info.lastUpdated.getTime())
     store
