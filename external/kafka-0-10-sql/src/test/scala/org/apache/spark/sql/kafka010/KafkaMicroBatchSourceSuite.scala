@@ -20,19 +20,19 @@ package org.apache.spark.sql.kafka010
 import java.io._
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Paths}
-import java.util.{Locale, Optional}
+import java.util.{Locale, Optional, UUID}
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
+
+import org.apache.commons.io.FileUtils
 
 import scala.collection.JavaConverters._
 import scala.io.Source
 import scala.util.Random
-
 import org.apache.kafka.clients.producer.{ProducerRecord, RecordMetadata}
 import org.apache.kafka.common.TopicPartition
 import org.scalatest.concurrent.PatienceConfiguration.Timeout
 import org.scalatest.time.SpanSugar._
-
 import org.apache.spark.sql.{Dataset, ForeachWriter, SparkSession}
 import org.apache.spark.sql.execution.datasources.v2.StreamingDataSourceV2Relation
 import org.apache.spark.sql.execution.streaming._
@@ -46,6 +46,7 @@ import org.apache.spark.sql.streaming.Trigger
 import org.apache.spark.sql.streaming.util.StreamManualClock
 import org.apache.spark.sql.test.SharedSQLContext
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.util.Utils
 
 abstract class KafkaSourceTest extends StreamTest with SharedSQLContext with KafkaTest {
 
@@ -1097,6 +1098,48 @@ class KafkaMicroBatchV2SourceSuite extends KafkaMicroBatchSourceSuiteBase {
     intercept[IllegalArgumentException] { test(minPartitions = "-1", 1, true) }
   }
 
+
+  test("default config of includeHeader doesn't break existing query from Spark 2.4") {
+    import testImplicits._
+
+    // FIXME: it should be just migrated from Spark 2.4 test run
+    val topic = "spark-test-topic-" + UUID.randomUUID()
+    println(topic)
+    // spark-test-topic-2b8619f5-d3c4-4c2d-b5d1-8d9d9458aa62
+    val tp = new TopicPartition(topic, 0)
+    testUtils.createTopic(topic, partitions = 5, overwrite = true)
+
+    testUtils.sendMessages(topic, Array(-20, -21, -22).map(_.toString), Some(0))
+    testUtils.sendMessages(topic, Array(-10, -11, -12).map(_.toString), Some(1))
+    testUtils.sendMessages(topic, Array(0, 1, 2).map(_.toString), Some(2))
+    testUtils.sendMessages(topic, Array(10, 11, 12).map(_.toString), Some(3))
+    testUtils.sendMessages(topic, Array(20, 21, 22).map(_.toString), Some(4))
+    require(testUtils.getLatestOffsets(Set(topic)).size === 5)
+
+    val kafka = spark
+      .readStream
+      .format("kafka")
+      .option("kafka.bootstrap.servers", testUtils.brokerAddress)
+      .option("kafka.metadata.max.age.ms", "1")
+      .option("subscribePattern", topic)
+      .option("startingOffsets", "earliest")
+      .load()
+
+    val query = kafka.dropDuplicates()
+      .selectExpr("CAST(key AS STRING)", "CAST(value AS STRING)")
+      .as[(String, String)]
+      .map(kv => kv._2.toInt + 1)
+
+    val checkpointDir = new File("/tmp/structured-streaming/checkpoint-version-2.4.3-kafka-include-headers-default") // Utils.createTempDir().getCanonicalFile
+    checkpointDir.mkdirs()
+
+    testStream(query)(
+      StartStream(checkpointLocation = checkpointDir.getAbsolutePath),
+      makeSureGetOffsetCalled,
+      CheckAnswer(-19, -20, -21, -9, -10, -11, 1, 2, 3, 11, 12, 13, 21, 22, 23),
+      StopStream
+    )
+  }
 }
 
 abstract class KafkaSourceSuiteBase extends KafkaSourceTest {
