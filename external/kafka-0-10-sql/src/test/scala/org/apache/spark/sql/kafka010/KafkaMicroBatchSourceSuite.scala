@@ -1125,12 +1125,14 @@ class KafkaMicroBatchV2SourceSuite extends KafkaMicroBatchSourceSuiteBase {
       .option("startingOffsets", "earliest")
       .load()
 
-    val query = kafka.dropDuplicates()
+    val query = kafka
+      .withColumn("value2", 'value)
+      .dropDuplicates()
       .selectExpr("CAST(key AS STRING)", "CAST(value AS STRING)")
       .as[(String, String)]
       .map(kv => kv._2.toInt + 1)
 
-    val checkpointDir = new File("/tmp/structured-streaming/checkpoint-version-2.4.3-kafka-include-headers-default") // Utils.createTempDir().getCanonicalFile
+    val checkpointDir = new File("/tmp/structured-streaming/checkpoint-version-2.4.3-kafka-include-headers-default-v2") // Utils.createTempDir().getCanonicalFile
     checkpointDir.mkdirs()
 
     testStream(query)(
