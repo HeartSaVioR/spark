@@ -228,7 +228,6 @@ case class FlatMapGroupsWithStateExec(
       def onIteratorCompletion: Unit = {
         if (groupState.hasRemoved && groupState.getTimeoutTimestamp == NO_TIMESTAMP) {
           stateManager.removeState(store, stateData.keyRow)
-          numUpdatedStateRows += 1
         } else {
           val currentTimeoutTimestamp = groupState.getTimeoutTimestamp
           val hasTimeoutChanged = currentTimeoutTimestamp != stateData.timeoutTimestamp
