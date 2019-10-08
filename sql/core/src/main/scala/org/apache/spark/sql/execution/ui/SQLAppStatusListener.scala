@@ -20,7 +20,6 @@ import java.util.{Date, NoSuchElementException}
 import java.util.concurrent.ConcurrentHashMap
 
 import scala.collection.JavaConverters._
-
 import org.apache.spark.{JobExecutionStatus, SparkConf}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.Status._
@@ -29,6 +28,7 @@ import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.metric._
 import org.apache.spark.sql.internal.StaticSQLConf._
 import org.apache.spark.status.{ElementTrackingStore, KVUtils, LiveEntity}
+import org.apache.spark.util.kvstore.KVIndex
 
 class SQLAppStatusListener(
     conf: SparkConf,
@@ -42,8 +42,10 @@ class SQLAppStatusListener(
   // Live tracked data is needed by the SQL status store to calculate metrics for in-flight
   // executions; that means arbitrary threads may be querying these maps, so they need to be
   // thread-safe.
-  private val liveExecutions = new ConcurrentHashMap[Long, LiveExecutionData]()
-  private val stageMetrics = new ConcurrentHashMap[Int, LiveStageMetrics]()
+  // LiveExecutionData done...
+  private[spark] val liveExecutions = new ConcurrentHashMap[Long, LiveExecutionData]()
+  // LiveStageMetrics done...
+  private[spark] val stageMetrics = new ConcurrentHashMap[Int, LiveStageMetrics]()
 
   // Returns true if this listener has no live data. Exposed for tests only.
   private[sql] def noLiveData(): Boolean = {
@@ -56,14 +58,18 @@ class SQLAppStatusListener(
 
   kvstore.onFlush {
     if (!live) {
-      val now = System.nanoTime()
-      liveExecutions.values.asScala.foreach { exec =>
-        // This saves the partial aggregated metrics to the store; this works currently because
-        // when the SHS sees an updated event log, all old data for the application is thrown
-        // away.
-        exec.metricsValues = aggregateMetrics(exec)
-        exec.write(kvstore, now)
-      }
+      flush()
+    }
+  }
+
+  private def flush(): Unit = {
+    val now = System.nanoTime()
+    liveExecutions.values.asScala.foreach { exec =>
+      // This saves the partial aggregated metrics to the store; this works currently because
+      // when the SHS sees an updated event log, all old data for the application is thrown
+      // away.
+      exec.metricsValues = aggregateMetrics(exec)
+      exec.write(kvstore, now)
     }
   }
 
@@ -387,9 +393,32 @@ class SQLAppStatusListener(
     }
   }
 
+  def snapshotState(): Unit = {
+    import org.json4s.jackson.JsonMethods._
+    val stateSerialized = SQLAppStatusListenerJsonProtocol.stateToJson(this)
+    val state = new SQLAppStatusListenerState(compact(render(stateSerialized)))
+    kvstore.write(state)
+  }
+
+  def forceFlush(): Unit = {
+    flush()
+  }
+
+  def restoreState(): Unit = {
+    import org.json4s.jackson.JsonMethods._
+    try {
+      val state = kvstore.read(classOf[SQLAppStatusListenerState],
+        classOf[SQLAppStatusListenerState].getName())
+      SQLAppStatusListenerJsonProtocol.restoreStateFromJson(
+        parse(state.stateSerialized), this)
+    } catch {
+      case _: NoSuchElementException =>
+      // FIXME: log error and swallow? throw illegal state exception?
+    }
+  }
 }
 
-private class LiveExecutionData(val executionId: Long) extends LiveEntity {
+private[spark] class LiveExecutionData(val executionId: Long) extends LiveEntity {
 
   var description: String = null
   var details: String = null
@@ -421,16 +450,20 @@ private class LiveExecutionData(val executionId: Long) extends LiveEntity {
       stages,
       metricsValues)
   }
-
 }
 
-private class LiveStageMetrics(
+private[spark] class LiveStageMetrics(
     val stageId: Int,
     var attemptId: Int,
     val accumulatorIds: Set[Long],
     val taskMetrics: ConcurrentHashMap[Long, LiveTaskMetrics])
 
-private class LiveTaskMetrics(
+private[spark] class LiveTaskMetrics(
     val ids: Array[Long],
     val values: Array[Long],
     val succeeded: Boolean)
+
+private[spark] class SQLAppStatusListenerState(val stateSerialized: String) {
+  @KVIndex
+  def id: String = classOf[SQLAppStatusListenerState].getName()
+}

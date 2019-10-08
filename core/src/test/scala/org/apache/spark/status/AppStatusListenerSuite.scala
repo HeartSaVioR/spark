@@ -676,6 +676,327 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
     }
   }
 
+  test("scheduler events - store and restore") {
+    var listener = new AppStatusListener(store, conf, false)
+
+    listener.onOtherEvent(SparkListenerLogStart("TestSparkVersion"))
+
+    // Start the application.
+    time += 1
+    listener.onApplicationStart(SparkListenerApplicationStart(
+      "name",
+      Some("id"),
+      time,
+      "user",
+      Some("attempt"),
+      None))
+
+    // Start a couple of executors.
+    time += 1
+    val execIds = Array("1", "2")
+
+    execIds.foreach { id =>
+      listener.onExecutorAdded(SparkListenerExecutorAdded(time, id,
+        new ExecutorInfo(s"$id.example.com", 1, Map.empty, Map.empty)))
+    }
+
+    // Start a job with 2 stages / 4 tasks each
+    time += 1
+    val stages = Seq(
+      new StageInfo(1, 0, "stage1", 4, Nil, Nil, "details1"),
+      new StageInfo(2, 0, "stage2", 4, Nil, Seq(1), "details2"))
+
+    val jobProps = new Properties()
+    jobProps.setProperty(SparkContext.SPARK_JOB_GROUP_ID, "jobGroup")
+    jobProps.setProperty(SparkContext.SPARK_SCHEDULER_POOL, "schedPool")
+
+    listener.onJobStart(SparkListenerJobStart(1, time, stages, jobProps))
+
+    // Submit stage 1
+    time += 1
+    stages.head.submissionTime = Some(time)
+    listener.onStageSubmitted(SparkListenerStageSubmitted(stages.head, jobProps))
+
+    // Start tasks from stage 1
+    time += 1
+
+    val s1Tasks = createTasks(4, execIds)
+    s1Tasks.foreach { task =>
+      listener.onTaskStart(SparkListenerTaskStart(stages.head.stageId,
+        stages.head.attemptNumber,
+        task))
+    }
+
+    // Send two executor metrics update. Only update one metric to avoid a lot of boilerplate code.
+    // The tasks are distributed among the two executors, so the executor-level metrics should
+    // hold half of the cummulative value of the metric being updated.
+    Seq(1L, 2L).foreach { value =>
+      s1Tasks.foreach { task =>
+        val accum = new AccumulableInfo(1L, Some(InternalAccumulator.MEMORY_BYTES_SPILLED),
+          Some(value), None, true, false, None)
+        listener.onExecutorMetricsUpdate(SparkListenerExecutorMetricsUpdate(
+          task.executorId,
+          Seq((task.taskId, stages.head.stageId, stages.head.attemptNumber, Seq(accum)))))
+      }
+    }
+
+    // Blacklisting executor for stage
+    time += 1
+    listener.onExecutorBlacklistedForStage(SparkListenerExecutorBlacklistedForStage(
+      time = time,
+      executorId = execIds.head,
+      taskFailures = 2,
+      stageId = stages.head.stageId,
+      stageAttemptId = stages.head.attemptNumber))
+
+    // Blacklisting node for stage
+    time += 1
+    listener.onNodeBlacklistedForStage(SparkListenerNodeBlacklistedForStage(
+      time = time,
+      hostId = "2.example.com", // this is where the second executor is hosted
+      executorFailures = 1,
+      stageId = stages.head.stageId,
+      stageAttemptId = stages.head.attemptNumber))
+
+    def assertSnapshottedState(): Unit = {
+      listener.forceFlush()
+      listener.snapshotState()
+
+      val tmpListener = new AppStatusListener(store, conf, false)
+      tmpListener.restoreState()
+
+      assert(tmpListener.liveJobs.mapValues(AppStatusListenerJsonProtocol.liveJobToJson)
+        === listener.liveJobs.mapValues(AppStatusListenerJsonProtocol.liveJobToJson))
+      assert(tmpListener.liveStages.entrySet().asScala.map { entry =>
+        entry.getKey -> AppStatusListenerJsonProtocol.liveStageToJson(entry.getValue)
+      } === listener.liveStages.entrySet().asScala.map { entry =>
+        entry.getKey -> AppStatusListenerJsonProtocol.liveStageToJson(entry.getValue)
+      })
+      assert(tmpListener.liveTasks.mapValues(AppStatusListenerJsonProtocol.liveTaskToJson)
+        === listener.liveTasks.mapValues(AppStatusListenerJsonProtocol.liveTaskToJson))
+      assert(tmpListener.liveExecutors.mapValues(AppStatusListenerJsonProtocol.liveExecutorToJson)
+        === listener.liveExecutors.mapValues(AppStatusListenerJsonProtocol.liveExecutorToJson))
+      assert(tmpListener.deadExecutors.mapValues(AppStatusListenerJsonProtocol.liveExecutorToJson)
+        === listener.deadExecutors.mapValues(AppStatusListenerJsonProtocol.liveExecutorToJson))
+      assert(tmpListener.liveRDDs.mapValues(AppStatusListenerJsonProtocol.liveRddToJson)
+        === listener.liveRDDs.mapValues(AppStatusListenerJsonProtocol.liveRddToJson))
+      assert(tmpListener.activeExecutorCount === listener.activeExecutorCount)
+    }
+
+    assertSnapshottedState()
+
+    // Fail one of the tasks, re-start it.
+    time += 1
+    s1Tasks.head.markFinished(TaskState.FAILED, time)
+    listener.onTaskEnd(SparkListenerTaskEnd(stages.head.stageId, stages.head.attemptNumber,
+      "taskType", TaskResultLost, s1Tasks.head, new ExecutorMetrics, null))
+
+    time += 1
+    val reattempt = newAttempt(s1Tasks.head, nextTaskId())
+    listener.onTaskStart(SparkListenerTaskStart(stages.head.stageId, stages.head.attemptNumber,
+      reattempt))
+
+    // Kill one task, restart it.
+    time += 1
+    val killed = s1Tasks.drop(1).head
+    killed.finishTime = time
+    killed.failed = true
+    listener.onTaskEnd(SparkListenerTaskEnd(stages.head.stageId, stages.head.attemptNumber,
+      "taskType", TaskKilled("killed"), killed, new ExecutorMetrics, null))
+
+    assertSnapshottedState()
+
+    // Start a new attempt and finish it with TaskCommitDenied, make sure it's handled like a kill.
+    time += 1
+    val denied = newAttempt(killed, nextTaskId())
+    val denyReason = TaskCommitDenied(1, 1, 1)
+    listener.onTaskStart(SparkListenerTaskStart(stages.head.stageId, stages.head.attemptNumber,
+      denied))
+
+    time += 1
+    denied.finishTime = time
+    denied.failed = true
+    listener.onTaskEnd(SparkListenerTaskEnd(stages.head.stageId, stages.head.attemptNumber,
+      "taskType", denyReason, denied, new ExecutorMetrics, null))
+
+    assertSnapshottedState()
+
+    // Start a new attempt.
+    val reattempt2 = newAttempt(denied, nextTaskId())
+    listener.onTaskStart(SparkListenerTaskStart(stages.head.stageId, stages.head.attemptNumber,
+      reattempt2))
+
+    // Succeed all tasks in stage 1.
+    val pending = s1Tasks.drop(2) ++ Seq(reattempt, reattempt2)
+
+    val s1Metrics = TaskMetrics.empty
+    s1Metrics.setExecutorCpuTime(2L)
+    s1Metrics.setExecutorRunTime(4L)
+
+    time += 1
+    pending.foreach { task =>
+      task.markFinished(TaskState.FINISHED, time)
+      listener.onTaskEnd(SparkListenerTaskEnd(stages.head.stageId, stages.head.attemptNumber,
+        "taskType", Success, task, new ExecutorMetrics, s1Metrics))
+    }
+
+    assertSnapshottedState()
+
+    // End stage 1.
+    time += 1
+    stages.head.completionTime = Some(time)
+    listener.onStageCompleted(SparkListenerStageCompleted(stages.head))
+
+    assertSnapshottedState()
+
+    // Submit stage 2.
+    time += 1
+    stages.last.submissionTime = Some(time)
+    listener.onStageSubmitted(SparkListenerStageSubmitted(stages.last, jobProps))
+
+    // Blacklisting node for stage
+    time += 1
+    listener.onNodeBlacklistedForStage(SparkListenerNodeBlacklistedForStage(
+      time = time,
+      hostId = "1.example.com",
+      executorFailures = 1,
+      stageId = stages.last.stageId,
+      stageAttemptId = stages.last.attemptNumber))
+
+    // Start and fail all tasks of stage 2.
+    time += 1
+    val s2Tasks = createTasks(4, execIds)
+    s2Tasks.foreach { task =>
+      listener.onTaskStart(SparkListenerTaskStart(stages.last.stageId,
+        stages.last.attemptNumber,
+        task))
+    }
+
+    time += 1
+    s2Tasks.foreach { task =>
+      task.markFinished(TaskState.FAILED, time)
+      listener.onTaskEnd(SparkListenerTaskEnd(stages.last.stageId, stages.last.attemptNumber,
+        "taskType", TaskResultLost, task, new ExecutorMetrics, null))
+    }
+
+    assertSnapshottedState()
+
+    // Fail stage 2.
+    time += 1
+    stages.last.completionTime = Some(time)
+    stages.last.failureReason = Some("uh oh")
+    listener.onStageCompleted(SparkListenerStageCompleted(stages.last))
+
+    assertSnapshottedState()
+
+    // - Re-submit stage 2, all tasks, and succeed them and the stage.
+    val oldS2 = stages.last
+    val newS2 = new StageInfo(oldS2.stageId, oldS2.attemptNumber + 1, oldS2.name, oldS2.numTasks,
+      oldS2.rddInfos, oldS2.parentIds, oldS2.details, oldS2.taskMetrics)
+
+    time += 1
+    newS2.submissionTime = Some(time)
+    listener.onStageSubmitted(SparkListenerStageSubmitted(newS2, jobProps))
+
+    val newS2Tasks = createTasks(4, execIds)
+
+    newS2Tasks.foreach { task =>
+      listener.onTaskStart(SparkListenerTaskStart(newS2.stageId, newS2.attemptNumber, task))
+    }
+
+    time += 1
+    newS2Tasks.foreach { task =>
+      task.markFinished(TaskState.FINISHED, time)
+      listener.onTaskEnd(SparkListenerTaskEnd(newS2.stageId, newS2.attemptNumber, "taskType",
+        Success, task, new ExecutorMetrics, null))
+    }
+
+    assertSnapshottedState()
+
+    time += 1
+    newS2.completionTime = Some(time)
+    listener.onStageCompleted(SparkListenerStageCompleted(newS2))
+
+    // End job.
+    time += 1
+    listener.onJobEnd(SparkListenerJobEnd(1, time, JobSucceeded))
+
+    assertSnapshottedState()
+
+    // Submit a second job that re-uses stage 1 and stage 2. Stage 1 won't be re-run, but
+    // stage 2 will. In any case, the DAGScheduler creates new info structures that are copies
+    // of the old stages, so mimic that behavior here. The "new" stage 1 is submitted without
+    // a submission time, which means it is "skipped", and the stage 2 re-execution should not
+    // change the stats of the already finished job.
+    time += 1
+    val j2Stages = Seq(
+      new StageInfo(3, 0, "stage1", 4, Nil, Nil, "details1"),
+      new StageInfo(4, 0, "stage2", 4, Nil, Seq(3), "details2"))
+    j2Stages.last.submissionTime = Some(time)
+    listener.onJobStart(SparkListenerJobStart(2, time, j2Stages, null))
+
+    listener.onStageSubmitted(SparkListenerStageSubmitted(j2Stages.head, jobProps))
+    listener.onStageCompleted(SparkListenerStageCompleted(j2Stages.head))
+    listener.onStageSubmitted(SparkListenerStageSubmitted(j2Stages.last, jobProps))
+
+    time += 1
+    val j2s2Tasks = createTasks(4, execIds)
+
+    j2s2Tasks.foreach { task =>
+      listener.onTaskStart(SparkListenerTaskStart(j2Stages.last.stageId,
+        j2Stages.last.attemptNumber,
+        task))
+    }
+
+    time += 1
+    j2s2Tasks.foreach { task =>
+      task.markFinished(TaskState.FINISHED, time)
+      listener.onTaskEnd(SparkListenerTaskEnd(j2Stages.last.stageId, j2Stages.last.attemptNumber,
+        "taskType", Success, task, new ExecutorMetrics, null))
+    }
+
+    time += 1
+    j2Stages.last.completionTime = Some(time)
+    listener.onStageCompleted(SparkListenerStageCompleted(j2Stages.last))
+
+    assertSnapshottedState()
+
+    time += 1
+    listener.onJobEnd(SparkListenerJobEnd(2, time, JobSucceeded))
+
+    // Blacklist an executor.
+    time += 1
+    listener.onExecutorBlacklisted(SparkListenerExecutorBlacklisted(time, "1", 42))
+
+    assertSnapshottedState()
+
+    time += 1
+    listener.onExecutorUnblacklisted(SparkListenerExecutorUnblacklisted(time, "1"))
+
+    assertSnapshottedState()
+
+    // Blacklist a node.
+    time += 1
+    listener.onNodeBlacklisted(SparkListenerNodeBlacklisted(time, "1.example.com", 2))
+
+    time += 1
+    listener.onNodeUnblacklisted(SparkListenerNodeUnblacklisted(time, "1.example.com"))
+
+    assertSnapshottedState()
+
+    // Stop executors.
+    time += 1
+    listener.onExecutorRemoved(SparkListenerExecutorRemoved(time, "1", "Test"))
+    listener.onExecutorRemoved(SparkListenerExecutorRemoved(time, "2", "Test"))
+
+    assertSnapshottedState()
+
+    // End the application.
+    listener.onApplicationEnd(SparkListenerApplicationEnd(42L))
+
+    assertSnapshottedState()
+  }
+
   test("storage events") {
     val listener = new AppStatusListener(store, conf, true)
     val maxMemory = 42L

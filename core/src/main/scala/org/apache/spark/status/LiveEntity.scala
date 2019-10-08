@@ -22,18 +22,18 @@ import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.immutable.{HashSet, TreeSet}
 import scala.collection.mutable.HashMap
-
 import com.google.common.collect.Interners
-
 import org.apache.spark.JobExecutionStatus
 import org.apache.spark.executor.{ExecutorMetrics, TaskMetrics}
 import org.apache.spark.resource.ResourceInformation
-import org.apache.spark.scheduler.{AccumulableInfo, StageInfo, TaskInfo}
+import org.apache.spark.scheduler.{AccumulableInfo, StageInfo, TaskInfo, TaskLocality}
 import org.apache.spark.status.api.v1
 import org.apache.spark.storage.RDDInfo
 import org.apache.spark.ui.SparkUI
-import org.apache.spark.util.AccumulatorContext
+import org.apache.spark.util.{AccumulatorContext, JsonProtocol}
 import org.apache.spark.util.collection.OpenHashSet
+
+import scala.collection.mutable
 
 /**
  * A mutable representation of a live entity in Spark (jobs, stages, tasks, et al). Every live
@@ -59,34 +59,34 @@ private[spark] abstract class LiveEntity {
 
 }
 
-private class LiveJob(
+private[spark] class LiveJob(
     val jobId: Int,
-    name: String,
+    val name: String,
     val submissionTime: Option[Date],
     val stageIds: Seq[Int],
-    jobGroup: Option[String],
-    numTasks: Int,
-    sqlExecutionId: Option[Long]) extends LiveEntity {
+    val jobGroup: Option[String],
+    val numTasks: Int,
+    val sqlExecutionId: Option[Long]) extends LiveEntity {
 
-  var activeTasks = 0
-  var completedTasks = 0
-  var failedTasks = 0
+  var activeTasks: Int = 0
+  var completedTasks: Int = 0
+  var failedTasks: Int = 0
 
   // Holds both the stage ID and the task index, packed into a single long value.
   val completedIndices = new OpenHashSet[Long]()
 
-  var killedTasks = 0
+  var killedTasks: Int = 0
   var killedSummary: Map[String, Int] = Map()
 
-  var skippedTasks = 0
+  var skippedTasks: Int = 0
   var skippedStages = Set[Int]()
 
   var status = JobExecutionStatus.RUNNING
   var completionTime: Option[Date] = None
 
   var completedStages: Set[Int] = Set()
-  var activeStages = 0
-  var failedStages = 0
+  var activeStages: Int = 0
+  var failedStages: Int = 0
 
   override protected def doUpdate(): Any = {
     val info = new v1.JobData(
@@ -112,20 +112,19 @@ private class LiveJob(
       killedSummary)
     new JobDataWrapper(info, skippedStages, sqlExecutionId)
   }
-
 }
 
-private class LiveTask(
+private[spark] class LiveTask(
     var info: TaskInfo,
-    stageId: Int,
-    stageAttemptId: Int,
-    lastUpdateTime: Option[Long]) extends LiveEntity {
+    val stageId: Int,
+    val stageAttemptId: Int,
+    val lastUpdateTime: Option[Long]) extends LiveEntity {
 
   import LiveEntityHelpers._
 
   // The task metrics use a special value when no metrics have been reported. The special value is
   // checked when calculating indexed values when writing to the store (see [[TaskDataWrapper]]).
-  private var metrics: v1.TaskMetrics = createMetrics(default = -1L)
+  private[spark] var metrics: v1.TaskMetrics = createMetrics(default = -1L)
 
   var errorMessage: Option[String] = None
 
@@ -229,7 +228,7 @@ private class LiveTask(
 
 }
 
-private class LiveExecutor(val executorId: String, _addTime: Long) extends LiveEntity {
+private[spark] class LiveExecutor(val executorId: String, _addTime: Long) extends LiveEntity {
 
   var hostPort: String = null
   var host: String = null
@@ -316,17 +315,17 @@ private class LiveExecutor(val executorId: String, _addTime: Long) extends LiveE
   }
 }
 
-private class LiveExecutorStageSummary(
-    stageId: Int,
-    attemptId: Int,
-    executorId: String) extends LiveEntity {
+private[spark] class LiveExecutorStageSummary(
+    val stageId: Int,
+    val attemptId: Int,
+    val executorId: String) extends LiveEntity {
 
   import LiveEntityHelpers._
 
-  var taskTime = 0L
-  var succeededTasks = 0
-  var failedTasks = 0
-  var killedTasks = 0
+  var taskTime: Long = 0L
+  var succeededTasks: Int = 0
+  var failedTasks: Int = 0
+  var killedTasks: Int = 0
   var isBlacklisted = false
 
   var metrics = createMetrics(default = 0L)
@@ -353,7 +352,7 @@ private class LiveExecutorStageSummary(
 
 }
 
-private class LiveStage extends LiveEntity {
+private[spark] class LiveStage extends LiveEntity {
 
   import LiveEntityHelpers._
 
@@ -366,15 +365,15 @@ private class LiveStage extends LiveEntity {
   var description: Option[String] = None
   var schedulingPool: String = SparkUI.DEFAULT_POOL_NAME
 
-  var activeTasks = 0
-  var completedTasks = 0
-  var failedTasks = 0
+  var activeTasks: Int = 0
+  var completedTasks: Int = 0
+  var failedTasks: Int = 0
   val completedIndices = new OpenHashSet[Int]()
 
-  var killedTasks = 0
+  var killedTasks: Int = 0
   var killedSummary: Map[String, Int] = Map()
 
-  var firstLaunchTime = Long.MaxValue
+  var firstLaunchTime: Long = Long.MaxValue
 
   var localitySummary: Map[String, Long] = Map()
 
@@ -458,7 +457,7 @@ private class LiveStage extends LiveEntity {
 
 }
 
-private class LiveRDDPartition(val blockName: String) {
+private[spark] class LiveRDDPartition(val blockName: String) {
 
   import LiveEntityHelpers._
 
@@ -489,7 +488,7 @@ private class LiveRDDPartition(val blockName: String) {
 
 }
 
-private class LiveRDDDistribution(exec: LiveExecutor) {
+private[spark] class LiveRDDDistribution(val exec: LiveExecutor) {
 
   import LiveEntityHelpers._
 
@@ -520,7 +519,7 @@ private class LiveRDDDistribution(exec: LiveExecutor) {
 
 }
 
-private class LiveRDD(val info: RDDInfo) extends LiveEntity {
+private[spark] class LiveRDD(val info: RDDInfo) extends LiveEntity {
 
   import LiveEntityHelpers._
 
@@ -566,6 +565,14 @@ private class LiveRDD(val info: RDDInfo) extends LiveEntity {
 
   def getDistributions(): scala.collection.Map[String, LiveRDDDistribution] = distributions
 
+  private[spark] def addPartitions(newPartitions: Map[String, LiveRDDPartition]): Unit = {
+    partitions ++= newPartitions
+  }
+
+  private[spark] def addDistributions(newDistributions: Map[String, LiveRDDDistribution]): Unit = {
+    distributions ++= newDistributions
+  }
+
   override protected def doUpdate(): Any = {
     val dists = if (distributions.nonEmpty) {
       Some(distributions.values.map(_.toApi()).toSeq)
@@ -589,7 +596,7 @@ private class LiveRDD(val info: RDDInfo) extends LiveEntity {
 
 }
 
-private class SchedulerPool(name: String) extends LiveEntity {
+private[spark] class SchedulerPool(val name: String) extends LiveEntity {
 
   var stageIds = Set[Int]()
 

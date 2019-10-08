@@ -22,11 +22,14 @@ import java.util.Date
 
 import com.fasterxml.jackson.annotation.JsonIgnore
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize
-
+import org.apache.spark.JobExecutionStatus
+import org.apache.spark.scheduler.TaskLocality
 import org.apache.spark.status.KVUtils._
 import org.apache.spark.status.api.v1._
 import org.apache.spark.ui.scope._
 import org.apache.spark.util.kvstore.KVIndex
+import org.json4s.JValue
+import org.json4s.JsonAST.JValue
 
 private[spark] case class AppStatusStoreMetadata(version: Long)
 
@@ -492,4 +495,9 @@ private[spark] class CachedQuantile(
   @KVIndex("stage") @JsonIgnore
   def stage: Array[Int] = Array(stageId, stageAttemptId)
 
+}
+
+private[spark] class AppStatusListenerState(val stateSerialized: String) {
+  @KVIndex
+  def id: String = classOf[AppStatusListenerState].getName()
 }

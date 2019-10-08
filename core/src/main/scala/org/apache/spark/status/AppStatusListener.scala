@@ -17,12 +17,11 @@
 
 package org.apache.spark.status
 
-import java.util.Date
+import java.util.{Date, NoSuchElementException}
 import java.util.concurrent.ConcurrentHashMap
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable.HashMap
-
 import org.apache.spark._
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.internal.Logging
@@ -33,6 +32,7 @@ import org.apache.spark.status.api.v1
 import org.apache.spark.storage._
 import org.apache.spark.ui.SparkUI
 import org.apache.spark.ui.scope._
+import org.json4s.{JValue, StringInput}
 
 /**
  * A Spark listener that writes application information to a data store. The types written to the
@@ -69,18 +69,24 @@ private[spark] class AppStatusListener(
 
   // Keep track of live entities, so that task metrics can be efficiently updated (without
   // causing too many writes to the underlying store, and other expensive operations).
-  private val liveStages = new ConcurrentHashMap[(Int, Int), LiveStage]()
-  private val liveJobs = new HashMap[Int, LiveJob]()
-  private val liveExecutors = new HashMap[String, LiveExecutor]()
-  private val deadExecutors = new HashMap[String, LiveExecutor]()
-  private val liveTasks = new HashMap[Long, LiveTask]()
-  private val liveRDDs = new HashMap[Int, LiveRDD]()
-  private val pools = new HashMap[String, SchedulerPool]()
+  // LiveStage done...
+  private[spark] val liveStages = new ConcurrentHashMap[(Int, Int), LiveStage]()
+  // LiveJob done...
+  private[spark] val liveJobs = new HashMap[Int, LiveJob]()
+  // LiveExecutor done...
+  private[spark] val liveExecutors = new HashMap[String, LiveExecutor]()
+  private[spark] val deadExecutors = new HashMap[String, LiveExecutor]()
+  // LiveTask done...
+  private[spark] val liveTasks = new HashMap[Long, LiveTask]()
+  // LiveRDD done...
+  private[spark] val liveRDDs = new HashMap[Int, LiveRDD]()
+  // SchedulerPool done...
+  private[spark] val pools = new HashMap[String, SchedulerPool]()
 
   private val SQL_EXECUTION_ID_KEY = "spark.sql.execution.id"
   // Keep the active executor count as a separate variable to avoid having to do synchronization
   // around liveExecutors.
-  @volatile private var activeExecutorCount = 0
+  @volatile private[spark] var activeExecutorCount = 0
 
   /** The last time when flushing `LiveEntity`s. This is to avoid flushing too frequently. */
   private var lastFlushTimeNs = System.nanoTime()
@@ -1241,4 +1247,28 @@ private[spark] class AppStatusListener(
     }
   }
 
+  def snapshotState(): Unit = {
+    import org.json4s.jackson.JsonMethods._
+    val stateSerialized = AppStatusListenerJsonProtocol.appStatusListenerStateToJson(this)
+    val state = new AppStatusListenerState(compact(render(stateSerialized)))
+    kvstore.write(state)
+  }
+
+  def forceFlush(): Unit = {
+    val now = System.nanoTime()
+    flush(update(_, now))
+  }
+
+  def restoreState(): Unit = {
+    import org.json4s.jackson.JsonMethods._
+    try {
+      val state = kvstore.read(classOf[AppStatusListenerState],
+        classOf[AppStatusListenerState].getName())
+      AppStatusListenerJsonProtocol.restoreAppStatusListenerStateFromJson(
+        parse(state.stateSerialized), this)
+    } catch {
+      case _: NoSuchElementException =>
+        // FIXME: log error and swallow? throw illegal state exception?
+    }
+  }
 }
