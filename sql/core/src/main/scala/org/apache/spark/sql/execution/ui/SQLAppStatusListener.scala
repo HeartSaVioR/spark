@@ -21,6 +21,8 @@ import java.util.concurrent.ConcurrentHashMap
 
 import scala.collection.JavaConverters._
 
+import org.json4s.JValue
+
 import org.apache.spark.{JobExecutionStatus, SparkConf}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.Status._
@@ -42,8 +44,8 @@ class SQLAppStatusListener(
   // Live tracked data is needed by the SQL status store to calculate metrics for in-flight
   // executions; that means arbitrary threads may be querying these maps, so they need to be
   // thread-safe.
-  private val liveExecutions = new ConcurrentHashMap[Long, LiveExecutionData]()
-  private val stageMetrics = new ConcurrentHashMap[Int, LiveStageMetrics]()
+  private[sql] val liveExecutions = new ConcurrentHashMap[Long, LiveExecutionData]()
+  private[sql] val stageMetrics = new ConcurrentHashMap[Int, LiveStageMetrics]()
 
   // Returns true if this listener has no live data. Exposed for tests only.
   private[sql] def noLiveData(): Boolean = {
@@ -65,6 +67,22 @@ class SQLAppStatusListener(
         exec.write(kvstore, now)
       }
     }
+  }
+
+  // TODO: figure out which is the preferred approach/data structure to snapshot and restore
+  def snapshotState(): JValue = {
+    SQLAppStatusListenerJsonProtocol.stateToJson(this)
+  }
+
+  def restoreState(json: JValue): Unit = {
+    SQLAppStatusListenerJsonProtocol.restoreStateFromJson(json, this)
+  }
+
+  // TODO: for now, this is just to ensure snapshot of live entities are in sync with entities
+  //  in KVStore during tests, but this must be also called in prior when we would
+  //  want to snapshot KVStore.
+  private[spark] def forceFlush(): Unit = {
+    liveExecutions.values.asScala.foreach(update(_, force = true))
   }
 
   override def onJobStart(event: SparkListenerJobStart): Unit = {
@@ -389,7 +407,7 @@ class SQLAppStatusListener(
 
 }
 
-private class LiveExecutionData(val executionId: Long) extends LiveEntity {
+private[sql] class LiveExecutionData(val executionId: Long) extends LiveEntity {
 
   var description: String = null
   var details: String = null
@@ -424,13 +442,13 @@ private class LiveExecutionData(val executionId: Long) extends LiveEntity {
 
 }
 
-private class LiveStageMetrics(
+private[sql] class LiveStageMetrics(
     val stageId: Int,
     var attemptId: Int,
     val accumulatorIds: Set[Long],
     val taskMetrics: ConcurrentHashMap[Long, LiveTaskMetrics])
 
-private class LiveTaskMetrics(
+private[sql] class LiveTaskMetrics(
     val ids: Array[Long],
     val values: Array[Long],
     val succeeded: Boolean)

@@ -59,14 +59,14 @@ private[spark] abstract class LiveEntity {
 
 }
 
-private class LiveJob(
+private[spark] class LiveJob(
     val jobId: Int,
-    name: String,
+    val name: String,
     val submissionTime: Option[Date],
     val stageIds: Seq[Int],
-    jobGroup: Option[String],
-    numTasks: Int,
-    sqlExecutionId: Option[Long]) extends LiveEntity {
+    val jobGroup: Option[String],
+    val numTasks: Int,
+    val sqlExecutionId: Option[Long]) extends LiveEntity {
 
   var activeTasks = 0
   var completedTasks = 0
@@ -115,17 +115,17 @@ private class LiveJob(
 
 }
 
-private class LiveTask(
+private[spark] class LiveTask(
     var info: TaskInfo,
-    stageId: Int,
-    stageAttemptId: Int,
-    lastUpdateTime: Option[Long]) extends LiveEntity {
+    val stageId: Int,
+    val stageAttemptId: Int,
+    val lastUpdateTime: Option[Long]) extends LiveEntity {
 
   import LiveEntityHelpers._
 
   // The task metrics use a special value when no metrics have been reported. The special value is
   // checked when calculating indexed values when writing to the store (see [[TaskDataWrapper]]).
-  private var metrics: v1.TaskMetrics = createMetrics(default = -1L)
+  private[spark] var metrics: v1.TaskMetrics = createMetrics(default = -1L)
 
   var errorMessage: Option[String] = None
 
@@ -229,7 +229,7 @@ private class LiveTask(
 
 }
 
-private class LiveExecutor(val executorId: String, _addTime: Long) extends LiveEntity {
+private[spark] class LiveExecutor(val executorId: String, _addTime: Long) extends LiveEntity {
 
   var hostPort: String = null
   var host: String = null
@@ -316,10 +316,10 @@ private class LiveExecutor(val executorId: String, _addTime: Long) extends LiveE
   }
 }
 
-private class LiveExecutorStageSummary(
-    stageId: Int,
-    attemptId: Int,
-    executorId: String) extends LiveEntity {
+private[spark] class LiveExecutorStageSummary(
+    val stageId: Int,
+    val attemptId: Int,
+    val executorId: String) extends LiveEntity {
 
   import LiveEntityHelpers._
 
@@ -353,7 +353,7 @@ private class LiveExecutorStageSummary(
 
 }
 
-private class LiveStage extends LiveEntity {
+private[spark] class LiveStage extends LiveEntity {
 
   import LiveEntityHelpers._
 
@@ -458,7 +458,7 @@ private class LiveStage extends LiveEntity {
 
 }
 
-private class LiveRDDPartition(val blockName: String) {
+private[spark] class LiveRDDPartition(val blockName: String) {
 
   import LiveEntityHelpers._
 
@@ -489,7 +489,7 @@ private class LiveRDDPartition(val blockName: String) {
 
 }
 
-private class LiveRDDDistribution(exec: LiveExecutor) {
+private[spark] class LiveRDDDistribution(val exec: LiveExecutor) {
 
   import LiveEntityHelpers._
 
@@ -520,7 +520,7 @@ private class LiveRDDDistribution(exec: LiveExecutor) {
 
 }
 
-private class LiveRDD(val info: RDDInfo) extends LiveEntity {
+private[spark] class LiveRDD(val info: RDDInfo) extends LiveEntity {
 
   import LiveEntityHelpers._
 
@@ -528,10 +528,10 @@ private class LiveRDD(val info: RDDInfo) extends LiveEntity {
   var memoryUsed = 0L
   var diskUsed = 0L
 
-  private val partitions = new HashMap[String, LiveRDDPartition]()
-  private val partitionSeq = new RDDPartitionSeq()
+  private[spark] val partitions = new HashMap[String, LiveRDDPartition]()
+  private[spark] val partitionSeq = new RDDPartitionSeq()
 
-  private val distributions = new HashMap[String, LiveRDDDistribution]()
+  private[spark] val distributions = new HashMap[String, LiveRDDDistribution]()
 
   def setStorageLevel(level: String): Unit = {
     this.storageLevel = weakIntern(level)
@@ -566,6 +566,15 @@ private class LiveRDD(val info: RDDInfo) extends LiveEntity {
 
   def getDistributions(): scala.collection.Map[String, LiveRDDDistribution] = distributions
 
+  private[spark] def addPartitions(newPartitions: Seq[LiveRDDPartition]): Unit = {
+    partitions ++= newPartitions.map { part => part.blockName -> part }.toMap
+    newPartitions.foreach(partitionSeq.addPartition)
+  }
+
+  private[spark] def addDistributions(newDistributions: Map[String, LiveRDDDistribution]): Unit = {
+    distributions ++= newDistributions
+  }
+
   override protected def doUpdate(): Any = {
     val dists = if (distributions.nonEmpty) {
       Some(distributions.values.map(_.toApi()).toSeq)
@@ -589,7 +598,7 @@ private class LiveRDD(val info: RDDInfo) extends LiveEntity {
 
 }
 
-private class SchedulerPool(name: String) extends LiveEntity {
+private[spark] class SchedulerPool(val name: String) extends LiveEntity {
 
   var stageIds = Set[Int]()
 
@@ -739,7 +748,7 @@ private object LiveEntityHelpers {
  * Internally, the sequence is mutable, and elements can modify the data they expose. Additions and
  * removals are O(1). It is not safe to do multiple writes concurrently.
  */
-private class RDDPartitionSeq extends Seq[v1.RDDPartitionInfo] {
+private[spark] class RDDPartitionSeq extends Seq[v1.RDDPartitionInfo] {
 
   @volatile private var _head: LiveRDDPartition = null
   @volatile private var _tail: LiveRDDPartition = null

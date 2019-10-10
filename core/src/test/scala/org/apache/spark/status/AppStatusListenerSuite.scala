@@ -22,6 +22,7 @@ import java.util.{Date, Properties}
 
 import scala.collection.JavaConverters._
 import scala.collection.immutable.Map
+import scala.collection.mutable
 import scala.reflect.{classTag, ClassTag}
 
 import org.scalatest.BeforeAndAfter
@@ -34,7 +35,7 @@ import org.apache.spark.scheduler._
 import org.apache.spark.scheduler.cluster._
 import org.apache.spark.status.api.v1
 import org.apache.spark.storage._
-import org.apache.spark.util.Utils
+import org.apache.spark.util.{JsonUtils, Utils}
 
 class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
 
@@ -100,7 +101,7 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
   }
 
   test("scheduler events") {
-    val listener = new AppStatusListener(store, conf, true)
+    var listener = new AppStatusListener(store, conf, true)
 
     listener.onOtherEvent(SparkListenerLogStart("TestSparkVersion"))
 
@@ -146,6 +147,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       }
     }
 
+    listener = renewListener(listener, live = true)
+
     // Start a job with 2 stages / 4 tasks each
     time += 1
     val stages = Seq(
@@ -174,6 +177,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       }
     }
 
+    listener = renewListener(listener, live = true)
+
     // Submit stage 1
     time += 1
     stages.head.submissionTime = Some(time)
@@ -188,6 +193,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(stage.info.submissionTime === Some(new Date(stages.head.submissionTime.get)))
       assert(stage.info.numTasks === stages.head.numTasks)
     }
+
+    listener = renewListener(listener, live = true)
 
     // Start tasks from stage 1
     time += 1
@@ -226,6 +233,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       }
     }
 
+    listener = renewListener(listener, live = true)
+
     // Send two executor metrics update. Only update one metric to avoid a lot of boilerplate code.
     // The tasks are distributed among the two executors, so the executor-level metrics should
     // hold half of the cummulative value of the metric being updated.
@@ -248,6 +257,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       execs.foreach { exec =>
         assert(exec.info.memoryBytesSpilled === s1Tasks.size * value / 2)
       }
+
+      listener = renewListener(listener, live = true)
     }
 
     // Blacklisting executor for stage
@@ -276,6 +287,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(exec.info.blacklistedInStages === Set(stages.head.stageId))
     }
 
+    listener = renewListener(listener, live = true)
+
     // Blacklisting node for stage
     time += 1
     listener.onNodeBlacklistedForStage(SparkListenerNodeBlacklistedForStage(
@@ -296,6 +309,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       // both executor is expected to be blacklisted
       assert(exec.info.isBlacklistedForStage)
     }
+
+    listener = renewListener(listener, live = true)
 
     // Fail one of the tasks, re-start it.
     time += 1
@@ -330,6 +345,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(task.attempt === reattempt.attemptNumber)
     }
 
+    listener = renewListener(listener, live = true)
+
     // Kill one task, restart it.
     time += 1
     val killed = s1Tasks.drop(1).head
@@ -352,6 +369,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(task.index === killed.index)
       assert(task.errorMessage === Some("killed"))
     }
+
+    listener = renewListener(listener, live = true)
 
     // Start a new attempt and finish it with TaskCommitDenied, make sure it's handled like a kill.
     time += 1
@@ -380,6 +399,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(task.index === killed.index)
       assert(task.errorMessage === Some(denyReason.toErrorString))
     }
+
+    listener = renewListener(listener, live = true)
 
     // Start a new attempt.
     val reattempt2 = newAttempt(denied, nextTaskId())
@@ -425,6 +446,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
 
     assert(store.count(classOf[TaskDataWrapper]) === pending.size + 3)
 
+    listener = renewListener(listener, live = true)
+
     // End stage 1.
     time += 1
     stages.head.completionTime = Some(time)
@@ -446,6 +469,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(exec.info.blacklistedInStages === Set())
     }
 
+    listener = renewListener(listener, live = true)
+
     // Submit stage 2.
     time += 1
     stages.last.submissionTime = Some(time)
@@ -460,6 +485,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(stage.info.submissionTime === Some(new Date(stages.last.submissionTime.get)))
     }
 
+    listener = renewListener(listener, live = true)
+
     // Blacklisting node for stage
     time += 1
     listener.onNodeBlacklistedForStage(SparkListenerNodeBlacklistedForStage(
@@ -472,6 +499,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
     check[ExecutorSummaryWrapper](execIds.head) { exec =>
       assert(exec.info.blacklistedInStages === Set(stages.last.stageId))
     }
+
+    listener = renewListener(listener, live = true)
 
     // Start and fail all tasks of stage 2.
     time += 1
@@ -499,6 +528,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(stage.info.numActiveTasks === 0)
     }
 
+    listener = renewListener(listener, live = true)
+
     // Fail stage 2.
     time += 1
     stages.last.completionTime = Some(time)
@@ -517,6 +548,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(stage.info.numCompleteTasks === 0)
       assert(stage.info.failureReason === stages.last.failureReason)
     }
+
+    listener = renewListener(listener, live = true)
 
     // - Re-submit stage 2, all tasks, and succeed them and the stage.
     val oldS2 = stages.last
@@ -557,6 +590,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(stage.info.numCompleteTasks === newS2Tasks.size)
     }
 
+    listener = renewListener(listener, live = true)
+
     // End job.
     time += 1
     listener.onJobEnd(SparkListenerJobEnd(1, time, JobSucceeded))
@@ -564,6 +599,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
     check[JobDataWrapper](1) { job =>
       assert(job.info.status === JobExecutionStatus.SUCCEEDED)
     }
+
+    listener = renewListener(listener, live = true)
 
     // Submit a second job that re-uses stage 1 and stage 2. Stage 1 won't be re-run, but
     // stage 2 will. In any case, the DAGScheduler creates new info structures that are copies
@@ -599,6 +636,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
         "taskType", Success, task, new ExecutorMetrics, null))
     }
 
+    listener = renewListener(listener, live = true)
+
     time += 1
     j2Stages.last.completionTime = Some(time)
     listener.onStageCompleted(SparkListenerStageCompleted(j2Stages.last))
@@ -619,12 +658,16 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(job.info.numSkippedTasks === s1Tasks.size)
     }
 
+    listener = renewListener(listener, live = true)
+
     // Blacklist an executor.
     time += 1
     listener.onExecutorBlacklisted(SparkListenerExecutorBlacklisted(time, "1", 42))
     check[ExecutorSummaryWrapper]("1") { exec =>
       assert(exec.info.isBlacklisted)
     }
+
+    listener = renewListener(listener, live = true)
 
     time += 1
     listener.onExecutorUnblacklisted(SparkListenerExecutorUnblacklisted(time, "1"))
@@ -645,6 +688,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(!exec.info.isBlacklisted)
     }
 
+    listener = renewListener(listener, live = true)
+
     // Stop executors.
     time += 1
     listener.onExecutorRemoved(SparkListenerExecutorRemoved(time, "1", "Test"))
@@ -656,6 +701,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
         assert(!exec.info.isActive)
       }
     }
+
+    listener = renewListener(listener, live = true)
 
     // End the application.
     listener.onApplicationEnd(SparkListenerApplicationEnd(42L))
@@ -674,11 +721,24 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(attempt.sparkUser === "user")
       assert(attempt.completed)
     }
+
+    renewListener(listener, live = true)
   }
 
   test("storage events") {
-    val listener = new AppStatusListener(store, conf, true)
+    var listener = new AppStatusListener(store, conf, true)
     val maxMemory = 42L
+
+    listener.onOtherEvent(SparkListenerLogStart("TestSparkVersion"))
+
+    // Start the application.
+    listener.onApplicationStart(SparkListenerApplicationStart(
+      "name",
+      Some("id"),
+      time,
+      "user",
+      Some("attempt"),
+      None))
 
     // Register a couple of block managers.
     val bm1 = BlockManagerId("1", "1.example.com", 42)
@@ -690,6 +750,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       check[ExecutorSummaryWrapper](bm.executorId) { exec =>
         assert(exec.info.maxMemory === maxMemory)
       }
+
+      listener = renewListener(listener, live = true)
     }
 
     val rdd1b1 = RddBlock(1, 1, 1L, 2L)
@@ -708,6 +770,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(wrapper.info.numPartitions === rdd1Info.numPartitions)
       assert(wrapper.info.storageLevel === rdd1Info.storageLevel.description)
     }
+
+    listener = renewListener(listener, live = true)
 
     // Add partition 1 replicated on two block managers.
     listener.onBlockUpdated(SparkListenerBlockUpdated(
@@ -744,6 +808,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(exec.info.diskUsed === rdd1b1.diskSize)
     }
 
+    listener = renewListener(listener, live = true)
+
     listener.onBlockUpdated(SparkListenerBlockUpdated(
       BlockUpdatedInfo(bm2, rdd1b1.blockId, level, rdd1b1.memSize, rdd1b1.diskSize)))
 
@@ -770,6 +836,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(exec.info.memoryUsed === rdd1b1.memSize)
       assert(exec.info.diskUsed === rdd1b1.diskSize)
     }
+
+    listener = renewListener(listener, live = true)
 
     // Add a second partition only to bm 1.
     listener.onBlockUpdated(SparkListenerBlockUpdated(
@@ -800,6 +868,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(exec.info.diskUsed === rdd1b1.diskSize + rdd1b2.diskSize)
     }
 
+    listener = renewListener(listener, live = true)
+
     // Remove block 1 from bm 1.
     listener.onBlockUpdated(SparkListenerBlockUpdated(
       BlockUpdatedInfo(bm1, rdd1b1.blockId, StorageLevel.NONE, rdd1b1.memSize, rdd1b1.diskSize)))
@@ -829,6 +899,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(exec.info.diskUsed === rdd1b2.diskSize)
     }
 
+    listener = renewListener(listener, live = true)
+
     // Remove block 1 from bm 2. This should leave only block 2's info in the store.
     listener.onBlockUpdated(SparkListenerBlockUpdated(
       BlockUpdatedInfo(bm2, rdd1b1.blockId, StorageLevel.NONE, rdd1b1.memSize, rdd1b1.diskSize)))
@@ -853,6 +925,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(exec.info.memoryUsed === 0L)
       assert(exec.info.diskUsed === 0L)
     }
+
+    listener = renewListener(listener, live = true)
 
     // Add a block from a different RDD. Verify the executor is updated correctly and also that
     // the distribution data for both rdds is updated to match the remaining memory.
@@ -880,6 +954,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(dist.memoryRemaining === maxMemory - rdd2b1.memSize - rdd1b2.memSize )
     }
 
+    listener = renewListener(listener, live = true)
+
     // Add block1 of rdd1 back to bm 1.
     listener.onBlockUpdated(SparkListenerBlockUpdated(
       BlockUpdatedInfo(bm1, rdd1b1.blockId, level, rdd1b1.memSize, rdd1b1.diskSize)))
@@ -889,6 +965,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(exec.info.memoryUsed === rdd1b1.memSize + rdd1b2.memSize + rdd2b1.memSize)
       assert(exec.info.diskUsed === rdd1b1.diskSize + rdd1b2.diskSize + rdd2b1.diskSize)
     }
+
+    listener = renewListener(listener, live = true)
 
     // Unpersist RDD1.
     listener.onUnpersistRDD(SparkListenerUnpersistRDD(rdd1b1.rddId))
@@ -903,6 +981,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(exec.info.diskUsed === rdd2b1.diskSize)
     }
 
+    listener = renewListener(listener, live = true)
+
     // Unpersist RDD2.
     listener.onUnpersistRDD(SparkListenerUnpersistRDD(rdd2b1.rddId))
     intercept[NoSuchElementException] {
@@ -914,6 +994,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(exec.info.memoryUsed === 0)
       assert(exec.info.diskUsed === 0)
     }
+
+    listener = renewListener(listener, live = true)
 
     // Update a StreamBlock.
     val stream1 = StreamBlockId(1, 1L)
@@ -932,12 +1014,16 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(stream.diskSize === 1L)
     }
 
+    listener = renewListener(listener, live = true)
+
     // Drop a StreamBlock.
     listener.onBlockUpdated(SparkListenerBlockUpdated(
       BlockUpdatedInfo(bm1, stream1, StorageLevel.NONE, 0L, 0L)))
     intercept[NoSuchElementException] {
       check[StreamBlockData](stream1.name) { _ => () }
     }
+
+    listener = renewListener(listener, live = true)
 
     // Update a BroadcastBlock.
     val broadcast1 = BroadcastBlockId(1L)
@@ -949,6 +1035,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(exec.info.diskUsed === 1L)
     }
 
+    listener = renewListener(listener, live = true)
+
     // Drop a BroadcastBlock.
     listener.onBlockUpdated(SparkListenerBlockUpdated(
       BlockUpdatedInfo(bm1, broadcast1, StorageLevel.NONE, 1L, 1L)))
@@ -956,6 +1044,8 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
       assert(exec.info.memoryUsed === 0)
       assert(exec.info.diskUsed === 0)
     }
+
+    renewListener(listener, live = true)
   }
 
   test("eviction of old data") {
@@ -1696,5 +1786,44 @@ class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
     val accum = Array((333L, 1, 1, taskMetrics.accumulators().map(AccumulatorSuite.makeInfo)))
     val executorUpdates = Map((stageId, 0) -> new ExecutorMetrics(executorMetrics))
     SparkListenerExecutorMetricsUpdate(executorId.toString, accum, executorUpdates)
+  }
+
+  private def renewListener(oldListener: AppStatusListener, live: Boolean): AppStatusListener = {
+    import AppStatusListenerJsonProtocol._
+    def convertLiveJobs(listener: AppStatusListener): Unit = {
+      listener.liveJobs.mapValues(liveJobToJson)
+    }
+
+    def convertLiveStages(listener: AppStatusListener): Unit = {
+      JsonUtils.mapValuesToImmutableMap(listener.liveStages)(liveStageToJson)
+    }
+
+    def convertLiveTasks(listener: AppStatusListener): Unit = {
+      JsonUtils.mapValuesToImmutableMap(listener.liveTasks)(liveTaskToJson)
+    }
+
+    def convertLiveRDDs(listener: AppStatusListener): Unit = {
+      JsonUtils.mapValuesToImmutableMap(listener.liveRDDs)(liveRddToJson)
+    }
+
+    def convertExecutors(executors: mutable.HashMap[String, LiveExecutor]): Unit = {
+      JsonUtils.mapValuesToImmutableMap(executors)(liveExecutorToJson)
+    }
+
+    oldListener.forceFlush()
+    val state = oldListener.snapshotState()
+    val newListener = new AppStatusListener(store, conf, live)
+    newListener.restoreState(state)
+
+    assert(convertLiveJobs(oldListener) === convertLiveJobs(newListener))
+    assert(convertLiveStages(oldListener) === convertLiveStages(newListener))
+    assert(convertLiveTasks(oldListener) === convertLiveTasks(newListener))
+    assert(convertLiveRDDs(oldListener) === convertLiveRDDs(newListener))
+    assert(convertExecutors(oldListener.liveExecutors) ===
+      convertExecutors(newListener.liveExecutors))
+    assert(convertExecutors(oldListener.deadExecutors) ===
+      convertExecutors(newListener.deadExecutors))
+
+    newListener
   }
 }

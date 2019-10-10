@@ -37,6 +37,7 @@ import org.apache.spark.resource.ResourceInformation
 import org.apache.spark.scheduler._
 import org.apache.spark.scheduler.cluster.ExecutorInfo
 import org.apache.spark.storage._
+import org.apache.spark.util.JsonUtils._
 
 /**
  * Serializes SparkListener events to/from JSON.  This protocol provides strong backwards-
@@ -1163,14 +1164,6 @@ private[spark] object JsonProtocol {
     val e = new Exception((json \ "Message").extract[String])
     e.setStackTrace(stackTraceFromJson(json \ "Stack Trace"))
     e
-  }
-
-  /** Return an option that translates JNothing to None */
-  private def jsonOption(json: JValue): Option[JValue] = {
-    json match {
-      case JNothing => None
-      case value: JValue => Some(value)
-    }
   }
 
   private def emptyJson: JObject = JObject(List[JField]())

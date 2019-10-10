@@ -23,6 +23,8 @@ import java.util.concurrent.ConcurrentHashMap
 import scala.collection.JavaConverters._
 import scala.collection.mutable.HashMap
 
+import org.json4s.JValue
+
 import org.apache.spark._
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.internal.Logging
@@ -69,18 +71,18 @@ private[spark] class AppStatusListener(
 
   // Keep track of live entities, so that task metrics can be efficiently updated (without
   // causing too many writes to the underlying store, and other expensive operations).
-  private val liveStages = new ConcurrentHashMap[(Int, Int), LiveStage]()
-  private val liveJobs = new HashMap[Int, LiveJob]()
-  private val liveExecutors = new HashMap[String, LiveExecutor]()
-  private val deadExecutors = new HashMap[String, LiveExecutor]()
-  private val liveTasks = new HashMap[Long, LiveTask]()
-  private val liveRDDs = new HashMap[Int, LiveRDD]()
-  private val pools = new HashMap[String, SchedulerPool]()
+  private[spark] val liveStages = new ConcurrentHashMap[(Int, Int), LiveStage]()
+  private[spark] val liveJobs = new HashMap[Int, LiveJob]()
+  private[spark] val liveExecutors = new HashMap[String, LiveExecutor]()
+  private[spark] val deadExecutors = new HashMap[String, LiveExecutor]()
+  private[spark] val liveTasks = new HashMap[Long, LiveTask]()
+  private[spark] val liveRDDs = new HashMap[Int, LiveRDD]()
+  private[spark] val pools = new HashMap[String, SchedulerPool]()
 
   private val SQL_EXECUTION_ID_KEY = "spark.sql.execution.id"
   // Keep the active executor count as a separate variable to avoid having to do synchronization
   // around liveExecutors.
-  @volatile private var activeExecutorCount = 0
+  @volatile private[spark] var activeExecutorCount = 0
 
   /** The last time when flushing `LiveEntity`s. This is to avoid flushing too frequently. */
   private var lastFlushTimeNs = System.nanoTime()
@@ -102,6 +104,25 @@ private[spark] class AppStatusListener(
       flush(update(_, now))
     }
   }
+
+  // TODO: figure out which is the preferred approach/data structure to snapshot and restore
+  def snapshotState(): JValue = {
+    AppStatusListenerJsonProtocol.stateToJson(this)
+  }
+
+  def restoreState(json: JValue): Unit = {
+    AppStatusListenerJsonProtocol.restoreStateFromJson(json, this)
+    // TODO: which would be better:
+    //  1) reading from kvstore
+    //  2) include AppInfo/AppSummary as a part of state
+    appInfo = kvstore.view(classOf[ApplicationInfoWrapper]).max(1).iterator().next().info
+    appSummary = kvstore.read(classOf[AppSummary], classOf[AppSummary].getName())
+  }
+
+  // TODO: for now, this is just to ensure snapshot of live entities are in sync with entities
+  //  in KVStore during tests, but this must be also called in prior when we would
+  //  want to snapshot KVStore.
+  private[spark] def forceFlush(): Unit = flush(update(_, System.nanoTime()))
 
   override def onOtherEvent(event: SparkListenerEvent): Unit = event match {
     case SparkListenerLogStart(version) => sparkVersion = version

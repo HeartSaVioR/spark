@@ -41,7 +41,7 @@ import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.internal.StaticSQLConf.UI_RETAINED_EXECUTIONS
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.status.ElementTrackingStore
-import org.apache.spark.util.{AccumulatorMetadata, JsonProtocol, LongAccumulator}
+import org.apache.spark.util.{AccumulatorMetadata, JsonProtocol, JsonUtils, LongAccumulator}
 import org.apache.spark.util.kvstore.InMemoryStore
 
 
@@ -158,8 +158,8 @@ class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTestUtils
       }
     }
 
-    val statusStore = createStatusStore()
-    val listener = statusStore.listener.get
+    var statusStore = createStatusStore()
+    var listener = statusStore.listener.get
 
     val executionId = 0
     val df = createTestDataFrame
@@ -193,6 +193,9 @@ class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTestUtils
 
     assert(statusStore.executionMetrics(executionId).isEmpty)
 
+    listener = renewListener(listener, live = true)
+    statusStore = new SQLAppStatusStore(kvstore, Some(listener))
+
     listener.onExecutorMetricsUpdate(SparkListenerExecutorMetricsUpdate("", Seq(
       // (task id, stage id, stage attempt, accum updates)
       (0L, 0, 0, createAccumulatorInfos(accumulatorUpdates)),
@@ -201,11 +204,17 @@ class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTestUtils
 
     checkAnswer(statusStore.executionMetrics(executionId), accumulatorUpdates.mapValues(_ * 2))
 
+    listener = renewListener(listener, live = true)
+    statusStore = new SQLAppStatusStore(kvstore, Some(listener))
+
     // Driver accumulator updates don't belong to this execution should be filtered and no
     // exception will be thrown.
     listener.onOtherEvent(SparkListenerDriverAccumUpdates(0, Seq((999L, 2L))))
 
     checkAnswer(statusStore.executionMetrics(executionId), accumulatorUpdates.mapValues(_ * 2))
+
+    listener = renewListener(listener, live = true)
+    statusStore = new SQLAppStatusStore(kvstore, Some(listener))
 
     listener.onExecutorMetricsUpdate(SparkListenerExecutorMetricsUpdate("", Seq(
       // (task id, stage id, stage attempt, accum updates)
@@ -214,6 +223,9 @@ class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTestUtils
     )))
 
     checkAnswer(statusStore.executionMetrics(executionId), accumulatorUpdates.mapValues(_ * 3))
+
+    listener = renewListener(listener, live = true)
+    statusStore = new SQLAppStatusStore(kvstore, Some(listener))
 
     // Retrying a stage should reset the metrics
     listener.onStageSubmitted(SparkListenerStageSubmitted(createStageInfo(0, 1)))
@@ -226,6 +238,9 @@ class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTestUtils
 
     checkAnswer(statusStore.executionMetrics(executionId), accumulatorUpdates.mapValues(_ * 2))
 
+    listener = renewListener(listener, live = true)
+    statusStore = new SQLAppStatusStore(kvstore, Some(listener))
+
     // Ignore the task end for the first attempt
     listener.onTaskEnd(SparkListenerTaskEnd(
       stageId = 0,
@@ -237,6 +252,9 @@ class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTestUtils
       null))
 
     checkAnswer(statusStore.executionMetrics(executionId), accumulatorUpdates.mapValues(_ * 2))
+
+    listener = renewListener(listener, live = true)
+    statusStore = new SQLAppStatusStore(kvstore, Some(listener))
 
     // Finish two tasks
     listener.onTaskEnd(SparkListenerTaskEnd(
@@ -258,6 +276,9 @@ class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTestUtils
 
     checkAnswer(statusStore.executionMetrics(executionId), accumulatorUpdates.mapValues(_ * 5))
 
+    listener = renewListener(listener, live = true)
+    statusStore = new SQLAppStatusStore(kvstore, Some(listener))
+
     // Summit a new stage
     listener.onStageSubmitted(SparkListenerStageSubmitted(createStageInfo(1, 0)))
 
@@ -268,6 +289,9 @@ class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTestUtils
     )))
 
     checkAnswer(statusStore.executionMetrics(executionId), accumulatorUpdates.mapValues(_ * 7))
+
+    listener = renewListener(listener, live = true)
+    statusStore = new SQLAppStatusStore(kvstore, Some(listener))
 
     // Finish two tasks
     listener.onTaskEnd(SparkListenerTaskEnd(
@@ -291,6 +315,9 @@ class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTestUtils
 
     assertJobs(statusStore.execution(executionId), running = Seq(0))
 
+    listener = renewListener(listener, live = true)
+    statusStore = new SQLAppStatusStore(kvstore, Some(listener))
+
     listener.onJobEnd(SparkListenerJobEnd(
       jobId = 0,
       time = System.currentTimeMillis(),
@@ -302,6 +329,8 @@ class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTestUtils
     assertJobs(statusStore.execution(executionId), completed = Seq(0))
 
     checkAnswer(statusStore.executionMetrics(executionId), accumulatorUpdates.mapValues(_ * 11))
+
+    renewListener(listener, live = true)
   }
 
   test("onExecutionEnd happens before onJobEnd(JobSucceeded)") {
@@ -608,6 +637,28 @@ class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTestUtils
       time))
     assert(statusStore.executionsCount === 2)
     assert(statusStore.execution(2) === None)
+  }
+
+  private def renewListener(
+      oldListener: SQLAppStatusListener, live: Boolean): SQLAppStatusListener = {
+    import SQLAppStatusListenerJsonProtocol._
+    def convertLiveExecutions(listener: SQLAppStatusListener): Unit = {
+      JsonUtils.mapValuesToImmutableMap(listener.liveExecutions)(liveExecutionDataToJson)
+    }
+
+    def convertStageMetrics(listener: SQLAppStatusListener): Unit = {
+      JsonUtils.mapValuesToImmutableMap(listener.stageMetrics)(liveStageMetricsToJson)
+    }
+
+    oldListener.forceFlush()
+    val state = oldListener.snapshotState()
+    val newListener = new SQLAppStatusListener(sparkContext.conf, kvstore, live)
+    newListener.restoreState(state)
+
+    assert(convertLiveExecutions(oldListener) === convertLiveExecutions(newListener))
+    assert(convertStageMetrics(oldListener) === convertStageMetrics(newListener))
+
+    newListener
   }
 }
 
