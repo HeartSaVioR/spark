@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.execution.streaming
 
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, DataOutputStream}
 import java.net.URI
 
 import org.apache.hadoop.fs.{FileStatus, Path}
@@ -105,10 +106,44 @@ class FileStreamSinkLog(
       logs.filter(f => !deletedFiles.contains(f.path))
     }
   }
+
+  override protected def serializeEntryToV2(data: SinkFileStatus): Array[Byte] = {
+    val baos = new ByteArrayOutputStream()
+    val dos = new DataOutputStream(baos)
+
+    dos.writeUTF(data.path)
+    dos.writeLong(data.size)
+    dos.writeBoolean(data.isDir)
+    dos.writeLong(data.modificationTime)
+    dos.writeInt(data.blockReplication)
+    dos.writeLong(data.blockSize)
+    dos.writeUTF(data.action)
+    dos.close()
+
+    baos.toByteArray
+  }
+
+  override protected def deserializeEntryFromV2(serialized: Array[Byte]): SinkFileStatus = {
+    val bais = new ByteArrayInputStream(serialized)
+    val dis = new DataInputStream(bais)
+
+    val status = SinkFileStatus(
+      dis.readUTF(),
+      dis.readLong(),
+      dis.readBoolean(),
+      dis.readLong(),
+      dis.readInt(),
+      dis.readLong(),
+      dis.readUTF())
+
+    dis.close()
+
+    status
+  }
 }
 
 object FileStreamSinkLog {
-  val VERSION = 1
+  val VERSION = 2
   val DELETE_ACTION = "delete"
   val ADD_ACTION = "add"
 }

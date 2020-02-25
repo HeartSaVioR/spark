@@ -31,6 +31,7 @@ import org.apache.hadoop.fs.{FSDataInputStream, Path, RawLocalFileSystem}
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.util.Utils
 
 class FileStreamSinkLogSuite extends SparkFunSuite with SharedSparkSession {
 
@@ -53,7 +54,7 @@ class FileStreamSinkLogSuite extends SparkFunSuite with SharedSparkSession {
     }
   }
 
-  test("serialize") {
+  test("serialize & deserialize") {
     withFileStreamSinkLog { sinkLog =>
       val logs = Array(
         SinkFileStatus(
@@ -81,59 +82,16 @@ class FileStreamSinkLogSuite extends SparkFunSuite with SharedSparkSession {
           blockSize = 30000L,
           action = FileStreamSinkLog.ADD_ACTION))
 
-      // scalastyle:off
-      val expected = s"""v$VERSION
-          |{"path":"/a/b/x","size":100,"isDir":false,"modificationTime":1000,"blockReplication":1,"blockSize":10000,"action":"add"}
-          |{"path":"/a/b/y","size":200,"isDir":false,"modificationTime":2000,"blockReplication":2,"blockSize":20000,"action":"delete"}
-          |{"path":"/a/b/z","size":300,"isDir":false,"modificationTime":3000,"blockReplication":3,"blockSize":30000,"action":"add"}""".stripMargin
-      // scalastyle:on
       val baos = new ByteArrayOutputStream()
       sinkLog.serialize(logs, baos)
-      assert(expected === baos.toString(UTF_8.name()))
+
+      val actualLogs = sinkLog.deserialize(new ByteArrayInputStream(baos.toByteArray))
+      assert(actualLogs === logs)
+
       baos.reset()
       sinkLog.serialize(Array(), baos)
-      assert(s"v$VERSION" === baos.toString(UTF_8.name()))
-    }
-  }
-
-  test("deserialize") {
-    withFileStreamSinkLog { sinkLog =>
-      // scalastyle:off
-      val logs = s"""v$VERSION
-          |{"path":"/a/b/x","size":100,"isDir":false,"modificationTime":1000,"blockReplication":1,"blockSize":10000,"action":"add"}
-          |{"path":"/a/b/y","size":200,"isDir":false,"modificationTime":2000,"blockReplication":2,"blockSize":20000,"action":"delete"}
-          |{"path":"/a/b/z","size":300,"isDir":false,"modificationTime":3000,"blockReplication":3,"blockSize":30000,"action":"add"}""".stripMargin
-      // scalastyle:on
-
-      val expected = Seq(
-        SinkFileStatus(
-          path = "/a/b/x",
-          size = 100L,
-          isDir = false,
-          modificationTime = 1000L,
-          blockReplication = 1,
-          blockSize = 10000L,
-          action = FileStreamSinkLog.ADD_ACTION),
-        SinkFileStatus(
-          path = "/a/b/y",
-          size = 200L,
-          isDir = false,
-          modificationTime = 2000L,
-          blockReplication = 2,
-          blockSize = 20000L,
-          action = FileStreamSinkLog.DELETE_ACTION),
-        SinkFileStatus(
-          path = "/a/b/z",
-          size = 300L,
-          isDir = false,
-          modificationTime = 3000L,
-          blockReplication = 3,
-          blockSize = 30000L,
-          action = FileStreamSinkLog.ADD_ACTION))
-
-      assert(expected === sinkLog.deserialize(new ByteArrayInputStream(logs.getBytes(UTF_8))))
-
-      assert(Nil === sinkLog.deserialize(new ByteArrayInputStream(s"v$VERSION".getBytes(UTF_8))))
+      val actualLogs2 = sinkLog.deserialize(new ByteArrayInputStream(baos.toByteArray))
+      assert(actualLogs2.isEmpty)
     }
   }
 
