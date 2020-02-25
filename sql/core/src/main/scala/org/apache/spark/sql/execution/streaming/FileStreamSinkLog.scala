@@ -17,14 +17,24 @@
 
 package org.apache.spark.sql.execution.streaming
 
+import java.io.{DataInputStream, DataOutputStream, InputStream, IOException, OutputStream}
 import java.net.URI
+import java.nio.charset.StandardCharsets.UTF_8
 
+import scala.collection.mutable
+import scala.io.{Source => IOSource}
+
+import com.google.common.io.ByteStreams
 import org.apache.hadoop.fs.{FileStatus, Path}
 import org.json4s.NoTypeHints
 import org.json4s.jackson.Serialization
 
+import org.apache.spark.io.LZ4CompressionCodec
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types.{BooleanType, IntegerType, LongType, StringType, StructField, StructType}
+import org.apache.spark.unsafe.types.UTF8String
 
 /**
  * The status of a file outputted by [[FileStreamSink]]. A file is visible only if it appears in
@@ -66,6 +76,41 @@ object SinkFileStatus {
   }
 }
 
+object SinkFileStatusV2 {
+  val SCHEMA = new StructType(
+    Array(
+      StructField("path", StringType),
+      StructField("size", LongType),
+      StructField("isDir", BooleanType),
+      StructField("modificationTime", LongType),
+      StructField("blockReplication", IntegerType),
+      StructField("blockSize", LongType),
+      StructField("action", StringType)
+    )
+  )
+
+  val PROJ_UNSAFE_ROW = UnsafeProjection.create(SCHEMA.fields.map(_.dataType))
+
+  def fromRow(row: UnsafeRow): SinkFileStatus = {
+    SinkFileStatus(
+      row.getString(0),
+      row.getLong(1),
+      row.getBoolean(2),
+      row.getLong(3),
+      row.getInt(4),
+      row.getLong(5),
+      row.getString(6)
+    )
+  }
+
+  def toRow(entry: SinkFileStatus): UnsafeRow = {
+    val row = new GenericInternalRow(Array[Any](
+      UTF8String.fromString(entry.path), entry.size, entry.isDir, entry.modificationTime,
+      entry.blockReplication, entry.blockSize, UTF8String.fromString(entry.action)))
+    PROJ_UNSAFE_ROW.apply(row).copy()
+  }
+}
+
 /**
  * A special log for [[FileStreamSink]]. It will write one log file for each batch. The first line
  * of the log file is the version number, and there are multiple JSON lines following. Each JSON
@@ -93,6 +138,8 @@ class FileStreamSinkLog(
   protected override val defaultCompactInterval =
     sparkSession.sessionState.conf.fileSinkLogCompactInterval
 
+  private val sparkConf = sparkSession.sparkContext.getConf
+
   require(defaultCompactInterval > 0,
     s"Please set ${SQLConf.FILE_SINK_LOG_COMPACT_INTERVAL.key} (was $defaultCompactInterval) " +
       "to a positive value.")
@@ -105,10 +152,16 @@ class FileStreamSinkLog(
       logs.filter(f => !deletedFiles.contains(f.path))
     }
   }
+
+  override def dataToUnsafeRow(data: SinkFileStatus): UnsafeRow = SinkFileStatusV2.toRow(data)
+
+  override def unsafeRowToData(row: UnsafeRow): SinkFileStatus = SinkFileStatusV2.fromRow(row)
+
+  override def numFieldsForUnsafeRow: Int = SinkFileStatusV2.SCHEMA.fields.length
 }
 
 object FileStreamSinkLog {
-  val VERSION = 1
+  val VERSION = 2
   val DELETE_ACTION = "delete"
   val ADD_ACTION = "add"
 }

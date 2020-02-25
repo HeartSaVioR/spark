@@ -17,16 +17,22 @@
 
 package org.apache.spark.sql.execution.streaming
 
+import java.io.{DataInputStream, DataOutputStream, InputStream, IOException, OutputStream}
+import java.nio.charset.StandardCharsets.UTF_8
 import java.util.{LinkedHashMap => JLinkedHashMap}
 import java.util.Map.Entry
 
 import scala.collection.mutable
+import scala.io.{Source => IOSource}
 
+import com.google.common.io.ByteStreams
 import org.json4s.NoTypeHints
 import org.json4s.jackson.Serialization
 
+import org.apache.spark.io.LZ4CompressionCodec
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.execution.streaming.FileStreamSource.FileEntry
+import org.apache.spark.sql.catalyst.expressions.UnsafeRow
+import org.apache.spark.sql.execution.streaming.FileStreamSource.{FileEntry, FileEntryV2}
 import org.apache.spark.sql.internal.SQLConf
 
 class FileStreamSourceLog(
@@ -51,6 +57,8 @@ class FileStreamSourceLog(
   protected override val isDeletingExpiredLog = sparkSession.sessionState.conf.fileSourceLogDeletion
 
   private implicit val formats = Serialization.formats(NoTypeHints)
+
+  private val sparkConf = sparkSession.sparkContext.getConf
 
   // A fixed size log entry cache to cache the file entries belong to the compaction batch. It is
   // used to avoid scanning the compacted log file to retrieve it's own batch data.
@@ -122,8 +130,14 @@ class FileStreamSourceLog(
     }
     batches
   }
+
+  override def dataToUnsafeRow(data: FileEntry): UnsafeRow = FileEntryV2.toRow(data)
+
+  override def unsafeRowToData(row: UnsafeRow): FileEntry = FileEntryV2.fromRow(row)
+
+  override def numFieldsForUnsafeRow: Int = FileEntryV2.SCHEMA.fields.length
 }
 
 object FileStreamSourceLog {
-  val VERSION = 1
+  val VERSION = 2
 }

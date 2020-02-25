@@ -240,6 +240,16 @@ class HDFSMetadataLog[T <: AnyRef : ClassTag](sparkSession: SparkSession, path: 
    * "v123xyz" etc.)
    */
   private[sql] def validateVersion(text: String, maxSupportedVersion: Int): Int = {
+    val version = parseVersion(text)
+    if (version > maxSupportedVersion) {
+      throw new IllegalStateException(s"UnsupportedLogVersion: maximum supported log version " +
+        s"is v${maxSupportedVersion}, but encountered v$version. The log file was produced " +
+        s"by a newer version of Spark and cannot be read by this version. Please upgrade.")
+    }
+    version
+  }
+
+  private[sql] def parseVersion(text: String): Int = {
     if (text.length > 0 && text(0) == 'v') {
       val version =
         try {
@@ -249,15 +259,8 @@ class HDFSMetadataLog[T <: AnyRef : ClassTag](sparkSession: SparkSession, path: 
             throw new IllegalStateException(s"Log file was malformed: failed to read correct log " +
               s"version from $text.")
         }
-      if (version > 0) {
-        if (version > maxSupportedVersion) {
-          throw new IllegalStateException(s"UnsupportedLogVersion: maximum supported log version " +
-            s"is v${maxSupportedVersion}, but encountered v$version. The log file was produced " +
-            s"by a newer version of Spark and cannot be read by this version. Please upgrade.")
-        } else {
-          return version
-        }
-      }
+
+      if (version > 0) return version
     }
 
     // reaching here means we failed to read the correct log version

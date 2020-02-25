@@ -29,12 +29,14 @@ import org.apache.hadoop.fs.{FileStatus, FileSystem, GlobFilter, Path}
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
+import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.connector.read.streaming
 import org.apache.spark.sql.connector.read.streaming.{ReadAllAvailable, ReadLimit, ReadMaxFiles, SupportsAdmissionControl}
 import org.apache.spark.sql.execution.datasources.{DataSource, InMemoryFileIndex, LogicalRelation}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types.{LongType, StringType, StructField, StructType}
+import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.ThreadUtils
 
 /**
@@ -312,6 +314,29 @@ object FileStreamSource {
   type Timestamp = Long
 
   case class FileEntry(path: String, timestamp: Timestamp, batchId: Long) extends Serializable
+
+  object FileEntryV2 {
+    val SCHEMA = new StructType(
+      Array(
+        StructField("path", StringType),
+        StructField("timestamp", LongType),
+        StructField("batchId", LongType)
+      )
+    )
+
+    val PROJ_UNSAFE_ROW = UnsafeProjection.create(SCHEMA.fields.map(_.dataType))
+
+    def fromRow(row: UnsafeRow): FileEntry = {
+      FileEntry(row.getString(0), row.getLong(1), row.getLong(2))
+    }
+
+    def toRow(entry: FileEntry): UnsafeRow = {
+      val row = new GenericInternalRow(Array[Any](
+        UTF8String.fromString(entry.path), entry.timestamp, entry.batchId
+      ))
+      PROJ_UNSAFE_ROW.apply(row).copy()
+    }
+  }
 
   /**
    * A custom hash map used to track the list of files seen. This map is not thread-safe.
