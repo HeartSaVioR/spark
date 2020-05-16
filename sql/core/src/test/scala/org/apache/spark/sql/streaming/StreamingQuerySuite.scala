@@ -99,9 +99,10 @@ class StreamingQuerySuite extends StreamTest with BeforeAndAfter with Logging wi
         MemoryStream[Int].toDS().groupBy().count()
           .writeStream
           .format("memory")
-          .outputMode("complete")
+          .outputMode("update")
           .queryName(s"name${RandomStringUtils.randomAlphabetic(10)}")
           .option("checkpointLocation", cpDir)
+          .option("recoverFromCheckpoint", true)
           .start()
       }
 
@@ -262,7 +263,7 @@ class StreamingQuerySuite extends StreamTest with BeforeAndAfter with Logging wi
 
     var lastProgressBeforeStop: StreamingQueryProgress = null
 
-    testStream(mapped, OutputMode.Complete)(
+    testStream(mapped, OutputMode.Update())(
       StartStream(Trigger.ProcessingTime(1000), triggerClock = clock),
       AssertStreamExecThreadIsWaitingForTime(1000),
       AssertOnQuery(_.status.isDataAvailable === false),
@@ -299,7 +300,7 @@ class StreamingQuerySuite extends StreamTest with BeforeAndAfter with Logging wi
       // Test status and progress while batch processing has completed
       AdvanceManualClock(350), // time = 1500 to unblock map task
       AssertClockTime(1500),
-      CheckAnswer(2),
+      CheckNewAnswer(2),
       AssertStreamExecThreadIsWaitingForTime(2000),  // will block until the next trigger
       AssertOnQuery(_.status.isDataAvailable),
       AssertOnQuery(_.status.isTriggerActive === false),
@@ -343,7 +344,7 @@ class StreamingQuerySuite extends StreamTest with BeforeAndAfter with Logging wi
       AdvanceManualClock(500), // allow another trigger
       AssertClockTime(2000),
       AssertStreamExecThreadIsWaitingForTime(3000),  // will block waiting for next trigger time
-      CheckAnswer(4),
+      CheckNewAnswer(4),
       AssertOnQuery(_.status.isDataAvailable),
       AssertOnQuery(_.status.isTriggerActive === false),
       AssertOnQuery(_.status.message === "Waiting for next trigger"),
@@ -847,7 +848,7 @@ class StreamingQuerySuite extends StreamTest with BeforeAndAfter with Logging wi
       .groupBy('char)
       .agg(sum('numSq))
 
-    testStream(otherDf, OutputMode.Complete())(
+    testStream(otherDf, OutputMode.Update())(
       AddData(stream, (1, 1), (2, 4)),
       CheckLastBatch(("A", 1)))
   }

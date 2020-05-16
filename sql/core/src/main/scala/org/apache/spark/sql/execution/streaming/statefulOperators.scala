@@ -305,25 +305,6 @@ case class StateStoreSaveExec(
         val commitTimeMs = longMetric("commitTimeMs")
 
         outputMode match {
-          // Update and output all rows in the StateStore.
-          case Some(Complete) =>
-            allUpdatesTimeMs += timeTakenMs {
-              while (iter.hasNext) {
-                val row = iter.next().asInstanceOf[UnsafeRow]
-                stateManager.put(store, row)
-                numUpdatedStateRows += 1
-              }
-            }
-            allRemovalsTimeMs += 0
-            commitTimeMs += timeTakenMs {
-              stateManager.commit(store)
-            }
-            setStoreMetrics(store)
-            stateManager.values(store).map { valueRow =>
-              numOutputRows += 1
-              valueRow
-            }
-
           // Update and output only rows being evicted from the StateStore
           // Assumption: watermark predicates must be non-empty if append mode is allowed
           case Some(Append) =>

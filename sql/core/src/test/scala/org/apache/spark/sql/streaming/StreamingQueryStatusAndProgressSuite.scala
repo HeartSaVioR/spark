@@ -188,7 +188,7 @@ class StreamingQueryStatusAndProgressSuite extends StreamTest with Eventually {
       .writeStream
       .queryName("progress_serializable_test")
       .format("memory")
-      .outputMode("complete")
+      .outputMode("update")
       .start()
     try {
       inputData.addData(1, 2, 3)
@@ -226,7 +226,7 @@ class StreamingQueryStatusAndProgressSuite extends StreamTest with Eventually {
         .writeStream
         .queryName("metric_continuity")
         .format("memory")
-        .outputMode("complete")
+        .outputMode("update")
         .start()
       try {
         inputData.addData(1, 2)

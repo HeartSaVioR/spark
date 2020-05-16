@@ -623,12 +623,6 @@ abstract class StreamExecution(
       case Append =>
         writeBuilder.buildForStreaming()
 
-      case Complete =>
-        // TODO: we should do this check earlier when we have capability API.
-        require(writeBuilder.isInstanceOf[SupportsTruncate],
-          table.name + " does not support Complete mode.")
-        writeBuilder.asInstanceOf[SupportsTruncate].truncate().buildForStreaming()
-
       case Update =>
         require(writeBuilder.isInstanceOf[SupportsStreamingUpdate],
           table.name + " does not support Update mode.")

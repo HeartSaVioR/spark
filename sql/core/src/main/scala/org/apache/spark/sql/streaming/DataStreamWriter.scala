@@ -298,7 +298,13 @@ final class DataStreamWriter[T] private[sql](ds: Dataset[T]) {
       val sink = new MemorySink()
       val resultDf = Dataset.ofRows(df.sparkSession, new MemoryPlan(sink, df.schema.toAttributes))
       val chkpointLoc = extraOptions.get("checkpointLocation")
-      val recoverFromChkpoint = outputMode == OutputMode.Complete()
+      // The 'recoverFromCheckpoint' option is only for unit tests - this is rather hack because
+      // we expect 'replayable' from checkpoint-supported sources, but memory source doesn't
+      // support it.
+      val recoverFromChkpoint = extraOptions.get("recoverFromCheckpoint") match {
+        case Some(value) => value.toBoolean
+        case _ => false
+      }
       val query = df.sparkSession.sessionState.streamingQueryManager.startQuery(
         extraOptions.get("queryName"),
         chkpointLoc,

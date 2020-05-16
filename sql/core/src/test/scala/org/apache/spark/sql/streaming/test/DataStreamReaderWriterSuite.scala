@@ -404,7 +404,6 @@ class DataStreamReaderWriterSuite extends StreamTest with BeforeAndAfter {
     }
   }
 
-
   test("check foreach() does not support partitioning") {
     val df = spark.readStream
       .format("org.apache.spark.sql.streaming.test")
@@ -445,7 +444,8 @@ class DataStreamReaderWriterSuite extends StreamTest with BeforeAndAfter {
         .writeStream
         .format("memory")
         .queryName(tableName)
-        .outputMode("complete")
+        .outputMode("update")
+        .option("recoverFromCheckpoint", true)
       if (provideInWriter) {
         writer.option("checkpointLocation", chkLoc)
       }
@@ -469,13 +469,13 @@ class DataStreamReaderWriterSuite extends StreamTest with BeforeAndAfter {
     q2.processAllAvailable()
     checkAnswer(
       spark.table(tableName),
-      Seq(Row(0, 2), Row(1, 1))
+      Seq(Row(0, 2))
     )
 
     q2.stop()
   }
 
-  test("MemorySink can recover from a checkpoint in Complete Mode") {
+  test("MemorySink can recover from a checkpoint when recoverFromCheckpoint is true") {
     val checkpointLoc = newMetadataDir
     val checkpointDir = new File(checkpointLoc, "offsets")
     checkpointDir.mkdirs()
@@ -483,7 +483,7 @@ class DataStreamReaderWriterSuite extends StreamTest with BeforeAndAfter {
     testMemorySinkCheckpointRecovery(checkpointLoc, provideInWriter = true)
   }
 
-  test("SPARK-18927: MemorySink can recover from a checkpoint provided in conf in Complete Mode") {
+  test("MemorySink can recover from a checkpoint provided when recoverFromCheckpoint is true") {
     val checkpointLoc = newMetadataDir
     val checkpointDir = new File(checkpointLoc, "offsets")
     checkpointDir.mkdirs()

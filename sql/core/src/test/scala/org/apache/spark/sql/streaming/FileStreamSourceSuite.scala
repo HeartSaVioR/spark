@@ -223,7 +223,6 @@ abstract class FileStreamSourceTest
 }
 
 class FileStreamSourceSuite extends FileStreamSourceTest {
-
   import testImplicits._
 
   override val streamingTimeout = 80.seconds
@@ -1296,9 +1295,9 @@ class FileStreamSourceSuite extends FileStreamSourceTest {
       // This is to avoid actually running a Spark job with 10000 tasks
       val df = files.filter("1 == 0").groupBy().count()
 
-      testStream(df, OutputMode.Complete)(
+      testStream(df, OutputMode.Update())(
         AddTextFileData("0", src, tmp),
-        CheckAnswer(0)
+        CheckNewAnswer(0)
       )
     }
   }

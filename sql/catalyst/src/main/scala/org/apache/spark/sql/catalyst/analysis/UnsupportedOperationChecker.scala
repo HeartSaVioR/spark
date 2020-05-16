@@ -152,23 +152,7 @@ object UnsupportedOperationChecker extends Logging {
                 s"streaming DataFrames/DataSets without watermark")(plan)
         }
 
-      case InternalOutputModes.Complete if aggregates.isEmpty =>
-        throwError(
-          s"$outputMode output mode not supported when there are no streaming aggregations on " +
-            s"streaming DataFrames/Datasets")(plan)
-
       case _ =>
-    }
-
-    /**
-     * Whether the subplan will contain complete data or incremental data in every incremental
-     * execution. Some operations may be allowed only when the child logical plan gives complete
-     * data.
-     */
-    def containsCompleteData(subplan: LogicalPlan): Boolean = {
-      val aggs = subplan.collect { case a@Aggregate(_, _, _) if a.isStreaming => a }
-      // Either the subplan has no streaming source, or it has aggregation with Complete mode
-      !subplan.isStreaming || (aggs.nonEmpty && outputMode == InternalOutputModes.Complete)
     }
 
     def checkUnsupportedExpressions(implicit operator: LogicalPlan): Unit = {
@@ -360,9 +344,8 @@ object UnsupportedOperationChecker extends Logging {
           throwError("Limits are not supported on streaming DataFrames/Datasets in Update " +
             "output mode")
 
-        case Sort(_, _, _) if !containsCompleteData(subPlan) =>
-          throwError("Sorting is not supported on streaming DataFrames/Datasets, unless it is on " +
-            "aggregated DataFrame/Dataset in Complete output mode")
+        case Sort(_, _, child) if child.isStreaming =>
+          throwError("Sorting is not supported on streaming DataFrames/Datasets")
 
         case Sample(_, _, _, _, child) if child.isStreaming =>
           throwError("Sampling is not supported on streaming DataFrames/Datasets")

@@ -34,31 +34,21 @@ private[sql] object InternalOutputModes {
   case object Append extends OutputMode
 
   /**
-   * OutputMode in which all the rows in the streaming DataFrame/Dataset will be written
-   * to the sink every time these is some updates. This output mode can only be used in queries
-   * that contain aggregations.
-   */
-  case object Complete extends OutputMode
-
-  /**
    * OutputMode in which only the rows in the streaming DataFrame/Dataset that were updated will be
    * written to the sink every time these is some updates. If the query doesn't contain
    * aggregations, it will be equivalent to `Append` mode.
    */
   case object Update extends OutputMode
 
-
   def apply(outputMode: String): OutputMode = {
     outputMode.toLowerCase(Locale.ROOT) match {
       case "append" =>
         OutputMode.Append
-      case "complete" =>
-        OutputMode.Complete
       case "update" =>
         OutputMode.Update
       case _ =>
         throw new IllegalArgumentException(s"Unknown output mode $outputMode. " +
-          "Accepted output modes are 'append', 'complete', 'update'")
+          "Accepted output modes are 'append', 'update'")
     }
   }
 }

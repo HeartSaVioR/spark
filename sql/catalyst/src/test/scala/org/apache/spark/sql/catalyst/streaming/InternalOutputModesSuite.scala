@@ -31,15 +31,13 @@ class InternalOutputModesSuite extends SparkFunSuite {
 
     testMode("append", OutputMode.Append)
     testMode("Append", OutputMode.Append)
-    testMode("complete", OutputMode.Complete)
-    testMode("Complete", OutputMode.Complete)
     testMode("update", OutputMode.Update)
     testMode("Update", OutputMode.Update)
   }
 
   test("unsupported strings") {
     def testMode(outputMode: String): Unit = {
-      val acceptedModes = Seq("append", "update", "complete")
+      val acceptedModes = Seq("append", "update")
       val e = intercept[IllegalArgumentException](InternalOutputModes(outputMode))
       (Seq("output mode", "unknown", outputMode) ++ acceptedModes).foreach { s =>
         assert(e.getMessage.toLowerCase(Locale.ROOT).contains(s.toLowerCase(Locale.ROOT)))

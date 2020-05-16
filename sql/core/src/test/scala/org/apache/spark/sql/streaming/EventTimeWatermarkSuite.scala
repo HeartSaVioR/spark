@@ -134,12 +134,12 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
       .agg(count("*") as 'count)
       .select($"window".getField("start").cast("long").as[Long], $"count".as[Long])
 
-    testStream(aggWithoutWatermark, outputMode = Complete)(
+    testStream(aggWithoutWatermark, outputMode = Update())(
       AddData(inputData1, 15),
-      CheckAnswer((15, 1)),
+      CheckNewAnswer((15, 1)),
       assertEventStats { e => assert(e.isEmpty) },
       AddData(inputData1, 10, 12, 14),
-      CheckAnswer((10, 3), (15, 1)),
+      CheckNewAnswer((10, 3)),
       assertEventStats { e => assert(e.isEmpty) }
     )
 
@@ -418,8 +418,9 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
       val unionWriter = firstDf.union(secondDf).agg(sum('value))
         .writeStream
         .option("checkpointLocation", checkpointDir.getCanonicalPath)
+        .option("recoverFromCheckpoint", true)
         .format("memory")
-        .outputMode("complete")
+        .outputMode("update")
         .queryName("test")
 
       val union = unionWriter.start()
@@ -474,31 +475,6 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
       assert(getWatermarkAfterData(secondData = Seq(200), query = union2) == 185000)
       assert(getWatermarkAfterData(firstData = Seq(200), query = union2) == 190000)
     }
-  }
-
-  test("complete mode") {
-    val inputData = MemoryStream[Int]
-
-    val windowedAggregation = inputData.toDF()
-        .withColumn("eventTime", $"value".cast("timestamp"))
-        .withWatermark("eventTime", "10 seconds")
-        .groupBy(window($"eventTime", "5 seconds") as 'window)
-        .agg(count("*") as 'count)
-        .select($"window".getField("start").cast("long").as[Long], $"count".as[Long])
-
-    // No eviction when asked to compute complete results.
-    testStream(windowedAggregation, OutputMode.Complete)(
-      AddData(inputData, 10, 11, 12),
-      CheckAnswer((10, 3)),
-      AddData(inputData, 25),
-      CheckAnswer((10, 3), (25, 1)),
-      AddData(inputData, 25),
-      CheckAnswer((10, 3), (25, 2)),
-      AddData(inputData, 10),
-      CheckAnswer((10, 4), (25, 2)),
-      AddData(inputData, 25),
-      CheckAnswer((10, 4), (25, 3))
-    )
   }
 
   test("group by on raw timestamp") {

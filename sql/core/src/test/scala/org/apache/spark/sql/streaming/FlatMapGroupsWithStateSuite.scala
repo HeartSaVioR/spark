@@ -679,50 +679,6 @@ class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest {
     )
   }
 
-  testWithAllStateVersions("flatMapGroupsWithState - streaming + aggregation") {
-    // Function to maintain running count up to 2, and then remove the count
-    // Returns the data and the count (-1 if count reached beyond 2 and state was just removed)
-    val stateFunc = (key: String, values: Iterator[String], state: GroupState[RunningCount]) => {
-
-      val count = state.getOption.map(_.count).getOrElse(0L) + values.size
-      if (count == 3) {
-        state.remove()
-        Iterator(key -> "-1")
-      } else {
-        state.update(RunningCount(count))
-        Iterator(key -> count.toString)
-      }
-    }
-
-    val inputData = MemoryStream[String]
-    val result =
-      inputData.toDS()
-        .groupByKey(x => x)
-        .flatMapGroupsWithState(Append, GroupStateTimeout.NoTimeout)(stateFunc)
-        .groupByKey(_._1)
-        .count()
-
-    testStream(result, Complete)(
-      AddData(inputData, "a"),
-      CheckNewAnswer(("a", 1)),
-      AddData(inputData, "a", "b"),
-      // mapGroups generates ("a", "2"), ("b", "1"); so increases counts of a and b by 1
-      CheckNewAnswer(("a", 2), ("b", 1)),
-      StopStream,
-      StartStream(),
-      AddData(inputData, "a", "b"),
-      // mapGroups should remove state for "a" and generate ("a", "-1"), ("b", "2") ;
-      // so increment a and b by 1
-      CheckNewAnswer(("a", 3), ("b", 2)),
-      StopStream,
-      StartStream(),
-      AddData(inputData, "a", "c"),
-      // mapGroups should recreate state for "a" and generate ("a", "1"), ("c", "1") ;
-      // so increment a and c by 1
-      CheckNewAnswer(("a", 4), ("b", 2), ("c", 1))
-    )
-  }
-
   test("flatMapGroupsWithState - batch") {
     // Function that returns running count only if its even, otherwise does not return
     val stateFunc = (key: String, values: Iterator[String], state: GroupState[RunningCount]) => {
@@ -1062,32 +1018,6 @@ class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest {
       CheckNewAnswer("a"),
       AssertOnQuery(_.lastExecution.executedPlan.outputPartitioning === UnknownPartitioning(0))
     )
-  }
-
-  test("disallow complete mode") {
-    val stateFunc = (key: String, values: Iterator[String], state: GroupState[Int]) => {
-      Iterator[String]()
-    }
-
-    var e = intercept[IllegalArgumentException] {
-      MemoryStream[String].toDS().groupByKey(x => x).flatMapGroupsWithState(
-        OutputMode.Complete, GroupStateTimeout.NoTimeout)(stateFunc)
-    }
-    assert(e.getMessage === "The output mode of function should be append or update")
-
-    val javaStateFunc = new FlatMapGroupsWithStateFunction[String, String, Int, String] {
-      import java.util.{Iterator => JIterator}
-      override def call(
-        key: String,
-        values: JIterator[String],
-        state: GroupState[Int]): JIterator[String] = { null }
-    }
-    e = intercept[IllegalArgumentException] {
-      MemoryStream[String].toDS().groupByKey(x => x).flatMapGroupsWithState(
-        javaStateFunc, OutputMode.Complete,
-        implicitly[Encoder[Int]], implicitly[Encoder[String]], GroupStateTimeout.NoTimeout)
-    }
-    assert(e.getMessage === "The output mode of function should be append or update")
   }
 
   def testWithTimeout(timeoutConf: GroupStateTimeout): Unit = {

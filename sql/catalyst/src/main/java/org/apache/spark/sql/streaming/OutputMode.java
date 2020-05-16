@@ -41,17 +41,6 @@ public class OutputMode {
   }
 
   /**
-   * OutputMode in which all the rows in the streaming DataFrame/Dataset will be written
-   * to the sink every time there are some updates. This output mode can only be used in queries
-   * that contain aggregations.
-   *
-   * @since 2.0.0
-   */
-  public static OutputMode Complete() {
-    return InternalOutputModes.Complete$.MODULE$;
-  }
-
-  /**
    * OutputMode in which only the rows that were updated in the streaming DataFrame/Dataset will
    * be written to the sink every time there are some updates. If the query doesn't contain
    * aggregations, it will be equivalent to `Append` mode.

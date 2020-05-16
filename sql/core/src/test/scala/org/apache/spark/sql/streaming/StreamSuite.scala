@@ -214,7 +214,7 @@ class StreamSuite extends StreamTest {
             .start(outputDir.getAbsolutePath)
           try {
             query.processAllAvailable()
-            val outputDf = spark.read.parquet(outputDir.getAbsolutePath).as[Long]
+            val outputDf = spark.read.parquet(outputDir.getAbsolutePath).as[Long].sort("a")
             checkDataset[Long](outputDf, (0L to 10L).toArray: _*)
           } finally {
             query.stop()
@@ -436,7 +436,6 @@ class StreamSuite extends StreamTest {
 
   test("output mode API in Scala") {
     assert(OutputMode.Append === InternalOutputModes.Append)
-    assert(OutputMode.Complete === InternalOutputModes.Complete)
     assert(OutputMode.Update === InternalOutputModes.Update)
   }
 
@@ -449,7 +448,7 @@ class StreamSuite extends StreamTest {
     val inputData = MemoryStream[String]
     val df = inputData.toDS().map(_ + "foo").groupBy("value").agg(count("*"))
     // Test StreamingQuery.display
-    val q = df.writeStream.queryName("memory_explain").outputMode("complete").format("memory")
+    val q = df.writeStream.queryName("memory_explain").outputMode("update").format("memory")
       .start()
       .asInstanceOf[StreamingQueryWrapper]
       .streamingQuery
@@ -489,7 +488,7 @@ class StreamSuite extends StreamTest {
     assert(!explainString.contains("LocalTableScan"))
 
     // Test StreamingQuery.display
-    val q = df.writeStream.queryName("memory_explain").outputMode("complete").format("memory")
+    val q = df.writeStream.queryName("memory_explain").outputMode("update").format("memory")
       .start()
       .asInstanceOf[StreamingQueryWrapper]
       .streamingQuery
@@ -703,18 +702,18 @@ class StreamSuite extends StreamTest {
     val inputData = MemoryStream[(Int, Int)]
     val agg = inputData.toDS().groupBy("_1").count()
 
-    testStream(agg, OutputMode.Complete())(
+    testStream(agg, OutputMode.Update())(
       AddData(inputData, (1, 0), (2, 0)),
       StartStream(additionalConfs = Map(SQLConf.SHUFFLE_PARTITIONS.key -> "2")),
-      CheckAnswer((1, 1), (2, 1)),
+      CheckNewAnswer((1, 1), (2, 1)),
       StopStream,
       AddData(inputData, (3, 0), (2, 0)),
       StartStream(additionalConfs = Map(SQLConf.SHUFFLE_PARTITIONS.key -> "5")),
-      CheckAnswer((1, 1), (2, 2), (3, 1)),
+      CheckNewAnswer((2, 2), (3, 1)),
       StopStream,
       AddData(inputData, (3, 0), (1, 0)),
       StartStream(additionalConfs = Map(SQLConf.SHUFFLE_PARTITIONS.key -> "1")),
-      CheckAnswer((1, 2), (2, 2), (3, 2)))
+      CheckNewAnswer((1, 2), (3, 2)))
   }
 
   testQuietly("recover from a Spark v2.1 checkpoint") {
@@ -732,7 +731,7 @@ class StreamSuite extends StreamTest {
         .groupBy($"value")
         .agg(count("*"))
         .writeStream
-        .outputMode("complete")
+        .outputMode("update")
         .format("memory")
     }
 
@@ -754,15 +753,20 @@ class StreamSuite extends StreamTest {
     withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> "10") {
       var streamingQuery: StreamingQuery = null
       try {
-        streamingQuery =
-          query.queryName("counts").option("checkpointLocation", dir1.getCanonicalPath).start()
+        streamingQuery = query
+          .queryName("counts")
+          .option("checkpointLocation", dir1.getCanonicalPath)
+          .option("recoverFromCheckpoint", true)
+          .start()
         streamingQuery.processAllAvailable()
+
         inputData.addData(9)
         streamingQuery.processAllAvailable()
 
-        checkAnswer(spark.table("counts").toDF(),
-          Row(1, 1L) :: Row(2, 1L) :: Row(3, 2L) :: Row(4, 2L) ::
-          Row(5, 2L) :: Row(6, 2L) :: Row(7, 1L) :: Row(8, 1L) :: Row(9, 1L) :: Nil)
+        val expectedSuperSet = Set(Row(1, 1L), Row(2, 1L), Row(3, 2L), Row(4, 2L),
+          Row(5, 2L), Row(6, 2L), Row(7, 1L), Row(8, 1L), Row(9, 1L))
+        assert(spark.table("counts").collect().toSet
+          .subsetOf(expectedSuperSet))
       } finally {
         if (streamingQuery ne null) {
           streamingQuery.stop()
@@ -779,8 +783,11 @@ class StreamSuite extends StreamTest {
       var streamingQuery: StreamingQuery = null
       try {
         intercept[StreamingQueryException] {
-          streamingQuery =
-            query.queryName("badQuery").option("checkpointLocation", dir2.getCanonicalPath).start()
+          streamingQuery = query
+            .queryName("badQuery")
+            .option("checkpointLocation", dir2.getCanonicalPath)
+            .option("recoverFromCheckpoint", true)
+            .start()
           streamingQuery.processAllAvailable()
         }
       } finally {
@@ -979,42 +986,6 @@ class StreamSuite extends StreamTest {
       CheckAnswer(1 to 3: _*))
   }
 
-  test("SPARK-30658: streaming limit before agg in complete mode") {
-    val inputData = MemoryStream[Int]
-    val limited = inputData.toDF().limit(5).groupBy("value").count()
-    testStream(limited, OutputMode.Complete())(
-      AddData(inputData, 1 to 3: _*),
-      CheckAnswer(Row(1, 1), Row(2, 1), Row(3, 1)),
-      AddData(inputData, 1 to 9: _*),
-      CheckAnswer(Row(1, 2), Row(2, 2), Row(3, 1)))
-  }
-
-  test("SPARK-30658: streaming limits before and after agg in complete mode " +
-    "(after limit < before limit)") {
-    val inputData = MemoryStream[Int]
-    val limited = inputData.toDF().limit(4).groupBy("value").count().orderBy("value").limit(3)
-    testStream(limited, OutputMode.Complete())(
-      StartStream(additionalConfs = Map(SQLConf.SHUFFLE_PARTITIONS.key -> "1")),
-      AddData(inputData, 1 to 9: _*),
-      // only 1 to 4 should be allowed to aggregate, and counts for only 1 to 3 should be output
-      CheckAnswer(Row(1, 1), Row(2, 1), Row(3, 1)),
-      AddData(inputData, 2 to 6: _*),
-      // None of the new values should be allowed to aggregate, same 3 counts should be output
-      CheckAnswer(Row(1, 1), Row(2, 1), Row(3, 1)))
-  }
-
-  test("SPARK-30658: streaming limits before and after agg in complete mode " +
-    "(before limit < after limit)") {
-    val inputData = MemoryStream[Int]
-    val limited = inputData.toDF().limit(2).groupBy("value").count().orderBy("value").limit(3)
-    testStream(limited, OutputMode.Complete())(
-      StartStream(additionalConfs = Map(SQLConf.SHUFFLE_PARTITIONS.key -> "1")),
-      AddData(inputData, 1 to 9: _*),
-      CheckAnswer(Row(1, 1), Row(2, 1)),
-      AddData(inputData, 2 to 6: _*),
-      CheckAnswer(Row(1, 1), Row(2, 1)))
-  }
-
   test("SPARK-30657: streaming limit after streaming dedup in append mode") {
     val inputData = MemoryStream[Int]
     val limited = inputData.toDF().dropDuplicates().limit(1)
@@ -1120,10 +1091,6 @@ class StreamSuite extends StreamTest {
 
     // Should be optimized from StreamingLocalLimitExec to LocalLimitExec
     verifyLocalLimit(inputDF.limit(1), expectStreamingLimit = false)
-    verifyLocalLimit(
-      inputDF.limit(1).groupBy().count(),
-      expectStreamingLimit = false,
-      outputMode = OutputMode.Complete())
 
     // Should be optimized as repartition is sufficient to ensure that the iterators of
     // StreamingDeduplicationExec should be consumed completely by the repartition exchange.
@@ -1132,11 +1099,6 @@ class StreamSuite extends StreamTest {
     // Should be LocalLimitExec in the first place, not from optimization of StreamingLocalLimitExec
     val staticDF = spark.range(1).toDF("value").limit(1)
     verifyLocalLimit(inputDF.toDF("value").join(staticDF, "value"), expectStreamingLimit = false)
-
-    verifyLocalLimit(
-      inputDF.groupBy().count().limit(1),
-      expectStreamingLimit = false,
-      outputMode = OutputMode.Complete())
   }
 
   test("is_continuous_processing property should be false for microbatch processing") {

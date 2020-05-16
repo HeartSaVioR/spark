@@ -80,50 +80,6 @@ class ForeachWriterSuite extends StreamTest with SharedSparkSession with BeforeA
     }
   }
 
-  test("foreach() with `complete` output mode") {
-    withTempDir { checkpointDir =>
-      val input = MemoryStream[Int]
-
-      val query = input.toDS()
-        .groupBy().count().as[Long].map(_.toInt)
-        .writeStream
-        .option("checkpointLocation", checkpointDir.getCanonicalPath)
-        .outputMode(OutputMode.Complete)
-        .foreach(new TestForeachWriter())
-        .start()
-
-      // -- batch 0 ---------------------------------------
-      input.addData(1, 2, 3, 4)
-      query.processAllAvailable()
-
-      var allEvents = ForeachWriterSuite.allEvents()
-      assert(allEvents.size === 1)
-      var expectedEvents = Seq(
-        ForeachWriterSuite.Open(partition = 0, version = 0),
-        ForeachWriterSuite.Process(value = 4),
-        ForeachWriterSuite.Close(None)
-      )
-      assert(allEvents === Seq(expectedEvents))
-
-      ForeachWriterSuite.clear()
-
-      // -- batch 1 ---------------------------------------
-      input.addData(5, 6, 7, 8)
-      query.processAllAvailable()
-
-      allEvents = ForeachWriterSuite.allEvents()
-      assert(allEvents.size === 1)
-      expectedEvents = Seq(
-        ForeachWriterSuite.Open(partition = 0, version = 1),
-        ForeachWriterSuite.Process(value = 8),
-        ForeachWriterSuite.Close(None)
-      )
-      assert(allEvents === Seq(expectedEvents))
-
-      query.stop()
-    }
-  }
-
   testQuietly("foreach with error") {
     withTempDir { checkpointDir =>
       val input = MemoryStream[Int]
@@ -156,40 +112,6 @@ class ForeachWriterSuite extends StreamTest with SharedSparkSession with BeforeA
       assert(errorEvent.error.get.getMessage === "ForeachSinkSuite error")
       // 'close' shouldn't be called with abort message if close with error has been called
       assert(allEvents(0).size == 3)
-    }
-  }
-
-  test("foreach with watermark: complete") {
-    val inputData = MemoryStream[Int]
-
-    val windowedAggregation = inputData.toDF()
-      .withColumn("eventTime", $"value".cast("timestamp"))
-      .withWatermark("eventTime", "10 seconds")
-      .groupBy(window($"eventTime", "5 seconds") as 'window)
-      .agg(count("*") as 'count)
-      .select($"count".as[Long])
-      .map(_.toInt)
-      .repartition(1)
-
-    val query = windowedAggregation
-      .writeStream
-      .outputMode(OutputMode.Complete)
-      .foreach(new TestForeachWriter())
-      .start()
-    try {
-      inputData.addData(10, 11, 12)
-      query.processAllAvailable()
-
-      val allEvents = ForeachWriterSuite.allEvents()
-      assert(allEvents.size === 1)
-      val expectedEvents = Seq(
-        ForeachWriterSuite.Open(partition = 0, version = 0),
-        ForeachWriterSuite.Process(value = 3),
-        ForeachWriterSuite.Close(None)
-      )
-      assert(allEvents === Seq(expectedEvents))
-    } finally {
-      query.stop()
     }
   }
 

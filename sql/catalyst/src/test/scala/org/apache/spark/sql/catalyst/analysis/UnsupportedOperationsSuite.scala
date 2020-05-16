@@ -112,11 +112,6 @@ class UnsupportedOperationsSuite extends SparkFunSuite {
     outputMode = Update)
 
   assertSupportedInStreamingPlan(
-    "aggregate - streaming aggregations in complete mode",
-    Aggregate(Nil, aggExprs("d"), streamRelation),
-    outputMode = Complete)
-
-  assertSupportedInStreamingPlan(
     "aggregate - streaming aggregations with watermark in append mode",
     Aggregate(Seq(attributeWithWatermark), aggExprs("d"), streamRelation),
     outputMode = Append)
@@ -133,12 +128,6 @@ class UnsupportedOperationsSuite extends SparkFunSuite {
     "distinct aggregate - aggregate on batch relation",
     Aggregate(Nil, distinctAggExprs, batchRelation),
     outputMode = Append)
-
-  assertNotSupportedInStreamingPlan(
-    "distinct aggregate - aggregate on streaming relation",
-    Aggregate(Nil, distinctAggExprs, streamRelation),
-    outputMode = Complete,
-    expectedMsgs = Seq("distinct aggregation"))
 
   val att = new AttributeReference(name = "a", dataType = LongType)()
   // FlatMapGroupsWithState: Both function modes equivalent and supported in batch.
@@ -176,19 +165,8 @@ class UnsupportedOperationsSuite extends SparkFunSuite {
     outputMode = Append,
     expectedMsgs = Seq("flatMapGroupsWithState in update mode", "Append"))
 
-  assertNotSupportedInStreamingPlan(
-    "flatMapGroupsWithState - flatMapGroupsWithState(Update) " +
-      "on streaming relation without aggregation in complete mode",
-    FlatMapGroupsWithState(
-      null, att, att, Seq(att), Seq(att), att, null, Update, isMapGroupsWithState = false, null,
-      streamRelation),
-    outputMode = Complete,
-    // Disallowed by the aggregation check but let's still keep this test in case it's broken in
-    // future.
-    expectedMsgs = Seq("Complete"))
-
   // FlatMapGroupsWithState(Update) in streaming with aggregation
-  for (outputMode <- Seq(Append, Update, Complete)) {
+  for (outputMode <- Seq(Append, Update)) {
     assertNotSupportedInStreamingPlan(
       "flatMapGroupsWithState - flatMapGroupsWithState(Update) on streaming relation " +
         s"with aggregation in $outputMode mode",
@@ -218,7 +196,7 @@ class UnsupportedOperationsSuite extends SparkFunSuite {
     expectedMsgs = Seq("flatMapGroupsWithState in append mode", "update"))
 
   // FlatMapGroupsWithState(Append) in streaming with aggregation
-  for (outputMode <- Seq(Append, Update, Complete)) {
+  for (outputMode <- Seq(Append, Update)) {
     assertSupportedInStreamingPlan(
       "flatMapGroupsWithState - flatMapGroupsWithState(Append) " +
         s"on streaming relation before aggregation in $outputMode mode",
@@ -241,17 +219,6 @@ class UnsupportedOperationsSuite extends SparkFunSuite {
       outputMode = outputMode,
       expectedMsgs = Seq("flatMapGroupsWithState", "after aggregation"))
   }
-
-  assertNotSupportedInStreamingPlan(
-    "flatMapGroupsWithState - " +
-      "flatMapGroupsWithState(Update) on streaming relation in complete mode",
-    FlatMapGroupsWithState(
-      null, att, att, Seq(att), Seq(att), att, null, Append, isMapGroupsWithState = false, null,
-      streamRelation),
-    outputMode = Complete,
-    // Disallowed by the aggregation check but let's still keep this test in case it's broken in
-    // future.
-    expectedMsgs = Seq("Complete"))
 
   // FlatMapGroupsWithState inside batch relation should always be allowed
   for (funcMode <- Seq(Append, Update)) {
@@ -300,18 +267,7 @@ class UnsupportedOperationsSuite extends SparkFunSuite {
     // future.
     expectedMsgs = Seq("mapGroupsWithState", "append"))
 
-  assertNotSupportedInStreamingPlan(
-    "mapGroupsWithState - mapGroupsWithState " +
-      "on streaming relation without aggregation in complete mode",
-    FlatMapGroupsWithState(
-      null, att, att, Seq(att), Seq(att), att, null, Update, isMapGroupsWithState = true, null,
-      streamRelation),
-    outputMode = Complete,
-    // Disallowed by the aggregation check but let's still keep this test in case it's broken in
-    // future.
-    expectedMsgs = Seq("Complete"))
-
-  for (outputMode <- Seq(Append, Update, Complete)) {
+  for (outputMode <- Seq(Append, Update)) {
     assertNotSupportedInStreamingPlan(
       "mapGroupsWithState - mapGroupsWithState on streaming relation " +
         s"with aggregation in $outputMode mode",
@@ -372,12 +328,6 @@ class UnsupportedOperationsSuite extends SparkFunSuite {
       Deduplicate(Seq(att), streamRelation)),
     outputMode = Append)
 
-  assertNotSupportedInStreamingPlan(
-    "Deduplicate - Deduplicate on streaming relation after aggregation",
-    Deduplicate(Seq(att), Aggregate(Nil, aggExprs("c"), streamRelation)),
-    outputMode = Complete,
-    expectedMsgs = Seq("dropDuplicates"))
-
   assertSupportedInStreamingPlan(
     "Deduplicate - Deduplicate on batch relation inside a streaming query",
     Deduplicate(Seq(att), batchRelation),
@@ -429,12 +379,6 @@ class UnsupportedOperationsSuite extends SparkFunSuite {
       condition = Some(attribute === attribute)),
     OutputMode.Update(),
     Seq("is not supported in Update output mode"))
-  assertNotSupportedInStreamingPlan(
-    s"left outer join with stream-stream relations and complete mode",
-    Aggregate(Nil, aggExprs("d"), streamRelation.join(streamRelation, joinType = LeftOuter,
-      condition = Some(attribute === attribute))),
-    OutputMode.Complete(),
-    Seq("is not supported in Complete output mode"))
 
   // Left outer joins: stream-stream allowed with join on watermark attribute
   // Note that the attribute need not be watermarked on both sides.
@@ -601,21 +545,6 @@ class UnsupportedOperationsSuite extends SparkFunSuite {
 
   // Sort: supported only on batch subplans and after aggregation on streaming plan + complete mode
   testUnaryOperatorInStreamingPlan("sort", Sort(Nil, true, _))
-  assertSupportedInStreamingPlan(
-    "sort - sort after aggregation in Complete output mode",
-    streamRelation.groupBy()(Count("*")).sortBy(),
-    Complete)
-  assertNotSupportedInStreamingPlan(
-    "sort - sort before aggregation in Complete output mode",
-    streamRelation.sortBy().groupBy()(Count("*")),
-    Complete,
-    Seq("sort", "aggregat", "complete"))
-  assertNotSupportedInStreamingPlan(
-    "sort - sort over aggregated data in Update output mode",
-    streamRelation.groupBy()(Count("*")).sortBy(),
-    Update,
-    Seq("sort", "aggregat", "complete")) // sort on aggregations is supported on Complete mode only
-
 
   // Other unary operations
   testUnaryOperatorInStreamingPlan(
@@ -626,7 +555,6 @@ class UnsupportedOperationsSuite extends SparkFunSuite {
   // Output modes with aggregation and non-aggregation plans
   testOutputMode(Append, shouldSupportAggregation = false, shouldSupportNonAggregation = true)
   testOutputMode(Update, shouldSupportAggregation = true, shouldSupportNonAggregation = true)
-  testOutputMode(Complete, shouldSupportAggregation = true, shouldSupportNonAggregation = false)
 
   // Unsupported expressions in streaming plan
   assertNotSupportedInStreamingPlan(

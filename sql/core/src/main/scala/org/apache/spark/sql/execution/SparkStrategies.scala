@@ -461,6 +461,7 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
         plan.collectFirst { case a: Aggregate if a.isStreaming => a }.isEmpty
       }
 
+      // FIXME: fix comments
       // The following cases of limits on a streaming plan has to be executed with a stateful
       // streaming plan.
       // 1. When the query is in append mode (that is, all logical plan operate on appended data).
@@ -468,9 +469,11 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
       //    operators that operate on appended data). This must be executed with a stateful
       //    streaming plan even if the query is in complete mode because of a later streaming
       //    aggregation (e.g., `streamingDf.limit(5).groupBy().count()`).
-      plan.isStreaming && (
-        outputMode == InternalOutputModes.Append ||
+      plan.isStreaming && outputMode == InternalOutputModes.Append
+        /*
+        (outputMode == InternalOutputModes.Append ||
         outputMode == InternalOutputModes.Complete && hasNoStreamingAgg)
+       */
     }
 
     override def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {

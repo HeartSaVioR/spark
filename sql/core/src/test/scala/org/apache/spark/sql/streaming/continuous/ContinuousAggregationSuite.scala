@@ -23,52 +23,55 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf.UNSUPPORTED_OPERATION_CHECK_ENABLED
 import org.apache.spark.sql.streaming.OutputMode
 
+// FIXME: Remove the functionality. It's never ever supported officially and no one actually
+//  maintain this. This is never documented.
+
 class ContinuousAggregationSuite extends ContinuousSuiteBase {
   import testImplicits._
 
-  test("not enabled") {
+  ignore("not enabled") {
     val ex = intercept[AnalysisException] {
       val input = ContinuousMemoryStream.singlePartition[Int]
-      testStream(input.toDF().agg(max('value)), OutputMode.Complete)()
+      testStream(input.toDF().agg(max('value)), OutputMode.Update())()
     }
 
     assert(ex.getMessage.contains(
       "In continuous processing mode, coalesce(1) must be called before aggregate operation"))
   }
 
-  test("basic") {
+  ignore("basic") {
     withSQLConf((UNSUPPORTED_OPERATION_CHECK_ENABLED.key, "false")) {
       val input = ContinuousMemoryStream.singlePartition[Int]
 
-      testStream(input.toDF().agg(max('value)), OutputMode.Complete)(
+      testStream(input.toDF().agg(max('value)), OutputMode.Update())(
         AddData(input, 0, 1, 2),
-        CheckAnswer(2),
+        CheckNewAnswer(2),
         StopStream,
         AddData(input, 3, 4, 5),
         StartStream(),
-        CheckAnswer(5),
+        CheckNewAnswer(5),
         AddData(input, -1, -2, -3),
-        CheckAnswer(5))
+        CheckNewAnswer(5))
     }
   }
 
-  test("multiple partitions with coalesce") {
+  ignore("multiple partitions with coalesce") {
     val input = ContinuousMemoryStream[Int]
 
     val df = input.toDF().coalesce(1).agg(max('value))
 
-    testStream(df, OutputMode.Complete)(
+    testStream(df, OutputMode.Update())(
       AddData(input, 0, 1, 2),
-      CheckAnswer(2),
+      CheckNewAnswer(2),
       StopStream,
       AddData(input, 3, 4, 5),
       StartStream(),
-      CheckAnswer(5),
+      CheckNewAnswer(5),
       AddData(input, -1, -2, -3),
-      CheckAnswer(5))
+      CheckNewAnswer(5))
   }
 
-  test("multiple partitions with coalesce - multiple transformations") {
+  ignore("multiple partitions with coalesce - multiple transformations") {
     val input = ContinuousMemoryStream[Int]
 
     // We use a barrier to make sure predicates both before and after coalesce work
@@ -80,18 +83,18 @@ class ContinuousAggregationSuite extends ContinuousSuiteBase {
       .where('copy =!= 2)
       .agg(max('value))
 
-    testStream(df, OutputMode.Complete)(
+    testStream(df, OutputMode.Update())(
       AddData(input, 0, 1, 2),
-      CheckAnswer(0),
+      CheckNewAnswer(0),
       StopStream,
       AddData(input, 3, 4, 5),
       StartStream(),
-      CheckAnswer(5),
+      CheckNewAnswer(5),
       AddData(input, -1, -2, -3),
-      CheckAnswer(5))
+      CheckNewAnswer(5))
   }
 
-  test("multiple partitions with multiple coalesce") {
+  ignore("multiple partitions with multiple coalesce") {
     val input = ContinuousMemoryStream[Int]
 
     val df = input.toDF()
@@ -101,24 +104,24 @@ class ContinuousAggregationSuite extends ContinuousSuiteBase {
       .select('value as 'copy, 'value)
       .agg(max('value))
 
-    testStream(df, OutputMode.Complete)(
+    testStream(df, OutputMode.Update())(
       AddData(input, 0, 1, 2),
-      CheckAnswer(2),
+      CheckNewAnswer(2),
       StopStream,
       AddData(input, 3, 4, 5),
       StartStream(),
-      CheckAnswer(5),
+      CheckNewAnswer(5),
       AddData(input, -1, -2, -3),
-      CheckAnswer(5))
+      CheckNewAnswer(5))
   }
 
-  test("repeated restart") {
+  ignore("repeated restart") {
     withSQLConf((UNSUPPORTED_OPERATION_CHECK_ENABLED.key, "false")) {
       val input = ContinuousMemoryStream.singlePartition[Int]
 
-      testStream(input.toDF().agg(max('value)), OutputMode.Complete)(
+      testStream(input.toDF().agg(max('value)), OutputMode.Update())(
         AddData(input, 0, 1, 2),
-        CheckAnswer(2),
+        CheckNewAnswer(2),
         StopStream,
         StartStream(),
         StopStream,
@@ -126,9 +129,9 @@ class ContinuousAggregationSuite extends ContinuousSuiteBase {
         StopStream,
         StartStream(),
         AddData(input, 0),
-        CheckAnswer(2),
+        CheckNewAnswer(2),
         AddData(input, 5),
-        CheckAnswer(5))
+        CheckNewAnswer(5))
     }
   }
 }

@@ -171,31 +171,6 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest {
     )
   }
 
-  test("deduplicate with aggregate - complete mode") {
-    val inputData = MemoryStream[(String, Int)]
-    val result = inputData.toDS()
-      .select($"_1" as "str", $"_2" as "num")
-      .dropDuplicates()
-      .groupBy("str")
-      .agg(sum("num"))
-      .as[(String, Long)]
-
-    testStream(result, Complete)(
-      AddData(inputData, "a" -> 1),
-      CheckLastBatch("a" -> 1L),
-      assertNumStateRows(total = Seq(1L, 1L), updated = Seq(1L, 1L)),
-      AddData(inputData, "a" -> 1), // Dropped
-      CheckLastBatch("a" -> 1L),
-      assertNumStateRows(total = Seq(1L, 1L), updated = Seq(0L, 0L)),
-      AddData(inputData, "a" -> 2),
-      CheckLastBatch("a" -> 3L),
-      assertNumStateRows(total = Seq(1L, 2L), updated = Seq(1L, 1L)),
-      AddData(inputData, "b" -> 1),
-      CheckLastBatch("a" -> 3L, "b" -> 1L),
-      assertNumStateRows(total = Seq(2L, 3L), updated = Seq(1L, 1L))
-    )
-  }
-
   test("deduplicate with file sink") {
     withTempDir { output =>
       withTempDir { checkpointDir =>

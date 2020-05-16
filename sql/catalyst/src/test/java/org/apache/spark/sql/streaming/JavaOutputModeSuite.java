@@ -28,7 +28,7 @@ public class JavaOutputModeSuite {
   public void testOutputModes() {
     OutputMode o1 = OutputMode.Append();
     Assert.assertTrue(o1.toString().toLowerCase(Locale.ROOT).contains("append"));
-    OutputMode o2 = OutputMode.Complete();
-    Assert.assertTrue(o2.toString().toLowerCase(Locale.ROOT).contains("complete"));
+    OutputMode o2 = OutputMode.Update();
+    Assert.assertTrue(o2.toString().toLowerCase(Locale.ROOT).contains("update"));
   }
 }

@@ -264,23 +264,17 @@ abstract class FileStreamSinkSuite extends StreamTest {
     }
   }
 
-  test("Update and Complete output mode not supported") {
+  test("Update output mode not supported") {
     val df = MemoryStream[Int].toDF().groupBy().count()
     val outputDir = Utils.createTempDir(namePrefix = "stream.output").getCanonicalPath
 
     withTempDir { dir =>
-
-      def testOutputMode(mode: String): Unit = {
-        val e = intercept[AnalysisException] {
-          df.writeStream.format("parquet").outputMode(mode).start(dir.getCanonicalPath)
-        }
-        Seq(mode, "not support").foreach { w =>
-          assert(e.getMessage.toLowerCase(Locale.ROOT).contains(w))
-        }
+      val e = intercept[AnalysisException] {
+        df.writeStream.format("parquet").outputMode("update").start(dir.getCanonicalPath)
       }
-
-      testOutputMode("update")
-      testOutputMode("complete")
+      Seq("update", "not support").foreach { w =>
+        assert(e.getMessage.toLowerCase(Locale.ROOT).contains(w))
+      }
     }
   }
 

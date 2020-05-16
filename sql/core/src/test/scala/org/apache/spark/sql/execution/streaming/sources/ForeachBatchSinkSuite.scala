@@ -61,24 +61,6 @@ class ForeachBatchSinkSuite extends StreamTest {
       check(in = 2, 3)(out = (0, 2L), (1, 2L)))
   }
 
-  test("foreachBatch with stateful query in complete mode") {
-    val mem = MemoryStream[Int]
-    val ds = mem.toDF()
-      .select($"value" % 2 as "key")
-      .groupBy("key")
-      .agg(count("*") as "value")
-      .toDF.as[KV]
-
-    val tester = new ForeachBatchTester[KV](mem)
-    val writer = (batchDS: Dataset[KV], batchId: Long) => tester.record(batchId, batchDS)
-
-    import tester._
-    testWriter(ds, writer, outputMode = OutputMode.Complete)(
-      check(in = 0)(out = (0, 1L)),
-      check(in = 1)(out = (0, 1L), (1, 1L)),
-      check(in = 2)(out = (0, 2L), (1, 1L)))
-  }
-
   test("foreachBatchSink does not affect metric generation") {
     val mem = MemoryStream[Int]
     val ds = mem.toDS.map(_ + 1)
