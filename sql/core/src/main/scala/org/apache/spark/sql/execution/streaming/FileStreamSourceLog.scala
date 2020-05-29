@@ -17,18 +17,16 @@
 
 package org.apache.spark.sql.execution.streaming
 
-import java.io.{DataInputStream, DataOutputStream, InputStream, IOException, OutputStream}
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, DataOutputStream, IOException, InputStream, OutputStream}
 import java.nio.charset.StandardCharsets.UTF_8
 import java.util.{LinkedHashMap => JLinkedHashMap}
 import java.util.Map.Entry
 
 import scala.collection.mutable
 import scala.io.{Source => IOSource}
-
 import com.google.common.io.ByteStreams
 import org.json4s.NoTypeHints
 import org.json4s.jackson.Serialization
-
 import org.apache.spark.io.LZ4CompressionCodec
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
@@ -136,8 +134,34 @@ class FileStreamSourceLog(
   override def unsafeRowToData(row: UnsafeRow): FileEntry = FileEntryV2.fromRow(row)
 
   override def numFieldsForUnsafeRow: Int = FileEntryV2.SCHEMA.fields.length
+
+  override protected def serializeEntryToV4(data: FileEntry): Array[Byte] = {
+    val baos = new ByteArrayOutputStream()
+    val dos = new DataOutputStream(baos)
+
+    dos.writeUTF(data.path)
+    dos.writeLong(data.timestamp)
+    dos.writeLong(data.batchId)
+    dos.close()
+
+    baos.toByteArray
+  }
+
+  override protected def deserializeEntryFromV4(serialized: Array[Byte]): FileEntry = {
+    val bais = new ByteArrayInputStream(serialized)
+    val dis = new DataInputStream(bais)
+
+    val entry = FileEntry(
+      dis.readUTF(),
+      dis.readLong(),
+      dis.readLong())
+
+    dis.close()
+
+    entry
+  }
 }
 
 object FileStreamSourceLog {
-  val VERSION = 3
+  val VERSION = 4
 }

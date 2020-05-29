@@ -294,4 +294,12 @@ class FakeCompactibleFileStreamLog(
   override def unsafeRowToData(row: UnsafeRow): String = row.getString(0)
 
   override def numFieldsForUnsafeRow: Int = schema.fields.length
+
+  override protected def serializeEntryToV4(data: String): Array[Byte] = {
+    data.getBytes(UTF_8)
+  }
+
+  override protected def deserializeEntryFromV4(serialized: Array[Byte]): String = {
+    new String(serialized, UTF_8)
+  }
 }

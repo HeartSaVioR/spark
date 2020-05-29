@@ -17,18 +17,17 @@
 
 package org.apache.spark.sql.execution.streaming
 
-import java.io.{DataInputStream, DataOutputStream, InputStream, IOException, OutputStream}
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, DataOutputStream, IOException, InputStream, OutputStream}
+import java.lang.{Boolean => JBoolean, Long => JLong}
 import java.net.URI
 import java.nio.charset.StandardCharsets.UTF_8
 
 import scala.collection.mutable
 import scala.io.{Source => IOSource}
-
 import com.google.common.io.ByteStreams
 import org.apache.hadoop.fs.{FileStatus, Path}
 import org.json4s.NoTypeHints
 import org.json4s.jackson.Serialization
-
 import org.apache.spark.io.LZ4CompressionCodec
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, UnsafeProjection, UnsafeRow}
@@ -158,10 +157,44 @@ class FileStreamSinkLog(
   override def unsafeRowToData(row: UnsafeRow): SinkFileStatus = SinkFileStatusV2.fromRow(row)
 
   override def numFieldsForUnsafeRow: Int = SinkFileStatusV2.SCHEMA.fields.length
+
+  override protected def serializeEntryToV4(data: SinkFileStatus): Array[Byte] = {
+    val baos = new ByteArrayOutputStream()
+    val dos = new DataOutputStream(baos)
+
+    dos.writeUTF(data.path)
+    dos.writeLong(data.size)
+    dos.writeBoolean(data.isDir)
+    dos.writeLong(data.modificationTime)
+    dos.writeInt(data.blockReplication)
+    dos.writeLong(data.blockSize)
+    dos.writeUTF(data.action)
+    dos.close()
+
+    baos.toByteArray
+  }
+
+  override protected def deserializeEntryFromV4(serialized: Array[Byte]): SinkFileStatus = {
+    val bais = new ByteArrayInputStream(serialized)
+    val dis = new DataInputStream(bais)
+
+    val status = SinkFileStatus(
+      dis.readUTF(),
+      dis.readLong(),
+      dis.readBoolean(),
+      dis.readLong(),
+      dis.readInt(),
+      dis.readLong(),
+      dis.readUTF())
+
+    dis.close()
+
+    status
+  }
 }
 
 object FileStreamSinkLog {
-  val VERSION = 3
+  val VERSION = 4
   val DELETE_ACTION = "delete"
   val ADD_ACTION = "add"
 }

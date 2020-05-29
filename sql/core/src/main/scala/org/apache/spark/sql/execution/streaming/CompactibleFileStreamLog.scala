@@ -138,9 +138,14 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
     }
   }
 
+  // V2
   def dataToUnsafeRow(data: T): UnsafeRow
   def unsafeRowToData(row: UnsafeRow): T
   def numFieldsForUnsafeRow: Int
+
+  // V4
+  protected def serializeEntryToV4(data: T): Array[Byte]
+  protected def deserializeEntryFromV4(serialized: Array[Byte]): T
 
   override def serialize(logData: Array[T], out: OutputStream): Unit = {
     // called inside a try-finally where the underlying stream is closed in the caller
@@ -149,6 +154,7 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
       case 1 => serializeToV1(out, logData)
       case 2 => serializeToV2(out, logData)
       case 3 => serializeToV3(out, logData)
+      case 4 => serializeToV4(out, logData)
       case _ =>
         throw new IllegalStateException(s"UnsupportedLogVersion: unknown log version is provided" +
           s", v$metadataLogVersion.")
@@ -188,6 +194,20 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
     }
   }
 
+  private def serializeToV4(out: OutputStream, logData: Array[T]): Unit = {
+    out.write('\n')
+    val dos = compressStream(out)
+    if (logData.nonEmpty) {
+      logData.foreach { data =>
+        val serialized = serializeEntryToV4(data)
+        dos.writeInt(serialized.length)
+        dos.write(serialized)
+      }
+    }
+    dos.writeInt(-1)
+    dos.flush()
+  }
+
   override def deserialize(in: InputStream): Array[T] = {
     val line = readLine(in)
     if (line == null || line.isEmpty) {
@@ -199,6 +219,7 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
       case 1 if version <= metadataLogVersion => deserializeFromV1(in)
       case 2 if version <= metadataLogVersion => deserializeFromV2(in)
       case 3 if version <= metadataLogVersion => deserializeFromV3(in)
+      case 4 if version <= metadataLogVersion => deserializeFromV4(in)
       case version =>
         throw new IllegalStateException(s"UnsupportedLogVersion: maximum supported log version " +
           s"is v${metadataLogVersion}, but encountered v$version. The log file was produced " +
@@ -238,6 +259,29 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
 
   private def deserializeFromV3(in: InputStream): Array[T] = {
     deserializeFromV1(decompressStream(in))
+  }
+
+  private def deserializeFromV4(in: InputStream): Array[T] = {
+    val list = new scala.collection.mutable.ArrayBuffer[T]
+
+    val dis = decompressStream(in)
+    var eof = false
+
+    while (!eof) {
+      val size = dis.readInt()
+      if (size == -1) {
+        eof = true
+      } else if (size < 0) {
+        throw new IOException(
+          s"Error to deserialize file: size cannot be $size")
+      } else {
+        val buffer = new Array[Byte](size)
+        ByteStreams.readFully(dis, buffer, 0, size)
+        list += deserializeEntryFromV4(buffer)
+      }
+    }
+
+    list.toArray
   }
 
   override def add(batchId: Long, logs: Array[T]): Boolean = {
