@@ -148,6 +148,7 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
     metadataLogVersion match {
       case 1 => serializeToV1(out, logData)
       case 2 => serializeToV2(out, logData)
+      case 3 => serializeToV3(out, logData)
       case _ =>
         throw new IllegalStateException(s"UnsupportedLogVersion: unknown log version is provided" +
           s", v$metadataLogVersion.")
@@ -174,6 +175,19 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
     dos.flush()
   }
 
+  private def serializeToV3(out: OutputStream, logData: Array[T]): Unit = {
+    out.write('\n')
+    if (logData.nonEmpty) {
+      val dos = compressStream(out)
+      dos.write(Serialization.write(logData.head).getBytes(UTF_8))
+      logData.tail.foreach { data =>
+        dos.write('\n')
+        dos.write(Serialization.write(data).getBytes(UTF_8))
+      }
+      dos.flush()
+    }
+  }
+
   override def deserialize(in: InputStream): Array[T] = {
     val line = readLine(in)
     if (line == null || line.isEmpty) {
@@ -184,6 +198,7 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
     version match {
       case 1 if version <= metadataLogVersion => deserializeFromV1(in)
       case 2 if version <= metadataLogVersion => deserializeFromV2(in)
+      case 3 if version <= metadataLogVersion => deserializeFromV3(in)
       case version =>
         throw new IllegalStateException(s"UnsupportedLogVersion: maximum supported log version " +
           s"is v${metadataLogVersion}, but encountered v$version. The log file was produced " +
@@ -219,6 +234,10 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
     }
 
     list.toArray
+  }
+
+  private def deserializeFromV3(in: InputStream): Array[T] = {
+    deserializeFromV1(decompressStream(in))
   }
 
   override def add(batchId: Long, logs: Array[T]): Boolean = {

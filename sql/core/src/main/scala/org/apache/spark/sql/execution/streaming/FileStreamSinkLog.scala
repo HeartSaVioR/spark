@@ -161,7 +161,7 @@ class FileStreamSinkLog(
 }
 
 object FileStreamSinkLog {
-  val VERSION = 2
+  val VERSION = 3
   val DELETE_ACTION = "delete"
   val ADD_ACTION = "add"
 }

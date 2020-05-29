@@ -139,5 +139,5 @@ class FileStreamSourceLog(
 }
 
 object FileStreamSourceLog {
-  val VERSION = 2
+  val VERSION = 3
 }

@@ -257,7 +257,7 @@ class CompactibleFileStreamLogSuite extends SharedSparkSession {
 }
 
 object FakeCompactibleFileStreamLog {
-  val VERSION = 2
+  val VERSION = 3
 }
 
 class FakeCompactibleFileStreamLog(
