@@ -72,6 +72,19 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
 
   protected def defaultCompactInterval: Int
 
+  /**
+   * In some case, log files being written from the application A should be able to be read from
+   * application B, which Spark versions between twos may not be same. To support writing log file
+   * which is readable from lower version of Spark, this method receives additional metadata log
+   * version which will be only used for writing.
+   *
+   * Note that this class doesn't "rewrite" the old batch files: to ensure the metadata to be read
+   * by lower version of Spark, the metadata log should be written with proper version from the
+   * scratch, or at least one compact batch should be written with proper version. (so that reader
+   * will ignore previous batch logs which may be written with higher version)
+   */
+  protected def writeMetadataLogVersion: Option[Int] = None
+
   protected final lazy val compactInterval: Int = {
     // SPARK-18187: "compactInterval" can be set by user via defaultCompactInterval.
     // If there are existing log entries, then we should ensure a compatible compactInterval
@@ -143,8 +156,9 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
 
   override def serialize(logData: Array[T], out: OutputStream): Unit = {
     // called inside a try-finally where the underlying stream is closed in the caller
-    out.write(("v" + metadataLogVersion).getBytes(UTF_8))
-    metadataLogVersion match {
+    val version = writeMetadataLogVersion.getOrElse(metadataLogVersion)
+    out.write(("v" + version).getBytes(UTF_8))
+    version match {
       case 1 => serializeToV1(out, logData)
       case 2 => serializeToV2(out, logData)
       case _ =>

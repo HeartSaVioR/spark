@@ -21,10 +21,7 @@ import java.io._
 import java.nio.charset.StandardCharsets._
 
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.test.SharedSparkSession
-import org.apache.spark.sql.types.{StringType, StructField, StructType}
-import org.apache.spark.unsafe.types.UTF8String
 
 class CompactibleFileStreamLogSuite extends SharedSparkSession {
 
@@ -133,11 +130,36 @@ class CompactibleFileStreamLogSuite extends SharedSparkSession {
       })
   }
 
+  test("write older version of metadata for compatibility") {
+    withTempDir { dir =>
+      def newFakeCompactibleFileStreamLog(
+          readVersion: Int,
+          writeVersion: Option[Int]): FakeCompactibleFileStreamLog =
+        new FakeCompactibleFileStreamLog(
+          readVersion,
+          writeVersion,
+          _fileCleanupDelayMs = Long.MaxValue, // this param does not matter here in this test case
+          _defaultCompactInterval = 3,         // this param does not matter here in this test case
+          _defaultMinBatchesToRetain = 1,      // this param does not matter here in this test case
+          spark,
+          dir.getCanonicalPath)
+
+      // writer understands version 2 but to ensure compatibility it sets the write version to 1
+      val writer = newFakeCompactibleFileStreamLog(2, Some(1))
+      // suppose a reader only understand version 1
+      val reader = newFakeCompactibleFileStreamLog(1, None)
+      writer.add(0, Array("entry"))
+      // reader can read the metadata log writer just wrote
+      assert(Array("entry") === reader.get(0).get)
+    }
+  }
+
   test("deserialization log written by future version") {
     withTempDir { dir =>
       def newFakeCompactibleFileStreamLog(version: Int): FakeCompactibleFileStreamLog =
         new FakeCompactibleFileStreamLog(
           version,
+          None,
           _fileCleanupDelayMs = Long.MaxValue, // this param does not matter here in this test case
           _defaultCompactInterval = 3,         // this param does not matter here in this test case
           _defaultMinBatchesToRetain = 1,      // this param does not matter here in this test case
@@ -246,6 +268,7 @@ class CompactibleFileStreamLogSuite extends SharedSparkSession {
     withTempDir { file =>
       val compactibleLog = new FakeCompactibleFileStreamLog(
         FakeCompactibleFileStreamLog.VERSION,
+        None,
         fileCleanupDelayMs,
         defaultCompactInterval,
         defaultMinBatchesToRetain,
@@ -262,6 +285,7 @@ object FakeCompactibleFileStreamLog {
 
 class FakeCompactibleFileStreamLog(
     metadataLogVersion: Int,
+    _writeMetadataLogVersion: Option[Int],
     _fileCleanupDelayMs: Long,
     _defaultCompactInterval: Int,
     _defaultMinBatchesToRetain: Int,
@@ -278,6 +302,8 @@ class FakeCompactibleFileStreamLog(
   override protected def isDeletingExpiredLog: Boolean = true
 
   override protected def defaultCompactInterval: Int = _defaultCompactInterval
+
+  override protected def writeMetadataLogVersion: Option[Int] = _writeMetadataLogVersion
 
   override protected val minBatchesToRetain: Int = _defaultMinBatchesToRetain
 

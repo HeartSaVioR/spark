@@ -31,14 +31,31 @@ import org.apache.hadoop.fs.{FSDataInputStream, Path, RawLocalFileSystem}
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
-import org.apache.spark.util.Utils
 
 class FileStreamSinkLogSuite extends SparkFunSuite with SharedSparkSession {
 
   import CompactibleFileStreamLog._
   import FileStreamSinkLog._
 
-  test("compactLogs") {
+  def executeFuncWithMetadataVersion(metadataVersion: Int, func: => Any): Unit = {
+    withSQLConf(
+      Seq(SQLConf.FILE_SINK_LOG_WRITE_METADATA_VERSION.key -> metadataVersion.toString): _*) {
+      func
+    }
+  }
+
+  // This makes sure tests are passing for all supported versions on write version, where
+  // the read version is set to the highest supported version. This ensures Spark can read
+  // older versions of file stream sink metadata log.
+  def testWithAllMetadataVersions(name: String)(func: => Any): Unit = {
+    for (version <- FileStreamSinkLog.SUPPORTED_VERSIONS) {
+      test(s"$name - metadata version $version") {
+        executeFuncWithMetadataVersion(version, func)
+      }
+    }
+  }
+
+  testWithAllMetadataVersions("compactLogs") {
     withFileStreamSinkLog { sinkLog =>
       val logs = Seq(
         newFakeSinkFileStatus("/a/b/x", FileStreamSinkLog.ADD_ACTION),
@@ -54,7 +71,7 @@ class FileStreamSinkLogSuite extends SparkFunSuite with SharedSparkSession {
     }
   }
 
-  test("serialize & deserialize") {
+  testWithAllMetadataVersions("serialize & deserialize") {
     withFileStreamSinkLog { sinkLog =>
       val logs = Array(
         SinkFileStatus(
@@ -95,7 +112,7 @@ class FileStreamSinkLogSuite extends SparkFunSuite with SharedSparkSession {
     }
   }
 
-  test("compact") {
+  testWithAllMetadataVersions("compact") {
     withSQLConf(SQLConf.FILE_SINK_LOG_COMPACT_INTERVAL.key -> "3") {
       withFileStreamSinkLog { sinkLog =>
         for (batchId <- 0 to 10) {
@@ -115,7 +132,7 @@ class FileStreamSinkLogSuite extends SparkFunSuite with SharedSparkSession {
     }
   }
 
-  test("delete expired file") {
+  testWithAllMetadataVersions("delete expired file") {
     // Set FILE_SINK_LOG_CLEANUP_DELAY to 0 so that we can detect the deleting behaviour
     // deterministically and one min batches to retain
     withSQLConf(
@@ -191,7 +208,7 @@ class FileStreamSinkLogSuite extends SparkFunSuite with SharedSparkSession {
     }
   }
 
-  test("read Spark 2.1.0 log format") {
+  testWithAllMetadataVersions("read Spark 2.1.0 log format") {
     assert(readFromResource("file-sink-log-version-2.1.0") === Seq(
       // SinkFileStatus("/a/b/0", 100, false, 100, 1, 100, FileStreamSinkLog.ADD_ACTION), -> deleted
       SinkFileStatus("/a/b/1", 100, false, 100, 1, 100, FileStreamSinkLog.ADD_ACTION),
@@ -206,7 +223,7 @@ class FileStreamSinkLogSuite extends SparkFunSuite with SharedSparkSession {
     ))
   }
 
-  test("getLatestBatchId") {
+  testWithAllMetadataVersions("getLatestBatchId") {
     withCountOpenLocalFileSystemAsLocalFileSystem {
       val scheme = CountOpenLocalFileSystem.scheme
       withSQLConf(SQLConf.FILE_SINK_LOG_COMPACT_INTERVAL.key -> "3") {
