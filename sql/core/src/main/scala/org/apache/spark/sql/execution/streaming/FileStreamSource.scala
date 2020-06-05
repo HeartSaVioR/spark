@@ -29,14 +29,12 @@ import org.apache.hadoop.fs.{FileStatus, FileSystem, GlobFilter, Path}
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
-import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.connector.read.streaming
 import org.apache.spark.sql.connector.read.streaming.{ReadAllAvailable, ReadLimit, ReadMaxFiles, SupportsAdmissionControl}
 import org.apache.spark.sql.execution.datasources.{DataSource, InMemoryFileIndex, LogicalRelation}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{LongType, StringType, StructField, StructType}
-import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.ThreadUtils
 
 /**

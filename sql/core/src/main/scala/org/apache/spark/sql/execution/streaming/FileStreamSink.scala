@@ -133,7 +133,6 @@ class FileStreamSink(
     FileStreamSink.checkEscapedMetadataPath(fs, metadataDir, sparkSession.sessionState.conf)
     metadataDir
   }
-
   private val fileLog =
     new FileStreamSinkLog(FileStreamSinkLog.VERSION, sparkSession, logPath.toString)
 

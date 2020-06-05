@@ -20,6 +20,7 @@ package org.apache.spark.sql.streaming
 import java.io.File
 import java.net.URI
 
+import scala.collection.mutable
 import scala.util.Random
 
 import org.apache.hadoop.fs._
@@ -38,6 +39,7 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.ExistsThrowsExceptionFileSystem._
 import org.apache.spark.sql.streaming.util.StreamManualClock
 import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.sql.types._
 import org.apache.spark.sql.types.{StructType, _}
 import org.apache.spark.util.Utils
 
