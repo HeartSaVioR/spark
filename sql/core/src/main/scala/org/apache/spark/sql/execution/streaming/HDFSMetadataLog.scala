@@ -165,7 +165,7 @@ class HDFSMetadataLog[T <: AnyRef : ClassTag](sparkSession: SparkSession, path: 
     }
   }
 
-  def applyFnToBatch(batchId: Long)(fn: InputStream => Unit): Unit = {
+  def applyFnToBatch[RET](batchId: Long)(fn: InputStream => RET): RET = {
     val batchMetadataFile = batchIdToPath(batchId)
     if (fileManager.exists(batchMetadataFile)) {
       val input = fileManager.open(batchMetadataFile)
@@ -180,7 +180,7 @@ class HDFSMetadataLog[T <: AnyRef : ClassTag](sparkSession: SparkSession, path: 
         IOUtils.closeQuietly(input)
       }
     } else {
-      throw new IllegalStateException(s"Unable to find batch $batchMetadataFile")
+      throw new FileNotFoundException(s"Unable to find batch $batchMetadataFile")
     }
   }
 

@@ -50,7 +50,8 @@ class MetadataLogFileIndex(
   logInfo(s"Reading streaming file log from $metadataDirectory")
   private val metadataLog =
     new FileStreamSinkLog(FileStreamSinkLog.VERSION, sparkSession, metadataDirectory.toString)
-  private val allFilesFromLog = metadataLog.allFiles().map(_.toFileStatus).filterNot(_.isDirectory)
+  private val allFilesFromLog = metadataLog.allFiles { entry => !entry.isDir }
+    .map(_.toFileStatus)
   private var cachedPartitionSpec: PartitionSpec = _
 
   override protected val leafFiles: mutable.LinkedHashMap[Path, FileStatus] = {

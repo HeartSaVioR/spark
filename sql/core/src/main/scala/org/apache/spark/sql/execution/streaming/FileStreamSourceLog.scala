@@ -82,7 +82,7 @@ class FileStreamSourceLog(
       if (isCompactionBatch(id, compactInterval) && fileEntryCache.containsKey(id)) {
         (id, Some(fileEntryCache.get(id)))
       } else {
-        val logs = super.get(id).map(_.filter(_.batchId == id))
+        val logs = filterInBatch(id)(_.batchId == id)
         (id, logs)
       }
     }.partition(_._2.isDefined)
