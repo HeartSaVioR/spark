@@ -61,9 +61,7 @@ class FileStreamSourceLog(
     }
   }
 
-  def compactLogs(logs: Seq[FileEntry]): Seq[FileEntry] = {
-    logs
-  }
+  override def shouldRetain(log: FileEntry): Boolean = true
 
   override def add(batchId: Long, logs: Array[FileEntry]): Boolean = {
     if (super.add(batchId, logs)) {
