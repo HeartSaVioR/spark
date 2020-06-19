@@ -165,6 +165,63 @@ class HDFSMetadataLog[T <: AnyRef : ClassTag](sparkSession: SparkSession, path: 
     }
   }
 
+  /**
+   * Apply provided function to each entry in the specific batch metadata log.
+   *
+   * Unlike get which will materialize all entries into memory, this method streamlines the process
+   * via READ-AND-PROCESS. This helps to avoid the memory issue on huge metadata log file.
+   *
+   * NOTE: This no longer fails early on corruption. The caller should handle the exception
+   * properly and make sure the logic is not affected by failing in the middle.
+   */
+  def applyFnToBatchByStream[RET](batchId: Long)(fn: InputStream => RET): RET = {
+    val batchMetadataFile = batchIdToPath(batchId)
+    if (fileManager.exists(batchMetadataFile)) {
+      val input = fileManager.open(batchMetadataFile)
+      try {
+        fn(input)
+      } catch {
+        case ise: IllegalStateException =>
+          // re-throw the exception with the log file path added
+          throw new IllegalStateException(
+            s"Failed to read log file $batchMetadataFile. ${ise.getMessage}", ise)
+      } finally {
+        IOUtils.closeQuietly(input)
+      }
+    } else {
+      throw new FileNotFoundException(s"Unable to find batch $batchMetadataFile")
+    }
+  }
+
+  /**
+   * Store the metadata for the specified batchId and return `true` if successful. This method
+   * fills the content of metadata via executing function. If the function throws exception,
+   * writing will be automatically cancelled and this method will propagate the exception.
+   *
+   * If the batchId's metadata has already been stored, this method will return `false`.
+   */
+  def addNewBatchByStream(batchId: Long)(fn: OutputStream => Unit): Boolean = {
+    get(batchId).map(_ => false).getOrElse {
+      // Only write metadata when the batch has not yet been written
+      val output = fileManager.createAtomic(batchIdToPath(batchId), overwriteIfPossible = false)
+      try {
+        fn(output)
+        output.close()
+      } catch {
+        case e: FileAlreadyExistsException =>
+          output.cancel()
+          // If next batch file already exists, then another concurrently running query has
+          // written it.
+          throw new ConcurrentModificationException(
+            s"Multiple streaming queries are concurrently using $path", e)
+        case e: Throwable =>
+          output.cancel()
+          throw e
+      }
+      true
+    }
+  }
+
   override def get(startId: Option[Long], endId: Option[Long]): Array[(Long, T)] = {
     assert(startId.isEmpty || endId.isEmpty || startId.get <= endId.get)
     val files = fileManager.list(metadataPath, batchFilesFilter)

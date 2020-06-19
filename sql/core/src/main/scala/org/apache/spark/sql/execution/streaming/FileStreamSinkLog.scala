@@ -102,13 +102,8 @@ class FileStreamSinkLog(
   protected override val writeMetadataLogVersion: Option[Int] =
     sparkSession.sessionState.conf.fileSinkWriteMetadataLogVersion
 
-  override def compactLogs(logs: Seq[SinkFileStatus]): Seq[SinkFileStatus] = {
-    val deletedFiles = logs.filter(_.action == FileStreamSinkLog.DELETE_ACTION).map(_.path).toSet
-    if (deletedFiles.isEmpty) {
-      logs
-    } else {
-      logs.filter(f => !deletedFiles.contains(f.path))
-    }
+  override def shouldRetain(log: SinkFileStatus): Boolean = {
+    log.action != FileStreamSinkLog.DELETE_ACTION
   }
 
   override protected def serializeEntryToV2(data: SinkFileStatus): Array[Byte] = {
