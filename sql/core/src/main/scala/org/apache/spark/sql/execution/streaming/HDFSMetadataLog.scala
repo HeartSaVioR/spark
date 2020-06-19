@@ -165,6 +165,47 @@ class HDFSMetadataLog[T <: AnyRef : ClassTag](sparkSession: SparkSession, path: 
     }
   }
 
+  def applyFnToBatch[RET](batchId: Long)(fn: InputStream => RET): RET = {
+    val batchMetadataFile = batchIdToPath(batchId)
+    if (fileManager.exists(batchMetadataFile)) {
+      val input = fileManager.open(batchMetadataFile)
+      try {
+        fn(input)
+      } catch {
+        case ise: IllegalStateException =>
+          // re-throw the exception with the log file path added
+          throw new IllegalStateException(
+            s"Failed to read log file $batchMetadataFile. ${ise.getMessage}", ise)
+      } finally {
+        IOUtils.closeQuietly(input)
+      }
+    } else {
+      throw new FileNotFoundException(s"Unable to find batch $batchMetadataFile")
+    }
+  }
+
+  def addNewBatch(batchId: Long)(fn: OutputStream => Unit): Boolean = {
+    get(batchId).map(_ => false).getOrElse {
+      // Only write metadata when the batch has not yet been written
+      val output = fileManager.createAtomic(batchIdToPath(batchId), overwriteIfPossible = false)
+      try {
+        fn(output)
+        output.close()
+      } catch {
+        case e: FileAlreadyExistsException =>
+          output.cancel()
+          // If next batch file already exists, then another concurrently running query has
+          // written it.
+          throw new ConcurrentModificationException(
+            s"Multiple streaming queries are concurrently using $path", e)
+        case e: Throwable =>
+          output.cancel()
+          throw e
+      }
+      true
+    }
+  }
+
   override def get(startId: Option[Long], endId: Option[Long]): Array[(Long, T)] = {
     assert(startId.isEmpty || endId.isEmpty || startId.get <= endId.get)
     val files = fileManager.list(metadataPath, batchFilesFilter)
