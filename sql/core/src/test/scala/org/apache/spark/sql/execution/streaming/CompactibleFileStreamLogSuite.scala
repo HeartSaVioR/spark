@@ -257,7 +257,8 @@ class CompactibleFileStreamLogSuite extends SharedSparkSession {
 }
 
 object FakeCompactibleFileStreamLog {
-  val VERSION = 3
+  // FIXME: probably we would like to refactor major thing if things work well with version 5
+  val VERSION = 4
 }
 
 class FakeCompactibleFileStreamLog(
@@ -301,5 +302,17 @@ class FakeCompactibleFileStreamLog(
 
   override protected def deserializeEntryFromV4(serialized: Array[Byte]): String = {
     new String(serialized, UTF_8)
+  }
+
+  override protected def serializeAuxFieldsToV5(dos: DataOutputStream, data: String): Unit = {
+    throw new UnsupportedOperationException("not a file entry")
+  }
+
+  override protected def deserializeEntryFromV5(
+      path: String,
+      timestamp: Long,
+      isDir: Boolean,
+      inputStreamAuxPart: DataInputStream): String = {
+    throw new UnsupportedOperationException("not a file entry")
   }
 }

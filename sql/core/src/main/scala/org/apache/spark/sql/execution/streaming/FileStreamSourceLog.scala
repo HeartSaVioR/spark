@@ -160,8 +160,22 @@ class FileStreamSourceLog(
 
     entry
   }
+
+  override protected def serializeAuxFieldsToV5(dos: DataOutputStream, data: FileEntry): Unit = {
+    // batchId: Long
+    dos.writeLong(data.batchId)
+  }
+
+  override protected def deserializeEntryFromV5(
+      path: String,
+      timestamp: Long,
+      isDir: Boolean,
+      inputStreamAuxPart: DataInputStream): FileEntry = {
+    val batchId = inputStreamAuxPart.readLong()
+    FileEntry(path, timestamp, batchId)
+  }
 }
 
 object FileStreamSourceLog {
-  val VERSION = 4
+  val VERSION = 5
 }

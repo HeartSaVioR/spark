@@ -22,10 +22,8 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit._
 
 import scala.util.control.NonFatal
-
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, FileSystem, GlobFilter, Path}
-
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
@@ -34,6 +32,7 @@ import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.connector.read.streaming
 import org.apache.spark.sql.connector.read.streaming.{ReadAllAvailable, ReadLimit, ReadMaxFiles, SupportsAdmissionControl}
 import org.apache.spark.sql.execution.datasources.{DataSource, InMemoryFileIndex, LogicalRelation}
+import org.apache.spark.sql.execution.streaming.CompactibleFileStreamLog.CompactibleFileEntryCommon
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{LongType, StringType, StructField, StructType}
 import org.apache.spark.unsafe.types.UTF8String
@@ -313,7 +312,10 @@ object FileStreamSource {
   /** Timestamp for file modification time, in ms since January 1, 1970 UTC. */
   type Timestamp = Long
 
-  case class FileEntry(path: String, timestamp: Timestamp, batchId: Long) extends Serializable
+  case class FileEntry(path: String, timestamp: Timestamp, batchId: Long)
+    extends Serializable with CompactibleFileEntryCommon {
+    override def isDir: Boolean = false
+  }
 
   object FileEntryV2 {
     val SCHEMA = new StructType(

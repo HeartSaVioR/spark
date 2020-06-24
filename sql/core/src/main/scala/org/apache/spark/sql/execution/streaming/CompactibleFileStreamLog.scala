@@ -17,18 +17,16 @@
 
 package org.apache.spark.sql.execution.streaming
 
-import java.io.{DataInputStream, DataOutputStream, InputStream, IOException, OutputStream}
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, DataOutputStream, File, IOException, InputStream, OutputStream}
 import java.nio.charset.StandardCharsets.UTF_8
 
 import scala.collection.mutable
 import scala.io.{Source => IOSource}
 import scala.reflect.ClassTag
-
 import com.google.common.io.ByteStreams
 import org.apache.hadoop.fs.Path
 import org.json4s.NoTypeHints
 import org.json4s.jackson.Serialization
-
 import org.apache.spark.io.LZ4CompressionCodec
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
@@ -147,6 +145,15 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
   protected def serializeEntryToV4(data: T): Array[Byte]
   protected def deserializeEntryFromV4(serialized: Array[Byte]): T
 
+  // V5
+  protected def serializeAuxFieldsToV5(dos: DataOutputStream, data: T): Unit
+  // FIXME: further optimize
+  protected def deserializeEntryFromV5(
+      path: String,
+      timestamp: Long,
+      isDir: Boolean,
+      inputStreamAuxPart: DataInputStream): T
+
   override def serialize(logData: Array[T], out: OutputStream): Unit = {
     // called inside a try-finally where the underlying stream is closed in the caller
     out.write(("v" + metadataLogVersion).getBytes(UTF_8))
@@ -155,6 +162,7 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
       case 2 => serializeToV2(out, logData)
       case 3 => serializeToV3(out, logData)
       case 4 => serializeToV4(out, logData)
+      case 5 => serializeToV5(out, logData)
       case _ =>
         throw new IllegalStateException(s"UnsupportedLogVersion: unknown log version is provided" +
           s", v$metadataLogVersion.")
@@ -208,6 +216,76 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
     dos.flush()
   }
 
+  def serializeCommonPartToV5(
+      dos: DataOutputStream,
+      isDir: Boolean,
+      refId: Int,
+      path: String,
+      timestamp: Long,
+      isPseudoEntry: Boolean): Unit = {
+    dos.writeBoolean(isDir)
+    dos.writeInt(refId)
+    dos.writeUTF(path)
+    dos.writeLong(timestamp)
+    dos.writeBoolean(isPseudoEntry)
+  }
+
+  private def serializeToV5(out: OutputStream, logData: Array[T]): Unit = {
+    out.write('\n')
+    val dos = compressStream(out)
+    if (logData.nonEmpty) {
+      var refIdSeq: Int = -1
+      val dirEntries = new mutable.HashMap[String, Int]()
+
+      logData.foreach { data =>
+        val common = data.asInstanceOf[CompactibleFileEntryCommon]
+        val isDir = common.isDir
+
+        val (refId, path) = {
+          if (isDir) {
+            val refId = dirEntries.getOrElseUpdate(common.path, {
+              refIdSeq += 1
+              refIdSeq
+            })
+            (refId, common.path)
+          } else {
+            val (dirPath, fileName) = common.path.splitAt(common.path.lastIndexOf('/') + 1)
+            val refId = dirEntries.getOrElseUpdate(dirPath, {
+              refIdSeq += 1
+
+              val baosEntry = new ByteArrayOutputStream()
+              val dosEntry = new DataOutputStream(baosEntry)
+              serializeCommonPartToV5(dosEntry, isDir = true, refIdSeq, dirPath, common.timestamp,
+                isPseudoEntry = true)
+              dosEntry.close()
+              val serialized = baosEntry.toByteArray
+              dos.writeInt(serialized.length)
+              dos.write(serialized)
+
+              refIdSeq
+            })
+
+            (refId, fileName)
+          }
+        }
+
+        val baosEntry = new ByteArrayOutputStream()
+        val dosEntry = new DataOutputStream(baosEntry)
+
+        serializeCommonPartToV5(dosEntry, isDir, refId, path, common.timestamp,
+          isPseudoEntry = false)
+        serializeAuxFieldsToV5(dosEntry, data)
+        dosEntry.close()
+
+        val serialized = baosEntry.toByteArray
+        dos.writeInt(serialized.length)
+        dos.write(serialized)
+      }
+    }
+    dos.writeInt(-1)
+    dos.flush()
+  }
+
   override def deserialize(in: InputStream): Array[T] = {
     val line = readLine(in)
     if (line == null || line.isEmpty) {
@@ -220,6 +298,7 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
       case 2 if version <= metadataLogVersion => deserializeFromV2(in)
       case 3 if version <= metadataLogVersion => deserializeFromV3(in)
       case 4 if version <= metadataLogVersion => deserializeFromV4(in)
+      case 5 if version <= metadataLogVersion => deserializeFromV5(in)
       case version =>
         throw new IllegalStateException(s"UnsupportedLogVersion: maximum supported log version " +
           s"is v${metadataLogVersion}, but encountered v$version. The log file was produced " +
@@ -278,6 +357,56 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
         val buffer = new Array[Byte](size)
         ByteStreams.readFully(dis, buffer, 0, size)
         list += deserializeEntryFromV4(buffer)
+      }
+    }
+
+    list.toArray
+  }
+
+  private def deserializeCommonPartFromV5(
+      dis: DataInputStream): (Boolean, Int, String, Long, Boolean) = {
+    // isDir, refId, path, timestamp, isPseudoEntry
+    (dis.readBoolean(), dis.readInt(), dis.readUTF(), dis.readLong(), dis.readBoolean())
+  }
+
+  private def deserializeFromV5(in: InputStream): Array[T] = {
+    val list = new scala.collection.mutable.ArrayBuffer[T]
+    val dirEntries = new mutable.HashMap[Int, String]()
+
+    val dis = decompressStream(in)
+    var eof = false
+
+    while (!eof) {
+      val size = dis.readInt()
+      if (size == -1) {
+        eof = true
+      } else if (size < 0) {
+        throw new IOException(
+          s"Error to deserialize file: size cannot be $size")
+      } else {
+        val buffer = new Array[Byte](size)
+        ByteStreams.readFully(dis, buffer, 0, size)
+
+        val baisEntry = new ByteArrayInputStream(buffer)
+        val disEntry = new DataInputStream(baisEntry)
+        val (isDir, refId, path, timestamp, isPseudoEntry) = deserializeCommonPartFromV5(disEntry)
+        val actualPath = if (isDir) {
+          if (dirEntries.get(refId).exists(_ != path)) {
+            throw new IllegalStateException(s"ref ID $refId is used for multiple times with " +
+              s"different paths!")
+          }
+          dirEntries.put(refId, path)
+          path
+        } else {
+          val dirPath = dirEntries.getOrElse(refId, {
+            throw new IllegalStateException(s"ref ID $refId doesn't exist!")
+          })
+          dirPath.stripSuffix("/") + "/" + path
+        }
+
+        if (!isPseudoEntry) {
+          list += deserializeEntryFromV5(actualPath, timestamp, isDir, disEntry)
+        }
       }
     }
 
@@ -450,6 +579,12 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
 object CompactibleFileStreamLog {
   val COMPACT_FILE_SUFFIX = ".compact"
   val COMPACT_LATENCY_WARN_THRESHOLD_MS = 2000
+
+  trait CompactibleFileEntryCommon {
+    def path: String
+    def timestamp: Long
+    def isDir: Boolean
+  }
 
   def getBatchIdFromFileName(fileName: String): Long = {
     fileName.stripSuffix(COMPACT_FILE_SUFFIX).toLong

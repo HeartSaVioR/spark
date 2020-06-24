@@ -31,6 +31,7 @@ import org.json4s.jackson.Serialization
 import org.apache.spark.io.LZ4CompressionCodec
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, UnsafeProjection, UnsafeRow}
+import org.apache.spark.sql.execution.streaming.CompactibleFileStreamLog.CompactibleFileEntryCommon
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{BooleanType, IntegerType, LongType, StringType, StructField, StructType}
 import org.apache.spark.unsafe.types.UTF8String
@@ -54,7 +55,8 @@ case class SinkFileStatus(
     modificationTime: Long,
     blockReplication: Int,
     blockSize: Long,
-    action: String) {
+    action: String) extends CompactibleFileEntryCommon {
+  override def timestamp: Long = modificationTime
 
   def toFileStatus: FileStatus = {
     new FileStatus(
@@ -191,10 +193,33 @@ class FileStreamSinkLog(
 
     status
   }
+
+  override protected def serializeAuxFieldsToV5(
+      dos: DataOutputStream,
+      data: SinkFileStatus): Unit = {
+    // size: Long, blockReplication: Int, blockSize: Long, action: String
+    dos.writeLong(data.size)
+    dos.writeInt(data.blockReplication)
+    dos.writeLong(data.blockSize)
+    dos.writeUTF(data.action)
+  }
+
+  override protected def deserializeEntryFromV5(
+      path: String,
+      timestamp: Long,
+      isDir: Boolean,
+      inputStreamAuxPart: DataInputStream): SinkFileStatus = {
+    val size = inputStreamAuxPart.readLong()
+    val blockReplication = inputStreamAuxPart.readInt()
+    val blockSize = inputStreamAuxPart.readLong()
+    val action = inputStreamAuxPart.readUTF()
+
+    SinkFileStatus(path, size, isDir, timestamp, blockReplication, blockSize, action)
+  }
 }
 
 object FileStreamSinkLog {
-  val VERSION = 4
+  val VERSION = 5
   val DELETE_ACTION = "delete"
   val ADD_ACTION = "add"
 }
