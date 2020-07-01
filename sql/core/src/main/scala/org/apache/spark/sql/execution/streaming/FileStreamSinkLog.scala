@@ -19,7 +19,7 @@ package org.apache.spark.sql.execution.streaming
 
 import java.net.URI
 
-import org.apache.hadoop.fs.{FileStatus, Path}
+import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
 import org.json4s.NoTypeHints
 import org.json4s.jackson.Serialization
 
@@ -30,7 +30,7 @@ import org.apache.spark.sql.internal.SQLConf
  * The status of a file outputted by [[FileStreamSink]]. A file is visible only if it appears in
  * the sink log and its action is not "delete".
  *
- * @param path the file path.
+ * @param path the file path. This can either be absolute path or relative path.
  * @param size the file size.
  * @param isDir whether this file is a directory.
  * @param modificationTime the file last modification time.
@@ -47,16 +47,29 @@ case class SinkFileStatus(
     blockSize: Long,
     action: String) {
 
-  def toFileStatus: FileStatus = {
+  def toFileStatus(fs: FileSystem, rootPath: Path): FileStatus = {
+    val pathAsHadoopPath = new Path(new URI(path))
+    val newPath = if (!pathAsHadoopPath.isAbsolute) {
+      pathAsHadoopPath.makeQualified(fs.getUri, rootPath)
+    } else {
+      pathAsHadoopPath
+    }
     new FileStatus(
-      size, isDir, blockReplication, blockSize, modificationTime, new Path(new URI(path)))
+      size, isDir, blockReplication, blockSize, modificationTime, newPath)
   }
 }
 
 object SinkFileStatus {
-  def apply(f: FileStatus): SinkFileStatus = {
+  def apply(f: FileStatus): SinkFileStatus = apply(f, None)
+
+  def apply(f: FileStatus, rootPathAsUri: Option[URI]): SinkFileStatus = {
+    val newPath = rootPathAsUri match {
+      case Some(uri) if f.getPath.isAbsolute => uri.relativize(f.getPath.toUri).toString
+      case _ => f.getPath.toUri.toString
+    }
+
     SinkFileStatus(
-      path = f.getPath.toUri.toString,
+      path = newPath,
       size = f.getLen,
       isDir = f.isDirectory,
       modificationTime = f.getModificationTime,

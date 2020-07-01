@@ -22,6 +22,7 @@ import java.util.UUID
 
 import scala.collection.mutable.ArrayBuffer
 
+import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
 import org.apache.hadoop.mapreduce.{JobContext, TaskAttemptContext}
 
@@ -46,6 +47,10 @@ class ManifestFileCommitProtocol(jobId: String, path: String)
 
   @transient private var pendingCommitFiles: ArrayBuffer[Path] = _
 
+  // Below two fields should be initialized in both contexts, task and job.
+  @transient private var configuration: Configuration = _
+  @transient private var rootPath: Path = _
+
   /**
    * Sets up the manifest log output and the batch id for this job.
    * Must be called before any other function.
@@ -58,6 +63,9 @@ class ManifestFileCommitProtocol(jobId: String, path: String)
   override def setupJob(jobContext: JobContext): Unit = {
     require(fileLog != null, "setupManifestOptions must be called before this function")
     pendingCommitFiles = new ArrayBuffer[Path]
+    configuration = jobContext.getConfiguration
+
+    setupRootPath(configuration)
   }
 
   override def commitJob(jobContext: JobContext, taskCommits: Seq[TaskCommitMessage]): Unit = {
@@ -87,7 +95,7 @@ class ManifestFileCommitProtocol(jobId: String, path: String)
     if (pendingCommitFiles.nonEmpty) {
       pendingCommitFiles.foreach { path =>
         try {
-          val fs = path.getFileSystem(jobContext.getConfiguration)
+          val fs = path.getFileSystem(configuration)
           // this is to make sure the file can be seen from driver as well
           if (fs.exists(path)) {
             fs.delete(path, false)
@@ -102,12 +110,16 @@ class ManifestFileCommitProtocol(jobId: String, path: String)
   }
 
   override def onTaskCommit(taskCommit: TaskCommitMessage): Unit = {
+    val fs = rootPath.getFileSystem(configuration)
     pendingCommitFiles ++= taskCommit.obj.asInstanceOf[Seq[SinkFileStatus]]
-      .map(_.toFileStatus.getPath)
+      .map(_.toFileStatus(fs, rootPath).getPath)
   }
 
   override def setupTask(taskContext: TaskAttemptContext): Unit = {
     addedFiles = new ArrayBuffer[String]
+    configuration = taskContext.getConfiguration
+
+    setupRootPath(configuration)
   }
 
   override def newTaskTempFile(
@@ -137,9 +149,10 @@ class ManifestFileCommitProtocol(jobId: String, path: String)
 
   override def commitTask(taskContext: TaskAttemptContext): TaskCommitMessage = {
     if (addedFiles.nonEmpty) {
-      val fs = new Path(addedFiles.head).getFileSystem(taskContext.getConfiguration)
+      val fs = new Path(addedFiles.head).getFileSystem(configuration)
+      val rootPathAsUri = Some(rootPath.toUri)
       val statuses: Seq[SinkFileStatus] =
-        addedFiles.map(f => SinkFileStatus(fs.getFileStatus(new Path(f))))
+        addedFiles.map(f => SinkFileStatus(fs.getFileStatus(new Path(f)), rootPathAsUri))
       new TaskCommitMessage(statuses)
     } else {
       new TaskCommitMessage(Seq.empty[SinkFileStatus])
@@ -149,8 +162,14 @@ class ManifestFileCommitProtocol(jobId: String, path: String)
   override def abortTask(taskContext: TaskAttemptContext): Unit = {
     // best effort cleanup of incomplete files
     if (addedFiles.nonEmpty) {
-      val fs = new Path(addedFiles.head).getFileSystem(taskContext.getConfiguration)
+      val fs = new Path(addedFiles.head).getFileSystem(configuration)
       addedFiles.foreach { file => fs.delete(new Path(file), false) }
     }
+  }
+
+  private def setupRootPath(conf: Configuration): Unit = {
+    val pathAsHadoopPath = new Path(path)
+    val fs = pathAsHadoopPath.getFileSystem(conf)
+    rootPath = pathAsHadoopPath.makeQualified(fs.getUri, fs.getWorkingDirectory)
   }
 }

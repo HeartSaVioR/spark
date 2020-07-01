@@ -23,12 +23,11 @@ import java.util.Locale
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
-
 import org.apache.hadoop.fs.Path
-import org.apache.hadoop.mapreduce.JobContext
-
+import org.apache.hadoop.mapreduce.{JobContext, TaskAttemptContext}
 import org.apache.spark.SparkConf
 import org.apache.spark.internal.io.FileCommitProtocol
+import org.apache.spark.internal.io.FileCommitProtocol.TaskCommitMessage
 import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskEnd}
 import org.apache.spark.sql.{AnalysisException, DataFrame}
 import org.apache.spark.sql.execution.DataSourceScanExec
@@ -573,6 +572,41 @@ abstract class FileStreamSinkSuite extends StreamTest {
       }
     }
   }
+
+  test("Manifest file commit protocol uses relative path to store metadata") {
+    withSQLConf(("spark.sql.streaming.commitProtocolClass",
+      classOf[VerifyingRelativePathManifestFileCommitProtocol].getCanonicalName)) {
+      withTempDir { outputDir =>
+        withTempDir { checkpointDir =>
+          val outputPath = outputDir.getAbsolutePath
+          val inputData = MemoryStream[Int]
+          val ds = inputData.toDS()
+
+          var query: StreamingQuery = null
+
+          try {
+            query =
+              ds.map(i => (i, -i, i * 1000))
+                .toDF("id1", "id2", "value")
+                .writeStream
+                .partitionBy("id1", "id2")
+                .option("checkpointLocation", checkpointDir.getAbsolutePath)
+                .format("parquet")
+                .start(outputPath)
+
+            inputData.addData(1, 2, 3)
+            failAfter(streamingTimeout) {
+              query.processAllAvailable()
+            }
+          } finally {
+            if (query != null) {
+              query.stop()
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 object PendingCommitFilesTrackingManifestFileCommitProtocol {
@@ -594,6 +628,39 @@ class PendingCommitFilesTrackingManifestFileCommitProtocol(jobId: String, path: 
   override def onTaskCommit(taskCommit: FileCommitProtocol.TaskCommitMessage): Unit = {
     super.onTaskCommit(taskCommit)
     addPendingCommitFiles(taskCommit.obj.asInstanceOf[Seq[SinkFileStatus]].map(_.path))
+  }
+}
+
+class VerifyingRelativePathManifestFileCommitProtocol(jobId: String, path: String)
+  extends ManifestFileCommitProtocol(jobId, path) {
+
+  @transient private var sinkLog: FileStreamSinkLog = _
+
+  private def verifyRelativePathEntries(entries: Seq[SinkFileStatus]): Unit = {
+    entries.foreach { file => assert(!new Path(file.path).isAbsolute) }
+  }
+
+  override def setupManifestOptions(fileLog: FileStreamSinkLog, batchId: Long): Unit = {
+    sinkLog = fileLog
+    super.setupManifestOptions(fileLog, batchId)
+  }
+
+  override def commitTask(
+      taskContext: TaskAttemptContext): FileCommitProtocol.TaskCommitMessage = {
+    val message = super.commitTask(taskContext)
+    verifyRelativePathEntries(message.obj.asInstanceOf[Seq[SinkFileStatus]])
+    message
+  }
+
+  override def commitJob(
+      jobContext: JobContext,
+      taskCommits: Seq[FileCommitProtocol.TaskCommitMessage]): Unit = {
+    val entries = taskCommits.flatMap(_.obj.asInstanceOf[Seq[SinkFileStatus]])
+    verifyRelativePathEntries(entries)
+    super.commitJob(jobContext, taskCommits)
+    // We write the metadata log as relative path. Skipping to compare with origin path here, as
+    // other UTs verify that Spark restores the path correctly.
+    assert(sinkLog.getLatest().get._2.toSeq == entries)
   }
 }
 
