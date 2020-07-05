@@ -90,6 +90,39 @@ private[spark] class GraphUIData(
     <div id={histogramDivId}></div>
   }
 
+  def generateTimelineHtmlWithTimestampData(
+      jsCollector: JsCollector,
+      divId: String,
+      values: Array[(Long, Long)]): Seq[Node] = {
+    val jsForData = values.map { case (x, y) =>
+      s"""{"x": $x, "y": $y}"""
+    }.mkString("[", ",", "]")
+    dataJavaScriptName = jsCollector.nextVariableName
+    jsCollector.addPreparedStatement(s"var $dataJavaScriptName = $jsForData;")
+
+    val (maxX, minX, maxY, minY) = if (values != null && values.length > 0) {
+      val xValues = values.map(_._1)
+      val yValues = values.map(_._2)
+      (xValues.max, xValues.min, yValues.max, yValues.min)
+    } else {
+      (0L, 0L, 0L, 0L)
+    }
+
+    jsCollector.addPreparedStatement(s"registerTimeline($minY, $maxY);")
+    if (batchInterval.isDefined) {
+      jsCollector.addStatement(
+        "drawTimeline(" +
+          s"'#$divId', $dataJavaScriptName, $minX, $maxX, $minY, $maxY, '$unitY'," +
+          s" ${batchInterval.get}" +
+          ");")
+    } else {
+      jsCollector.addStatement(
+        s"drawTimeline('#$divId', $dataJavaScriptName, $minX, $maxX, $minY, $maxY," +
+          s" '$unitY');")
+    }
+    <div id={divId}></div>
+  }
+
   def generateAreaStackHtmlWithData(
       jsCollector: JsCollector,
       values: Array[(Long, ju.Map[String, JLong])]): Seq[Node] = {

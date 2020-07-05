@@ -147,6 +147,12 @@ private[ui] class StreamingQueryStatisticsPage(parent: StreamingQueryTab)
     val maxBatchDuration = withNoProgress(query, query.recentProgress.map(_.batchDuration).max, 0L)
     val minBatchDuration = 0L
 
+    val maxWatermark = withNoProgress(query,
+      query.recentProgress.flatMap { p =>
+        Option(p.eventTime.get("watermark")).map(parseProgressTimestamp)
+      }.max, 0L)
+    val minWatermark = 0L
+
     val inputRateData = withNoProgress(query,
       query.recentProgress.map(p => (parseProgressTimestamp(p.timestamp),
         withNumberInvalid { p.inputRowsPerSecond })), Array.empty[(Long, Double)])
@@ -159,6 +165,27 @@ private[ui] class StreamingQueryStatisticsPage(parent: StreamingQueryTab)
     val batchDurations = withNoProgress(query,
       query.recentProgress.map(p => (parseProgressTimestamp(p.timestamp),
         withNumberInvalid { p.batchDuration })), Array.empty[(Long, Double)])
+
+    val watermarkGaps = withNoProgress(query,
+      query.recentProgress.map(p => (parseProgressTimestamp(p.timestamp),
+        Option(p.eventTime.get("watermark")).map { w =>
+          parseProgressTimestamp(w)
+        }
+        .getOrElse(0L)))
+        .filter(p => p._2 > 0)
+        // gap between batch timestamp and watermark
+        .map(p => (p._1, Math.max(p._1 - p._2, 0L))),
+      Array.empty[(Long, Long)])
+
+    val watermarks = withNoProgress(query,
+      query.recentProgress.map(p => (parseProgressTimestamp(p.timestamp),
+        Option(p.eventTime.get("watermark")).map { w =>
+          parseProgressTimestamp(w)
+        }
+        .getOrElse(0L)))
+        .filter(p => p._2 > 0),
+      Array.empty[(Long, Long)])
+
     val operationDurationData = withNoProgress(
       query,
       query.recentProgress.map { p =>
@@ -229,6 +256,18 @@ private[ui] class StreamingQueryStatisticsPage(parent: StreamingQueryTab)
         0L,
         "ms")
 
+    val graphUIDataForWatermark =
+      new GraphUIData(
+        "watermark-timeline",
+        "watermark-gap-timeline",
+        Seq.empty[(Long, Double)],
+        0L,
+        0L,
+        0L,
+        0L,
+        " (epoch)"
+      )
+
     val table = if (query.lastProgress != null) {
       // scalastyle:off
       <table id="stat-table" class="table table-bordered" style="width: auto">
@@ -275,6 +314,15 @@ private[ui] class StreamingQueryStatisticsPage(parent: StreamingQueryTab)
             </td>
             <td class="timeline">{graphUIDataForBatchDuration.generateTimelineHtml(jsCollector)}</td>
             <td class="histogram">{graphUIDataForBatchDuration.generateHistogramHtml(jsCollector)}</td>
+          </tr>
+          <tr>
+            <td style="vertical-align: middle;">
+              <div style="width: 160px;">
+                <div><strong>Watermark {SparkUIUtils.tooltip("The watermark value of the batch.", "right")}</strong></div>
+              </div>
+            </td>
+            <td class="watermark-timeline">{graphUIDataForWatermark.generateTimelineHtmlWithTimestampData(jsCollector, "watermark-timeline", watermarks)}</td>
+            <td class="watermark-gap-timeline">{graphUIDataForWatermark.generateTimelineHtmlWithTimestampData(jsCollector, "watermark-gap-timeline", watermarkGaps)}</td>
           </tr>
           <tr>
             <td style="vertical-align: middle;">
