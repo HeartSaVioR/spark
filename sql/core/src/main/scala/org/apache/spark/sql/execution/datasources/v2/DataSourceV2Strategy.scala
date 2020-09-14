@@ -18,7 +18,6 @@
 package org.apache.spark.sql.execution.datasources.v2
 
 import scala.collection.JavaConverters._
-
 import org.apache.spark.sql.{AnalysisException, SparkSession, Strategy}
 import org.apache.spark.sql.catalyst.analysis.{ResolvedNamespace, ResolvedTable}
 import org.apache.spark.sql.catalyst.expressions.{And, Expression, NamedExpression, PredicateHelper, SubqueryExpression}
@@ -29,6 +28,7 @@ import org.apache.spark.sql.connector.read.streaming.{ContinuousStream, MicroBat
 import org.apache.spark.sql.execution.{FilterExec, LeafExecNode, ProjectExec, RowDataSourceScanExec, SparkPlan}
 import org.apache.spark.sql.execution.datasources.DataSourceStrategy
 import org.apache.spark.sql.execution.streaming.continuous.{WriteToContinuousDataSource, WriteToContinuousDataSourceExec}
+import org.apache.spark.sql.execution.streaming.sources.{WriteToMicroBatchDataSourceV1Exec, WriteToMicroBatchDataSourceV1WithBatchId}
 import org.apache.spark.sql.sources.{BaseRelation, TableScan}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
@@ -110,6 +110,9 @@ class DataSourceV2Strategy(session: SparkSession) extends Strategy with Predicat
 
     case WriteToDataSourceV2(writer, query) =>
       WriteToDataSourceV2Exec(writer, planLater(query)) :: Nil
+
+    case WriteToMicroBatchDataSourceV1WithBatchId(batchId, sink, query) =>
+      WriteToMicroBatchDataSourceV1Exec(batchId, sink, planLater(query)) :: Nil
 
     case CreateV2Table(catalog, ident, schema, parts, props, ifNotExists) =>
       val propsWithOwner = CatalogV2Util.withDefaultOwnership(props)

@@ -21,7 +21,6 @@ import java.util.UUID
 
 import scala.collection.JavaConverters._
 import scala.util.control.NonFatal
-
 import org.apache.spark.{SparkEnv, SparkException, TaskContext}
 import org.apache.spark.executor.CommitDeniedException
 import org.apache.spark.internal.Logging
@@ -33,7 +32,8 @@ import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.connector.catalog.{Identifier, StagedTable, StagingTableCatalog, SupportsWrite, TableCatalog}
 import org.apache.spark.sql.connector.expressions.Transform
 import org.apache.spark.sql.connector.write.{BatchWrite, DataWriterFactory, LogicalWriteInfoImpl, PhysicalWriteInfoImpl, SupportsDynamicOverwrite, SupportsOverwrite, SupportsTruncate, V1WriteBuilder, WriteBuilder, WriterCommitMessage}
-import org.apache.spark.sql.execution.{SparkPlan, UnaryExecNode}
+import org.apache.spark.sql.execution.{SparkPlan, UnaryExecNode, WriterExecPlanUtil}
+import org.apache.spark.sql.execution.streaming.sources.MicroBatchWriteExecPlan
 import org.apache.spark.sql.sources.{AlwaysTrue, Filter}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.util.{LongAccumulator, Utils}
@@ -350,7 +350,7 @@ trait BatchWriteHelper {
 /**
  * The base physical plan for writing data into data source v2.
  */
-trait V2TableWriteExec extends V2CommandExec with UnaryExecNode {
+trait V2TableWriteExec extends V2CommandExec with UnaryExecNode with MicroBatchWriteExecPlan {
   def query: SparkPlan
 
   var commitProgress: Option[StreamWriterCommitProgress] = None
@@ -359,16 +359,7 @@ trait V2TableWriteExec extends V2CommandExec with UnaryExecNode {
   override def output: Seq[Attribute] = Nil
 
   protected def writeWithV2(batchWrite: BatchWrite): Seq[InternalRow] = {
-    val rdd: RDD[InternalRow] = {
-      val tempRdd = query.execute()
-      // SPARK-23271 If we are attempting to write a zero partition rdd, create a dummy single
-      // partition rdd to make sure we at least set up one write task to write the metadata.
-      if (tempRdd.partitions.length == 0) {
-        sparkContext.parallelize(Array.empty[InternalRow], 1)
-      } else {
-        tempRdd
-      }
-    }
+    val rdd = WriterExecPlanUtil.rddWithNonEmptyPartitions(query.execute(), sparkContext)
     val writerFactory = batchWrite.createBatchWriterFactory(
       PhysicalWriteInfoImpl(rdd.getNumPartitions))
     val useCommitCoordinator = batchWrite.useCommitCoordinator

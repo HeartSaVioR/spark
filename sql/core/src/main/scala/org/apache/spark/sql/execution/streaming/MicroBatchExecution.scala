@@ -28,8 +28,8 @@ import org.apache.spark.sql.catalyst.util.truncatedString
 import org.apache.spark.sql.connector.catalog.{SupportsRead, SupportsWrite, Table, TableCapability}
 import org.apache.spark.sql.connector.read.streaming.{MicroBatchStream, Offset => OffsetV2, ReadLimit, SparkDataStream, SupportsAdmissionControl}
 import org.apache.spark.sql.execution.SQLExecution
-import org.apache.spark.sql.execution.datasources.v2.{StreamingDataSourceV2Relation, StreamWriterCommitProgress, WriteToDataSourceV2Exec}
-import org.apache.spark.sql.execution.streaming.sources.WriteToMicroBatchDataSource
+import org.apache.spark.sql.execution.datasources.v2.{StreamingDataSourceV2Relation, StreamWriterCommitProgress}
+import org.apache.spark.sql.execution.streaming.sources.{MicroBatchWriteExecPlan, MicroBatchWritePlan, WriteToMicroBatchDataSource, WriteToMicroBatchDataSourceV1}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.{OutputMode, Trigger}
 import org.apache.spark.util.Clock
@@ -79,8 +79,11 @@ class MicroBatchExecution(
       sparkSession.sqlContext.conf.disabledV2StreamingMicroBatchReaders.split(",")
 
     import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Implicits._
+
+    // TODO: transform source in logical plan
     val _logicalPlan = analyzedPlan.transform {
       case streamingRelation @ StreamingRelation(dataSourceV1, sourceName, output) =>
+        // TODO: v1
         toExecutionRelationMap.getOrElseUpdate(streamingRelation, {
           // Materialize source to avoid creating it in every batch
           val metadataPath = s"$resolvedCheckpointRoot/sources/$nextSourceId"
@@ -94,6 +97,7 @@ class MicroBatchExecution(
         val dsStr = if (src.nonEmpty) s"[${src.get}]" else ""
         val v2Disabled = disabledSources.contains(src.getOrElse(None).getClass.getCanonicalName)
         if (!v2Disabled && table.supports(TableCapability.MICRO_BATCH_READ)) {
+          // TODO: v2
           v2ToRelationMap.getOrElseUpdate(s, {
             // Materialize source to avoid creating it in every batch
             val metadataPath = s"$resolvedCheckpointRoot/sources/$nextSourceId"
@@ -108,6 +112,7 @@ class MicroBatchExecution(
           throw new UnsupportedOperationException(
             s"Data source $srcName does not support microbatch processing.")
         } else {
+          // TODO: v1
           v2ToExecutionRelationMap.getOrElseUpdate(s, {
             // Materialize source to avoid creating it in every batch
             val metadataPath = s"$resolvedCheckpointRoot/sources/$nextSourceId"
@@ -144,7 +149,10 @@ class MicroBatchExecution(
         val streamingWrite = createStreamingWrite(s, extraOptions, _logicalPlan)
         WriteToMicroBatchDataSource(streamingWrite, _logicalPlan)
 
-      case _ => _logicalPlan
+      case s: Sink =>
+        WriteToMicroBatchDataSourceV1(s, _logicalPlan)
+
+      case s => throw new IllegalArgumentException(s"Unsupported type of sink $s")
     }
   }
 
@@ -309,6 +317,7 @@ class MicroBatchExecution(
                * because certain sources (e.g., KafkaSource) assume on restart the last
                * batch will be executed before getOffset is called again. */
               availableOffsets.foreach {
+                // TODO: v1
                 case (source: Source, end: Offset) =>
                   val start = committedOffsets.get(source).map(_.asInstanceOf[Offset])
                   source.getBatch(start, end)
@@ -323,6 +332,7 @@ class MicroBatchExecution(
                 math.max(watermarkTracker.currentWatermark, commitMetadata.nextBatchWatermarkMs))
             } else if (latestCommittedBatchId == latestBatchId - 1) {
               availableOffsets.foreach {
+                // TODO: v1
                 case (source: Source, end: Offset) =>
                   val start = committedOffsets.get(source).map(_.asInstanceOf[Offset])
                   if (start.map(_ == end).getOrElse(true)) {
@@ -380,24 +390,29 @@ class MicroBatchExecution(
 
     // Generate a map from each unique source to the next available offset.
     val latestOffsets: Map[SparkDataStream, Option[OffsetV2]] = uniqueSources.map {
+      // TODO: v2 & limit
       case (s: SupportsAdmissionControl, limit) =>
         updateStatusMessage(s"Getting offsets from $s")
         reportTimeTaken("latestOffset") {
           val startOffsetOpt = availableOffsets.get(s)
           val startOffset = s match {
+            // TODO: v1
             case _: Source =>
               startOffsetOpt.orNull
+            // TODO: v2
             case v2: MicroBatchStream =>
               startOffsetOpt.map(offset => v2.deserializeOffset(offset.json))
                 .getOrElse(v2.initialOffset())
           }
           (s, Option(s.latestOffset(startOffset, limit)))
         }
+      // TODO: v1
       case (s: Source, _) =>
         updateStatusMessage(s"Getting offsets from $s")
         reportTimeTaken("getOffset") {
           (s, s.getOffset)
         }
+      // TODO: v2
       case (s: MicroBatchStream, _) =>
         updateStatusMessage(s"Getting offsets from $s")
         reportTimeTaken("latestOffset") {
@@ -444,7 +459,9 @@ class MicroBatchExecution(
           val prevBatchOff = offsetLog.get(currentBatchId - 1)
           if (prevBatchOff.isDefined) {
             prevBatchOff.get.toStreamProgress(sources).foreach {
+              // TODO: v1
               case (src: Source, off: Offset) => src.commit(off)
+              // TODO: v2
               case (stream: MicroBatchStream, off) =>
                 stream.commit(stream.deserializeOffset(off.json))
               case (src, _) =>
@@ -480,6 +497,7 @@ class MicroBatchExecution(
     // Request unprocessed data from all sources.
     newData = reportTimeTaken("getBatch") {
       availableOffsets.flatMap {
+        // TODO: v1
         case (source: Source, available: Offset)
           if committedOffsets.get(source).map(_ != available).getOrElse(true) =>
           val current = committedOffsets.get(source).map(_.asInstanceOf[Offset])
@@ -490,13 +508,16 @@ class MicroBatchExecution(
           logDebug(s"Retrieving data from $source: $current -> $available")
           Some(source -> batch.logicalPlan)
 
+        // TODO: v2
         case (stream: MicroBatchStream, available)
           if committedOffsets.get(stream).map(_ != available).getOrElse(true) =>
           val current = committedOffsets.get(stream).map {
             off => stream.deserializeOffset(off.json)
           }
           val endOffset: OffsetV2 = available match {
+            // TODO: v1??
             case v1: SerializedOffset => stream.deserializeOffset(v1.json)
+            // TODO: v2
             case v2: OffsetV2 => v2
           }
           val startOffset = current.getOrElse(stream.initialOffset)
@@ -552,10 +573,8 @@ class MicroBatchExecution(
           cd.dataType, cd.timeZoneId)
     }
 
-    val triggerLogicalPlan = sink match {
-      case _: Sink => newAttributePlan
-      case _: SupportsWrite =>
-        newAttributePlan.asInstanceOf[WriteToMicroBatchDataSource].createPlan(currentBatchId)
+    val triggerLogicalPlan = newAttributePlan match {
+      case m: MicroBatchWritePlan => m.createPlan(currentBatchId)
       case _ => throw new IllegalArgumentException(s"unknown sink type for $sink")
     }
 
@@ -582,16 +601,10 @@ class MicroBatchExecution(
 
     val batchSinkProgress: Option[StreamWriterCommitProgress] = reportTimeTaken("addBatch") {
       SQLExecution.withNewExecutionId(lastExecution) {
-        sink match {
-          case s: Sink => s.addBatch(currentBatchId, nextBatch)
-          case _: SupportsWrite =>
-            // This doesn't accumulate any data - it just forces execution of the microbatch writer.
-            nextBatch.collect()
-        }
-        lastExecution.executedPlan match {
-          case w: WriteToDataSourceV2Exec => w.commitProgress
-          case _ => None
-        }
+        // This doesn't accumulate any data - it just forces execution of the microbatch writer.
+        nextBatch.collect()
+
+        lastExecution.executedPlan.asInstanceOf[MicroBatchWriteExecPlan].commitProgress
       }
     }
 

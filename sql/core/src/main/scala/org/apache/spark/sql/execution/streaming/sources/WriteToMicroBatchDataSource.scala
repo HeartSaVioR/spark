@@ -17,10 +17,22 @@
 
 package org.apache.spark.sql.execution.streaming.sources
 
+import org.apache.spark.rdd.{EmptyRDD, RDD}
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.connector.write.streaming.StreamingWrite
-import org.apache.spark.sql.execution.datasources.v2.WriteToDataSourceV2
+import org.apache.spark.sql.execution.{SparkPlan, WriterExecPlanUtil}
+import org.apache.spark.sql.execution.datasources.v2.{StreamWriterCommitProgress, WriteToDataSourceV2}
+import org.apache.spark.sql.execution.streaming.Sink
+
+trait MicroBatchWritePlan {
+  def createPlan(batchId: Long): LogicalPlan
+}
+
+trait MicroBatchWriteExecPlan {
+  def commitProgress: Option[StreamWriterCommitProgress]
+}
 
 /**
  * The logical plan for writing data to a micro-batch stream.
@@ -29,11 +41,42 @@ import org.apache.spark.sql.execution.datasources.v2.WriteToDataSourceV2
  * to [[WriteToDataSourceV2]] with [[MicroBatchWrite]] before execution.
  */
 case class WriteToMicroBatchDataSource(write: StreamingWrite, query: LogicalPlan)
-  extends LogicalPlan {
+  extends LogicalPlan with MicroBatchWritePlan {
   override def children: Seq[LogicalPlan] = Seq(query)
   override def output: Seq[Attribute] = Nil
 
-  def createPlan(batchId: Long): WriteToDataSourceV2 = {
+  override def createPlan(batchId: Long): WriteToDataSourceV2 = {
     WriteToDataSourceV2(new MicroBatchWrite(batchId, write), query)
+  }
+}
+
+case class WriteToMicroBatchDataSourceV1(sink: Sink, query: LogicalPlan)
+  extends LogicalPlan with MicroBatchWritePlan {
+  override def children: Seq[LogicalPlan] = Seq(query)
+  override def output: Seq[Attribute] = Nil
+
+  override def createPlan(batchId: Long): WriteToMicroBatchDataSourceV1WithBatchId = {
+    WriteToMicroBatchDataSourceV1WithBatchId(batchId, sink, query)
+  }
+}
+
+case class WriteToMicroBatchDataSourceV1WithBatchId(batchId: Long, sink: Sink, query: LogicalPlan)
+  extends LogicalPlan {
+  override def children: Seq[LogicalPlan] = Seq(query)
+  override def output: Seq[Attribute] = Nil
+}
+
+case class WriteToMicroBatchDataSourceV1Exec(batchId: Long, sink: Sink, query: SparkPlan)
+  extends SparkPlan with MicroBatchWriteExecPlan {
+  override def children: Seq[SparkPlan] = Seq(query)
+  override def output: Seq[Attribute] = Nil
+  override val commitProgress: Option[StreamWriterCommitProgress] = None
+
+  override protected def doExecute(): RDD[InternalRow] = {
+    val rdd = WriterExecPlanUtil.rddWithNonEmptyPartitions(
+      query.execute(), sparkContext)
+    val df = sqlContext.sparkSession.internalCreateDataFrame(rdd, query.schema, isStreaming = false)
+    sink.addBatch(batchId, df)
+    new EmptyRDD[InternalRow](sparkContext)
   }
 }

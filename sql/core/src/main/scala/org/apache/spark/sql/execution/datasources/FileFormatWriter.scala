@@ -24,7 +24,6 @@ import org.apache.hadoop.fs.{FileAlreadyExistsException, Path}
 import org.apache.hadoop.mapreduce._
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat
 import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl
-
 import org.apache.spark._
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.io.{FileCommitProtocol, SparkHadoopWriterUtils}
@@ -38,7 +37,7 @@ import org.apache.spark.sql.catalyst.expressions.BindReferences.bindReferences
 import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, ExprCode}
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, DateTimeUtils}
-import org.apache.spark.sql.execution.{ProjectExec, SortExec, SparkPlan, SQLExecution}
+import org.apache.spark.sql.execution.{ProjectExec, SQLExecution, SortExec, SparkPlan, WriterExecPlanUtil}
 import org.apache.spark.sql.types.StringType
 import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.{SerializableConfiguration, Utils}
@@ -182,13 +181,8 @@ object FileFormatWriter extends Logging {
           child = empty2NullPlan).execute()
       }
 
-      // SPARK-23271 If we are attempting to write a zero partition rdd, create a dummy single
-      // partition rdd to make sure we at least set up one write task to write the metadata.
-      val rddWithNonEmptyPartitions = if (rdd.partitions.length == 0) {
-        sparkSession.sparkContext.parallelize(Array.empty[InternalRow], 1)
-      } else {
-        rdd
-      }
+      val rddWithNonEmptyPartitions = WriterExecPlanUtil.rddWithNonEmptyPartitions(
+        rdd, sparkSession.sparkContext)
 
       val jobIdInstant = new Date().getTime
       val ret = new Array[WriteTaskResult](rddWithNonEmptyPartitions.partitions.length)
