@@ -30,7 +30,7 @@ trait MicroBatchWritePlan {
   def createPlan(batchId: Long): LogicalPlan
 }
 
-trait MicroBatchWriteExecPlan {
+trait HasStreamWriterCommitProgress {
   def commitProgress: Option[StreamWriterCommitProgress]
 }
 
@@ -67,10 +67,9 @@ case class WriteToMicroBatchDataSourceV1WithBatchId(batchId: Long, sink: Sink, q
 }
 
 case class WriteToMicroBatchDataSourceV1Exec(batchId: Long, sink: Sink, query: SparkPlan)
-  extends SparkPlan with MicroBatchWriteExecPlan {
+  extends SparkPlan {
   override def children: Seq[SparkPlan] = Seq(query)
   override def output: Seq[Attribute] = Nil
-  override val commitProgress: Option[StreamWriterCommitProgress] = None
 
   override protected def doExecute(): RDD[InternalRow] = {
     val rdd = WriterExecPlanUtil.rddWithNonEmptyPartitions(

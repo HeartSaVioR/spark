@@ -33,7 +33,7 @@ import org.apache.spark.sql.connector.catalog.{Identifier, StagedTable, StagingT
 import org.apache.spark.sql.connector.expressions.Transform
 import org.apache.spark.sql.connector.write.{BatchWrite, DataWriterFactory, LogicalWriteInfoImpl, PhysicalWriteInfoImpl, SupportsDynamicOverwrite, SupportsOverwrite, SupportsTruncate, V1WriteBuilder, WriteBuilder, WriterCommitMessage}
 import org.apache.spark.sql.execution.{SparkPlan, UnaryExecNode, WriterExecPlanUtil}
-import org.apache.spark.sql.execution.streaming.sources.MicroBatchWriteExecPlan
+import org.apache.spark.sql.execution.streaming.sources.HasStreamWriterCommitProgress
 import org.apache.spark.sql.sources.{AlwaysTrue, Filter}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.util.{LongAccumulator, Utils}
@@ -350,7 +350,7 @@ trait BatchWriteHelper {
 /**
  * The base physical plan for writing data into data source v2.
  */
-trait V2TableWriteExec extends V2CommandExec with UnaryExecNode with MicroBatchWriteExecPlan {
+trait V2TableWriteExec extends V2CommandExec with UnaryExecNode with HasStreamWriterCommitProgress {
   def query: SparkPlan
 
   var commitProgress: Option[StreamWriterCommitProgress] = None

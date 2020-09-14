@@ -29,7 +29,7 @@ import org.apache.spark.sql.connector.catalog.{SupportsRead, SupportsWrite, Tabl
 import org.apache.spark.sql.connector.read.streaming.{MicroBatchStream, Offset => OffsetV2, ReadLimit, SparkDataStream, SupportsAdmissionControl}
 import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.datasources.v2.{StreamingDataSourceV2Relation, StreamWriterCommitProgress}
-import org.apache.spark.sql.execution.streaming.sources.{MicroBatchWriteExecPlan, MicroBatchWritePlan, WriteToMicroBatchDataSource, WriteToMicroBatchDataSourceV1}
+import org.apache.spark.sql.execution.streaming.sources.{HasStreamWriterCommitProgress, MicroBatchWritePlan, WriteToMicroBatchDataSource, WriteToMicroBatchDataSourceV1}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.{OutputMode, Trigger}
 import org.apache.spark.util.Clock
@@ -587,7 +587,10 @@ class MicroBatchExecution(
         // This doesn't accumulate any data - it just forces execution of the microbatch writer.
         nextBatch.collect()
 
-        lastExecution.executedPlan.asInstanceOf[MicroBatchWriteExecPlan].commitProgress
+        lastExecution.executedPlan match {
+          case p: HasStreamWriterCommitProgress => p.commitProgress
+          case _ => None
+        }
       }
     }
 
