@@ -80,10 +80,8 @@ class MicroBatchExecution(
 
     import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Implicits._
 
-    // TODO: transform source in logical plan
     val _logicalPlan = analyzedPlan.transform {
       case streamingRelation @ StreamingRelation(dataSourceV1, sourceName, output) =>
-        // TODO: v1
         toExecutionRelationMap.getOrElseUpdate(streamingRelation, {
           // Materialize source to avoid creating it in every batch
           val metadataPath = s"$resolvedCheckpointRoot/sources/$nextSourceId"
@@ -97,7 +95,6 @@ class MicroBatchExecution(
         val dsStr = if (src.nonEmpty) s"[${src.get}]" else ""
         val v2Disabled = disabledSources.contains(src.getOrElse(None).getClass.getCanonicalName)
         if (!v2Disabled && table.supports(TableCapability.MICRO_BATCH_READ)) {
-          // TODO: v2
           v2ToRelationMap.getOrElseUpdate(s, {
             // Materialize source to avoid creating it in every batch
             val metadataPath = s"$resolvedCheckpointRoot/sources/$nextSourceId"
@@ -112,7 +109,6 @@ class MicroBatchExecution(
           throw new UnsupportedOperationException(
             s"Data source $srcName does not support microbatch processing.")
         } else {
-          // TODO: v1
           v2ToExecutionRelationMap.getOrElseUpdate(s, {
             // Materialize source to avoid creating it in every batch
             val metadataPath = s"$resolvedCheckpointRoot/sources/$nextSourceId"
@@ -317,7 +313,6 @@ class MicroBatchExecution(
                * because certain sources (e.g., KafkaSource) assume on restart the last
                * batch will be executed before getOffset is called again. */
               availableOffsets.foreach {
-                // TODO: v1
                 case (source: Source, end: Offset) =>
                   val start = committedOffsets.get(source).map(_.asInstanceOf[Offset])
                   source.getBatch(start, end)
@@ -332,7 +327,6 @@ class MicroBatchExecution(
                 math.max(watermarkTracker.currentWatermark, commitMetadata.nextBatchWatermarkMs))
             } else if (latestCommittedBatchId == latestBatchId - 1) {
               availableOffsets.foreach {
-                // TODO: v1
                 case (source: Source, end: Offset) =>
                   val start = committedOffsets.get(source).map(_.asInstanceOf[Offset])
                   if (start.map(_ == end).getOrElse(true)) {
@@ -390,29 +384,24 @@ class MicroBatchExecution(
 
     // Generate a map from each unique source to the next available offset.
     val latestOffsets: Map[SparkDataStream, Option[OffsetV2]] = uniqueSources.map {
-      // TODO: v2 & limit
       case (s: SupportsAdmissionControl, limit) =>
         updateStatusMessage(s"Getting offsets from $s")
         reportTimeTaken("latestOffset") {
           val startOffsetOpt = availableOffsets.get(s)
           val startOffset = s match {
-            // TODO: v1
             case _: Source =>
               startOffsetOpt.orNull
-            // TODO: v2
             case v2: MicroBatchStream =>
               startOffsetOpt.map(offset => v2.deserializeOffset(offset.json))
                 .getOrElse(v2.initialOffset())
           }
           (s, Option(s.latestOffset(startOffset, limit)))
         }
-      // TODO: v1
       case (s: Source, _) =>
         updateStatusMessage(s"Getting offsets from $s")
         reportTimeTaken("getOffset") {
           (s, s.getOffset)
         }
-      // TODO: v2
       case (s: MicroBatchStream, _) =>
         updateStatusMessage(s"Getting offsets from $s")
         reportTimeTaken("latestOffset") {
@@ -459,9 +448,7 @@ class MicroBatchExecution(
           val prevBatchOff = offsetLog.get(currentBatchId - 1)
           if (prevBatchOff.isDefined) {
             prevBatchOff.get.toStreamProgress(sources).foreach {
-              // TODO: v1
               case (src: Source, off: Offset) => src.commit(off)
-              // TODO: v2
               case (stream: MicroBatchStream, off) =>
                 stream.commit(stream.deserializeOffset(off.json))
               case (src, _) =>
@@ -497,7 +484,6 @@ class MicroBatchExecution(
     // Request unprocessed data from all sources.
     newData = reportTimeTaken("getBatch") {
       availableOffsets.flatMap {
-        // TODO: v1
         case (source: Source, available: Offset)
           if committedOffsets.get(source).map(_ != available).getOrElse(true) =>
           val current = committedOffsets.get(source).map(_.asInstanceOf[Offset])
@@ -508,16 +494,13 @@ class MicroBatchExecution(
           logDebug(s"Retrieving data from $source: $current -> $available")
           Some(source -> batch.logicalPlan)
 
-        // TODO: v2
         case (stream: MicroBatchStream, available)
           if committedOffsets.get(stream).map(_ != available).getOrElse(true) =>
           val current = committedOffsets.get(stream).map {
             off => stream.deserializeOffset(off.json)
           }
           val endOffset: OffsetV2 = available match {
-            // TODO: v1??
             case v1: SerializedOffset => stream.deserializeOffset(v1.json)
-            // TODO: v2
             case v2: OffsetV2 => v2
           }
           val startOffset = current.getOrElse(stream.initialOffset)
