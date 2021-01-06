@@ -19,7 +19,8 @@ package org.apache.spark.sql.kafka010.consumer
 
 import java.{util => ju}
 import java.io.Closeable
-import java.util.concurrent.TimeoutException
+import java.util.concurrent.{TimeoutException, TimeUnit}
+import java.util.concurrent.atomic.AtomicLong
 
 import scala.collection.JavaConverters._
 
@@ -33,6 +34,7 @@ import org.apache.spark.kafka010.{KafkaConfigUpdater, KafkaTokenUtil}
 import org.apache.spark.sql.kafka010.KafkaSourceProvider._
 import org.apache.spark.sql.kafka010.consumer.KafkaDataConsumer.{AvailableOffsetRange, UNKNOWN_OFFSET}
 import org.apache.spark.util.{ShutdownHookManager, UninterruptibleThread}
+
 
 /**
  * This class simplifies the usages of Kafka consumer in Spark SQL Kafka connector.
@@ -271,8 +273,12 @@ private[kafka010] class KafkaDataConsumer(
     require(offset < untilOffset,
       s"offset must always be less than untilOffset [offset: $offset, untilOffset: $untilOffset]")
 
+    val startTime = System.nanoTime()
+
     val consumer = getOrRetrieveConsumer()
     val fetchedData = getOrRetrieveFetchedData(offset)
+
+    timeTakenToRetrieve.addAndGet(System.nanoTime() - startTime)
 
     logDebug(s"Get $groupId $topicPartition nextOffset ${fetchedData.nextOffsetInFetchedData} " +
       "requested $offset")
@@ -606,8 +612,17 @@ private[kafka010] object KafkaDataConsumer extends Logging {
   private val consumerPool = new InternalKafkaConsumerPool(sparkConf)
   private val fetchedDataPool = new FetchedDataPool(sparkConf)
 
+  // DEBUG: ...
+  private val timeTakenToRetrieve = new AtomicLong(0L)
+
   ShutdownHookManager.addShutdownHook { () =>
     try {
+      // DEBUG: ...
+      val timeRetrieveNs = timeTakenToRetrieve.get()
+      val timeRetrieveMs = TimeUnit.NANOSECONDS.toMillis(timeRetrieveNs)
+      logInfo("debug ver. 17")
+      logInfo(s"Total time taken to retrieve: $timeRetrieveMs ms")
+
       fetchedDataPool.shutdown()
       consumerPool.close()
     } catch {
