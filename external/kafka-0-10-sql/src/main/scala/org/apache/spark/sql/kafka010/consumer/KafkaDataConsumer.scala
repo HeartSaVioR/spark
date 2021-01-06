@@ -620,7 +620,7 @@ private[kafka010] object KafkaDataConsumer extends Logging {
       // DEBUG: ...
       val timeRetrieveNs = timeTakenToRetrieve.get()
       val timeRetrieveMs = TimeUnit.NANOSECONDS.toMillis(timeRetrieveNs)
-      logInfo("debug ver. 17")
+      logInfo("debug ver. 17-original")
       logInfo(s"Total time taken to retrieve: $timeRetrieveMs ms")
 
       fetchedDataPool.shutdown()
