@@ -19,6 +19,7 @@ package org.apache.spark.sql.execution
 import java.io.File
 
 import scala.collection.mutable
+import scala.util.Random
 
 import org.apache.hadoop.fs.Path
 
@@ -29,6 +30,7 @@ import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
 import org.apache.spark.sql.execution.datasources.v2.orc.OrcScan
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
+
 
 /**
  * Test suite base for testing the redaction of DataSourceScanExec/BatchScanExec.
@@ -121,15 +123,22 @@ class DataSourceScanExecRedactionSuite extends DataSourceScanRedactionTest {
 
   test("SPARK-31793: FileSourceScanExec metadata should contain limited file paths") {
     withTempPath { path =>
+      // create a sub-directory with long name so that each root path will always exceed the limit
+      // this is to ensure we always test the case for the path truncation
       val dir = path.getCanonicalPath
+      // 110 = limit 100 + margin 10 to clearly avoid edge case
+      val dataDirName = Random.alphanumeric.take(110 - dir.length).toList.mkString
+      val dataDir = new File(path, dataDirName)
+      dataDir.mkdir()
+
       val partitionCol = "partitionCol"
       spark.range(10)
         .select("id", "id")
         .toDF("value", partitionCol)
         .write
         .partitionBy(partitionCol)
-        .orc(dir)
-      val paths = (0 to 9).map(i => new File(dir, s"$partitionCol=$i").getCanonicalPath)
+        .orc(dataDir.getCanonicalPath)
+      val paths = (0 to 9).map(i => new File(dataDir, s"$partitionCol=$i").getCanonicalPath)
       val plan = spark.read.orc(paths: _*).queryExecution.executedPlan
       val location = plan collectFirst {
         case f: FileSourceScanExec => f.metadata("Location")
@@ -144,17 +153,13 @@ class DataSourceScanExecRedactionSuite extends DataSourceScanRedactionTest {
 
       // extract paths in location metadata (removing classname, brackets, separators)
       val pathsInLocation = location.get.substring(
-        location.get.indexOf('[') + 1, location.get.indexOf(']')).split(", ").toSeq
+        location.get.indexOf('[') + 1, location.get.indexOf(']'))
+        .split(", ").toSeq
 
-      // If the temp path length is less than (stop appending threshold - 1), say, 100 - 1 = 99,
-      // location should include more than one paths. Otherwise location should include only one
-      // path.
-      // (Note we apply subtraction with 1 to count start bracket '['.)
-      if (paths.head.length < 99) {
-        assert(pathsInLocation.size >= 2)
-      } else {
-        assert(pathsInLocation.size == 1)
-      }
+      // the only one path should be available
+      assert(pathsInLocation.size == 2)
+      // indicator ("... N more") should be available
+      assert(pathsInLocation.exists(_.contains("... ")))
     }
   }
 }
