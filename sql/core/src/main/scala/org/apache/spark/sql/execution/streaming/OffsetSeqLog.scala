@@ -21,6 +21,7 @@ package org.apache.spark.sql.execution.streaming
 import java.io.{InputStream, OutputStream}
 import java.nio.charset.StandardCharsets._
 
+import scala.collection.mutable
 import scala.io.{Source => IOSource}
 
 import org.apache.spark.sql.SparkSession
@@ -45,6 +46,26 @@ import org.apache.spark.sql.connector.read.streaming.{Offset => OffsetV2}
  */
 class OffsetSeqLog(sparkSession: SparkSession, path: String)
   extends HDFSMetadataLog[OffsetSeq](sparkSession, path) {
+
+  private val cachedMetadata = new mutable.TreeMap[Long, OffsetSeq]()
+
+  override def add(batchId: Long, metadata: OffsetSeq): Boolean = {
+    val added = super.add(batchId, metadata)
+    if (added) {
+      // cache metadata as it will be read again
+      cachedMetadata.put(batchId, metadata)
+      // we don't access metadata for (batchId - 2) batches; evict them
+      cachedMetadata.dropWhile(_._1 <= batchId - 2)
+      // FIXME: DEBUG
+      logWarning(s"DEBUG: size of cachedMetadata = ${cachedMetadata.size}")
+    }
+    added
+  }
+
+  override def get(batchId: Long): Option[OffsetSeq] = {
+    logWarning(s"DEBUG: cachedMetadata.get($batchId) = ${cachedMetadata.get(batchId)}")
+    cachedMetadata.get(batchId).orElse(super.get(batchId))
+  }
 
   override protected def deserialize(in: InputStream): OffsetSeq = {
     // called inside a try-finally where the underlying stream is closed in the caller
