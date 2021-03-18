@@ -1469,6 +1469,15 @@ object SQLConf {
       .checkValue(v => Set(1, 2).contains(v), "Valid versions are 1 and 2")
       .createWithDefault(2)
 
+  val STREAMING_SESSION_WINDOW_MERGE_SESSIONS_IN_LOCAL_PARTITION =
+    buildConf("spark.sql.streaming.sessionWindow.merge.sessions.in.local.partition")
+      .internal()
+      .doc("When true, streaming session window sorts and merge sessions in local partition " +
+        "prior to shuffle. This is to reduce the rows to shuffle, but only beneficial when " +
+        "there're lots of rows in a batch being assigned to same sessions.")
+      .booleanConf
+      .createWithDefault(false)
+
   val UNSUPPORTED_OPERATION_CHECK_ENABLED =
     buildConf("spark.sql.streaming.unsupportedOperationCheck")
       .internal()
@@ -3432,6 +3441,9 @@ class SQLConf extends Serializable with Logging {
   def topKSortFallbackThreshold: Int = getConf(TOP_K_SORT_FALLBACK_THRESHOLD)
 
   def fastHashAggregateRowMaxCapacityBit: Int = getConf(FAST_HASH_AGGREGATE_MAX_ROWS_CAPACITY_BIT)
+
+  def streamingSessionWindowMergeSessionInLocalPartition: Boolean =
+    getConf(STREAMING_SESSION_WINDOW_MERGE_SESSIONS_IN_LOCAL_PARTITION)
 
   def datetimeJava8ApiEnabled: Boolean = getConf(DATETIME_JAVA8API_ENABLED)
 

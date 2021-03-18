@@ -2324,6 +2324,23 @@ def window(timeColumn, windowDuration, slideDuration=None, startTime=None):
     return Column(res)
 
 
+@since(3.0)
+@ignore_unicode_prefix
+def session_window(timeColumn, gapDuration):
+    """
+    # FIXME: python doc!!
+    """
+    def check_string_field(field, fieldName):
+        if not field or type(field) is not str:
+            raise TypeError("%s should be provided as a string" % fieldName)
+
+    sc = SparkContext._active_spark_context
+    time_col = _to_java_column(timeColumn)
+    check_string_field(gapDuration, "gapDuration")
+    res = sc._jvm.functions.session_window(time_col, gapDuration)
+    return Column(res)
+
+
 # ---------------------------- misc functions ----------------------------------
 
 def crc32(col):

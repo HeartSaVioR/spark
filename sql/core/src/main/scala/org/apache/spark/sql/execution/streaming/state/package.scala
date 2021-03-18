@@ -117,5 +117,48 @@ package object state {
         storeCoordinator,
         extraOptions)
     }
+
+    /** Map each partition of an RDD along with data in a [[SessionWindowLinkedListState]]. */
+    def mapPartitionsWithSessionWindowLinkedListState[U: ClassTag](
+        sqlContext: SQLContext,
+        stateInfo: StatefulOperatorStateInfo,
+        keySchema: StructType,
+        valueSchema: StructType,
+        indexOrdinal: Option[Int])(
+        storeUpdateFunction: (SessionWindowLinkedListState, Iterator[T]) => Iterator[U])
+      : SessionWindowLinkedListStateStoreRDD[T, U] = {
+
+      mapPartitionsWithSessionWindowLinkedListState(
+        stateInfo,
+        keySchema,
+        valueSchema,
+        indexOrdinal,
+        sqlContext.sessionState,
+        Some(sqlContext.streams.stateStoreCoordinator))(
+        storeUpdateFunction)
+    }
+
+    /** Map each partition of an RDD along with data in a [[SessionWindowLinkedListState]]. */
+    private[streaming] def mapPartitionsWithSessionWindowLinkedListState[U: ClassTag](
+        stateInfo: StatefulOperatorStateInfo,
+        keySchema: StructType,
+        valueSchema: StructType,
+        indexOrdinal: Option[Int],
+        sessionState: SessionState,
+        storeCoordinator: Option[StateStoreCoordinatorRef])(
+        storeUpdateFunction: (SessionWindowLinkedListState, Iterator[T]) => Iterator[U])
+      : SessionWindowLinkedListStateStoreRDD[T, U] = {
+
+      val cleanedF = dataRDD.sparkContext.clean(storeUpdateFunction)
+      new SessionWindowLinkedListStateStoreRDD(
+        dataRDD,
+        cleanedF,
+        stateInfo,
+        keySchema,
+        valueSchema,
+        indexOrdinal,
+        sessionState,
+        storeCoordinator)
+    }
   }
 }

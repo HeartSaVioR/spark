@@ -29,6 +29,7 @@ import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjectio
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
 import org.apache.spark.sql.catalyst.plans.physical.{AllTuples, ClusteredDistribution, Distribution, Partitioning}
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes._
+import org.apache.spark.sql.catalyst.util.TypeUtils
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.execution.streaming.state._
@@ -435,6 +436,373 @@ case class StateStoreSaveExec(
     (outputMode.contains(Append) || outputMode.contains(Update)) &&
       eventTimeWatermark.isDefined &&
       newMetadata.batchWatermarkMs > eventTimeWatermark.get
+  }
+}
+
+// FIXME: javadoc!
+case class SessionWindowStateStoreRestoreExec(
+    keyWithoutSessionExpressions: Seq[Attribute],
+    sessionExpression: Attribute,
+    stateInfo: Option[StatefulOperatorStateInfo],
+    eventTimeWatermark: Option[Long],
+    child: SparkPlan)
+  extends UnaryExecNode with StateStoreReader with WatermarkSupport {
+
+  override def keyExpressions: Seq[Attribute] = keyWithoutSessionExpressions
+
+  override protected def doExecute(): RDD[InternalRow] = {
+    val numOutputRows = longMetric("numOutputRows")
+
+    child.execute().mapPartitionsWithSessionWindowLinkedListState(
+      getStateInfo,
+      keyExpressions.toStructType,
+      child.output.toStructType,
+      indexOrdinal = None,
+      sqlContext.sessionState,
+      Some(sqlContext.streams.stateStoreCoordinator)) { case (state, iter) =>
+
+      val keyWithoutSessionProjection = GenerateUnsafeProjection.generate(
+        keyWithoutSessionExpressions, child.output)
+      val sessionProjection = GenerateUnsafeProjection.generate(Seq(sessionExpression),
+        child.output)
+
+      // We need to filter out outdated inputs
+      val filteredIterator = watermarkPredicateForData match {
+        case Some(predicate) => iter.filter((row: InternalRow) => !predicate.eval(row))
+        case None => iter
+      }
+
+      new MergingSortWithSessionWindowLinkedListStateIterator(
+        filteredIterator,
+        state,
+        keyWithoutSessionExpressions,
+        sessionExpression,
+        keyWithoutSessionProjection,
+        sessionProjection,
+        child.output).map { row =>
+        numOutputRows += 1
+        row
+      }
+    }
+  }
+
+  override def output: Seq[Attribute] = child.output
+
+  override def outputPartitioning: Partitioning = child.outputPartitioning
+
+  override def outputOrdering: Seq[SortOrder] = {
+    (keyWithoutSessionExpressions ++ Seq(sessionExpression)).map(SortOrder(_, Ascending))
+  }
+
+  override def requiredChildDistribution: Seq[Distribution] = {
+    if (keyWithoutSessionExpressions.isEmpty) {
+      AllTuples :: Nil
+    } else {
+      ClusteredDistribution(keyWithoutSessionExpressions, stateInfo.map(_.numPartitions)) :: Nil
+    }
+  }
+
+  override def requiredChildOrdering: Seq[Seq[SortOrder]] = {
+    Seq((keyWithoutSessionExpressions ++ Seq(sessionExpression)).map(SortOrder(_, Ascending)))
+  }
+}
+
+/**
+ * For each input tuple, the key is calculated and sessions are being `put` into
+ * the [[SessionWindowLinkedListState]].
+ */
+case class SessionWindowStateStoreSaveExec(
+    keyWithoutSessionExpressions: Seq[Attribute],
+    sessionExpression: Attribute,
+    stateInfo: Option[StatefulOperatorStateInfo] = None,
+    outputMode: Option[OutputMode] = None,
+    eventTimeWatermark: Option[Long] = None,
+    child: SparkPlan)
+  extends UnaryExecNode with StateStoreWriter with WatermarkSupport {
+
+  override def keyExpressions: Seq[Attribute] = keyWithoutSessionExpressions
+
+  override protected def doExecute(): RDD[InternalRow] = {
+    metrics // force lazy init at driver
+    assert(outputMode.nonEmpty,
+      "Incorrect planning in IncrementalExecution, outputMode has not been set")
+
+    child.execute().mapPartitionsWithSessionWindowLinkedListState(
+      getStateInfo,
+      keyWithoutSessionExpressions.toStructType,
+      child.output.toStructType,
+      indexOrdinal = None,
+      sqlContext.sessionState,
+      Some(sqlContext.streams.stateStoreCoordinator)) { (state, iter) =>
+
+      val numOutputRows = longMetric("numOutputRows")
+      val numUpdatedStateRows = longMetric("numUpdatedStateRows")
+      val allUpdatesTimeMs = longMetric("allUpdatesTimeMs")
+      val allRemovalsTimeMs = longMetric("allRemovalsTimeMs")
+      val commitTimeMs = longMetric("commitTimeMs")
+
+      val keyProjection = GenerateUnsafeProjection.generate(keyExpressions, child.output)
+      val sessionProjection = GenerateUnsafeProjection.generate(Seq(sessionExpression),
+        child.output)
+
+      val keyOrdering = TypeUtils.getInterpretedOrdering(keyExpressions.toStructType)
+        .asInstanceOf[Ordering[UnsafeRow]]
+
+      var lastSearchedSessionStartOption: Option[Long] = None
+      var stateFetchedKey: UnsafeRow = null
+
+      def reflectNewSession(row: UnsafeRow): Boolean = {
+        val key = keyProjection(row)
+        val session = sessionProjection(row).getStruct(0, 2)
+        val sessionStart = session.getLong(0)
+        val sessionEnd = session.getLong(1)
+
+        if (state.isEmpty(key)) {
+          state.setHead(key, sessionStart, row)
+          return true
+        }
+
+        // need to find sessions which could be replaced with new session
+        // new session should enclose previous session(s) if it overlaps,
+        // since session always expands
+
+        val nearestSessions = state.getSessionStartOnNearest(key, sessionStart)
+        if (nearestSessions != null) {
+          // there's rare chance that existing session and row is equivalent
+          // because in MergingSortWithSessionWindowLinkedListStateIterator,
+          // we emit existing sessions only when it overlaps with input row
+          // so unless aggregation make no difference, it will not happen
+          // always replace instead of comparing with actual value
+
+          // if the old session can be replaced with new session,
+          // (condition: 1:1 match, no change on "session start")
+          // just replace it to avoid overhead on manipulating linked list
+
+          nearestSessions._2 match {
+            case Some(next) if next > sessionEnd =>
+              state.update(key, sessionStart, row)
+              return true
+            case None =>
+              state.update(key, sessionStart, row)
+              return true
+
+            case _ =>
+          }
+        }
+
+        if (stateFetchedKey == null || keyOrdering.equiv(stateFetchedKey, key)) {
+          stateFetchedKey = key
+          lastSearchedSessionStartOption = None
+        }
+
+        // find the first state session which is enclosed by new session
+        val firstStateSessionEnclosedByNewSession = lastSearchedSessionStartOption match {
+          case Some(lastSearchedSessionStart) =>
+            state.findFirstSessionStartEnsurePredicate(key, start => start >= sessionStart,
+              lastSearchedSessionStart)
+
+          case None =>
+            state.findFirstSessionStartEnsurePredicate(key, start => start >= sessionStart)
+        }
+
+        firstStateSessionEnclosedByNewSession match {
+          case Some(firstStateSessionStart) =>
+            // get previous earlier to enable addAfter on new session after removal
+            val prevForFirstStateSession = state.getPrevSessionStart(key, firstStateSessionStart)
+
+            // search and remove sessions which is enclosed by new session
+            var currentStateSessionStart: Option[Long] = Some(firstStateSessionStart)
+            var stop = false
+            while (!stop && currentStateSessionStart.isDefined) {
+              val stateSession = state.get(key, currentStateSessionStart.get)
+
+              val stateSessionStart = sessionProjection(stateSession).getStruct(0, 2).getLong(0)
+              val stateSessionEnd = sessionProjection(stateSession).getStruct(0, 2).getLong(1)
+
+              require(stateSessionStart == currentStateSessionStart.get,
+                "Session pointer doesn't match with actual session start!")
+
+              // get next to continue searching after removal
+              val nextStateSessionStart = state.getNextSessionStart(key, stateSessionStart)
+
+              // remove session if it is enclosed
+              if (stateSessionStart >= sessionStart && stateSessionEnd <= sessionEnd) {
+                state.remove(key, stateSessionStart)
+                currentStateSessionStart = nextStateSessionStart
+              } else {
+                stop = true
+              }
+            }
+
+            // currentStateSessionStart is now the earliest session in state which
+            // new session should be added before
+            (prevForFirstStateSession, currentStateSessionStart) match {
+              case (_, Some(next)) =>
+                state.addBefore(key, sessionStart, row, next)
+                lastSearchedSessionStartOption = Some(sessionStart)
+
+              case (Some(prev), None) =>
+                state.addAfter(key, sessionStart, row, prev)
+                lastSearchedSessionStartOption = Some(sessionStart)
+
+              case (None, None) =>
+                // we removed all elements
+                require(state.isEmpty(key), "It must be empty list since all elements are removed!")
+                state.setHead(key, sessionStart, row)
+            }
+
+          case None =>
+            // add to last: we got rid of the case list is empty
+            val lastSessionStartOption = lastSearchedSessionStartOption match {
+              case Some(lastSearchedSessionStart) =>
+                state.getLastSessionStart(key, lastSearchedSessionStart)
+              case None => state.getLastSessionStart(key)
+            }
+
+            lastSessionStartOption match {
+              case Some(lastSessionStart) =>
+                state.addAfter(key, sessionStart, row, lastSessionStart)
+
+              case None =>
+                throw new IllegalStateException("List should not be empty!")
+            }
+        }
+
+        // we don't need to search before the start of new session, since new sessions are sorted
+        // by session start
+        lastSearchedSessionStartOption = Some(sessionStart)
+
+        true
+      }
+
+      // assuming late events were dropped before
+
+      outputMode match {
+        case Some(Complete) =>
+          allUpdatesTimeMs += timeTakenMs {
+            while (iter.hasNext) {
+              val row = iter.next().asInstanceOf[UnsafeRow]
+
+              if (reflectNewSession(row)) {
+                numUpdatedStateRows += 1
+              }
+            }
+          }
+
+          CompletionIterator[InternalRow, Iterator[InternalRow]](
+            state.getAllRowPairs.map(_.value), {
+              commitTimeMs += timeTakenMs { state.commit() }
+              setStoreMetrics(state)
+            }
+          )
+
+        // Update and output only sessions being evicted from the MultiValuesStateManager
+        // Assumption: watermark predicates must be non-empty if append mode is allowed
+        case Some(Append) =>
+          allUpdatesTimeMs += timeTakenMs {
+            while (iter.hasNext) {
+              val row = iter.next().asInstanceOf[UnsafeRow]
+              if (reflectNewSession(row)) {
+                numUpdatedStateRows += 1
+              }
+            }
+          }
+
+          val removalStartTimeNs = System.nanoTime
+
+          val retIter = state.removeByValueCondition(row => watermarkPredicateForData match {
+            case Some(predicate) => predicate.eval(row)
+            case None => false
+          }, stopOnConditionMismatch = true).map { row =>
+            numOutputRows += 1
+            row.value
+          }
+
+          CompletionIterator[InternalRow, Iterator[InternalRow]](retIter, {
+            allRemovalsTimeMs += NANOSECONDS.toMillis(System.nanoTime - removalStartTimeNs)
+            commitTimeMs += timeTakenMs { state.commit() }
+            setStoreMetrics(state)
+          })
+
+        // Update and output modified rows from the MultiValuesStateManager.
+        case Some(Update) =>
+
+          new NextIterator[InternalRow] {
+            private val updatesStartTimeNs = System.nanoTime
+
+            override protected def getNext(): InternalRow = {
+              var ret: InternalRow = null
+
+              while (ret == null && iter.hasNext) {
+                val row = iter.next().asInstanceOf[UnsafeRow]
+                if (reflectNewSession(row)) {
+                  numUpdatedStateRows += 1
+                  ret = row
+                }
+              }
+
+              if (ret == null && !iter.hasNext) {
+                finished = true
+                null
+              } else {
+                // !iter.hasNext && ret != null => can return ret, and next getNext() call will
+                // set finished = true
+                // iter.hasNext && (ret != null || ret == null) => not possible
+                numOutputRows += 1
+                ret
+              }
+            }
+
+            override protected def close(): Unit = {
+              allUpdatesTimeMs += NANOSECONDS.toMillis(System.nanoTime - updatesStartTimeNs)
+
+              // Remove old aggregates if watermark specified
+              allRemovalsTimeMs += timeTakenMs {
+                // fully consume iterator to ensure all necessary elements are evicted
+                state.removeByValueCondition(row => watermarkPredicateForData match {
+                  case Some(predicate) => predicate.eval(row)
+                  case None => false
+                }, stopOnConditionMismatch = true).toList
+              }
+              commitTimeMs += timeTakenMs { state.commit() }
+              setStoreMetrics(state)
+            }
+          }
+
+        case _ => throw new UnsupportedOperationException(s"Invalid output mode: $outputMode")
+      }
+    }
+  }
+
+  override def output: Seq[Attribute] = child.output
+
+  override def outputPartitioning: Partitioning = child.outputPartitioning
+
+  override def requiredChildDistribution: Seq[Distribution] = {
+    if (keyWithoutSessionExpressions.isEmpty) {
+      AllTuples :: Nil
+    } else {
+      ClusteredDistribution(keyWithoutSessionExpressions, stateInfo.map(_.numPartitions)) :: Nil
+    }
+  }
+
+  override def requiredChildOrdering: Seq[Seq[SortOrder]] = {
+    Seq((keyWithoutSessionExpressions ++ Seq(sessionExpression)).map(SortOrder(_, Ascending)))
+  }
+
+  override def shouldRunAnotherBatch(newMetadata: OffsetSeqMetadata): Boolean = {
+    (outputMode.contains(Append) || outputMode.contains(Update)) &&
+      eventTimeWatermark.isDefined &&
+      newMetadata.batchWatermarkMs > eventTimeWatermark.get
+  }
+
+  protected def setStoreMetrics(state: SessionWindowLinkedListState): Unit = {
+    val storeMetrics = state.metrics
+    longMetric("numTotalStateRows") += storeMetrics.numKeys
+    longMetric("stateMemory") += storeMetrics.memoryUsedBytes
+    storeMetrics.customMetrics.foreach { case (metric, value) =>
+      longMetric(metric.name) += value
+    }
   }
 }
 

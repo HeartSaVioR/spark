@@ -3625,6 +3625,13 @@ object functions {
     window(timeColumn, windowDuration, windowDuration, "0 second")
   }
 
+  // FIXME: javadoc!
+  def session_window(timeColumn: Column, gapDuration: String): Column = {
+    withExpr {
+      SessionWindow(timeColumn.expr, gapDuration)
+    }.as("session_window")
+  }
+
   /**
    * Creates timestamp from the number of seconds since UTC epoch.
    * @group datetime_funcs
