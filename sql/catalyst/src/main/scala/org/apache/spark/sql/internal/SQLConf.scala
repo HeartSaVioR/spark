@@ -1478,6 +1478,17 @@ object SQLConf {
       .booleanConf
       .createWithDefault(false)
 
+  val STREAMING_SESSION_WINDOW_STATE_FORMAT_VERSION =
+    buildConf("spark.sql.streaming.sessionWindow.stateFormatVersion")
+      .internal()
+      .doc("State format version used by streaming session window in a streaming query. " +
+        "State between versions are tend to be incompatible, so state format version shouldn't " +
+        "be modified after running.")
+      .version("3.2.0")
+      .intConf
+      .checkValue(v => Set(1).contains(v), "Valid version is 1")
+      .createWithDefault(1)
+
   val UNSUPPORTED_OPERATION_CHECK_ENABLED =
     buildConf("spark.sql.streaming.unsupportedOperationCheck")
       .internal()
