@@ -17,14 +17,14 @@
 
 package org.apache.spark.sql.streaming
 
+import java.util.Locale
+
 import org.scalatest.BeforeAndAfter
 import org.scalatest.matchers.must.Matchers
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.execution.streaming.MemoryStream
-// FIXME: tests commented out use such import
-// import org.apache.spark.sql.functions.{count, session_window, sum}
-import org.apache.spark.sql.functions.{count, session_window}
+import org.apache.spark.sql.functions.{count, session_window, sum}
 import org.apache.spark.sql.internal.SQLConf
 
 class StreamingSessionWindowSuite extends StreamTest
@@ -136,8 +136,6 @@ class StreamingSessionWindowSuite extends StreamTest
     )
   }
 
-  // FIXME: commented out due to not support of no group key
-  /*
   testWithAllOptionsMergingSessionInLocalPartition("complete mode - session window - no key") {
     // complete mode doesn't honor watermark: even it is specified, watermark will be
     // always Unix timestamp 0
@@ -152,40 +150,16 @@ class StreamingSessionWindowSuite extends StreamTest
       .select($"session".getField("start").cast("long").as[Long],
         $"session".getField("end").cast("long").as[Long], $"count".as[Long], $"sum".as[Long])
 
-    testStream(windowedAggregation, OutputMode.Complete())(
-      AddData(inputData, 10, 11),
-      CheckNewAnswer((10, 16, 2, 21)),
-
-      AddData(inputData, 17),
-      CheckNewAnswer(
-        (10, 16, 2, 21),
-        (17, 22, 1, 17)
-      ),
-
-      AddData(inputData, 35),
-      CheckNewAnswer(
-        (10, 16, 2, 21),
-        (17, 22, 1, 17),
-        (35, 40, 1, 35)
-      ),
-
-      // should reflect late row
-      AddData(inputData, 22),
-      CheckNewAnswer(
-        (10, 16, 2, 21),
-        (17, 27, 2, 39),
-        (35, 40, 1, 35)
-      ),
-
-      AddData(inputData, 40),
-      CheckNewAnswer(
-        (10, 16, 2, 21),
-        (17, 27, 2, 39),
-        (35, 45, 2, 75)
+    val e = intercept[StreamingQueryException] {
+      testStream(windowedAggregation, OutputMode.Complete())(
+        AddData(inputData, 40),
+        CheckAnswer() // this is just to trigger the exception
       )
-    )
+    }
+    Seq("Global aggregation with session window", "not supported").foreach { m =>
+      assert(e.getMessage.toLowerCase(Locale.ROOT).contains(m.toLowerCase(Locale.ROOT)))
+    }
   }
-   */
 
   testWithAllOptionsMergingSessionInLocalPartition("append mode - session window") {
     // Implements StructuredSessionization.scala leveraging "session" function
@@ -296,8 +270,6 @@ class StreamingSessionWindowSuite extends StreamTest
     )
   }
 
-  // FIXME: commented out due to not support of no group key
-  /*
   testWithAllOptionsMergingSessionInLocalPartition("append mode - session window - no key") {
     val inputData = MemoryStream[Int]
 
@@ -310,37 +282,16 @@ class StreamingSessionWindowSuite extends StreamTest
       .select($"session".getField("start").cast("long").as[Long],
         $"session".getField("end").cast("long").as[Long], $"count".as[Long], $"sum".as[Long])
 
-    testStream(windowedAggregation)(
-      AddData(inputData, 10, 11), // sessions: (10,16)
-      CheckNewAnswer(),
-
-      AddData(inputData, 17),
-      // Advance watermark to 7 seconds
-      // sessions: (10,16), (17,23)
-      CheckNewAnswer(),
-
-      AddData(inputData, 25),
-      // Advance watermark to 15 seconds
-      // sessions: (10,16), (17,23), (25,30)
-      CheckNewAnswer(),
-
-      AddData(inputData, 35),
-      // Advance watermark to 25 seconds
-      // sessions: (10,16), (17,22), (25,30), (35,40)
-      // evicts: (10,16), (17,22)
-      CheckNewAnswer((10, 16, 2, 21), (17, 22, 1, 17)),
-
-      AddData(inputData, 10),   // Should not emit anything as data less than watermark
-      CheckNewAnswer(),
-
-      AddData(inputData, 40),
-      // Advance watermark to 30 seconds
-      // sessions: (25,30) / (35,45)
-      // evicts: (25,30)
-      CheckNewAnswer((25, 30, 1, 25))
-    )
+    val e = intercept[StreamingQueryException] {
+      testStream(windowedAggregation)(
+        AddData(inputData, 40),
+        CheckAnswer() // this is just to trigger the exception
+      )
+    }
+    Seq("Global aggregation with session window", "not supported").foreach { m =>
+      assert(e.getMessage.toLowerCase(Locale.ROOT).contains(m.toLowerCase(Locale.ROOT)))
+    }
   }
-   */
 
   // FIXME: commented out due to not support of update mode
   /*

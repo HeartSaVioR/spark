@@ -3962,7 +3962,6 @@ object SessionWindowing extends Rule[LogicalPlan] {
   private final val SESSION_START = "start"
   private final val SESSION_END = "end"
 
-  // FIXME: javadoc
   def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsUp {
     case p: LogicalPlan if p.children.size == 1 =>
       val child = p.children.head

@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.execution.aggregate
 
+import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.plans.physical.{AllTuples, ClusteredDistribution}
@@ -383,6 +384,11 @@ object AggUtils {
 
     val groupWithoutSessionExpression = groupingExpressions.filterNot { p =>
       p.semanticEquals(sessionExpression)
+    }
+
+    if (groupWithoutSessionExpression.isEmpty) {
+      throw new AnalysisException("Global aggregation with session window in streaming query" +
+        " is not supported.")
     }
 
     val groupingWithoutSessionAttributes = groupWithoutSessionExpression.map(_.toAttribute)

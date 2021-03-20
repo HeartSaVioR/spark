@@ -479,7 +479,6 @@ case class SessionWindowStateStoreRestoreExec(
         case None => iter
       }
 
-      // FIXME: should we use timeExpression, or sessionExpression is enough?
       val stateStoreManager = StreamingSessionWindowStateManager.createStateManager(
         keyExpressions, sessionExpression, child.output, child.output, stateInfo, storeConf,
         hadoopConfBcast.value.value, partitionId, stateVersion)
@@ -657,6 +656,8 @@ case class SessionWindowStateStoreSaveExec(
               updateStateMetrics(stateStoreManager)
             }
           }
+
+          // FIXME: implement UPDATE mode
         case _ => throw new UnsupportedOperationException(s"Invalid output mode: $outputMode")
       }
     }
@@ -693,9 +694,9 @@ case class SessionWindowStateStoreSaveExec(
   }
 
   private def putToStore(
-                          baseIter: Iterator[InternalRow],
-                          stateManager: StreamingSessionWindowStateManager,
-                          needFilter: Boolean) {
+      baseIter: Iterator[InternalRow],
+      stateManager: StreamingSessionWindowStateManager,
+      needFilter: Boolean) {
     val numUpdatedStateRows = longMetric("numUpdatedStateRows")
     val iter = if (needFilter) {
       baseIter.filter(row => !watermarkPredicateForData.get.eval(row))
@@ -741,9 +742,9 @@ case class SessionWindowStateStoreSaveExec(
    * add to store, only update the changed window elements
    */
   private def replaceModifyWindow(
-                                   key: UnsafeRow,
-                                   values: Seq[UnsafeRow],
-                                   stateManager: StreamingSessionWindowStateManager) {
+      key: UnsafeRow,
+      values: Seq[UnsafeRow],
+      stateManager: StreamingSessionWindowStateManager) {
     val savedStates = stateManager.getStates(key)
     if (savedStates.isEmpty) {
       stateManager.putStates(key, values.toSeq)
@@ -782,8 +783,9 @@ case class SessionWindowStateStoreSaveExec(
    *       [12:00:08, 12:00:13] have overlapped with [12:00:00, 12:00:25], so can't put it into
    *       result array
    */
-  private def removeOverlapWindow(newWindows: Seq[UnsafeRow],
-                                  oldWindows: Seq[UnsafeRow]): Seq[UnsafeRow] = {
+  private def removeOverlapWindow(
+      newWindows: Seq[UnsafeRow],
+      oldWindows: Seq[UnsafeRow]): Seq[UnsafeRow] = {
     assert(newWindows.nonEmpty && oldWindows.nonEmpty,
       "new windows & old windows must be nonEmpty")
 
@@ -819,8 +821,10 @@ case class SessionWindowStateStoreSaveExec(
     result.toSeq
   }
 
-  private def checkNoOverlap(index: Int, latestValidRecord: WindowRecord,
-                             sorted: ArrayBuffer[WindowRecord]): Boolean = {
+  private def checkNoOverlap(
+      index: Int,
+      latestValidRecord: WindowRecord,
+      sorted: ArrayBuffer[WindowRecord]): Boolean = {
     val current = sorted(index)
     if (0 < index && index < sorted.size - 1) {
       checkNoOverlapBetweenRecord(current, sorted(index - 1)) &&
@@ -860,18 +864,6 @@ case class SessionWindowStateStoreSaveExec(
       res
     }
   }
-
-  // FIXME: necessary?
-  /*
-    protected def setStoreMetrics(state: SessionWindowLinkedListState): Unit = {
-    val storeMetrics = state.metrics
-    longMetric("numTotalStateRows") += storeMetrics.numKeys
-    longMetric("stateMemory") += storeMetrics.memoryUsedBytes
-    storeMetrics.customMetrics.foreach { case (metric, value) =>
-      longMetric(metric.name) += value
-    }
-  }
-   */
 }
 
 /** Physical operator for executing streaming Deduplicate. */
