@@ -123,10 +123,9 @@ class MergingSortWithSessionWindowStateIterator(
       currentStateIter = null
 
       if (currentRow != null && currentRow.keys != currentStateFetchedKey) {
-        // FIXME: this should be able to be optimized with merge sort between input rows
-        //  and state rows, as both should be sorted.
-        //  Note that during merge sort we shouldn't require both iterators are materialized.
-        //  Element should be evaluated one by one.
+        // We expect a small number of sessions per group key, so materializing them
+        // and sorting wouldn't hurt much. The important thing is that we shouldn't buffer input
+        // rows to sort with existing sessions.
         val unsortedIter = stateManager.getStates(currentRow.keys)
         currentStateIter = unsortedIter.map(_.copy()).toList.sortWith((row1, row2) => {
           def getSessionStart(r: InternalRow): Long = {
