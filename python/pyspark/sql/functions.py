@@ -2324,7 +2324,7 @@ def window(timeColumn, windowDuration, slideDuration=None, startTime=None):
     return Column(res)
 
 
-@since(3.0)
+@since(3.2)
 @ignore_unicode_prefix
 def session_window(timeColumn, gapDuration):
     """

@@ -24,6 +24,8 @@ import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjectio
 import org.apache.spark.sql.execution.metric.SQLMetric
 
 // FIXME: javadoc!
+// FIXME: test suite needed? implementations of AggregationIterator don't seem to have
+//  individual test suite
 // FIXME: groupingExpressions should contain sessionExpression
 class MergingSessionsIterator(
     partIndex: Int,

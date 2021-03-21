@@ -23,6 +23,7 @@ import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjectio
 import org.apache.spark.sql.execution.streaming.state.StreamingSessionWindowStateManager
 
 // FIXME: javadoc!!
+// FIXME: individual test suite?
 class MergingSortWithSessionWindowStateIterator(
     iter: Iterator[InternalRow],
     stateManager: StreamingSessionWindowStateManager,
