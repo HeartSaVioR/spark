@@ -541,7 +541,6 @@ case class SessionWindowStateStoreSaveExec(
       sparkContext.hadoopConfiguration, sqlContext.conf)))
 
   private val childOutputSchema = child.output.toStructType
-  private val stateValueSchema = new StructType().add("values", ArrayType(childOutputSchema))
   private val childEncoder = RowEncoder(childOutputSchema).resolveAndBind().createDeserializer()
 
   override protected def doExecute(): RDD[InternalRow] = {
@@ -661,7 +660,7 @@ case class SessionWindowStateStoreSaveExec(
             }
           }
 
-          // FIXME: implement UPDATE mode
+        // FIXME: implement UPDATE mode
         case _ => throw new UnsupportedOperationException(s"Invalid output mode: $outputMode")
       }
     }
