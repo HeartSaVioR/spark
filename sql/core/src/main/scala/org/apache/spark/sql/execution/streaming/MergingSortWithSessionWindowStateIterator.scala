@@ -22,8 +22,17 @@ import org.apache.spark.sql.catalyst.expressions.{Attribute, UnsafeProjection, U
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
 import org.apache.spark.sql.execution.streaming.state.StreamingSessionWindowStateManager
 
-// FIXME: javadoc!!
-// FIXME: individual test suite?
+/**
+ * This class technically does the merge sort between input rows and existing sessions in state,
+ * to optimize the cost of sort on "input rows + existing sessions". This is based on the
+ * precondition that input rows are sorted by "group keys + start time of session window".
+ *
+ * This only materializes the existing sessions into memory, which are tend to be not many per
+ * group key. The cost of sorting existing sessions would be also minor based on the assumption.
+ *
+ * The output rows are sorted with "group keys + start time of session window", which is same as
+ * the sort condition on input rows.
+ */
 class MergingSortWithSessionWindowStateIterator(
     iter: Iterator[InternalRow],
     stateManager: StreamingSessionWindowStateManager,
@@ -127,6 +136,10 @@ class MergingSortWithSessionWindowStateIterator(
         // We expect a small number of sessions per group key, so materializing them
         // and sorting wouldn't hurt much. The important thing is that we shouldn't buffer input
         // rows to sort with existing sessions.
+        // TODO: check that getStates guarantees elements are sorted. If then, we can just copy
+        //  these elements and skip sorting. Don't simply rely on implementation details: if we
+        //  want to leverage getStates provides sorted elements, do update interface contract
+        //  and have a test suite to verify the behavior.
         val unsortedIter = stateManager.getStates(currentRow.keys)
         currentStateIter = unsortedIter.map(_.copy()).toList.sortWith((row1, row2) => {
           def getSessionStart(r: InternalRow): Long = {

@@ -20,7 +20,6 @@ package org.apache.spark.sql.execution.aggregate
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
-import org.apache.spark.sql.catalyst.plans.physical.{AllTuples, ClusteredDistribution}
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.streaming._
 
@@ -484,38 +483,24 @@ object AggUtils {
     finalAndCompleteAggregate :: Nil
   }
 
-  private def mayAppendUpdatingSessionExec(groupingExpressions: Seq[NamedExpression],
-                                           maybeChildPlan: SparkPlan): SparkPlan =
+  private def mayAppendUpdatingSessionExec(
+      groupingExpressions: Seq[NamedExpression],
+      maybeChildPlan: SparkPlan): SparkPlan = {
     groupingExpressions.find(_.metadata.contains(SessionWindow.marker)) match {
       case Some(sessionExpression) =>
-        val groupWithoutSessionExpression = groupingExpressions.filterNot {
-          p => p.semanticEquals(sessionExpression)
-        }
-
-        val groupingWithoutSessionAttributes = groupWithoutSessionExpression.map(_.toAttribute)
-
-        val childDistribution = if (groupWithoutSessionExpression.isEmpty) {
-          AllTuples :: Nil
-        } else {
-          ClusteredDistribution(groupWithoutSessionExpression) :: Nil
-        }
-        val childOrdering = Seq((groupingWithoutSessionAttributes ++ Seq(sessionExpression))
-          .map(SortOrder(_, Ascending)))
-        val updatedSession = UpdatingSessionExec(
+        UpdatingSessionExec(
           groupingExpressions.map(_.toAttribute),
           sessionExpression.toAttribute,
-          optRequiredChildDistribution = Some(childDistribution),
-          optRequiredChildOrdering = Some(childOrdering),
           maybeChildPlan)
-        updatedSession
+
       case None => maybeChildPlan
     }
+  }
 
   private def mayAppendMergingSessionExec(
       groupingExpressions: Seq[NamedExpression],
       aggregateExpressions: Seq[AggregateExpression],
       partialAggregate: SparkPlan): SparkPlan = {
-
     groupingExpressions.find(_.metadata.contains(SessionWindow.marker)) match {
       case Some(sessionExpression) =>
         val aggExpressions = aggregateExpressions.map(_.copy(mode = PartialMerge))

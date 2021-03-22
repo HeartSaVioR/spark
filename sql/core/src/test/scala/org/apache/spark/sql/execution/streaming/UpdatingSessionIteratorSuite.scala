@@ -323,8 +323,11 @@ class UpdatingSessionIteratorSuite extends SharedSparkSession {
 
     val noKeySessionAttribute = noKeyRowAttributes.filter(attr => attr.name == "session").head
 
-    def createNoKeyRow(sessionStart: Long, sessionEnd: Long,
-                       aggVal1: Long, aggVal2: Double): UnsafeRow = {
+    def createNoKeyRow(
+        sessionStart: Long,
+        sessionEnd: Long,
+        aggVal1: Long,
+        aggVal2: Double): UnsafeRow = {
       val genericRow = new GenericInternalRow(4)
       val session: Array[Any] = new Array[Any](2)
       session(0) = sessionStart
@@ -340,8 +343,11 @@ class UpdatingSessionIteratorSuite extends SharedSparkSession {
       rowProjection(genericRow)
     }
 
-    def assertNoKeyRowsEqualsWithNewSession(expectedRow: InternalRow, retRow: InternalRow,
-                                            newSessionStart: Long, newSessionEnd: Long): Unit = {
+    def assertNoKeyRowsEqualsWithNewSession(
+        expectedRow: InternalRow,
+        retRow: InternalRow,
+        newSessionStart: Long,
+        newSessionEnd: Long): Unit = {
       assert(retRow.getStruct(0, 2).getLong(0) == newSessionStart)
       assert(retRow.getStruct(0, 2).getLong(1) == newSessionEnd)
       assert(retRow.getLong(1) === expectedRow.getLong(1))
@@ -370,8 +376,13 @@ class UpdatingSessionIteratorSuite extends SharedSparkSession {
     assert(iterator.hasNext === false)
   }
 
-  private def createRow(key1: String, key2: Int, sessionStart: Long, sessionEnd: Long,
-                        aggVal1: Long, aggVal2: Double): UnsafeRow = {
+  private def createRow(
+      key1: String,
+      key2: Int,
+      sessionStart: Long,
+      sessionEnd: Long,
+      aggVal1: Long,
+      aggVal2: Double): UnsafeRow = {
     val genericRow = new GenericInternalRow(6)
     if (key1 != null) {
       genericRow.update(0, UTF8String.fromString(key1))
@@ -407,8 +418,11 @@ class UpdatingSessionIteratorSuite extends SharedSparkSession {
     assert(doubleEquals(retRow.getDouble(3), expectedRow.getDouble(3)))
   }
 
-  private def assertRowsEqualsWithNewSession(expectedRow: InternalRow, retRow: InternalRow,
-                                             newSessionStart: Long, newSessionEnd: Long): Unit = {
+  private def assertRowsEqualsWithNewSession(
+      expectedRow: InternalRow,
+      retRow: InternalRow,
+      newSessionStart: Long,
+      newSessionEnd: Long): Unit = {
     assert(retRow.getString(0) === expectedRow.getString(0))
     assert(retRow.getInt(1) === expectedRow.getInt(1))
     assert(retRow.getStruct(2, 2).getLong(0) == newSessionStart)
@@ -416,5 +430,4 @@ class UpdatingSessionIteratorSuite extends SharedSparkSession {
     assert(retRow.getLong(3) === expectedRow.getLong(3))
     assert(doubleEquals(retRow.getDouble(3), expectedRow.getDouble(3)))
   }
-
 }

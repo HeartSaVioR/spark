@@ -24,7 +24,18 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
 import org.apache.spark.sql.execution.ExternalAppendOnlyUnsafeRowArray
 
-// FIXME: javadoc!!
+/**
+ * This class calculates and updates the session window for each element in the given iterator,
+ * which makes elements in the same session window having same session spec. Downstream can apply
+ * aggregation to finally merge these elements bound to the same session window.
+ *
+ * This class works on the precondition that given iterator is sorted by "group keys + start time
+ * of session window", and modified iterator still retains the characteristic of the sort.
+ *
+ * This class copies the elements to safely update on each element, as well as buffers elements
+ * which are bound to the same session window. Due to such overheads, [[MergingSessionsIterator]]
+ * should be used whenever possible.
+ */
 class UpdatingSessionIterator(
     iter: Iterator[InternalRow],
     groupingExpressions: Seq[NamedExpression],
@@ -33,8 +44,6 @@ class UpdatingSessionIterator(
     inMemoryThreshold: Int,
     spillThreshold: Int) extends Iterator[InternalRow] {
 
-  val sessionIndex = inputSchema.indexOf(sessionExpression)
-
   private val groupingWithoutSession: Seq[NamedExpression] =
     groupingExpressions.diff(Seq(sessionExpression))
   private val groupingWithoutSessionAttributes: Seq[Attribute] =
@@ -42,22 +51,22 @@ class UpdatingSessionIterator(
   private[this] val groupingWithoutSessionProjection: UnsafeProjection =
     UnsafeProjection.create(groupingWithoutSession, inputSchema)
 
-  val valuesExpressions: Seq[Attribute] = inputSchema.diff(groupingWithoutSession)
+  private val valuesExpressions: Seq[Attribute] = inputSchema.diff(groupingWithoutSession)
 
   private[this] val sessionProjection: UnsafeProjection =
     UnsafeProjection.create(Seq(sessionExpression), inputSchema)
 
-  var currentKeys: InternalRow = _
-  var currentSession: UnsafeRow = _
+  private var currentKeys: InternalRow = _
+  private var currentSession: UnsafeRow = _
 
-  var currentRows: ExternalAppendOnlyUnsafeRowArray = new ExternalAppendOnlyUnsafeRowArray(
+  private var currentRows: ExternalAppendOnlyUnsafeRowArray = new ExternalAppendOnlyUnsafeRowArray(
     inMemoryThreshold, spillThreshold)
 
-  var returnRows: ExternalAppendOnlyUnsafeRowArray = _
-  var returnRowsIter: Iterator[InternalRow] = _
-  var errorOnIterator: Boolean = false
+  private var returnRows: ExternalAppendOnlyUnsafeRowArray = _
+  private var returnRowsIter: Iterator[InternalRow] = _
+  private var errorOnIterator: Boolean = false
 
-  val processedKeys: mutable.HashSet[InternalRow] = new mutable.HashSet[InternalRow]()
+  private val processedKeys: mutable.HashSet[InternalRow] = new mutable.HashSet[InternalRow]()
 
   override def hasNext: Boolean = {
     assertIteratorNotCorrupted()
@@ -127,8 +136,10 @@ class UpdatingSessionIterator(
     returnRowsIter.next()
   }
 
-  private def startNewSession(currentRow: InternalRow, groupingKey: UnsafeRow,
-                              sessionStruct: UnsafeRow): Unit = {
+  private def startNewSession(
+      currentRow: InternalRow,
+      groupingKey: UnsafeRow,
+      sessionStruct: UnsafeRow): Unit = {
     if (processedKeys.contains(groupingKey)) {
       handleBrokenPreconditionForSort()
     }
@@ -161,12 +172,6 @@ class UpdatingSessionIterator(
   private def handleBrokenPreconditionForSort(): Unit = {
     errorOnIterator = true
     throw new IllegalStateException("The iterator must be sorted by key and session start!")
-  }
-
-  private def createSessionRow(): InternalRow = {
-    val sessionRow = new SpecificInternalRow(Seq(sessionExpression.toAttribute).toStructType)
-    sessionRow.update(0, currentSession)
-    sessionRow
   }
 
   private val join = new JoinedRow
@@ -215,5 +220,4 @@ class UpdatingSessionIterator(
       throw new IllegalStateException("The iterator is already corrupted.")
     }
   }
-
 }

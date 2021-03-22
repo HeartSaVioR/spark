@@ -25,9 +25,20 @@ import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.execution.{SparkPlan, UnaryExecNode}
 import org.apache.spark.sql.execution.metric.SQLMetrics
 
-// FIXME: javadoc should provide precondition that input must be sorted
-// or both required child distribution as well as required child ordering should be presented
-// to guarantee input will be sorted
+/**
+ * This node is a variant of SortAggregateExec which merges the session windows based on the fact
+ * child node will provide inputs as sorted by group keys + the start time of session window.
+ *
+ * When merging windows, it also applies aggregations on merged window, which eliminates the
+ * necessity on buffering inputs (which requires copying rows) and update the session spec
+ * for each input.
+ *
+ * This class receives requiredChildDistribution from caller, to enable merging session in
+ * local partition before shuffling. Specifying both parameters to None won't trigger shuffle,
+ * but sort would still happen per local partition.
+ *
+ * Refer [[MergingSessionsIterator]] for more details.
+ */
 case class MergingSessionsExec(
     requiredChildDistributionExpressions: Option[Seq[Expression]],
     requiredChildDistributionOption: Option[Seq[Distribution]],
@@ -39,7 +50,7 @@ case class MergingSessionsExec(
     resultExpressions: Seq[NamedExpression],
     child: SparkPlan) extends UnaryExecNode {
 
-  val keyWithoutSessionExpressions = groupingExpressions.diff(Seq(sessionExpression))
+  private val keyWithoutSessionExpressions = groupingExpressions.diff(Seq(sessionExpression))
 
   private[this] val aggregateBufferAttributes = {
     aggregateExpressions.flatMap(_.aggregateFunction.aggBufferAttributes)

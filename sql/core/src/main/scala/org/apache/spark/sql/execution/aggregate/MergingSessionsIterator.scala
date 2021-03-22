@@ -23,10 +23,14 @@ import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
 import org.apache.spark.sql.execution.metric.SQLMetric
 
-// FIXME: javadoc!
-// FIXME: test suite needed? implementations of AggregationIterator don't seem to have
-//  individual test suite
-// FIXME: groupingExpressions should contain sessionExpression
+/**
+ * This is a variant of SortAggregateIterator which merges the session windows based on the fact
+ * input rows are sorted by "group keys + the start time of session window".
+ *
+ * When merging windows, it also applies aggregations on merged window, which eliminates the
+ * necessity on buffering inputs (which requires copying rows) and update the session spec
+ * for each input.
+ */
 class MergingSessionsIterator(
     partIndex: Int,
     groupingExpressions: Seq[NamedExpression],
@@ -52,7 +56,6 @@ class MergingSessionsIterator(
   val groupingWithoutSession: Seq[NamedExpression] =
     groupingExpressions.diff(Seq(sessionExpression))
   val groupingWithoutSessionAttributes: Seq[Attribute] = groupingWithoutSession.map(_.toAttribute)
-
 
   /**
    * Creates a new aggregation buffer and initializes buffer values
@@ -101,8 +104,6 @@ class MergingSessionsIterator(
 
   private[this] val groupingWithoutSessionProjection: UnsafeProjection =
     UnsafeProjection.create(groupingWithoutSession, valueAttributes)
-
-  private[this] val sessionIndex = resultExpressions.indexOf(sessionExpression)
 
   private[this] val sessionProjection: UnsafeProjection =
     UnsafeProjection.create(Seq(sessionExpression), valueAttributes)

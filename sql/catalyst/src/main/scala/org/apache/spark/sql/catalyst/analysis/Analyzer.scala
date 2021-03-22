@@ -3954,7 +3954,7 @@ object TimeWindowing extends Rule[LogicalPlan] {
   }
 }
 
-// FIXME: javadoc
+/** Maps a time column to a session window. */
 object SessionWindowing extends Rule[LogicalPlan] {
   import org.apache.spark.sql.catalyst.dsl.expressions._
 
@@ -3962,7 +3962,13 @@ object SessionWindowing extends Rule[LogicalPlan] {
   private final val SESSION_START = "start"
   private final val SESSION_END = "end"
 
-  // FIXME: javadoc
+  /**
+   * Generates the logical plan for generating session window on a timestamp column.
+   * Each session window is initially defined as [timestamp, timestamp + gap).
+   *
+   * This also adds a marker to the session column so that downstream can easily find the column
+   * on session window.
+   */
   def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsUp {
     case p: LogicalPlan if p.children.size == 1 =>
       val child = p.children.head

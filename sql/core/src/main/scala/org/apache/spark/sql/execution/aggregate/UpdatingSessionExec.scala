@@ -19,19 +19,36 @@ package org.apache.spark.sql.execution.aggregate
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Attribute, SortOrder}
-import org.apache.spark.sql.catalyst.plans.physical.{Distribution, Partitioning}
+import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, SortOrder}
+import org.apache.spark.sql.catalyst.plans.physical.{AllTuples, ClusteredDistribution, Distribution, Partitioning}
 import org.apache.spark.sql.execution.{SparkPlan, UnaryExecNode}
 
-// FIXME: javadoc should provide precondition that input must be sorted
-// or both required child distribution as well as required child ordering should be presented
-// to guarantee input will be sorted
+/**
+ * This node is a variant of SortAggregateExec which merges the session windows based on the fact
+ * child node will provide inputs as sorted by group keys + the start time of session window.
+ *
+ * When merging windows, it also applies aggregations on merged window, which eliminates the
+ * necessity on buffering inputs (which requires copying rows) and update the session spec
+ * for each input.
+ *
+ * There are lots of overhead compared to [[MergingSessionsExec]]. Use [[MergingSessionsExec]]
+ * instead whenever possible. Use this node when we have to leverage the nodes other than
+ * [[MergingSessionsExec]] to apply aggregation.
+ *
+ * Refer [[UpdatingSessionIterator]] for more details.
+ */
 case class UpdatingSessionExec(
     keyExpressions: Seq[Attribute],
     sessionExpression: Attribute,
-    optRequiredChildDistribution: Option[Seq[Distribution]],
-    optRequiredChildOrdering: Option[Seq[Seq[SortOrder]]],
     child: SparkPlan) extends UnaryExecNode {
+
+  private val groupWithoutSessionExpression = keyExpressions.filterNot {
+    p => p.semanticEquals(sessionExpression)
+  }
+  private val groupingWithoutSessionAttributes = groupWithoutSessionExpression.map(_.toAttribute)
+
+  val childOrdering = Seq((groupingWithoutSessionAttributes ++ Seq(sessionExpression))
+    .map(SortOrder(_, Ascending)))
 
   override protected def doExecute(): RDD[InternalRow] = {
     val inMemoryThreshold = sqlContext.conf.windowExecBufferInMemoryThreshold
@@ -47,13 +64,16 @@ case class UpdatingSessionExec(
 
   override def outputPartitioning: Partitioning = child.outputPartitioning
 
-  override def requiredChildDistribution: Seq[Distribution] = optRequiredChildDistribution match {
-    case Some(distribution) => distribution
-    case None => super.requiredChildDistribution
+  override def requiredChildDistribution: Seq[Distribution] = {
+    if (groupWithoutSessionExpression.isEmpty) {
+      AllTuples :: Nil
+    } else {
+      ClusteredDistribution(groupWithoutSessionExpression) :: Nil
+    }
   }
 
-  override def requiredChildOrdering: Seq[Seq[SortOrder]] = optRequiredChildOrdering match {
-    case Some(ordering) => ordering
-    case None => super.requiredChildOrdering
+  override def requiredChildOrdering: Seq[Seq[SortOrder]] = {
+    Seq((groupingWithoutSessionAttributes ++ Seq(sessionExpression))
+      .map(SortOrder(_, Ascending)))
   }
 }

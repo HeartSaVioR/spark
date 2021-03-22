@@ -443,7 +443,12 @@ case class StateStoreSaveExec(
   }
 }
 
-// FIXME: javadoc!
+/**
+ * This class sorts input rows and existing sessions in state and provides output rows as
+ * sorted by "group keys + start time of session window".
+ *
+ * Refer [[MergingSortWithSessionWindowStateIterator]] for more details.
+ */
 case class SessionWindowStateStoreRestoreExec(
     keyWithoutSessionExpressions: Seq[Attribute],
     sessionExpression: Attribute,
@@ -538,7 +543,6 @@ case class SessionWindowStateStoreSaveExec(
   private val childOutputSchema = child.output.toStructType
   private val stateValueSchema = new StructType().add("values", ArrayType(childOutputSchema))
   private val childEncoder = RowEncoder(childOutputSchema).resolveAndBind().createDeserializer()
-  private val encoder = RowEncoder(stateValueSchema).resolveAndBind().createSerializer()
 
   override protected def doExecute(): RDD[InternalRow] = {
     metrics // force lazy init at driver
