@@ -696,12 +696,14 @@ case class SessionWindowStateStoreSaveExec(
 
       private def applyChangesOnKey(): Unit = {
         if (curValuesOnKey.nonEmpty) {
-          if (needFilter) {
+          val updatedRows = if (needFilter) {
             replaceModifyWindow(curKey, curValuesOnKey.toSeq, stateManager)
           } else {
             stateManager.putStates(curKey, curValuesOnKey.toSeq)
+            curValuesOnKey.length
           }
-          numUpdatedStateRows += curValuesOnKey.length
+
+          numUpdatedStateRows += updatedRows
           curValuesOnKey.clear
         }
       }
@@ -761,15 +763,17 @@ case class SessionWindowStateStoreSaveExec(
   private def replaceModifyWindow(
       key: UnsafeRow,
       values: Seq[UnsafeRow],
-      stateManager: StreamingSessionWindowStateManager) {
+      stateManager: StreamingSessionWindowStateManager): Long = {
     val savedStates = stateManager.getStates(key)
     if (savedStates.isEmpty) {
       stateManager.putStates(key, values.toSeq)
+      values.length
     } else {
       // get origin state from state store by specified key
       // filter out the window which have overlapped with new state
       val newStates = removeOverlapWindow(values.toSeq, savedStates)
       stateManager.putStates(key, newStates)
+      newStates.length
     }
   }
 
