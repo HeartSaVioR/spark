@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.execution.streaming.state
 
+import scala.collection.mutable.ArrayBuffer
+
 import org.apache.hadoop.conf.Configuration
 
 import org.apache.spark.sql.catalyst.InternalRow
@@ -24,6 +26,7 @@ import org.apache.spark.sql.catalyst.expressions.{Attribute, Literal, SpecificIn
 import org.apache.spark.sql.catalyst.util.ArrayData
 import org.apache.spark.sql.execution.streaming.StatefulOperatorStateInfo
 import org.apache.spark.sql.types.{ArrayType, StructType, TimestampType}
+import org.apache.spark.util.NextIterator
 
 /**
  * Base trait for state manager purposed to be used from streaming session window aggregation.
@@ -96,6 +99,18 @@ sealed trait StreamingSessionWindowStateManager extends Serializable {
    */
   def updateMetrics(updateFunc: StateStoreMetrics => Unit)
 
+  /**
+   * Remove using a predicate on values.
+   *
+   * At a high level, this produces an iterator over the values such that value satisfies the
+   * predicate, where producing an element removes the value from the state store and producing
+   * all elements with a given key updates it accordingly.
+   *
+   * This implies the iterator must be consumed fully without any other operations on this manager
+   * or the underlying store being interleaved.
+   */
+  def removeByValueCondition(removalCondition: UnsafeRow => Boolean): Iterator[UnsafeRow]
+
   def allStateStoreNames(): Seq[String]
 
   /**
@@ -152,6 +167,70 @@ abstract class StreamingSessionWindowStateManagerBaseImpl(
 
   override def getStartTime(row: InternalRow): Long =
     timeProjector(row).getStruct(0, 2).getLong(0)
+
+  override def removeByValueCondition(
+      removalCondition: UnsafeRow => Boolean): Iterator[UnsafeRow] = {
+    new NextIterator[UnsafeRow] {
+      var curKey: UnsafeRow = null
+      var curStartTimeList: Seq[Long] = Seq.empty
+      var startTimeIdx: Int = -1
+      var updatedStartTimes: ArrayBuffer[Long] = ArrayBuffer.empty
+
+      val allKeysIter = getAllKeys()
+
+      def internalHasNext(): Boolean = {
+        while ((curKey == null || startTimeIdx >= curStartTimeList.size) &&
+          allKeysIter.hasNext) {
+          updateState()
+          curKey = allKeysIter.next()
+          curStartTimeList = getStartTimeList(curKey)
+          startTimeIdx = 0
+        }
+        if (curKey == null ||
+          (startTimeIdx >= curStartTimeList.size && !allKeysIter.hasNext)) {
+          updateState()
+          false
+        } else {
+          true
+        }
+      }
+
+      private def updateState(): Unit = {
+        if (curKey != null) {
+          if (curStartTimeList.nonEmpty && updatedStartTimes.isEmpty) {
+            removeKey(curKey)
+          } else {
+            putStartTimeList(curKey, updatedStartTimes.toSeq)
+          }
+          updatedStartTimes.clear()
+        }
+      }
+
+      override protected def getNext(): UnsafeRow = {
+        var removedValueRow: UnsafeRow = null
+        while (internalHasNext() && removedValueRow == null) {
+          val row = getState(curKey, curStartTimeList(startTimeIdx))
+          if (removalCondition(row)) {
+            // Evict the row from the state store.
+            removedValueRow = row
+            removeState(curKey, curStartTimeList(startTimeIdx))
+          } else {
+            updatedStartTimes += curStartTimeList(startTimeIdx)
+          }
+          startTimeIdx += 1
+        }
+
+        if (removedValueRow == null) {
+          finished = true
+          null
+        } else {
+          removedValueRow
+        }
+      }
+
+      override protected def close(): Unit = {}
+    }
+  }
 }
 
 /**

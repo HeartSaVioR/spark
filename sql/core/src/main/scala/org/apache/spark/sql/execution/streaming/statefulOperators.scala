@@ -593,69 +593,24 @@ case class SessionWindowStateStoreSaveExec(
           }
 
           val removalStartTimeNs = System.nanoTime
-          val allKeysIter = stateStoreManager.getAllKeys()
 
           new NextIterator[InternalRow] {
-            var curKey: UnsafeRow = null
-            var curStartTimeList: Seq[Long] = Seq.empty
-            var startTimeIdx: Int = -1
-            var updatedStartTimes: ArrayBuffer[Long] = ArrayBuffer.empty
-
-            def internalHasNext(): Boolean = {
-              while ((curKey == null || startTimeIdx >= curStartTimeList.size) &&
-                allKeysIter.hasNext) {
-                updateState()
-                curKey = allKeysIter.next()
-                curStartTimeList = stateStoreManager.getStartTimeList(curKey)
-                startTimeIdx = 0
-              }
-              if (curKey == null ||
-                (startTimeIdx >= curStartTimeList.size && !allKeysIter.hasNext)) {
-                updateState()
-                false
-              } else {
-                true
-              }
-            }
-
-            private def updateState(): Unit = {
-              if (curKey != null) {
-                if (curStartTimeList.nonEmpty && updatedStartTimes.isEmpty) {
-                  stateStoreManager.removeKey(curKey)
-                } else {
-                  stateStoreManager.putStartTimeList(curKey, updatedStartTimes.toSeq)
-                }
-                updatedStartTimes.clear()
-              }
-            }
+            private val evictedIter = stateStoreManager.removeByValueCondition(
+              watermarkPredicateForData.get.eval)
 
             override protected def getNext(): InternalRow = {
-              var removedValueRow: InternalRow = null
-              while (internalHasNext() && removedValueRow == null) {
-                val row = stateStoreManager.getState(curKey, curStartTimeList(startTimeIdx))
-                if (watermarkPredicateForData.get.eval(row)) {
-                  // Evict the row from the state store.
-                  removedValueRow = row
-                  stateStoreManager.removeState(curKey, curStartTimeList(startTimeIdx))
-                } else {
-                  updatedStartTimes += curStartTimeList(startTimeIdx)
-                }
-                startTimeIdx += 1
-              }
-
-              if (removedValueRow == null) {
+              if (evictedIter.hasNext) {
+                numOutputRows += 1
+                evictedIter.next()
+              } else {
                 finished = true
                 null
-              } else {
-                removedValueRow
               }
             }
 
             override protected def close(): Unit = {
               allRemovalsTimeMs += NANOSECONDS.toMillis(System.nanoTime - removalStartTimeNs)
-              commitTimeMs += timeTakenMs {
-                stateStoreManager.commit()
-              }
+              commitTimeMs += timeTakenMs { stateStoreManager.commit() }
               updateStateMetrics(stateStoreManager)
             }
           }
@@ -696,6 +651,9 @@ case class SessionWindowStateStoreSaveExec(
     stateStoreManager.updateMetrics(updater)
   }
 
+  // FIXME: if we could convert this logic to provide iterator which is same as iter
+  //  applied watermark predicate but also put state to the state manager, that would become the
+  //  implementation of update mode.
   private def putToStore(
       baseIter: Iterator[InternalRow],
       stateManager: StreamingSessionWindowStateManager,
