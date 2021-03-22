@@ -293,8 +293,6 @@ class StreamingSessionWindowSuite extends StreamTest
     }
   }
 
-  // FIXME: commented out due to not support of update mode. let's uncomment after fixing.
-  /*
   testWithAllOptionsMergingSessionInLocalPartition("update mode - session window") {
     // Implements StructuredSessionization.scala leveraging "session" function
     // as a test, to verify the sessionization works with simple example
@@ -417,7 +415,6 @@ class StreamingSessionWindowSuite extends StreamTest
       )
     )
   }
-   */
 
   testWithAllOptionsMergingSessionInLocalPartition("update mode - session window - no key") {
     val inputData = MemoryStream[Int]

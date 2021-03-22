@@ -33,7 +33,7 @@ import org.apache.spark.sql.execution.streaming.state.StreamingSessionWindowStat
  * The output rows are sorted with "group keys + start time of session window", which is same as
  * the sort condition on input rows.
  */
-// FIXME: test suite needed?
+// TODO: test suite needed?
 class MergingSortWithSessionWindowStateIterator(
     iter: Iterator[InternalRow],
     stateManager: StreamingSessionWindowStateManager,

@@ -21,6 +21,7 @@ import java.sql.Timestamp
 import java.util.UUID
 import java.util.concurrent.TimeUnit._
 
+import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
 
@@ -615,7 +616,33 @@ case class SessionWindowStateStoreSaveExec(
             }
           }
 
-        // FIXME: implement UPDATE mode
+        case Some(Update) =>
+          val iterPutToStore = iteratorPutToStore(iter, stateStoreManager, true, true)
+          new NextIterator[InternalRow] {
+            private val updatesStartTimeNs = System.nanoTime
+
+            override protected def getNext(): InternalRow = {
+              if (iterPutToStore.hasNext) {
+                iterPutToStore.next()
+              } else {
+                finished = true
+                null
+              }
+            }
+
+            override protected def close(): Unit = {
+              allUpdatesTimeMs += NANOSECONDS.toMillis(System.nanoTime - updatesStartTimeNs)
+
+              allRemovalsTimeMs += timeTakenMs {
+                watermarkPredicateForData.foreach { pred =>
+                  stateStoreManager.removeByValueCondition(pred.eval)
+                }
+              }
+              commitTimeMs += timeTakenMs { stateStoreManager.commit() }
+              updateStateMetrics(stateStoreManager)
+            }
+          }
+
         case _ => throw new UnsupportedOperationException(s"Invalid output mode: $outputMode")
       }
     }
@@ -651,13 +678,11 @@ case class SessionWindowStateStoreSaveExec(
     stateStoreManager.updateMetrics(updater)
   }
 
-  // FIXME: if we could convert this logic to provide iterator which is same as iter
-  //  applied watermark predicate but also put state to the state manager, that would become the
-  //  implementation of update mode.
-  private def putToStore(
+  private def iteratorPutToStore(
       baseIter: Iterator[InternalRow],
       stateManager: StreamingSessionWindowStateManager,
-      needFilter: Boolean) {
+      needFilter: Boolean,
+      returnOnlyUpdatedRows: Boolean): Iterator[InternalRow] = {
     val numUpdatedStateRows = longMetric("numUpdatedStateRows")
     val iter = if (needFilter) {
       baseIter.filter(row => !watermarkPredicateForData.get.eval(row))
@@ -665,37 +690,68 @@ case class SessionWindowStateStoreSaveExec(
       baseIter
     }
 
-    var preKey: UnsafeRow = null
-    val values = new ArrayBuffer[UnsafeRow]()
-    while (iter.hasNext) {
-      val row = iter.next().asInstanceOf[UnsafeRow]
-      val key = stateManager.getKey(row)
-      if (preKey == null || preKey == key) {
+    new NextIterator[InternalRow] {
+      var curKey: UnsafeRow = null
+      val curValuesOnKey = new ArrayBuffer[UnsafeRow]()
+
+      private def applyChangesOnKey(): Unit = {
+        if (curValuesOnKey.nonEmpty) {
+          if (needFilter) {
+            replaceModifyWindow(curKey, curValuesOnKey.toSeq, stateManager)
+          } else {
+            stateManager.putStates(curKey, curValuesOnKey.toSeq)
+          }
+          numUpdatedStateRows += curValuesOnKey.length
+          curValuesOnKey.clear
+        }
+      }
+
+      @tailrec
+      override protected def getNext(): InternalRow = {
+        if (!iter.hasNext) {
+          applyChangesOnKey()
+          finished = true
+          return null
+        }
+
+        val row = iter.next().asInstanceOf[UnsafeRow]
+        val key = stateManager.getKey(row)
+
+        if (curKey == null || curKey != key) {
+          // new group appears
+          applyChangesOnKey()
+          curKey = key.copy()
+        }
+
         // must copy the row, for this row is a reference in iterator and
         // will change when iter.next
-        values += row.copy
-      } else {
-        if (needFilter) {
-          replaceModifyWindow(preKey, values.toSeq, stateManager)
+        curValuesOnKey += row.copy
+
+        if (!returnOnlyUpdatedRows) {
+          row
         } else {
-          stateManager.putStates(preKey, values.toSeq)
+          val startTime = stateManager.getStartTime(row)
+          val stateRow = stateManager.getState(key, startTime)
+          if (stateRow == null || !stateRow.equals(row)) {
+            row
+          } else {
+            // current row isn't the "updated" row, continue to the next row
+            getNext()
+          }
         }
-        numUpdatedStateRows += 1
-
-        // clear buffer
-        values.clear
-        values += row.copy
       }
-      preKey = key.copy
+
+      override protected def close(): Unit = {}
     }
+  }
 
-    if (values.nonEmpty) {
-      if (needFilter) {
-        replaceModifyWindow(preKey, values.toSeq, stateManager)
-      } else {
-        stateManager.putStates(preKey, values.toSeq)
-      }
-      values.clear
+  private def putToStore(
+      baseIter: Iterator[InternalRow],
+      stateManager: StreamingSessionWindowStateManager,
+      needFilter: Boolean) {
+    val iterPutToStore = iteratorPutToStore(baseIter, stateManager, needFilter, false)
+    while (iterPutToStore.hasNext) {
+      iterPutToStore.next()
     }
   }
 
