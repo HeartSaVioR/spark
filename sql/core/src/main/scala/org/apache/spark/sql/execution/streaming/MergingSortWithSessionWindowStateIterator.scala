@@ -50,8 +50,11 @@ class MergingSortWithSessionWindowStateIterator(
       GenerateUnsafeProjection.generate(Seq(sessionExpression), inputSchema))
   }
 
-  private case class SessionRowInformation(keys: UnsafeRow, sessionStart: Long, sessionEnd: Long,
-                                           row: InternalRow)
+  private case class SessionRowInformation(
+      keys: UnsafeRow,
+      sessionStart: Long,
+      sessionEnd: Long,
+      row: InternalRow)
 
   private object SessionRowInformation {
     def of(row: InternalRow): SessionRowInformation = {
