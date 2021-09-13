@@ -23,7 +23,7 @@ import org.apache.hadoop.conf.Configuration
 
 import org.apache.spark.benchmark.Benchmark
 import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, UnsafeProjection, UnsafeRow}
-import org.apache.spark.sql.execution.streaming.state.{HDFSBackedStateStoreProvider, RocksDBStateStoreProvider, StateStoreConf, StateStoreId, StateStoreProvider}
+import org.apache.spark.sql.execution.streaming.state.{HDFSBackedStateStoreProvider, RocksDBStateStoreProvider, StateStore, StateStoreConf, StateStoreId, StateStoreProvider}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructType}
 import org.apache.spark.unsafe.types.UTF8String
@@ -44,9 +44,10 @@ import org.apache.spark.util.Utils
  */
 object StateStoreBenchmark extends SqlBasedBenchmark {
 
-  private val numOfRows = 100000
+  private val numOfRows: Seq[Int] = Seq(250000, 500000, 750000, 1000000)
 
-  // TODO: need to have update rates
+  // 50%, 25%, 10%, 5%, 1%, no update
+  private val updateRates: Seq[Int] = Seq(50, 25, 10, 5, 1, 0)
 
   // 50%, 25%, 10%, 5%, 1%, no evict
   private val evictRates: Seq[(Int, Int)] = Seq((2, 50), (4, 25), (10, 10), (20, 5), (100, 1),
@@ -60,63 +61,83 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
   private val valueProjection = UnsafeProjection.create(valueSchema)
 
   override def runBenchmarkSuite(mainArgs: Array[String]): Unit = {
-    runBenchmark("full scan") {
-      val testData = constructTestData(numOfRows)
+    runBenchmark("simulate eviction") {
+      val testData = constructTestData(numOfRows.last)
 
-      val inMemoryProvider = newHDFSBackedStateStoreProvider()
-      val inMemoryStore = inMemoryProvider.getStore(0)
+      numOfRows.foreach { numOfRow =>
+        val curData = testData.take(numOfRow)
 
-      val rocksDBProvider = newRocksDBStateProvider()
-      val rocksDBStore = rocksDBProvider.getStore(0)
+        val inMemoryProvider = newHDFSBackedStateStoreProvider()
+        val inMemoryStore = inMemoryProvider.getStore(0)
 
-      testData.foreach { case (key, value) =>
-        inMemoryStore.put(key, value)
-        rocksDBStore.put(key, value)
-      }
+        val rocksDBProvider = newRocksDBStateProvider()
+        val rocksDBStore = rocksDBProvider.getStore(0)
 
-      val newVersionForInMemory = inMemoryStore.commit()
-      val newVersionForRocksDB = rocksDBStore.commit()
-
-      evictRates.foreach { case (evictModVal, evictRate) =>
-        val benchmark = new Benchmark(s"simulating evict on $numOfRows rows, evict rate " +
-          s"$evictRate %", numOfRows, output = output)
-
-        benchmark.addTimerCase("HDFSBackedStateStoreProvider", 1000) { timer =>
-          val inMemoryStore2 = inMemoryProvider.getStore(newVersionForInMemory)
-
-          timer.startTiming()
-          inMemoryStore2.iterator().foreach { r =>
-            if (r.key.getInt(1) % evictModVal == 0) {
-              inMemoryStore2.remove(r.key)
-            }
-          }
-          timer.stopTiming()
-
-          inMemoryStore2.abort()
+        curData.foreach { case (key, value) =>
+          inMemoryStore.put(key, value)
+          rocksDBStore.put(key, value)
         }
 
-        benchmark.addTimerCase("RocksDBStateStoreProvider", 1000) { timer =>
-          val rocksDBStore2 = rocksDBProvider.getStore(newVersionForRocksDB)
+        val newVersionForInMemory = inMemoryStore.commit()
+        val newVersionForRocksDB = rocksDBStore.commit()
 
-          timer.startTiming()
-          rocksDBStore2.iterator().foreach { r =>
-            if (r.key.getInt(1) % evictModVal == 0) {
-              rocksDBStore2.remove(r.key)
+        updateRates.foreach { updateRate =>
+          val numRowsUpdate = numOfRow / 100 * updateRate
+
+          evictRates.foreach { case (evictModVal, evictRate) =>
+            val benchmark = new Benchmark(s"simulating evict on $numOfRow rows, update " +
+              s"$numRowsUpdate rows ($updateRate %), evict rate $evictRate %",
+              numOfRow, output = output)
+
+            benchmark.addTimerCase("HDFSBackedStateStoreProvider", 1000) { timer =>
+              val inMemoryStore2 = inMemoryProvider.getStore(newVersionForInMemory)
+
+              timer.startTiming()
+              insertRows(inMemoryStore2, numRows = numRowsUpdate, minIdx = numOfRows.last)
+              evictAsFullScanAndRemove(inMemoryStore2, evictModVal)
+              timer.stopTiming()
+
+              inMemoryStore2.abort()
             }
+
+            benchmark.addTimerCase("RocksDBStateStoreProvider", 1000) { timer =>
+              val rocksDBStore2 = rocksDBProvider.getStore(newVersionForRocksDB)
+
+              timer.startTiming()
+              insertRows(rocksDBStore2, numRows = numRowsUpdate, minIdx = numOfRows.last)
+              evictAsFullScanAndRemove(rocksDBStore2, evictModVal)
+              timer.stopTiming()
+
+              rocksDBStore2.abort()
+            }
+
+            benchmark.run()
           }
-          timer.stopTiming()
 
-          rocksDBStore2.abort()
+          inMemoryProvider.close()
+          rocksDBProvider.close()
         }
-
-        benchmark.run()
       }
-
-      inMemoryProvider.close()
-      rocksDBProvider.close()
     }
   }
 
+  private def insertRows(store: StateStore, numRows: Int, minIdx: Int): Unit = {
+
+  }
+
+  private def evictAsScanningIndexAndRemove(store: StateStore, evictMod: Int): Unit = {
+
+  }
+
+  private def evictAsFullScanAndRemove(store: StateStore, evictMod: Int): Unit = {
+    store.iterator().foreach { r =>
+      if (r.key.getInt(1) % evictMod == 0) {
+        store.remove(r.key)
+      }
+    }
+  }
+
+  // FIXME: should the size of key / value be variables?
   private def constructTestData(numRows: Int): Seq[(UnsafeRow, UnsafeRow)] = {
     (1 to numRows).map { idx =>
       val keyRow = new GenericInternalRow(2)
