@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.execution.benchmark
 
+import java.{util => jutil}
+
 import scala.util.Random
 
 import org.apache.hadoop.conf.Configuration
@@ -44,14 +46,15 @@ import org.apache.spark.util.Utils
  */
 object StateStoreBenchmark extends SqlBasedBenchmark {
 
-  private val numOfRows: Seq[Int] = Seq(250000, 500000, 750000, 1000000)
+  private val numOfRows: Seq[Int] = Seq(10000, 50000, 100000, 500000, 1000000)
 
-  // 50%, 25%, 10%, 5%, 1%, no update
-  private val updateRates: Seq[Int] = Seq(50, 25, 10, 5, 1, 0)
+  // 100%, 75%, 50%, 25%, 10%, 5%, 1%, no update
+  // rate is relative to the number of rows in prev. batch
+  private val updateRates: Seq[Int] = Seq(100, 75, 50, 25, 10, 5, 1, 0)
 
-  // 50%, 25%, 10%, 5%, 1%, no evict
-  private val evictRates: Seq[(Int, Int)] = Seq((2, 50), (4, 25), (10, 10), (20, 5), (100, 1),
-    (Int.MaxValue, 0))
+  // 100%, 75%, 50%, 25%, 10%, 5%, 1%, no evict
+  // rate is relative to the number of rows in prev. batch
+  private val evictRates: Seq[Int] = Seq(100, 75, 50, 25, 10, 5, 1, 0)
 
   private val keySchema = StructType(
     Seq(StructField("key1", StringType, true), StructField("key2", IntegerType, true)))
@@ -61,9 +64,9 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
   private val valueProjection = UnsafeProjection.create(valueSchema)
 
   override def runBenchmarkSuite(mainArgs: Array[String]): Unit = {
-    runBenchmark("simulate eviction") {
-      val testData = constructTestData(numOfRows.last)
+    val testData = constructTestData(numOfRows.last)
 
+    runBenchmark("simulate eviction") {
       numOfRows.foreach { numOfRow =>
         val curData = testData.take(numOfRow)
 
@@ -73,10 +76,16 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
         val rocksDBProvider = newRocksDBStateProvider()
         val rocksDBStore = rocksDBProvider.getStore(0)
 
-        curData.foreach { case (key, value) =>
-          inMemoryStore.put(key, value)
-          rocksDBStore.put(key, value)
-        }
+        val indexForInMemoryStore = new jutil.concurrent.ConcurrentSkipListMap[
+          Int, jutil.List[UnsafeRow]]()
+        val indexForRocksDBStore = new jutil.concurrent.ConcurrentSkipListMap[
+          Int, jutil.List[UnsafeRow]]()
+
+        updateRowsWithSortedMapIndex(inMemoryStore, indexForInMemoryStore, curData)
+        updateRowsWithSortedMapIndex(rocksDBStore, indexForRocksDBStore, curData)
+
+        assert(indexForInMemoryStore.size() == numOfRow)
+        assert(indexForRocksDBStore.size() == numOfRow)
 
         val newVersionForInMemory = inMemoryStore.commit()
         val newVersionForRocksDB = rocksDBStore.commit()
@@ -87,9 +96,11 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
           val numRowsUpdate = numOfRow / 100 * updateRate
           val curRowsToUpdate = rowsToUpdate.take(numRowsUpdate)
 
-          evictRates.foreach { case (evictModVal, evictRate) =>
+          evictRates.foreach { evictRate =>
+            val maxIdxToEvict = numOfRow / 100 * evictRate
+
             val benchmark = new Benchmark(s"simulating evict on $numOfRow rows, update " +
-              s"$numRowsUpdate rows ($updateRate %), evict rate $evictRate %",
+              s"$numRowsUpdate rows ($updateRate %), evict $maxIdxToEvict rows ($evictRate %)",
               numOfRow, output = output)
 
             benchmark.addTimerCase("HDFSBackedStateStoreProvider", 1000) { timer =>
@@ -97,8 +108,34 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
 
               timer.startTiming()
               updateRows(inMemoryStore2, curRowsToUpdate)
-              evictAsFullScanAndRemove(inMemoryStore2, evictModVal)
+              evictAsFullScanAndRemove(inMemoryStore2, maxIdxToEvict)
               timer.stopTiming()
+
+              inMemoryStore2.abort()
+            }
+
+            benchmark.addTimerCase("HDFSBackedStateStoreProvider - sorted map index",
+              1000) { timer =>
+
+              val inMemoryStore2 = inMemoryProvider.getStore(newVersionForInMemory)
+
+              val curIndex = new jutil.concurrent.ConcurrentSkipListMap[Int,
+                jutil.List[UnsafeRow]]()
+              curIndex.putAll(indexForInMemoryStore)
+
+              assert(curIndex.size() == numOfRow)
+
+              timer.startTiming()
+              updateRowsWithSortedMapIndex(inMemoryStore2, curIndex, curRowsToUpdate)
+
+              assert(curIndex.size() == numOfRow + curRowsToUpdate.size)
+
+              evictAsScanSortedMapIndexAndRemove(inMemoryStore2, curIndex, maxIdxToEvict)
+              timer.stopTiming()
+
+              assert(curIndex.size() == numOfRow + curRowsToUpdate.size - maxIdxToEvict)
+
+              curIndex.clear()
 
               inMemoryStore2.abort()
             }
@@ -108,33 +145,103 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
 
               timer.startTiming()
               updateRows(rocksDBStore2, curRowsToUpdate)
-              evictAsFullScanAndRemove(rocksDBStore2, evictModVal)
+              evictAsFullScanAndRemove(rocksDBStore2, maxIdxToEvict)
               timer.stopTiming()
+
+              rocksDBStore2.abort()
+            }
+
+            benchmark.addTimerCase("RocksDBStateStoreProvider - sorted map index",
+              1000) { timer =>
+
+              val rocksDBStore2 = rocksDBProvider.getStore(newVersionForRocksDB)
+
+              val curIndex = new jutil.concurrent.ConcurrentSkipListMap[Int,
+                jutil.List[UnsafeRow]]()
+              curIndex.putAll(indexForRocksDBStore)
+
+              assert(curIndex.size() == numOfRow)
+
+              timer.startTiming()
+              updateRowsWithSortedMapIndex(rocksDBStore2, curIndex, curRowsToUpdate)
+
+              assert(curIndex.size() == numOfRow + curRowsToUpdate.size)
+
+              evictAsScanSortedMapIndexAndRemove(rocksDBStore2, curIndex, maxIdxToEvict)
+              timer.stopTiming()
+
+              assert(curIndex.size() == numOfRow + curRowsToUpdate.size - maxIdxToEvict)
+
+              curIndex.clear()
 
               rocksDBStore2.abort()
             }
 
             benchmark.run()
           }
-
-          inMemoryProvider.close()
-          rocksDBProvider.close()
         }
+
+        inMemoryProvider.close()
+        rocksDBProvider.close()
       }
     }
   }
 
-  private def updateRows(store: StateStore, rows: Seq[(UnsafeRow, UnsafeRow)]): Unit = {
+  private def updateRows(
+      store: StateStore,
+      rows: Seq[(UnsafeRow, UnsafeRow)]): Unit = {
     rows.foreach { case (key, value) =>
       store.put(key, value)
     }
   }
 
-  private def evictAsFullScanAndRemove(store: StateStore, evictMod: Int): Unit = {
+  private def evictAsFullScanAndRemove(
+      store: StateStore,
+      maxIdxToEvict: Int): Unit = {
     store.iterator().foreach { r =>
-      if (r.key.getInt(1) % evictMod == 0) {
+      if (r.key.getInt(1) < maxIdxToEvict) {
         store.remove(r.key)
       }
+    }
+  }
+
+  private def updateRowsWithSortedMapIndex(
+      store: StateStore,
+      index: jutil.SortedMap[Int, jutil.List[UnsafeRow]],
+      rows: Seq[(UnsafeRow, UnsafeRow)]): Unit = {
+    rows.foreach { case (key, value) =>
+      val idx = key.getInt(1)
+
+      // TODO: rewrite this in atomic way?
+      if (index.containsKey(idx)) {
+        val list = index.get(idx)
+        list.add(key)
+      } else {
+        val list = new jutil.ArrayList[UnsafeRow]()
+        list.add(key)
+        index.put(idx, list)
+      }
+
+      store.put(key, value)
+    }
+  }
+
+  private def evictAsScanSortedMapIndexAndRemove(
+      store: StateStore,
+      index: jutil.SortedMap[Int, jutil.List[UnsafeRow]],
+      maxIdxToEvict: Int): Unit = {
+    val keysToRemove = index.headMap(maxIdxToEvict + 1)
+    val keysToRemoveIter = keysToRemove.entrySet().iterator()
+    while (keysToRemoveIter.hasNext) {
+      val entry = keysToRemoveIter.next()
+      val keys = entry.getValue
+      val keysIter = keys.iterator()
+      while (keysIter.hasNext) {
+        val key = keysIter.next()
+        store.remove(key)
+      }
+      keys.clear()
+      keysToRemoveIter.remove()
     }
   }
 
