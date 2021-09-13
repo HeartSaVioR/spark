@@ -81,8 +81,11 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
         val newVersionForInMemory = inMemoryStore.commit()
         val newVersionForRocksDB = rocksDBStore.commit()
 
+        val rowsToUpdate = constructTestData(numOfRow / 100 * updateRates.last,
+          minIdx = numOfRow + 1)
         updateRates.foreach { updateRate =>
           val numRowsUpdate = numOfRow / 100 * updateRate
+          val curRowsToUpdate = rowsToUpdate.take(numRowsUpdate)
 
           evictRates.foreach { case (evictModVal, evictRate) =>
             val benchmark = new Benchmark(s"simulating evict on $numOfRow rows, update " +
@@ -93,7 +96,7 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
               val inMemoryStore2 = inMemoryProvider.getStore(newVersionForInMemory)
 
               timer.startTiming()
-              insertRows(inMemoryStore2, numRows = numRowsUpdate, minIdx = numOfRows.last)
+              updateRows(inMemoryStore2, curRowsToUpdate)
               evictAsFullScanAndRemove(inMemoryStore2, evictModVal)
               timer.stopTiming()
 
@@ -104,7 +107,7 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
               val rocksDBStore2 = rocksDBProvider.getStore(newVersionForRocksDB)
 
               timer.startTiming()
-              insertRows(rocksDBStore2, numRows = numRowsUpdate, minIdx = numOfRows.last)
+              updateRows(rocksDBStore2, curRowsToUpdate)
               evictAsFullScanAndRemove(rocksDBStore2, evictModVal)
               timer.stopTiming()
 
@@ -121,12 +124,10 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
     }
   }
 
-  private def insertRows(store: StateStore, numRows: Int, minIdx: Int): Unit = {
-
-  }
-
-  private def evictAsScanningIndexAndRemove(store: StateStore, evictMod: Int): Unit = {
-
+  private def updateRows(store: StateStore, rows: Seq[(UnsafeRow, UnsafeRow)]): Unit = {
+    rows.foreach { case (key, value) =>
+      store.put(key, value)
+    }
   }
 
   private def evictAsFullScanAndRemove(store: StateStore, evictMod: Int): Unit = {
@@ -138,13 +139,13 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
   }
 
   // FIXME: should the size of key / value be variables?
-  private def constructTestData(numRows: Int): Seq[(UnsafeRow, UnsafeRow)] = {
+  private def constructTestData(numRows: Int, minIdx: Int = 0): Seq[(UnsafeRow, UnsafeRow)] = {
     (1 to numRows).map { idx =>
       val keyRow = new GenericInternalRow(2)
       keyRow.update(0, UTF8String.fromString("a"))
-      keyRow.setInt(1, idx)
+      keyRow.setInt(1, minIdx + idx)
       val valueRow = new GenericInternalRow(1)
-      valueRow.setInt(0, idx)
+      valueRow.setInt(0, minIdx + idx)
 
       val keyUnsafeRow = keyProjection(keyRow).copy()
       val valueUnsafeRow = valueProjection(valueRow).copy()
