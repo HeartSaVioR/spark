@@ -44,9 +44,14 @@ import org.apache.spark.util.Utils
  */
 object StateStoreBenchmark extends SqlBasedBenchmark {
 
-  // private val maxNumOfRows = 1000000
-  private val maxNumOfRows = 1000000
-  private val minNumOfRows = 1000000
+  private val numOfRows = 100000
+
+  // TODO: need to have update rates
+
+  // 50%, 25%, 10%, 5%, 1%, no evict
+  private val evictRates: Seq[(Int, Int)] = Seq((2, 50), (4, 25), (10, 10), (20, 5), (100, 1),
+    (Int.MaxValue, 0))
+
   private val keySchema = StructType(
     Seq(StructField("key1", StringType, true), StructField("key2", IntegerType, true)))
   private val valueSchema = StructType(Seq(StructField("value", IntegerType, true)))
@@ -56,37 +61,32 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
 
   override def runBenchmarkSuite(mainArgs: Array[String]): Unit = {
     runBenchmark("full scan") {
-      val testData = constructTestData(maxNumOfRows)
-      var curNumOfRows = minNumOfRows
+      val testData = constructTestData(numOfRows)
 
-      while (curNumOfRows <= maxNumOfRows) {
-        val curTestData = testData.take(curNumOfRows)
+      val inMemoryProvider = newHDFSBackedStateStoreProvider()
+      val inMemoryStore = inMemoryProvider.getStore(0)
 
-        val benchmark = new Benchmark(s"full scan on $curNumOfRows rows",
-          curNumOfRows, output = output)
+      val rocksDBProvider = newRocksDBStateProvider()
+      val rocksDBStore = rocksDBProvider.getStore(0)
 
-        val inMemoryProvider = newHDFSBackedStateStoreProvider()
-        val inMemoryStore = inMemoryProvider.getStore(0)
+      testData.foreach { case (key, value) =>
+        inMemoryStore.put(key, value)
+        rocksDBStore.put(key, value)
+      }
 
-        val rocksDBProvider = newRocksDBStateProvider()
-        val rocksDBStore = rocksDBProvider.getStore(0)
+      val newVersionForInMemory = inMemoryStore.commit()
+      val newVersionForRocksDB = rocksDBStore.commit()
 
-        curTestData.foreach { case (key, value) =>
-          inMemoryStore.put(key, value)
-          rocksDBStore.put(key, value)
-        }
-
-        val newVersionForInMemory = inMemoryStore.commit()
-        val newVersionForRocksDB = rocksDBStore.commit()
-
-        val evictRate = 10 // 1/10
+      evictRates.foreach { case (evictModVal, evictRate) =>
+        val benchmark = new Benchmark(s"simulating evict on $numOfRows rows, evict rate " +
+          s"$evictRate %", numOfRows, output = output)
 
         benchmark.addTimerCase("HDFSBackedStateStoreProvider", 1000) { timer =>
           val inMemoryStore2 = inMemoryProvider.getStore(newVersionForInMemory)
 
           timer.startTiming()
           inMemoryStore2.iterator().foreach { r =>
-            if (r.key.getInt(1) % evictRate == 0) {
+            if (r.key.getInt(1) % evictModVal == 0) {
               inMemoryStore2.remove(r.key)
             }
           }
@@ -100,7 +100,7 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
 
           timer.startTiming()
           rocksDBStore2.iterator().foreach { r =>
-            if (r.key.getInt(1) % evictRate == 0) {
+            if (r.key.getInt(1) % evictModVal == 0) {
               rocksDBStore2.remove(r.key)
             }
           }
@@ -110,12 +110,10 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
         }
 
         benchmark.run()
-
-        inMemoryProvider.close()
-        rocksDBProvider.close()
-
-        curNumOfRows *= 10
       }
+
+      inMemoryProvider.close()
+      rocksDBProvider.close()
     }
   }
 
