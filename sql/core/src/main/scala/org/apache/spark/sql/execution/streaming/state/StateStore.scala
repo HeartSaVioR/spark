@@ -130,6 +130,11 @@ trait StateStore extends ReadStateStore {
    */
   override def iterator(): Iterator[UnsafeRowPair]
 
+  /** FIXME: method doc */
+  def evictOnWatermark(
+      watermarkMs: Long,
+      altPred: UnsafeRowPair => Boolean): Iterator[UnsafeRowPair]
+
   /** Current metrics of the state store */
   def metrics: StateStoreMetrics
 
@@ -229,6 +234,19 @@ class InvalidUnsafeRowException
     "checkpoint or use the legacy Spark version to process the streaming state.", null)
 
 /**
+ * FIXME: classdoc
+ *
+ * @param numColsPrefixKey The number of leftmost columns to be used as prefix key.
+ *                         A value not greater than 0 means the operator doesn't activate prefix
+ *                         key, and the operator should not call prefixScan method in StateStore.
+ * @param eventTimeColIdx  column specifying event time for the row. only works when the column
+ *                         is in the key. array type as the column can be struct type.
+ */
+case class StatefulOperatorContext(
+    numColsPrefixKey: Int = 0,
+    eventTimeColIdx: Array[Int] = Array.empty)
+
+/**
  * Trait representing a provider that provide [[StateStore]] instances representing
  * versions of state data.
  *
@@ -255,9 +273,7 @@ trait StateStoreProvider {
    * @param stateStoreId Id of the versioned StateStores that this provider will generate
    * @param keySchema Schema of keys to be stored
    * @param valueSchema Schema of value to be stored
-   * @param numColsPrefixKey The number of leftmost columns to be used as prefix key.
-   *                         A value not greater than 0 means the operator doesn't activate prefix
-   *                         key, and the operator should not call prefixScan method in StateStore.
+   * @param operatorContext FIXME: ...
    * @param storeConfs Configurations used by the StateStores
    * @param hadoopConf Hadoop configuration that could be used by StateStore to save state data
    */
@@ -265,7 +281,7 @@ trait StateStoreProvider {
       stateStoreId: StateStoreId,
       keySchema: StructType,
       valueSchema: StructType,
-      numColsPrefixKey: Int,
+      operatorContext: StatefulOperatorContext,
       storeConfs: StateStoreConf,
       hadoopConf: Configuration): Unit
 
@@ -318,11 +334,11 @@ object StateStoreProvider {
       providerId: StateStoreProviderId,
       keySchema: StructType,
       valueSchema: StructType,
-      numColsPrefixKey: Int,
+      operatorContext: StatefulOperatorContext,
       storeConf: StateStoreConf,
       hadoopConf: Configuration): StateStoreProvider = {
     val provider = create(storeConf.providerClass)
-    provider.init(providerId.storeId, keySchema, valueSchema, numColsPrefixKey,
+    provider.init(providerId.storeId, keySchema, valueSchema, operatorContext,
       storeConf, hadoopConf)
     provider
   }
@@ -471,13 +487,13 @@ object StateStore extends Logging {
       storeProviderId: StateStoreProviderId,
       keySchema: StructType,
       valueSchema: StructType,
-      numColsPrefixKey: Int,
+      operatorContext: StatefulOperatorContext,
       version: Long,
       storeConf: StateStoreConf,
       hadoopConf: Configuration): ReadStateStore = {
     require(version >= 0)
     val storeProvider = getStateStoreProvider(storeProviderId, keySchema, valueSchema,
-      numColsPrefixKey, storeConf, hadoopConf)
+      operatorContext, storeConf, hadoopConf)
     storeProvider.getReadStore(version)
   }
 
@@ -486,13 +502,13 @@ object StateStore extends Logging {
       storeProviderId: StateStoreProviderId,
       keySchema: StructType,
       valueSchema: StructType,
-      numColsPrefixKey: Int,
+      operatorContext: StatefulOperatorContext,
       version: Long,
       storeConf: StateStoreConf,
       hadoopConf: Configuration): StateStore = {
     require(version >= 0)
     val storeProvider = getStateStoreProvider(storeProviderId, keySchema, valueSchema,
-      numColsPrefixKey, storeConf, hadoopConf)
+      operatorContext, storeConf, hadoopConf)
     storeProvider.getStore(version)
   }
 
@@ -500,7 +516,7 @@ object StateStore extends Logging {
       storeProviderId: StateStoreProviderId,
       keySchema: StructType,
       valueSchema: StructType,
-      numColsPrefixKey: Int,
+      operatorContext: StatefulOperatorContext,
       storeConf: StateStoreConf,
       hadoopConf: Configuration): StateStoreProvider = {
     loadedProviders.synchronized {
@@ -527,7 +543,7 @@ object StateStore extends Logging {
       val provider = loadedProviders.getOrElseUpdate(
         storeProviderId,
         StateStoreProvider.createAndInit(
-          storeProviderId, keySchema, valueSchema, numColsPrefixKey, storeConf, hadoopConf)
+          storeProviderId, keySchema, valueSchema, operatorContext, storeConf, hadoopConf)
       )
       val otherProviderIds = loadedProviders.keys.filter(_ != storeProviderId).toSeq
       val providerIdsToUnload = reportActiveStoreInstance(storeProviderId, otherProviderIds)

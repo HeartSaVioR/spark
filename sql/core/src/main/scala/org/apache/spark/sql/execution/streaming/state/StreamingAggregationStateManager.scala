@@ -51,6 +51,12 @@ sealed trait StreamingAggregationStateManager extends Serializable {
   /** Remove a single non-null key from the target state store. */
   def remove(store: StateStore, key: UnsafeRow): Unit
 
+  // FIXME: method doc!
+  def evictOnWatermark(
+    store: StateStore,
+    watermarkMs: Long,
+    altPred: UnsafeRowPair => Boolean): Iterator[UnsafeRowPair]
+
   /** Return an iterator containing all the key-value pairs in target state store. */
   def iterator(store: ReadStateStore): Iterator[UnsafeRowPair]
 
@@ -128,6 +134,13 @@ class StreamingAggregationStateManagerImplV1(
   override def values(store: ReadStateStore): Iterator[UnsafeRow] = {
     store.iterator().map(_.value)
   }
+
+  override def evictOnWatermark(
+      store: StateStore,
+      watermarkMs: Long,
+      altPred: UnsafeRowPair => Boolean): Iterator[UnsafeRowPair] = {
+    store.evictOnWatermark(watermarkMs, altPred)
+  }
 }
 
 /**
@@ -184,6 +197,16 @@ class StreamingAggregationStateManagerImplV2(
 
   override def iterator(store: ReadStateStore): Iterator[UnsafeRowPair] = {
     store.iterator().map(rowPair => new UnsafeRowPair(rowPair.key, restoreOriginalRow(rowPair)))
+  }
+
+
+  override def evictOnWatermark(
+      store: StateStore,
+      watermarkMs: Long,
+      altPred: UnsafeRowPair => Boolean): Iterator[UnsafeRowPair] = {
+    store.evictOnWatermark(watermarkMs, altPred).map { rowPair =>
+      new UnsafeRowPair(rowPair.key, restoreOriginalRow(rowPair))
+    }
   }
 
   override def values(store: ReadStateStore): Iterator[UnsafeRow] = {

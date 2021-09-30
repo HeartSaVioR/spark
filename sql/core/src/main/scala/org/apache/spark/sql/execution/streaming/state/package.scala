@@ -35,14 +35,14 @@ package object state {
         stateInfo: StatefulOperatorStateInfo,
         keySchema: StructType,
         valueSchema: StructType,
-        numColsPrefixKey: Int)(
+        operatorContext: StatefulOperatorContext)(
         storeUpdateFunction: (StateStore, Iterator[T]) => Iterator[U]): StateStoreRDD[T, U] = {
 
       mapPartitionsWithStateStore(
         stateInfo,
         keySchema,
         valueSchema,
-        numColsPrefixKey,
+        operatorContext,
         sqlContext.sessionState,
         Some(sqlContext.streams.stateStoreCoordinator))(
         storeUpdateFunction)
@@ -53,7 +53,7 @@ package object state {
         stateInfo: StatefulOperatorStateInfo,
         keySchema: StructType,
         valueSchema: StructType,
-        numColsPrefixKey: Int,
+        operatorContext: StatefulOperatorContext,
         sessionState: SessionState,
         storeCoordinator: Option[StateStoreCoordinatorRef],
         extraOptions: Map[String, String] = Map.empty)(
@@ -77,7 +77,7 @@ package object state {
         stateInfo.storeVersion,
         keySchema,
         valueSchema,
-        numColsPrefixKey,
+        operatorContext,
         sessionState,
         storeCoordinator,
         extraOptions)
@@ -88,7 +88,7 @@ package object state {
         stateInfo: StatefulOperatorStateInfo,
         keySchema: StructType,
         valueSchema: StructType,
-        numColsPrefixKey: Int,
+        operatorContext: StatefulOperatorContext,
         sessionState: SessionState,
         storeCoordinator: Option[StateStoreCoordinatorRef],
         extraOptions: Map[String, String] = Map.empty)(
@@ -112,7 +112,7 @@ package object state {
         stateInfo.storeVersion,
         keySchema,
         valueSchema,
-        numColsPrefixKey,
+        operatorContext,
         sessionState,
         storeCoordinator,
         extraOptions)

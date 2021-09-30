@@ -270,8 +270,8 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
 
     def generateStoreVersions(): Unit = {
       for (i <- 1 to 20) {
-        val store = StateStore.get(storeProviderId1, keySchema, valueSchema, numColsPrefixKey = 0,
-          latestStoreVersion, storeConf, hadoopConf)
+        val store = StateStore.get(storeProviderId1, keySchema, valueSchema,
+          StatefulOperatorContext(), latestStoreVersion, storeConf, hadoopConf)
         put(store, "a", 0, i)
         store.commit()
         latestStoreVersion += 1
@@ -324,7 +324,7 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
           }
 
           // Reload the store and verify
-          StateStore.get(storeProviderId1, keySchema, valueSchema, numColsPrefixKey = 0,
+          StateStore.get(storeProviderId1, keySchema, valueSchema, StatefulOperatorContext(),
             latestStoreVersion, storeConf, hadoopConf)
           assert(StateStore.isLoaded(storeProviderId1))
 
@@ -336,7 +336,7 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
           }
 
           // Reload the store and verify
-          StateStore.get(storeProviderId1, keySchema, valueSchema, numColsPrefixKey = 0,
+          StateStore.get(storeProviderId1, keySchema, valueSchema, StatefulOperatorContext(),
             latestStoreVersion, storeConf, hadoopConf)
           assert(StateStore.isLoaded(storeProviderId1))
 
@@ -344,7 +344,7 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
           // then this executor should unload inactive instances immediately.
           coordinatorRef
             .reportActiveInstance(storeProviderId1, "other-host", "other-exec", Seq.empty)
-          StateStore.get(storeProviderId2, keySchema, valueSchema, numColsPrefixKey = 0,
+          StateStore.get(storeProviderId2, keySchema, valueSchema, StatefulOperatorContext(),
             0, storeConf, hadoopConf)
           assert(!StateStore.isLoaded(storeProviderId1))
           assert(StateStore.isLoaded(storeProviderId2))
@@ -453,7 +453,7 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
     // Getting the store should not create temp file
     val store0 = shouldNotCreateTempFile {
       StateStore.get(
-        storeId, keySchema, valueSchema, numColsPrefixKey = 0,
+        storeId, keySchema, valueSchema, StatefulOperatorContext(),
         version = 0, storeConf, hadoopConf)
     }
 
@@ -470,7 +470,7 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
     // Remove should create a temp file
     val store1 = shouldNotCreateTempFile {
       StateStore.get(
-        storeId, keySchema, valueSchema, numColsPrefixKey = 0,
+        storeId, keySchema, valueSchema, StatefulOperatorContext(),
         version = 1, storeConf, hadoopConf)
     }
     remove(store1, _._1 == "a")
@@ -485,7 +485,7 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
     // Commit without any updates should create a delta file
     val store2 = shouldNotCreateTempFile {
       StateStore.get(
-        storeId, keySchema, valueSchema, numColsPrefixKey = 0,
+        storeId, keySchema, valueSchema, StatefulOperatorContext(),
         version = 2, storeConf, hadoopConf)
     }
     store2.commit()
@@ -720,11 +720,12 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
       hadoopConf: Configuration = new Configuration): HDFSBackedStateStoreProvider = {
     val sqlConf = getDefaultSQLConf(minDeltasForSnapshot, numOfVersToRetainInMemory)
     val provider = new HDFSBackedStateStoreProvider()
+    // FIXME: event time column?
     provider.init(
       StateStoreId(dir, opId, partition),
       keySchema,
       valueSchema,
-      numColsPrefixKey = numColsPrefixKey,
+      StatefulOperatorContext(numColsPrefixKey = numColsPrefixKey),
       new StateStoreConf(sqlConf),
       hadoopConf)
     provider
@@ -1027,31 +1028,31 @@ abstract class StateStoreSuiteBase[ProviderClass <: StateStoreProvider]
       // Verify that trying to get incorrect versions throw errors
       intercept[IllegalArgumentException] {
         StateStore.get(
-          storeId, keySchema, valueSchema, 0, -1, storeConf, hadoopConf)
+          storeId, keySchema, valueSchema, StatefulOperatorContext(), -1, storeConf, hadoopConf)
       }
       assert(!StateStore.isLoaded(storeId)) // version -1 should not attempt to load the store
 
       intercept[IllegalStateException] {
         StateStore.get(
-          storeId, keySchema, valueSchema, 0, 1, storeConf, hadoopConf)
+          storeId, keySchema, valueSchema, StatefulOperatorContext(), 1, storeConf, hadoopConf)
       }
 
       // Increase version of the store and try to get again
       val store0 = StateStore.get(
-        storeId, keySchema, valueSchema, 0, 0, storeConf, hadoopConf)
+        storeId, keySchema, valueSchema, StatefulOperatorContext(), 0, storeConf, hadoopConf)
       assert(store0.version === 0)
       put(store0, "a", 0, 1)
       store0.commit()
 
       val store1 = StateStore.get(
-        storeId, keySchema, valueSchema, 0, 1, storeConf, hadoopConf)
+        storeId, keySchema, valueSchema, StatefulOperatorContext(), 1, storeConf, hadoopConf)
       assert(StateStore.isLoaded(storeId))
       assert(store1.version === 1)
       assert(rowPairsToDataSet(store1.iterator()) === Set(("a", 0) -> 1))
 
       // Verify that you can also load older version
       val store0reloaded = StateStore.get(
-        storeId, keySchema, valueSchema, 0, 0, storeConf, hadoopConf)
+        storeId, keySchema, valueSchema, StatefulOperatorContext(), 0, storeConf, hadoopConf)
       assert(store0reloaded.version === 0)
       assert(rowPairsToDataSet(store0reloaded.iterator()) === Set.empty)
 
@@ -1060,7 +1061,7 @@ abstract class StateStoreSuiteBase[ProviderClass <: StateStoreProvider]
       assert(!StateStore.isLoaded(storeId))
 
       val store1reloaded = StateStore.get(
-        storeId, keySchema, valueSchema, 0, 1, storeConf, hadoopConf)
+        storeId, keySchema, valueSchema, StatefulOperatorContext(), 1, storeConf, hadoopConf)
       assert(StateStore.isLoaded(storeId))
       assert(store1reloaded.version === 1)
       put(store1reloaded, "a", 0, 2)

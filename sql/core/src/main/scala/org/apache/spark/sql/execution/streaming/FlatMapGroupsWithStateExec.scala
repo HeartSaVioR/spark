@@ -224,21 +224,23 @@ case class FlatMapGroupsWithStateExec(
           val stateStoreId = StateStoreId(
             stateInfo.get.checkpointLocation, stateInfo.get.operatorId, partitionId)
           val storeProviderId = StateStoreProviderId(stateStoreId, stateInfo.get.queryRunId)
+          // FIXME: would setting prefixScan / evict help?
           val store = StateStore.get(
             storeProviderId,
             groupingAttributes.toStructType,
             stateManager.stateSchema,
-            numColsPrefixKey = 0,
+            StatefulOperatorContext(),
             stateInfo.get.storeVersion, storeConf, hadoopConfBroadcast.value.value)
           val processor = new InputProcessor(store)
           processDataWithPartition(childDataIterator, store, processor, Some(initStateIterator))
       }
     } else {
+      // FIXME: would setting prefixScan / evict help?
       child.execute().mapPartitionsWithStateStore[InternalRow](
         getStateInfo,
         groupingAttributes.toStructType,
         stateManager.stateSchema,
-        numColsPrefixKey = 0,
+        StatefulOperatorContext(),
         session.sqlContext.sessionState,
         Some(session.sqlContext.streams.stateStoreCoordinator)
       ) { case (store: StateStore, singleIterator: Iterator[InternalRow]) =>
@@ -334,6 +336,7 @@ case class FlatMapGroupsWithStateExec(
             throw new IllegalStateException(
               s"Cannot filter timed out keys for $timeoutConf")
         }
+        // FIXME: would setting prefixScan / evict help?
         val timingOutPairs = stateManager.getAllState(store).filter { state =>
           state.timeoutTimestamp != NO_TIMESTAMP && state.timeoutTimestamp < timeoutThreshold
         }

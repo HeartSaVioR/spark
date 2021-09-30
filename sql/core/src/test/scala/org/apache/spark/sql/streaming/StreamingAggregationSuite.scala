@@ -35,7 +35,7 @@ import org.apache.spark.sql.execution.{SparkPlan, UnaryExecNode}
 import org.apache.spark.sql.execution.exchange.Exchange
 import org.apache.spark.sql.execution.streaming._
 import org.apache.spark.sql.execution.streaming.sources.MemorySink
-import org.apache.spark.sql.execution.streaming.state.{StateSchemaNotCompatible, StateStore, StreamingAggregationStateManager}
+import org.apache.spark.sql.execution.streaming.state.{HDFSBackedStateStoreProvider, RocksDBStateStoreProvider, StateSchemaNotCompatible, StateStore, StreamingAggregationStateManager}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.OutputMode._
@@ -53,29 +53,47 @@ class StreamingAggregationSuite extends StateStoreMetricsTest with Assertions {
   import testImplicits._
 
   def executeFuncWithStateVersionSQLConf(
+      providerCls: String,
       stateVersion: Int,
       confPairs: Seq[(String, String)],
       func: => Any): Unit = {
     withSQLConf(confPairs ++
-      Seq(SQLConf.STREAMING_AGGREGATION_STATE_FORMAT_VERSION.key -> stateVersion.toString): _*) {
+      Seq(
+        SQLConf.STREAMING_AGGREGATION_STATE_FORMAT_VERSION.key -> stateVersion.toString,
+        SQLConf.STATE_STORE_PROVIDER_CLASS.key -> providerCls.stripSuffix("$")): _*) {
       func
     }
   }
 
   def testWithAllStateVersions(name: String, confPairs: (String, String)*)
                               (func: => Any): Unit = {
-    for (version <- StreamingAggregationStateManager.supportedVersions) {
-      test(s"$name - state format version $version") {
-        executeFuncWithStateVersionSQLConf(version, confPairs, func)
+    val providers = Seq(
+      // FIXME: testing...
+      // classOf[HDFSBackedStateStoreProvider].getCanonicalName,
+      classOf[RocksDBStateStoreProvider].getCanonicalName)
+
+    for (
+      version <- StreamingAggregationStateManager.supportedVersions;
+      provider <- providers
+    ) yield {
+      test(s"$name - state format version $version / provider: $provider") {
+        executeFuncWithStateVersionSQLConf(provider, version, confPairs, func)
       }
     }
   }
 
   def testQuietlyWithAllStateVersions(name: String, confPairs: (String, String)*)
                                      (func: => Any): Unit = {
-    for (version <- StreamingAggregationStateManager.supportedVersions) {
-      testQuietly(s"$name - state format version $version") {
-        executeFuncWithStateVersionSQLConf(version, confPairs, func)
+    val providers = Seq(
+      classOf[HDFSBackedStateStoreProvider].getCanonicalName,
+      classOf[RocksDBStateStoreProvider].getCanonicalName)
+
+    for (
+      version <- StreamingAggregationStateManager.supportedVersions;
+      provider <- providers
+    ) yield {
+      testQuietly(s"$name - state format version $version / provider: $provider") {
+        executeFuncWithStateVersionSQLConf(provider, version, confPairs, func)
       }
     }
   }

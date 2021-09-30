@@ -87,8 +87,9 @@ class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvid
         queryRunId = UUID.randomUUID, operatorId = 0, storeVersion = 0, numPartitions = 5)
 
       // Create state store in a task and get the RocksDBConf from the instantiated RocksDB instance
+      // FIXME: event time column?
       val rocksDBConfInTask: RocksDBConf = testRDD.mapPartitionsWithStateStore[RocksDBConf](
-        spark.sqlContext, testStateInfo, testSchema, testSchema, 0) {
+        spark.sqlContext, testStateInfo, testSchema, testSchema, StatefulOperatorContext()) {
           (store: StateStore, _: Iterator[String]) =>
             // Use reflection to get RocksDB instance
             val dbInstanceMethod =
@@ -144,7 +145,8 @@ class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvid
       numColsPrefixKey: Int): RocksDBStateStoreProvider = {
     val provider = new RocksDBStateStoreProvider()
     provider.init(
-      storeId, keySchema, valueSchema, numColsPrefixKey = numColsPrefixKey,
+      storeId, keySchema, valueSchema,
+      StatefulOperatorContext(numColsPrefixKey = numColsPrefixKey),
       new StateStoreConf, new Configuration)
     provider
   }

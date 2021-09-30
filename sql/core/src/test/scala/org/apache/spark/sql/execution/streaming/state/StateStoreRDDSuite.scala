@@ -60,13 +60,13 @@ class StateStoreRDDSuite extends SparkFunSuite with BeforeAndAfter with BeforeAn
       val path = Utils.createDirectory(tempDir, Random.nextFloat.toString).toString
       val rdd1 = makeRDD(spark.sparkContext, Seq(("a", 0), ("b", 0), ("a", 0)))
         .mapPartitionsWithStateStore(spark.sqlContext, operatorStateInfo(path, version = 0),
-          keySchema, valueSchema, numColsPrefixKey = 0)(increment)
+          keySchema, valueSchema, StatefulOperatorContext())(increment)
       assert(rdd1.collect().toSet === Set(("a", 0) -> 2, ("b", 0) -> 1))
 
       // Generate next version of stores
       val rdd2 = makeRDD(spark.sparkContext, Seq(("a", 0), ("c", 0)))
         .mapPartitionsWithStateStore(spark.sqlContext, operatorStateInfo(path, version = 1),
-          keySchema, valueSchema, numColsPrefixKey = 0)(increment)
+          keySchema, valueSchema, StatefulOperatorContext())(increment)
       assert(rdd2.collect().toSet === Set(("a", 0) -> 3, ("b", 0) -> 1, ("c", 0) -> 1))
 
       // Make sure the previous RDD still has the same data.
@@ -84,7 +84,7 @@ class StateStoreRDDSuite extends SparkFunSuite with BeforeAndAfter with BeforeAn
       implicit val sqlContext = spark.sqlContext
       makeRDD(spark.sparkContext, Seq(("a", 0))).mapPartitionsWithStateStore(
         sqlContext, operatorStateInfo(path, version = storeVersion),
-        keySchema, valueSchema, numColsPrefixKey = 0)(increment)
+        keySchema, valueSchema, StatefulOperatorContext())(increment)
     }
 
     // Generate RDDs and state store data
@@ -134,19 +134,19 @@ class StateStoreRDDSuite extends SparkFunSuite with BeforeAndAfter with BeforeAn
 
       val rddOfGets1 = makeRDD(spark.sparkContext, Seq(("a", 0), ("b", 0), ("c", 0)))
         .mapPartitionsWithStateStore(spark.sqlContext, operatorStateInfo(path, version = 0),
-          keySchema, valueSchema, numColsPrefixKey = 0)(iteratorOfGets)
+          keySchema, valueSchema, StatefulOperatorContext())(iteratorOfGets)
       assert(rddOfGets1.collect().toSet ===
         Set(("a", 0) -> None, ("b", 0) -> None, ("c", 0) -> None))
 
       val rddOfPuts = makeRDD(spark.sparkContext, Seq(("a", 0), ("b", 0), ("a", 0)))
         .mapPartitionsWithStateStore(sqlContext, operatorStateInfo(path, version = 0),
-          keySchema, valueSchema, numColsPrefixKey = 0)(iteratorOfPuts)
+          keySchema, valueSchema, StatefulOperatorContext())(iteratorOfPuts)
       assert(rddOfPuts.collect().toSet ===
         Set(("a", 0) -> 1, ("a", 0) -> 2, ("b", 0) -> 1))
 
       val rddOfGets2 = makeRDD(spark.sparkContext, Seq(("a", 0), ("b", 0), ("c", 0)))
         .mapPartitionsWithStateStore(sqlContext, operatorStateInfo(path, version = 1),
-          keySchema, valueSchema, numColsPrefixKey = 0)(iteratorOfGets)
+          keySchema, valueSchema, StatefulOperatorContext())(iteratorOfGets)
       assert(rddOfGets2.collect().toSet ===
         Set(("a", 0) -> Some(2), ("b", 0) -> Some(1), ("c", 0) -> None))
     }
@@ -172,7 +172,7 @@ class StateStoreRDDSuite extends SparkFunSuite with BeforeAndAfter with BeforeAn
 
         val rdd = makeRDD(spark.sparkContext, Seq(("a", 0), ("b", 0), ("a", 0)))
           .mapPartitionsWithStateStore(sqlContext, operatorStateInfo(path, queryRunId = queryRunId),
-          keySchema, valueSchema, numColsPrefixKey = 0)(increment)
+          keySchema, valueSchema, StatefulOperatorContext())(increment)
         require(rdd.partitions.length === 2)
 
         assert(
@@ -200,13 +200,13 @@ class StateStoreRDDSuite extends SparkFunSuite with BeforeAndAfter with BeforeAn
         val opId = 0
         val rdd1 = makeRDD(spark.sparkContext, Seq(("a", 0), ("b", 0), ("a", 0)))
           .mapPartitionsWithStateStore(sqlContext, operatorStateInfo(path, version = 0),
-            keySchema, valueSchema, numColsPrefixKey = 0)(increment)
+            keySchema, valueSchema, StatefulOperatorContext())(increment)
         assert(rdd1.collect().toSet === Set(("a", 0) -> 2, ("b", 0) -> 1))
 
         // Generate next version of stores
         val rdd2 = makeRDD(spark.sparkContext, Seq(("a", 0), ("c", 0)))
           .mapPartitionsWithStateStore(sqlContext, operatorStateInfo(path, version = 1),
-            keySchema, valueSchema, numColsPrefixKey = 0)(increment)
+            keySchema, valueSchema, StatefulOperatorContext())(increment)
         assert(rdd2.collect().toSet === Set(("a", 0) -> 3, ("b", 0) -> 1, ("c", 0) -> 1))
 
         // Make sure the previous RDD still has the same data.

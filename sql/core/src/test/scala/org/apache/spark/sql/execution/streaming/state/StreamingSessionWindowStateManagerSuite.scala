@@ -181,9 +181,11 @@ class StreamingSessionWindowStateManagerSuite extends StreamTest with BeforeAndA
         stateFormatVersion)
 
       val storeProviderId = StateStoreProviderId(stateInfo, 0, StateStoreId.DEFAULT_STORE_NAME)
+      // FIXME: event time column?
       val store = StateStore.get(
         storeProviderId, manager.getStateKeySchema, manager.getStateValueSchema,
-        manager.getNumColsForPrefixKey, stateInfo.storeVersion, storeConf, new Configuration)
+        StatefulOperatorContext(numColsPrefixKey = manager.getNumColsForPrefixKey),
+        stateInfo.storeVersion, storeConf, new Configuration)
 
       try {
         f(manager, store)

@@ -50,4 +50,18 @@ class MemoryStateStore extends StateStore() {
   override def prefixScan(prefixKey: UnsafeRow): Iterator[UnsafeRowPair] = {
     throw new UnsupportedOperationException("Doesn't support prefix scan!")
   }
+
+  /** FIXME: method doc */
+  override def evictOnWatermark(
+      watermarkMs: Long,
+      altPred: UnsafeRowPair => Boolean): Iterator[UnsafeRowPair] = {
+    iterator().filter { pair =>
+      if (altPred.apply(pair)) {
+        remove(pair.key)
+        true
+      } else {
+        false
+      }
+    }
+  }
 }
