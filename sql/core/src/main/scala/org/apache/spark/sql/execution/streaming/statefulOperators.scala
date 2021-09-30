@@ -237,11 +237,10 @@ trait WatermarkSupport extends SparkPlan {
   protected def removeKeysOlderThanWatermark(store: StateStore): Unit = {
     if (watermarkPredicateForKeys.nonEmpty) {
       val numRemovedStateRows = longMetric("numRemovedStateRows")
-      store.iterator().foreach { rowPair =>
-        if (watermarkPredicateForKeys.get.eval(rowPair.key)) {
-          store.remove(rowPair.key)
-          numRemovedStateRows += 1
-        }
+      store.evictOnWatermark(eventTimeWatermark.get, pair => {
+        watermarkPredicateForKeys.get.eval(pair.key)
+      }).foreach { _ =>
+        numRemovedStateRows += 1
       }
     }
   }
@@ -251,11 +250,10 @@ trait WatermarkSupport extends SparkPlan {
       store: StateStore): Unit = {
     if (watermarkPredicateForKeys.nonEmpty) {
       val numRemovedStateRows = longMetric("numRemovedStateRows")
-      storeManager.keys(store).foreach { keyRow =>
-        if (watermarkPredicateForKeys.get.eval(keyRow)) {
-          storeManager.remove(store, keyRow)
-          numRemovedStateRows += 1
-        }
+      storeManager.evictOnWatermark(store,
+        eventTimeWatermark.get, pair => watermarkPredicateForKeys.get.eval(pair.key)
+      ).foreach { _ =>
+        numRemovedStateRows += 1
       }
     }
   }
@@ -307,7 +305,8 @@ case class StateStoreRestoreExec(
       getStateInfo,
       keyExpressions.toStructType,
       stateManager.getStateValueSchema,
-      numColsPrefixKey = 0,
+      // FIXME: set event time column here!
+      StatefulOperatorContext(),
       session.sessionState,
       Some(session.streams.stateStoreCoordinator)) { case (store, iter) =>
         val hasInput = iter.hasNext
@@ -365,11 +364,26 @@ case class StateStoreSaveExec(
     assert(outputMode.nonEmpty,
       "Incorrect planning in IncrementalExecution, outputMode has not been set")
 
+    val eventTimeIdx = keyExpressions.indexWhere(_.metadata.contains(EventTimeWatermark.delayKey))
+    val eventTimeColIdx = if (eventTimeIdx >= 0) {
+      keyExpressions.toStructType(eventTimeIdx).dataType match {
+        // FIXME: for now, we only consider window operation here, as we do the same in
+        //   WatermarkSupport.watermarkExpression
+        case StructType(_) => Array[Int](eventTimeIdx, 1)
+        case TimestampType => Array[Int](eventTimeIdx)
+        case _ => throw new IllegalStateException(
+          "The type of event time column should be timestamp")
+      }
+    } else {
+      Array.empty[Int]
+    }
+
     child.execute().mapPartitionsWithStateStore(
       getStateInfo,
       keyExpressions.toStructType,
       stateManager.getStateValueSchema,
-      numColsPrefixKey = 0,
+      // FIXME: set event time column here!
+      StatefulOperatorContext(eventTimeColIdx = eventTimeColIdx),
       session.sessionState,
       Some(session.streams.stateStoreCoordinator)) { (store, iter) =>
         val numOutputRows = longMetric("numOutputRows")
@@ -414,18 +428,16 @@ case class StateStoreSaveExec(
             }
 
             val removalStartTimeNs = System.nanoTime
-            val rangeIter = stateManager.iterator(store)
+            val evictedIter = stateManager.evictOnWatermark(store,
+              eventTimeWatermark.get, pair => watermarkPredicateForKeys.get.eval(pair.key))
 
             new NextIterator[InternalRow] {
               override protected def getNext(): InternalRow = {
                 var removedValueRow: InternalRow = null
-                while(rangeIter.hasNext && removedValueRow == null) {
-                  val rowPair = rangeIter.next()
-                  if (watermarkPredicateForKeys.get.eval(rowPair.key)) {
-                    stateManager.remove(store, rowPair.key)
-                    numRemovedStateRows += 1
-                    removedValueRow = rowPair.value
-                  }
+                while(evictedIter.hasNext && removedValueRow == null) {
+                  val rowPair = evictedIter.next()
+                  numRemovedStateRows += 1
+                  removedValueRow = rowPair.value
                 }
                 if (removedValueRow == null) {
                   finished = true
@@ -541,7 +553,8 @@ case class SessionWindowStateStoreRestoreExec(
       getStateInfo,
       stateManager.getStateKeySchema,
       stateManager.getStateValueSchema,
-      numColsPrefixKey = stateManager.getNumColsForPrefixKey,
+      // FIXME: set event time column here!
+      StatefulOperatorContext(stateManager.getNumColsForPrefixKey),
       session.sessionState,
       Some(session.streams.stateStoreCoordinator)) { case (store, iter) =>
 
@@ -618,7 +631,8 @@ case class SessionWindowStateStoreSaveExec(
       getStateInfo,
       stateManager.getStateKeySchema,
       stateManager.getStateValueSchema,
-      numColsPrefixKey = stateManager.getNumColsForPrefixKey,
+      // FIXME: set event time column!
+      StatefulOperatorContext(numColsPrefixKey = stateManager.getNumColsForPrefixKey),
       session.sessionState,
       Some(session.streams.stateStoreCoordinator)) { case (store, iter) =>
 
@@ -652,6 +666,7 @@ case class SessionWindowStateStoreSaveExec(
 
           val removalStartTimeNs = System.nanoTime
           new NextIterator[InternalRow] {
+            // FIXME: can we optimize this case as well?
             private val removedIter = stateManager.removeByValueCondition(
               store, watermarkPredicateForData.get.eval)
 
@@ -751,7 +766,8 @@ case class StreamingDeduplicateExec(
       getStateInfo,
       keyExpressions.toStructType,
       child.output.toStructType,
-      numColsPrefixKey = 0,
+      // FIXME: set event time column!
+      StatefulOperatorContext(),
       session.sessionState,
       Some(session.streams.stateStoreCoordinator),
       // We won't check value row in state store since the value StreamingDeduplicateExec.EMPTY_ROW

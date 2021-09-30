@@ -25,7 +25,8 @@ import org.apache.spark.{SparkConf, SparkEnv}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
 import org.apache.spark.sql.types.StructType
-import org.apache.spark.util.Utils
+import org.apache.spark.unsafe.Platform
+import org.apache.spark.util.{NextIterator, Utils}
 
 private[sql] class RocksDBStateStoreProvider
   extends StateStoreProvider with Logging with Closeable {
@@ -60,12 +61,23 @@ private[sql] class RocksDBStateStoreProvider
       verify(state == UPDATING, "Cannot put after already committed or aborted")
       verify(key != null, "Key cannot be null")
       require(value != null, "Cannot put a null value")
-      rocksDB.put(encoder.encodeKey(key), encoder.encodeValue(value))
+
+      val encodedKey = encoder.encodeKey(key)
+      val encodedValue = encoder.encodeValue(value)
+      rocksDB.put(encodedKey, encodedValue)
+
+      if (encoder.supportEventTimeIndex) {
+        val timestamp = encoder.extractEventTime(key)
+        val tsKey = encoder.encodeEventTimeIndexKey(timestamp, encodedKey)
+
+        rocksDB.put(CF_EVENT_TIME_INDEX, tsKey, Array.empty)
+      }
     }
 
     override def remove(key: UnsafeRow): Unit = {
       verify(state == UPDATING, "Cannot remove after already committed or aborted")
       verify(key != null, "Key cannot be null")
+      // FIXME: this should reflect the index
       rocksDB.remove(encoder.encodeKey(key))
     }
 
@@ -161,13 +173,75 @@ private[sql] class RocksDBStateStoreProvider
 
     /** Return the [[RocksDB]] instance in this store. This is exposed mainly for testing. */
     def dbInstance(): RocksDB = rocksDB
+
+    /** FIXME: method doc */
+    override def evictOnWatermark(
+        watermarkMs: Long,
+        altPred: UnsafeRowPair => Boolean): Iterator[UnsafeRowPair] = {
+
+      if (encoder.supportEventTimeIndex) {
+        val kv = new ByteArrayPair()
+
+        // FIXME: DEBUG
+        // logWarning(s"DEBUG: start iterating event time index, watermark $watermarkMs")
+
+        new NextIterator[UnsafeRowPair] {
+          private val iter = rocksDB.iterator(CF_EVENT_TIME_INDEX)
+          override protected def getNext(): UnsafeRowPair = {
+            if (iter.hasNext) {
+              val pair = iter.next()
+
+              val encodedTs = Platform.getLong(pair.key, Platform.BYTE_ARRAY_OFFSET)
+              val decodedTs = BinarySortable.decodeBinarySortableLong(encodedTs)
+
+              // FIXME: DEBUG
+              // logWarning(s"DEBUG: decoded TS: $decodedTs")
+
+              if (decodedTs > watermarkMs) {
+                finished = true
+                null
+              } else {
+                // FIXME: can we leverage deleteRange to bulk delete on index?
+                rocksDB.remove(CF_EVENT_TIME_INDEX, pair.key)
+                val (_, encodedKey) = encoder.decodeEventTimeIndexKey(pair.key)
+                val value = rocksDB.get(encodedKey)
+                if (value == null) {
+                  throw new IllegalStateException("Event time index has been broken!")
+                }
+                kv.set(encodedKey, value)
+                val rowPair = encoder.decode(kv)
+                rocksDB.remove(encodedKey)
+                rowPair
+              }
+            } else {
+              finished = true
+              null
+            }
+          }
+
+          override protected def close(): Unit = {
+            iter.closeIfNeeded()
+          }
+        }
+      } else {
+        rocksDB.iterator().flatMap { kv =>
+          val rowPair = encoder.decode(kv)
+          if (altPred(rowPair)) {
+            rocksDB.remove(kv.key)
+            Some(rowPair)
+          } else {
+            None
+          }
+        }
+      }
+    }
   }
 
   override def init(
       stateStoreId: StateStoreId,
       keySchema: StructType,
       valueSchema: StructType,
-      numColsPrefixKey: Int,
+      operatorContext: StatefulOperatorContext,
       storeConf: StateStoreConf,
       hadoopConf: Configuration): Unit = {
     this.stateStoreId_ = stateStoreId
@@ -176,11 +250,14 @@ private[sql] class RocksDBStateStoreProvider
     this.storeConf = storeConf
     this.hadoopConf = hadoopConf
 
-    require((keySchema.length == 0 && numColsPrefixKey == 0) ||
-      (keySchema.length > numColsPrefixKey), "The number of columns in the key must be " +
-      "greater than the number of columns for prefix key!")
+    require((keySchema.length == 0 && operatorContext.numColsPrefixKey == 0) ||
+      (keySchema.length > operatorContext.numColsPrefixKey), "The number of columns in the key " +
+      "must be greater than the number of columns for prefix key!")
 
-    this.encoder = RocksDBStateEncoder.getEncoder(keySchema, valueSchema, numColsPrefixKey)
+    this.operatorContext = operatorContext
+
+    this.encoder = RocksDBStateEncoder.getEncoder(keySchema, valueSchema,
+      operatorContext.numColsPrefixKey, operatorContext.eventTimeColIdx)
 
     rocksDB // lazy initialization
   }
@@ -212,6 +289,7 @@ private[sql] class RocksDBStateStoreProvider
   @volatile private var valueSchema: StructType = _
   @volatile private var storeConf: StateStoreConf = _
   @volatile private var hadoopConf: Configuration = _
+  @volatile private var operatorContext: StatefulOperatorContext = _
 
   private[sql] lazy val rocksDB = {
     val dfsRootDir = stateStoreId.storeCheckpointLocation().toString
@@ -219,7 +297,10 @@ private[sql] class RocksDBStateStoreProvider
       s"partId=${stateStoreId.partitionId},name=${stateStoreId.storeName})"
     val sparkConf = Option(SparkEnv.get).map(_.conf).getOrElse(new SparkConf)
     val localRootDir = Utils.createTempDir(Utils.getLocalDir(sparkConf), storeIdStr)
-    new RocksDB(dfsRootDir, RocksDBConf(storeConf), localRootDir, hadoopConf, storeIdStr)
+    new RocksDB(dfsRootDir, RocksDBConf(storeConf),
+      columnFamilies = Seq("default", RocksDBStateStoreProvider.CF_EVENT_TIME_INDEX),
+      localRootDir = localRootDir,
+      hadoopConf = hadoopConf, loggingId = storeIdStr)
   }
 
   @volatile private var encoder: RocksDBStateEncoder = _
@@ -233,6 +314,9 @@ object RocksDBStateStoreProvider {
   // Version as a single byte that specifies the encoding of the row data in RocksDB
   val STATE_ENCODING_NUM_VERSION_BYTES = 1
   val STATE_ENCODING_VERSION: Byte = 0
+
+  // reserved column families
+  val CF_EVENT_TIME_INDEX: String = "__event_time_idx"
 
   // Native operation latencies report as latency in microseconds
   // as SQLMetrics support millis. Convert the value to millis

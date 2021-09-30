@@ -24,7 +24,7 @@ import scala.collection.JavaConverters
 import org.scalatest.time.{Minute, Span}
 
 import org.apache.spark.sql.execution.streaming.{MemoryStream, StreamingQueryWrapper}
-import org.apache.spark.sql.functions.count
+import org.apache.spark.sql.functions.{count, timestamp_seconds, window}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming._
 
@@ -50,6 +50,64 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest {
         }
       )
     }
+  }
+
+  test("append mode") {
+    val inputData = MemoryStream[Int]
+    val conf = Map(SQLConf.STATE_STORE_PROVIDER_CLASS.key ->
+      classOf[RocksDBStateStoreProvider].getName)
+
+    val windowedAggregation = inputData.toDF()
+      .withColumn("eventTime", timestamp_seconds($"value"))
+      .withWatermark("eventTime", "10 seconds")
+      .groupBy(window($"eventTime", "5 seconds") as 'window)
+      .agg(count("*") as 'count)
+      .select($"window".getField("start").cast("long").as[Long], $"count".as[Long])
+
+    testStream(windowedAggregation)(
+      StartStream(additionalConfs = conf),
+      AddData(inputData, 10, 11, 12, 13, 14, 15),
+      CheckNewAnswer(),
+      AddData(inputData, 25),   // Advance watermark to 15 seconds
+      CheckNewAnswer((10, 5)),
+      // assertNumStateRows(2),
+      // assertNumRowsDroppedByWatermark(0),
+      AddData(inputData, 10),   // Should not emit anything as data less than watermark
+      CheckNewAnswer()
+      // assertNumStateRows(2),
+      // assertNumRowsDroppedByWatermark(1)
+    )
+  }
+
+  test("update mode") {
+    val inputData = MemoryStream[Int]
+    val conf = Map(SQLConf.STATE_STORE_PROVIDER_CLASS.key ->
+      classOf[RocksDBStateStoreProvider].getName)
+
+    val windowedAggregation = inputData.toDF()
+      .withColumn("eventTime", timestamp_seconds($"value"))
+      .withWatermark("eventTime", "10 seconds")
+      .groupBy(window($"eventTime", "5 seconds") as 'window)
+      .agg(count("*") as 'count)
+      .select($"window".getField("start").cast("long").as[Long], $"count".as[Long])
+
+    testStream(windowedAggregation, OutputMode.Update)(
+      StartStream(additionalConfs = conf),
+      AddData(inputData, 10, 11, 12, 13, 14, 15),
+      CheckNewAnswer((10, 5), (15, 1)),
+      AddData(inputData, 25),     // Advance watermark to 15 seconds
+      CheckNewAnswer((25, 1)),
+      // assertNumStateRows(2),
+      // assertNumRowsDroppedByWatermark(0),
+      AddData(inputData, 10, 25), // Ignore 10 as its less than watermark
+      CheckNewAnswer((25, 2)),
+      // assertNumStateRows(2),
+      // assertNumRowsDroppedByWatermark(1),
+      AddData(inputData, 10),     // Should not emit anything as data less than watermark
+      CheckNewAnswer()
+      // assertNumStateRows(2),
+      // assertNumRowsDroppedByWatermark(1)
+    )
   }
 
   test("SPARK-36236: query progress contains only the expected RocksDB store custom metrics") {

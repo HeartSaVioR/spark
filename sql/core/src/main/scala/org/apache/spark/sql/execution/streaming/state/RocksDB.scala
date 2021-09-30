@@ -18,6 +18,7 @@
 package org.apache.spark.sql.execution.streaming.state
 
 import java.io.File
+import java.util
 import java.util.Locale
 import javax.annotation.concurrent.GuardedBy
 
@@ -50,9 +51,12 @@ import org.apache.spark.util.{NextIterator, Utils}
  * @param hadoopConf   Hadoop configuration for talking to the remote file system
  * @param loggingId    Id that will be prepended in logs for isolating concurrent RocksDBs
  */
+// FIXME: optionally receiving column families
 class RocksDB(
     dfsRootDir: String,
     val conf: RocksDBConf,
+    // TODO: change "default" to constant
+    columnFamilies: Seq[String] = Seq("default"),
     localRootDir: File = Utils.createTempDir(),
     hadoopConf: Configuration = new Configuration,
     loggingId: String = "") extends Logging {
@@ -65,16 +69,10 @@ class RocksDB(
   private val flushOptions = new FlushOptions().setWaitForFlush(true)  // wait for flush to complete
   private val writeBatch = new WriteBatchWithIndex(true)  // overwrite multiple updates to a key
 
-  private val bloomFilter = new BloomFilter()
-  private val tableFormatConfig = new BlockBasedTableConfig()
-  tableFormatConfig.setBlockSize(conf.blockSizeKB * 1024)
-  tableFormatConfig.setBlockCache(new LRUCache(conf.blockCacheSizeMB * 1024 * 1024))
-  tableFormatConfig.setFilterPolicy(bloomFilter)
-  tableFormatConfig.setFormatVersion(conf.formatVersion)
-
-  private val dbOptions = new Options() // options to open the RocksDB
+  private val dbOptions: DBOptions = new DBOptions() // options to open the RocksDB
   dbOptions.setCreateIfMissing(true)
-  dbOptions.setTableFormatConfig(tableFormatConfig)
+  dbOptions.setCreateMissingColumnFamilies(true)
+
   private val dbLogger = createLogger() // for forwarding RocksDB native logs to log4j
   dbOptions.setStatistics(new Statistics())
   private val nativeStats = dbOptions.statistics()
@@ -87,6 +85,8 @@ class RocksDB(
   private val acquireLock = new Object
 
   @volatile private var db: NativeRocksDB = _
+  @volatile private var columnFamilyHandles: util.Map[String, ColumnFamilyHandle] = _
+  @volatile private var defaultColumnFamilyHandle: ColumnFamilyHandle = _
   @volatile private var loadedVersion = -1L   // -1 = nothing valid is loaded
   @volatile private var numKeysOnLoadedVersion = 0L
   @volatile private var numKeysOnWritingVersion = 0L
@@ -96,7 +96,7 @@ class RocksDB(
   @volatile private var acquiredThreadInfo: AcquiredThreadInfo = _
 
   private val prefixScanReuseIter =
-    new java.util.concurrent.ConcurrentHashMap[Long, RocksIterator]()
+    new java.util.concurrent.ConcurrentHashMap[(Long, Int), RocksIterator]()
 
   /**
    * Load the given version of data in a native RocksDB instance.
@@ -137,7 +137,28 @@ class RocksDB(
    * @note This will return the last written value even if it was uncommitted.
    */
   def get(key: Array[Byte]): Array[Byte] = {
-    writeBatch.getFromBatchAndDB(db, readOptions, key)
+    get(defaultColumnFamilyHandle, key)
+  }
+
+  // FIXME: method doc
+  def get(cf: String, key: Array[Byte]): Array[Byte] = {
+    get(findColumnFamilyHandle(cf), key)
+  }
+
+  private def get(cfHandle: ColumnFamilyHandle, key: Array[Byte]): Array[Byte] = {
+    writeBatch.getFromBatchAndDB(db, cfHandle, readOptions, key)
+  }
+
+  def merge(key: Array[Byte], value: Array[Byte]): Unit = {
+    merge(defaultColumnFamilyHandle, key, value)
+  }
+
+  def merge(cf: String, key: Array[Byte], value: Array[Byte]): Unit = {
+    merge(findColumnFamilyHandle(cf), key, value)
+  }
+
+  private def merge(cfHandle: ColumnFamilyHandle, key: Array[Byte], value: Array[Byte]): Unit = {
+    writeBatch.merge(cfHandle, key, value)
   }
 
   /**
@@ -145,8 +166,20 @@ class RocksDB(
    * @note This update is not committed to disk until commit() is called.
    */
   def put(key: Array[Byte], value: Array[Byte]): Array[Byte] = {
-    val oldValue = writeBatch.getFromBatchAndDB(db, readOptions, key)
-    writeBatch.put(key, value)
+    put(defaultColumnFamilyHandle, key, value)
+  }
+
+  // FIXME: method doc
+  def put(cf: String, key: Array[Byte], value: Array[Byte]): Array[Byte] = {
+    put(findColumnFamilyHandle(cf), key, value)
+  }
+
+  private def put(
+      cfHandle: ColumnFamilyHandle,
+      key: Array[Byte],
+      value: Array[Byte]): Array[Byte] = {
+    val oldValue = writeBatch.getFromBatchAndDB(db, cfHandle, readOptions, key)
+    writeBatch.put(cfHandle, key, value)
     if (oldValue == null) {
       numKeysOnWritingVersion += 1
     }
@@ -158,9 +191,18 @@ class RocksDB(
    * @note This update is not committed to disk until commit() is called.
    */
   def remove(key: Array[Byte]): Array[Byte] = {
-    val value = writeBatch.getFromBatchAndDB(db, readOptions, key)
+    remove(defaultColumnFamilyHandle, key)
+  }
+
+  // FIXME: method doc
+  def remove(cf: String, key: Array[Byte]): Array[Byte] = {
+    remove(findColumnFamilyHandle(cf), key)
+  }
+
+  private def remove(cfHandle: ColumnFamilyHandle, key: Array[Byte]): Array[Byte] = {
+    val value = writeBatch.getFromBatchAndDB(db, cfHandle, readOptions, key)
     if (value != null) {
-      writeBatch.remove(key)
+      writeBatch.delete(cfHandle, key)
       numKeysOnWritingVersion -= 1
     }
     value
@@ -169,8 +211,17 @@ class RocksDB(
   /**
    * Get an iterator of all committed and uncommitted key-value pairs.
    */
-  def iterator(): Iterator[ByteArrayPair] = {
-    val iter = writeBatch.newIteratorWithBase(db.newIterator())
+  def iterator(): NextIterator[ByteArrayPair] = {
+    iterator(defaultColumnFamilyHandle)
+  }
+
+  // FIXME: doc
+  def iterator(cf: String): NextIterator[ByteArrayPair] = {
+    iterator(findColumnFamilyHandle(cf))
+  }
+
+  private def iterator(cfHandle: ColumnFamilyHandle): NextIterator[ByteArrayPair] = {
+    val iter = writeBatch.newIteratorWithBase(cfHandle, db.newIterator(cfHandle))
     logInfo(s"Getting iterator from version $loadedVersion")
     iter.seekToFirst()
 
@@ -197,11 +248,20 @@ class RocksDB(
   }
 
   def prefixScan(prefix: Array[Byte]): Iterator[ByteArrayPair] = {
+    prefixScan(defaultColumnFamilyHandle, prefix)
+  }
+
+  def prefixScan(cf: String, prefix: Array[Byte]): Iterator[ByteArrayPair] = {
+    prefixScan(findColumnFamilyHandle(cf), prefix)
+  }
+
+  private def prefixScan(
+      cfHandle: ColumnFamilyHandle, prefix: Array[Byte]): Iterator[ByteArrayPair] = {
     val threadId = Thread.currentThread().getId
-    val iter = prefixScanReuseIter.computeIfAbsent(threadId, tid => {
-      val it = writeBatch.newIteratorWithBase(db.newIterator())
+    val iter = prefixScanReuseIter.computeIfAbsent((threadId, cfHandle.getID), key => {
+      val it = writeBatch.newIteratorWithBase(cfHandle, db.newIterator(cfHandle))
       logInfo(s"Getting iterator from version $loadedVersion for prefix scan on " +
-        s"thread ID $tid")
+        s"thread ID ${key._1} and column family ID ${key._2}")
       it
     })
 
@@ -223,6 +283,14 @@ class RocksDB(
     }
   }
 
+  private def findColumnFamilyHandle(cf: String): ColumnFamilyHandle = {
+    val cfHandle = columnFamilyHandles.get(cf)
+    if (cfHandle == null) {
+      throw new IllegalArgumentException(s"Handle for column family $cf is not found")
+    }
+    cfHandle
+  }
+
   /**
    * Commit all the updates made as a version to DFS. The steps it needs to do to commits are:
    * - Write all the updates to the native RocksDB
@@ -242,11 +310,16 @@ class RocksDB(
       val writeTimeMs = timeTakenMs { db.write(writeOptions, writeBatch) }
 
       logInfo(s"Flushing updates for $newVersion")
-      val flushTimeMs = timeTakenMs { db.flush(flushOptions) }
+      val flushTimeMs = timeTakenMs {
+        db.flush(flushOptions,
+          new util.ArrayList[ColumnFamilyHandle](columnFamilyHandles.values()))
+      }
 
       val compactTimeMs = if (conf.compactOnCommit) {
         logInfo("Compacting")
-        timeTakenMs { db.compactRange() }
+        timeTakenMs {
+          columnFamilyHandles.values().forEach(cfHandle => db.compactRange(cfHandle))
+        }
       } else 0
 
       logInfo("Pausing background work")
@@ -279,6 +352,7 @@ class RocksDB(
       loadedVersion
     } catch {
       case t: Throwable =>
+        logWarning(s"ERROR! exc: $t", t)
         loadedVersion = -1  // invalidate loaded version
         throw t
     } finally {
@@ -422,12 +496,43 @@ class RocksDB(
 
   private def openDB(): Unit = {
     assert(db == null)
-    db = NativeRocksDB.open(dbOptions, workingDir.toString)
+
+    val columnFamilyDescriptors = new util.ArrayList[ColumnFamilyDescriptor]()
+    columnFamilies.foreach { cf =>
+      val bloomFilter = new BloomFilter()
+      val tableFormatConfig = new BlockBasedTableConfig()
+      tableFormatConfig.setBlockSize(conf.blockSizeKB * 1024)
+      tableFormatConfig.setBlockCache(new LRUCache(conf.blockCacheSizeMB * 1024 * 1024))
+      tableFormatConfig.setFilterPolicy(bloomFilter)
+      tableFormatConfig.setFormatVersion(conf.formatVersion)
+
+      val columnFamilyOptions = new ColumnFamilyOptions()
+      columnFamilyOptions.setTableFormatConfig(tableFormatConfig)
+      columnFamilyDescriptors.add(new ColumnFamilyDescriptor(cf.getBytes(), columnFamilyOptions))
+    }
+
+    val cfHandles = new util.ArrayList[ColumnFamilyHandle](columnFamilyDescriptors.size())
+    db = NativeRocksDB.open(dbOptions, workingDir.toString, columnFamilyDescriptors,
+      cfHandles)
+
+    columnFamilyHandles = new util.HashMap[String, ColumnFamilyHandle]()
+    columnFamilies.indices.foreach { idx =>
+      columnFamilyHandles.put(columnFamilies(idx), cfHandles.get(idx))
+    }
+
+    // FIXME: constant
+    defaultColumnFamilyHandle = columnFamilyHandles.get("default")
+
     logInfo(s"Opened DB with conf ${conf}")
   }
 
   private def closeDB(): Unit = {
     if (db != null) {
+      columnFamilyHandles.entrySet().forEach(pair => db.destroyColumnFamilyHandle(pair.getValue))
+      columnFamilyHandles.clear()
+      columnFamilyHandles = null
+      defaultColumnFamilyHandle = null
+
       db.close()
       db = null
     }
@@ -441,8 +546,15 @@ class RocksDB(
         // Warn is mapped to info because RocksDB warn is too verbose
         // (e.g. dumps non-warning stuff like stats)
         val loggingFunc: ( => String) => Unit = infoLogLevel match {
+          /*
           case InfoLogLevel.FATAL_LEVEL | InfoLogLevel.ERROR_LEVEL => logError(_)
           case InfoLogLevel.WARN_LEVEL | InfoLogLevel.INFO_LEVEL => logInfo(_)
+          case InfoLogLevel.DEBUG_LEVEL => logDebug(_)
+          case _ => logTrace(_)
+           */
+          case InfoLogLevel.FATAL_LEVEL | InfoLogLevel.ERROR_LEVEL => logError(_)
+          case InfoLogLevel.WARN_LEVEL => logWarning(_)
+          case InfoLogLevel.INFO_LEVEL => logInfo(_)
           case InfoLogLevel.DEBUG_LEVEL => logDebug(_)
           case _ => logTrace(_)
         }

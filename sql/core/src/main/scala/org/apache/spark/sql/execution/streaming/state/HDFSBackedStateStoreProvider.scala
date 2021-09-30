@@ -100,8 +100,11 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
 
     /** Trait and classes representing the internal state of the store */
     trait STATE
+
     case object UPDATING extends STATE
+
     case object COMMITTED extends STATE
+
     case object ABORTED extends STATE
 
     private val newVersion = version + 1
@@ -195,6 +198,22 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
     override def toString(): String = {
       s"HDFSStateStore[id=(op=${id.operatorId},part=${id.partitionId}),dir=$baseDir]"
     }
+
+    /** FIXME: method doc */
+    override def evictOnWatermark(
+        watermarkMs: Long,
+        altPred: UnsafeRowPair => Boolean): Iterator[UnsafeRowPair] = {
+      // HDFSBackedStateStore doesn't index event time column
+      // FIXME: should we do this for in-memory as well?
+      iterator().filter { pair =>
+        if (altPred.apply(pair)) {
+          remove(pair.key)
+          true
+        } else {
+          false
+        }
+      }
+    }
   }
 
   def getMetricsForProvider(): Map[String, Long] = synchronized {
@@ -219,7 +238,7 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
 
   private def getLoadedMapForStore(version: Long): HDFSBackedStateStoreMap = synchronized {
     require(version >= 0, "Version cannot be less than 0")
-    val newMap = HDFSBackedStateStoreMap.create(keySchema, numColsPrefixKey)
+    val newMap = HDFSBackedStateStoreMap.create(keySchema, operatorContext.numColsPrefixKey)
     if (version > 0) {
       newMap.putAll(loadMap(version))
     }
@@ -230,7 +249,7 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
       stateStoreId: StateStoreId,
       keySchema: StructType,
       valueSchema: StructType,
-      numColsPrefixKey: Int,
+      operatorContext: StatefulOperatorContext,
       storeConf: StateStoreConf,
       hadoopConf: Configuration): Unit = {
     this.stateStoreId_ = stateStoreId
@@ -240,10 +259,11 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
     this.hadoopConf = hadoopConf
     this.numberOfVersionsToRetainInMemory = storeConf.maxVersionsToRetainInMemory
 
-    require((keySchema.length == 0 && numColsPrefixKey == 0) ||
-      (keySchema.length > numColsPrefixKey), "The number of columns in the key must be " +
-      "greater than the number of columns for prefix key!")
-    this.numColsPrefixKey = numColsPrefixKey
+    require((keySchema.length == 0 && operatorContext.numColsPrefixKey == 0) ||
+      (keySchema.length > operatorContext.numColsPrefixKey), "The number of columns in the key " +
+      "must be greater than the number of columns for prefix key!")
+
+    this.operatorContext = operatorContext
 
     fm.mkdirs(baseDir)
   }
@@ -283,7 +303,7 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
   @volatile private var storeConf: StateStoreConf = _
   @volatile private var hadoopConf: Configuration = _
   @volatile private var numberOfVersionsToRetainInMemory: Int = _
-  @volatile private var numColsPrefixKey: Int = 0
+  @volatile private var operatorContext: StatefulOperatorContext = _
 
   // TODO: The validation should be moved to a higher level so that it works for all state store
   // implementations
@@ -401,7 +421,8 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
 
         if (lastAvailableVersion <= 0) {
           // Use an empty map for versions 0 or less.
-          lastAvailableMap = Some(HDFSBackedStateStoreMap.create(keySchema, numColsPrefixKey))
+          lastAvailableMap = Some(HDFSBackedStateStoreMap.create(keySchema,
+            operatorContext.numColsPrefixKey))
         } else {
           lastAvailableMap =
             synchronized { Option(loadedMaps.get(lastAvailableVersion)) }
@@ -411,7 +432,8 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
 
       // Load all the deltas from the version after the last available one up to the target version.
       // The last available version is the one with a full snapshot, so it doesn't need deltas.
-      val resultMap = HDFSBackedStateStoreMap.create(keySchema, numColsPrefixKey)
+      val resultMap = HDFSBackedStateStoreMap.create(keySchema,
+        operatorContext.numColsPrefixKey)
       resultMap.putAll(lastAvailableMap.get)
       for (deltaVersion <- lastAvailableVersion + 1 to version) {
         updateFromDeltaFile(deltaVersion, resultMap)
@@ -554,7 +576,7 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
 
   private def readSnapshotFile(version: Long): Option[HDFSBackedStateStoreMap] = {
     val fileToRead = snapshotFile(version)
-    val map = HDFSBackedStateStoreMap.create(keySchema, numColsPrefixKey)
+    val map = HDFSBackedStateStoreMap.create(keySchema, operatorContext.numColsPrefixKey)
     var input: DataInputStream = null
 
     try {
