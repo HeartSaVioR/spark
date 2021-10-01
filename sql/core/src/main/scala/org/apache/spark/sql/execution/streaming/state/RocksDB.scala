@@ -88,8 +88,6 @@ class RocksDB(
 
   @volatile private var db: NativeRocksDB = _
   @volatile private var loadedVersion = -1L   // -1 = nothing valid is loaded
-  @volatile private var numKeysOnLoadedVersion = 0L
-  @volatile private var numKeysOnWritingVersion = 0L
   @volatile private var fileManagerMetrics = RocksDBFileManagerMetrics.EMPTY_METRICS
 
   @GuardedBy("acquireLock")
@@ -112,8 +110,6 @@ class RocksDB(
         closeDB()
         val metadata = fileManager.loadCheckpointFromDfs(version, workingDir)
         openDB()
-        numKeysOnWritingVersion = metadata.numKeys
-        numKeysOnLoadedVersion = metadata.numKeys
         loadedVersion = version
         fileManagerMetrics = fileManager.latestLoadCheckpointMetrics
       }
@@ -144,26 +140,16 @@ class RocksDB(
    * Put the given value for the given key and return the last written value.
    * @note This update is not committed to disk until commit() is called.
    */
-  def put(key: Array[Byte], value: Array[Byte]): Array[Byte] = {
-    val oldValue = writeBatch.getFromBatchAndDB(db, readOptions, key)
+  def put(key: Array[Byte], value: Array[Byte]): Unit = {
     writeBatch.put(key, value)
-    if (oldValue == null) {
-      numKeysOnWritingVersion += 1
-    }
-    oldValue
   }
 
   /**
    * Remove the key if present, and return the previous value if it was present (null otherwise).
    * @note This update is not committed to disk until commit() is called.
    */
-  def remove(key: Array[Byte]): Array[Byte] = {
-    val value = writeBatch.getFromBatchAndDB(db, readOptions, key)
-    if (value != null) {
-      writeBatch.remove(key)
-      numKeysOnWritingVersion -= 1
-    }
-    value
+  def remove(key: Array[Byte]): Unit = {
+    writeBatch.remove(key)
   }
 
   /**
@@ -249,6 +235,8 @@ class RocksDB(
         timeTakenMs { db.compactRange() }
       } else 0
 
+      val approxNumKeys = db.getAggregatedLongProperty("rocksdb.estimate-num-keys")
+
       logInfo("Pausing background work")
       val pauseTimeMs = timeTakenMs {
         db.pauseBackgroundWork() // To avoid files being changed while committing
@@ -262,9 +250,8 @@ class RocksDB(
 
       logInfo(s"Syncing checkpoint for $newVersion to DFS")
       val fileSyncTimeMs = timeTakenMs {
-        fileManager.saveCheckpointToDfs(checkpointDir, newVersion, numKeysOnWritingVersion)
+        fileManager.saveCheckpointToDfs(checkpointDir, newVersion, approxNumKeys)
       }
-      numKeysOnLoadedVersion = numKeysOnWritingVersion
       loadedVersion = newVersion
       fileManagerMetrics = fileManager.latestSaveCheckpointMetrics
       commitLatencyMs ++= Map(
@@ -294,7 +281,6 @@ class RocksDB(
   def rollback(): Unit = {
     closePrefixScanIterators()
     writeBatch.clear()
-    numKeysOnWritingVersion = numKeysOnLoadedVersion
     release()
     logInfo(s"Rolled back to $loadedVersion")
   }
@@ -366,9 +352,10 @@ class RocksDB(
       nativeStats.getTickerCount(typ)
     }
 
+    val approxNumKeys = db.getAggregatedLongProperty("rocksdb.estimate-num-keys")
+
     RocksDBMetrics(
-      numKeysOnLoadedVersion,
-      numKeysOnWritingVersion,
+      approxNumKeys,
       readerMemUsage + memTableMemUsage,
       totalSSTFilesBytes,
       nativeOpsLatencyMicros.toMap,
@@ -573,8 +560,7 @@ object RocksDBConf {
 
 /** Class to represent stats from each commit. */
 case class RocksDBMetrics(
-    numCommittedKeys: Long,
-    numUncommittedKeys: Long,
+    approxNumKeys: Long,
     memUsageBytes: Long,
     totalSSTFilesBytes: Long,
     nativeOpsHistograms: Map[String, RocksDBNativeHistogram],

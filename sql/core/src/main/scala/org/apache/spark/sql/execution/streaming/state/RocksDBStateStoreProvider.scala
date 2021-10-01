@@ -147,7 +147,7 @@ private[sql] class RocksDBStateStoreProvider
         Map(CUSTOM_METRIC_ZIP_FILE_BYTES_UNCOMPRESSED -> bytes)).getOrElse(Map())
 
       StateStoreMetrics(
-        rocksDBMetrics.numUncommittedKeys,
+        rocksDBMetrics.approxNumKeys,
         rocksDBMetrics.memUsageBytes,
         stateStoreCustomMetrics)
     }
