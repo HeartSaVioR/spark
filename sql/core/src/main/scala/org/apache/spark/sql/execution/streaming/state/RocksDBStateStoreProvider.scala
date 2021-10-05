@@ -19,6 +19,8 @@ package org.apache.spark.sql.execution.streaming.state
 
 import java.io._
 
+import scala.collection.mutable
+
 import org.apache.hadoop.conf.Configuration
 
 import org.apache.spark.{SparkConf, SparkEnv}
@@ -65,13 +67,6 @@ private[sql] class RocksDBStateStoreProvider
       val encodedKey = encoder.encodeKey(key)
       val encodedValue = encoder.encodeValue(value)
       rocksDB.put(encodedKey, encodedValue)
-
-      if (encoder.supportEventTimeIndex) {
-        val timestamp = encoder.extractEventTime(key)
-        val tsKey = encoder.encodeEventTimeIndexKey(timestamp, encodedKey)
-
-        rocksDB.put(CF_EVENT_TIME_INDEX, tsKey, Array.empty)
-      }
     }
 
     override def remove(key: UnsafeRow): Unit = {
@@ -159,7 +154,7 @@ private[sql] class RocksDBStateStoreProvider
         Map(CUSTOM_METRIC_ZIP_FILE_BYTES_UNCOMPRESSED -> bytes)).getOrElse(Map())
 
       StateStoreMetrics(
-        rocksDBMetrics.numUncommittedKeys,
+        rocksDBMetrics.approxNumKeys,
         rocksDBMetrics.memUsageBytes,
         stateStoreCustomMetrics)
     }
@@ -185,9 +180,9 @@ private[sql] class RocksDBStateStoreProvider
         // FIXME: DEBUG
         // logWarning(s"DEBUG: start iterating event time index, watermark $watermarkMs")
 
-        new NextIterator[UnsafeRowPair] {
+        val filteredIter = new NextIterator[ByteArrayPair] {
           private val iter = rocksDB.iterator(CF_EVENT_TIME_INDEX)
-          override protected def getNext(): UnsafeRowPair = {
+          override protected def getNext(): ByteArrayPair = {
             if (iter.hasNext) {
               val pair = iter.next()
 
@@ -201,17 +196,7 @@ private[sql] class RocksDBStateStoreProvider
                 finished = true
                 null
               } else {
-                // FIXME: can we leverage deleteRange to bulk delete on index?
-                rocksDB.remove(CF_EVENT_TIME_INDEX, pair.key)
-                val (_, encodedKey) = encoder.decodeEventTimeIndexKey(pair.key)
-                val value = rocksDB.get(encodedKey)
-                if (value == null) {
-                  throw new IllegalStateException("Event time index has been broken!")
-                }
-                kv.set(encodedKey, value)
-                val rowPair = encoder.decode(kv)
-                rocksDB.remove(encodedKey)
-                rowPair
+                pair
               }
             } else {
               finished = true
@@ -221,6 +206,37 @@ private[sql] class RocksDBStateStoreProvider
 
           override protected def close(): Unit = {
             iter.closeIfNeeded()
+          }
+        }
+
+        filteredIter.flatMap { pair =>
+          rocksDB.remove(CF_EVENT_TIME_INDEX, pair.key)
+
+          val keysAsBinary = pair.value
+          var offset = 0
+          val keys = new mutable.ArrayBuffer[Array[Byte]]()
+          while (offset < keysAsBinary.length) {
+            val keyLen = Platform.getInt(keysAsBinary, Platform.BYTE_ARRAY_OFFSET + offset)
+            offset += 4
+            val key = new Array[Byte](keyLen)
+            Platform.copyMemory(keysAsBinary, Platform.BYTE_ARRAY_OFFSET + offset,
+              key, Platform.BYTE_ARRAY_OFFSET, keyLen)
+            offset += keyLen
+            keys += key
+
+            // FIXME: DEBUG
+            // logWarning(s"DEBUG: keys $keys / offset $offset")
+          }
+
+          keys.map { key =>
+            val value = rocksDB.get(key)
+            if (value == null) {
+              throw new IllegalStateException("Event time index has been broken!")
+            }
+            kv.set(key, value)
+            val rowPair = encoder.decode(kv)
+            rocksDB.remove(key)
+            rowPair
           }
         }
       } else {

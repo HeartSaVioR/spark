@@ -65,9 +65,9 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
 
   private def runEvictBenchmark(): Unit = {
     runBenchmark("evict rows") {
-      val numOfRows = Seq(10000) // Seq(1000, 10000, 100000)
-      val numOfTimestamps = Seq(10, 100, 1000)
-      val numOfEvictionRates = Seq(50, 25, 10, 5, 1, 0) // Seq(100, 75, 50, 25, 1, 0)
+      val numOfRows = Seq(100000) // Seq(1000, 10000, 100000)
+      val numOfTimestamps = Seq(100, 1000, 10000, 100000)
+      val numOfEvictionRates = Seq(100, 50, 10, 0) // Seq(100, 75, 50, 25, 1, 0)
 
       numOfRows.foreach { numOfRow =>
         numOfTimestamps.foreach { numOfTimestamp =>
@@ -93,14 +93,17 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
 
           numOfEvictionRates.foreach { numOfEvictionRate =>
             val numOfRowsToEvict = numOfRow * numOfEvictionRate / 100
+
             // scalastyle:off println
+            /*
             System.out.println(s"numOfRowsToEvict: $numOfRowsToEvict / " +
               s"timestampsInMicros: $timestampsInMicros / " +
               s"numOfEvictionRate: $numOfEvictionRate / " +
               s"numOfTimestamp: $numOfTimestamp / " +
               s"take: ${numOfTimestamp * numOfEvictionRate / 100}")
-
+            */
             // scalastyle:on println
+
             val maxTimestampToEvictInMillis = timestampsInMicros
               .take(numOfTimestamp * numOfEvictionRate / 100)
               .lastOption.map(_ / 1000).getOrElse(-1L)
