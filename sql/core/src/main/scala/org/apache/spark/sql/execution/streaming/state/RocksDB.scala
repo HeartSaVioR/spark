@@ -235,7 +235,7 @@ class RocksDB(
         timeTakenMs { db.compactRange() }
       } else 0
 
-      val approxNumKeys = db.getAggregatedLongProperty("rocksdb.estimate-num-keys")
+      val approxNumKeys = db.getLongProperty("rocksdb.estimate-num-keys")
 
       logInfo("Pausing background work")
       val pauseTimeMs = timeTakenMs {
@@ -352,7 +352,7 @@ class RocksDB(
       nativeStats.getTickerCount(typ)
     }
 
-    val approxNumKeys = db.getAggregatedLongProperty("rocksdb.estimate-num-keys")
+    val approxNumKeys = db.getLongProperty("rocksdb.estimate-num-keys")
 
     RocksDBMetrics(
       approxNumKeys,
