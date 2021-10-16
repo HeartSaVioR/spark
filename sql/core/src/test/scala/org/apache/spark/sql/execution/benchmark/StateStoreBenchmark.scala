@@ -23,7 +23,7 @@ import org.apache.hadoop.conf.Configuration
 
 import org.apache.spark.benchmark.Benchmark
 import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, UnsafeProjection, UnsafeRow}
-import org.apache.spark.sql.execution.streaming.state.{HDFSBackedStateStoreProvider, RocksDBStateStoreProvider, StateStore, StateStoreConf, StateStoreId, StateStoreProvider}
+import org.apache.spark.sql.execution.streaming.state.{HDFSBackedStateStoreProvider, RocksDBStateStoreProvider, RocksDBStateStoreProviderNew, StateStore, StateStoreConf, StateStoreId, StateStoreProvider}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{IntegerType, StructField, StructType, TimestampType}
 import org.apache.spark.util.Utils
@@ -53,11 +53,110 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
   override def runBenchmarkSuite(mainArgs: Array[String]): Unit = {
     // runPutBenchmark()
     // runDeleteBenchmark()
-    runEvictBenchmark()
+    // runEvictBenchmark()
+    // runPutWithCommitBenchmark()
+    // runGetAndOverwriteBenchmark()
+    runAccurateLatencyOverheadBenchmark()
   }
 
   final def skip(benchmarkName: String)(func: => Any): Unit = {
     output.foreach(_.write(s"$benchmarkName is skipped".getBytes))
+  }
+
+  private def runAccurateLatencyOverheadBenchmark(): Unit = {
+    runBenchmark("additional operations") {
+      val numRows = 1000000
+      val benchmark = new Benchmark(s"additional operations",
+        numRows, minNumIters = 1000, output = output)
+
+      def latencyOverhead(sampleInterval: Int): Unit = {
+        var cursor = 0L
+        var totalNs = 0L
+        (1 to numRows).foreach { _ =>
+          if (sampleInterval == 0) {
+            val startTimeNs = System.nanoTime()
+            val elapsedNs = System.nanoTime() - startTimeNs
+            totalNs += elapsedNs
+          } else {
+            if (cursor % sampleInterval == 0) {
+              val startTimeNs = System.nanoTime()
+              val elapsedNs = System.nanoTime() - startTimeNs
+              totalNs += elapsedNs * sampleInterval
+            }
+            cursor += 1
+          }
+        }
+      }
+
+      benchmark.addCase("no sample") { _ =>
+        latencyOverhead(0)
+      }
+
+      benchmark.addCase("1/5 sample") { _ =>
+        latencyOverhead(5)
+      }
+
+      benchmark.addCase("1/10 sample") { _ =>
+        latencyOverhead(10)
+      }
+
+      benchmark.addCase("1/50 sample") { _ =>
+        latencyOverhead(50)
+      }
+
+      benchmark.addCase("1/100 sample") { _ =>
+        latencyOverhead(100)
+      }
+
+      benchmark.run()
+    }
+  }
+
+  private def runPutWithCommitBenchmark(): Unit = {
+    runBenchmark("put rows & commit") {
+      val numOfRowToPutPerVersion = 10000
+      val numVersions = 100
+      val benchmark = new Benchmark(s"putting $numOfRowToPutPerVersion and committing" +
+        s" per version, $numVersions versions",
+        numOfRowToPutPerVersion * 100, minNumIters = 100, output = output)
+
+      benchmark.addTimerCase("HDFSBackedStateStoreProvider") { timer =>
+        val inMemoryProvider = newHDFSBackedStateStoreProvider()
+        var curVersion = 0L
+        (1 to numVersions).foreach { _ =>
+          val testData = constructRandomizedTestData(numOfRowToPutPerVersion,
+            (1 to numOfRowToPutPerVersion).map(_ * 1000L).toList, 0)
+          val inMemoryStore = inMemoryProvider.getStore(curVersion)
+
+          // include the time to update rows, because there is an overhead on writing
+          // changelog while updating. the actual latency on updating row is trivial.
+          timer.startTiming()
+          updateRows(inMemoryStore, testData)
+          curVersion = inMemoryStore.commit()
+          timer.stopTiming()
+        }
+        inMemoryProvider.close()
+      }
+
+      benchmark.addTimerCase("RocksDBStateStoreProvider") { timer =>
+        val rocksDBProvider = newRocksDBStateProvider()
+        var curVersion = 0L
+        (1 to numVersions).foreach { _ =>
+          val testData = constructRandomizedTestData(numOfRowToPutPerVersion,
+            (1 to numOfRowToPutPerVersion).map(_ * 1000L).toList, 0)
+          val rocksDBStore = rocksDBProvider.getStore(curVersion)
+
+          updateRows(rocksDBStore, testData)
+
+          timer.startTiming()
+          curVersion = rocksDBStore.commit()
+          timer.stopTiming()
+        }
+        rocksDBProvider.close()
+      }
+
+      benchmark.run()
+    }
   }
 
   private def runPutBenchmark(): Unit = {
@@ -126,6 +225,91 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
 
         inMemoryProvider.close()
         rocksDBProvider.close()
+      }
+    }
+  }
+
+  private def runGetAndOverwriteBenchmark(): Unit = {
+    runBenchmark("get and overwrite rows (simulate workload on streaming aggregation)") {
+      val numOfRows = Seq(10000)
+      val overwriteRates = Seq(100, 75, 50, 25, 10, 5, 0)
+      numOfRows.foreach { numOfRow =>
+        val testData = constructRandomizedTestData(numOfRow,
+          (1 to numOfRow).map(_ * 1000L).toList, 0)
+
+        val inMemoryProvider = newHDFSBackedStateStoreProvider()
+        val rocksDBProvider = newRocksDBStateProvider()
+        val rocksDBProviderNew = newRocksDBStateProviderNew()
+
+        val inMemoryStore = inMemoryProvider.getStore(0)
+        updateRows(inMemoryStore, testData)
+
+        val rocksDBStore = rocksDBProvider.getStore(0)
+        updateRows(rocksDBStore, testData)
+
+        val rocksDBStoreNew = rocksDBProviderNew.getStore(0)
+        updateRows(rocksDBStoreNew, testData)
+
+        val committedInMemoryVersion = inMemoryStore.commit()
+        val committedVersion = rocksDBStore.commit()
+        val committedVersionNew = rocksDBStoreNew.commit()
+
+        val rowsToOverwrite = testData.map { case (key, value) =>
+          // modify the value in the value row to simulate overwrite
+          value.setLong(0, value.getLong(0) + 1)
+          (key, value)
+        }
+
+        val benchmark = new Benchmark(s"get and overwrite $numOfRow rows",
+          numOfRow, minNumIters = 1000, output = output)
+
+        benchmark.addTimerCase("HDFSBackedStateStoreProvider") { timer =>
+          val inMemoryStore = inMemoryProvider.getStore(committedInMemoryVersion)
+
+          // issues "get operation" first to the all keys
+          timer.startTiming()
+          getRows(inMemoryStore, testData.map(_._1))
+
+          // overwrite all keys
+          updateRows(inMemoryStore, rowsToOverwrite)
+          timer.stopTiming()
+
+          inMemoryStore.abort()
+        }
+
+        benchmark.addTimerCase("RocksDBStateStoreProvider") { timer =>
+          val rocksDBStore = rocksDBProvider.getStore(committedVersion)
+
+          // issues "get operation" first to the all keys
+          timer.startTiming()
+          getRows(rocksDBStore, testData.map(_._1))
+
+          // overwrite all keys
+          updateRows(rocksDBStore, rowsToOverwrite)
+          timer.stopTiming()
+
+          rocksDBStore.abort()
+        }
+
+        benchmark.addTimerCase("New RocksDBStateStoreProvider") { timer =>
+          val rocksDBStoreNew = rocksDBProviderNew.getStore(committedVersion)
+
+          // issues "get operation" first to the all keys
+          timer.startTiming()
+          getRows(rocksDBStoreNew, testData.map(_._1))
+
+          // overwrite all keys
+          updateRows(rocksDBStoreNew, rowsToOverwrite)
+          timer.stopTiming()
+
+          rocksDBStoreNew.abort()
+        }
+
+        benchmark.run()
+
+        inMemoryProvider.close()
+        rocksDBProvider.close()
+        rocksDBProviderNew.close()
       }
     }
   }
@@ -265,6 +449,10 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
     }
   }
 
+  private def getRows(store: StateStore, keys: Seq[UnsafeRow]): Seq[UnsafeRow] = {
+    keys.map(store.get)
+  }
+
   private def updateRows(
       store: StateStore,
       rows: Seq[(UnsafeRow, UnsafeRow)]): Unit = {
@@ -333,6 +521,18 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
   private def newRocksDBStateProvider(): StateStoreProvider = {
     val storeId = StateStoreId(newDir(), Random.nextInt(), 0)
     val provider = new RocksDBStateStoreProvider()
+    val sqlConf = new SQLConf()
+    sqlConf.setConfString("spark.sql.streaming.stateStore.compression.codec", "zstd")
+    val storeConf = new StateStoreConf(sqlConf)
+    provider.init(
+      storeId, keySchema, valueSchema, 0,
+      storeConf, new Configuration)
+    provider
+  }
+
+  private def newRocksDBStateProviderNew(): StateStoreProvider = {
+    val storeId = StateStoreId(newDir(), Random.nextInt(), 0)
+    val provider = new RocksDBStateStoreProviderNew()
     val sqlConf = new SQLConf()
     sqlConf.setConfString("spark.sql.streaming.stateStore.compression.codec", "zstd")
     val storeConf = new StateStoreConf(sqlConf)

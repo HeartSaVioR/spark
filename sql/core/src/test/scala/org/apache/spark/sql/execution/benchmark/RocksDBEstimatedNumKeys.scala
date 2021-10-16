@@ -25,18 +25,18 @@ import scala.util.Random
 import org.apache.hadoop.conf.Configuration
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.execution.streaming.state.{ByteArrayPair, RocksDB, RocksDBConf}
+import org.apache.spark.sql.execution.streaming.state.{ByteArrayPair, RocksDBConfNew, RocksDBNew}
 import org.apache.spark.util.{NextIterator, Utils}
 
 object RocksDBEstimatedNumKeys extends Logging {
   def main(args: Array[String]): Unit = {
-    def testOps(compactOnCommit: Boolean): Unit = {
-      logWarning(s"Running tests... compactOnCommit: $compactOnCommit")
+    def testOps(compactInterval: Int): Unit = {
+      logWarning(s"Running tests... compactInterval: $compactInterval")
 
       val remoteDir = Utils.createTempDir().toString
       new File(remoteDir).delete()  // to make sure that the directory gets created
 
-      val conf = RocksDBConf().copy(compactOnCommit = compactOnCommit)
+      val conf = RocksDBConfNew().copy(compactIntervalOnCommit = compactInterval)
 
       withDB(remoteDir, conf = conf, version = 0) { db =>
         var latestVersion = 0L
@@ -133,8 +133,8 @@ object RocksDBEstimatedNumKeys extends Logging {
       }
     }
 
-    for (compactOnCommit <- Seq(false, true)) {
-      testOps(compactOnCommit)
+    for (compactIntervalOnCommit <- Seq(1, 5, 10)) {
+      testOps(compactIntervalOnCommit)
     }
   }
 
@@ -147,12 +147,12 @@ object RocksDBEstimatedNumKeys extends Logging {
   private def withDB[T](
       remoteDir: String,
       version: Int = 0,
-      conf: RocksDBConf = RocksDBConf().copy(compactOnCommit = false, minVersionsToRetain = 100),
+      conf: RocksDBConfNew = RocksDBConfNew().copy(minVersionsToRetain = 100),
       hadoopConf: Configuration = new Configuration())(
-      func: RocksDB => T): T = {
-    var db: RocksDB = null
+      func: RocksDBNew => T): T = {
+    var db: RocksDBNew = null
     try {
-      db = new RocksDB(
+      db = new RocksDBNew(
         remoteDir, conf = conf, hadoopConf = hadoopConf,
         loggingId = s"[Thread-${Thread.currentThread.getId}]")
       db.load(version)

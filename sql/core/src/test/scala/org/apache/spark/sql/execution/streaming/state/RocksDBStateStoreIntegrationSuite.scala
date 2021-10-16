@@ -35,7 +35,7 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest {
     withTempDir { dir =>
       val input = MemoryStream[Int]
       val conf = Map(SQLConf.STATE_STORE_PROVIDER_CLASS.key ->
-        classOf[RocksDBStateStoreProvider].getName)
+        classOf[RocksDBStateStoreProviderNew].getName)
 
       testStream(input.toDF.groupBy().count(), outputMode = OutputMode.Update)(
         StartStream(checkpointLocation = dir.getAbsolutePath, additionalConfs = conf),
@@ -59,7 +59,7 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest {
     withTempDir { dir =>
       withSQLConf(
         (SQLConf.STREAMING_NO_DATA_PROGRESS_EVENT_INTERVAL.key -> "10"),
-        (SQLConf.STATE_STORE_PROVIDER_CLASS.key -> classOf[RocksDBStateStoreProvider].getName),
+        (SQLConf.STATE_STORE_PROVIDER_CLASS.key -> classOf[RocksDBStateStoreProviderNew].getName),
         (SQLConf.CHECKPOINT_LOCATION.key -> dir.getCanonicalPath),
         (SQLConf.SHUFFLE_PARTITIONS.key, "1")) {
         val inputData = MemoryStream[Int]
@@ -111,7 +111,7 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest {
     }
 
     withSQLConf(
-      SQLConf.STATE_STORE_PROVIDER_CLASS.key -> classOf[RocksDBStateStoreProvider].getName) {
+      SQLConf.STATE_STORE_PROVIDER_CLASS.key -> classOf[RocksDBStateStoreProviderNew].getName) {
       withTempDir { dir =>
         val inputData = MemoryStream[Int]
 
@@ -148,7 +148,7 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest {
 
   testQuietly("SPARK-36519: RocksDB format version can be set by the SQL conf") {
     withSQLConf(
-      SQLConf.STATE_STORE_PROVIDER_CLASS.key -> classOf[RocksDBStateStoreProvider].getName,
+      SQLConf.STATE_STORE_PROVIDER_CLASS.key -> classOf[RocksDBStateStoreProviderNew].getName,
       // Set an unsupported RocksDB format version and the query should fail if it's passed down
       // into RocksDB
       SQLConf.STATE_STORE_ROCKSDB_FORMAT_VERSION.key -> "100") {

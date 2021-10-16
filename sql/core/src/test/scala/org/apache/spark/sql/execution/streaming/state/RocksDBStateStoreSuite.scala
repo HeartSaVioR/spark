@@ -33,7 +33,7 @@ import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.Platform
 import org.apache.spark.util.Utils
 
-class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvider]
+class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProviderNew]
   with BeforeAndAfter {
 
   before {
@@ -49,7 +49,7 @@ class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvid
   import StateStoreTestsHelper._
 
   test("version encoding") {
-    import RocksDBStateStoreProvider._
+    import RocksDBStateStoreProviderNew._
 
     tryWithProviderResource(newStoreProvider()) { provider =>
       val store = provider.getStore(0)
@@ -72,7 +72,7 @@ class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvid
       // Set the session confs that should be passed into RocksDB
       val testConfs = Seq(
         ("spark.sql.streaming.stateStore.providerClass",
-          classOf[RocksDBStateStoreProvider].getName),
+          classOf[RocksDBStateStoreProviderNew].getName),
         (RocksDBConf.ROCKSDB_CONF_NAME_PREFIX + ".compactOnCommit", "true"),
         (RocksDBConf.ROCKSDB_CONF_NAME_PREFIX + ".lockAcquireTimeoutMs", "10"),
         (SQLConf.STATE_STORE_ROCKSDB_FORMAT_VERSION.key, "4")
@@ -104,7 +104,7 @@ class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvid
   }
 
   test("rocksdb file manager metrics exposed") {
-    import RocksDBStateStoreProvider._
+    import RocksDBStateStoreProviderNew._
     def getCustomMetric(metrics: StateStoreMetrics, customMetric: StateStoreCustomMetric): Long = {
       val metricPair = metrics.customMetrics.find(_._1.name == customMetric.name)
       assert(metricPair.isDefined)
@@ -127,22 +127,22 @@ class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvid
     }
   }
 
-  override def newStoreProvider(): RocksDBStateStoreProvider = {
+  override def newStoreProvider(): RocksDBStateStoreProviderNew = {
     newStoreProvider(StateStoreId(newDir(), Random.nextInt(), 0))
   }
 
-  def newStoreProvider(storeId: StateStoreId): RocksDBStateStoreProvider = {
+  def newStoreProvider(storeId: StateStoreId): RocksDBStateStoreProviderNew = {
     newStoreProvider(storeId, numColsPrefixKey = 0)
   }
 
-  override def newStoreProvider(numPrefixCols: Int): RocksDBStateStoreProvider = {
+  override def newStoreProvider(numPrefixCols: Int): RocksDBStateStoreProviderNew = {
     newStoreProvider(StateStoreId(newDir(), Random.nextInt(), 0), numColsPrefixKey = numPrefixCols)
   }
 
   def newStoreProvider(
       storeId: StateStoreId,
-      numColsPrefixKey: Int): RocksDBStateStoreProvider = {
-    val provider = new RocksDBStateStoreProvider()
+      numColsPrefixKey: Int): RocksDBStateStoreProviderNew = {
+    val provider = new RocksDBStateStoreProviderNew()
     provider.init(
       storeId, keySchema, valueSchema, numColsPrefixKey = numColsPrefixKey,
       new StateStoreConf, new Configuration)
@@ -150,12 +150,12 @@ class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvid
   }
 
   override def getLatestData(
-      storeProvider: RocksDBStateStoreProvider): Set[((String, Int), Int)] = {
+      storeProvider: RocksDBStateStoreProviderNew): Set[((String, Int), Int)] = {
     getData(storeProvider, version = -1)
   }
 
   override def getData(
-      provider: RocksDBStateStoreProvider,
+      provider: RocksDBStateStoreProviderNew,
       version: Int = -1): Set[((String, Int), Int)] = {
     tryWithProviderResource(newStoreProvider(provider.stateStoreId)) { reloadedProvider =>
       val versionToRead = if (version < 0) reloadedProvider.latestVersion else version
@@ -165,7 +165,7 @@ class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvid
 
   override def newStoreProvider(
     minDeltasForSnapshot: Int,
-    numOfVersToRetainInMemory: Int): RocksDBStateStoreProvider = newStoreProvider()
+    numOfVersToRetainInMemory: Int): RocksDBStateStoreProviderNew = newStoreProvider()
 
   override def getDefaultSQLConf(
     minDeltasForSnapshot: Int,

@@ -25,7 +25,7 @@ import org.scalatest.matchers.must.Matchers
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.{AnalysisException, Column, DataFrame}
 import org.apache.spark.sql.execution.streaming.MemoryStream
-import org.apache.spark.sql.execution.streaming.state.{HDFSBackedStateStoreProvider, RocksDBStateStoreProvider}
+import org.apache.spark.sql.execution.streaming.state.{HDFSBackedStateStoreProvider, RocksDBStateStoreProviderNew}
 import org.apache.spark.sql.functions.{count, session_window, sum}
 import org.apache.spark.sql.internal.SQLConf
 
@@ -45,7 +45,7 @@ class StreamingSessionWindowSuite extends StreamTest
     }
     val providerOptions = Seq(
       classOf[HDFSBackedStateStoreProvider].getCanonicalName,
-      classOf[RocksDBStateStoreProvider].getCanonicalName
+      classOf[RocksDBStateStoreProviderNew].getCanonicalName
     ).map { value =>
       (SQLConf.STATE_STORE_PROVIDER_CLASS.key, value.stripSuffix("$"))
     }

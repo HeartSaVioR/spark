@@ -27,9 +27,9 @@ import org.apache.spark.sql.catalyst.expressions.UnsafeRow
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.Utils
 
-private[sql] class RocksDBStateStoreProvider
+private[sql] class RocksDBStateStoreProviderNew
   extends StateStoreProvider with Logging with Closeable {
-  import RocksDBStateStoreProvider._
+  import RocksDBStateStoreProviderNew._
 
   class RocksDBStateStore(lastVersion: Long) extends StateStore {
     /** Trait and classes representing the internal state of the store */
@@ -41,7 +41,7 @@ private[sql] class RocksDBStateStoreProvider
     @volatile private var state: STATE = UPDATING
     @volatile private var isValidated = false
 
-    override def id: StateStoreId = RocksDBStateStoreProvider.this.stateStoreId
+    override def id: StateStoreId = RocksDBStateStoreProviderNew.this.stateStoreId
 
     override def version: Long = lastVersion
 
@@ -147,7 +147,7 @@ private[sql] class RocksDBStateStoreProvider
         Map(CUSTOM_METRIC_ZIP_FILE_BYTES_UNCOMPRESSED -> bytes)).getOrElse(Map())
 
       StateStoreMetrics(
-        rocksDBMetrics.numUncommittedKeys,
+        rocksDBMetrics.approxNumKeys,
         rocksDBMetrics.memUsageBytes,
         stateStoreCustomMetrics)
     }
@@ -159,8 +159,8 @@ private[sql] class RocksDBStateStoreProvider
         s"dir=${id.storeCheckpointLocation()}]"
     }
 
-    /** Return the [[RocksDB]] instance in this store. This is exposed mainly for testing. */
-    def dbInstance(): RocksDB = rocksDB
+    /** Return the [[RocksDBNew]] instance in this store. This is exposed mainly for testing. */
+    def dbInstance(): RocksDBNew = rocksDB
   }
 
   override def init(
@@ -219,7 +219,7 @@ private[sql] class RocksDBStateStoreProvider
       s"partId=${stateStoreId.partitionId},name=${stateStoreId.storeName})"
     val sparkConf = Option(SparkEnv.get).map(_.conf).getOrElse(new SparkConf)
     val localRootDir = Utils.createTempDir(Utils.getLocalDir(sparkConf), storeIdStr)
-    new RocksDB(dfsRootDir, RocksDBConf(storeConf), localRootDir, hadoopConf, storeIdStr)
+    new RocksDBNew(dfsRootDir, RocksDBConfNew(storeConf), localRootDir, hadoopConf, storeIdStr)
   }
 
   @volatile private var encoder: RocksDBStateEncoder = _
@@ -229,7 +229,7 @@ private[sql] class RocksDBStateStoreProvider
   }
 }
 
-object RocksDBStateStoreProvider {
+object RocksDBStateStoreProviderNew {
   // Version as a single byte that specifies the encoding of the row data in RocksDB
   val STATE_ENCODING_NUM_VERSION_BYTES = 1
   val STATE_ENCODING_VERSION: Byte = 0

@@ -18,7 +18,7 @@
 package org.apache.spark.sql.execution.streaming.state
 
 import org.apache.spark.sql.catalyst.expressions.{BoundReference, JoinedRow, UnsafeProjection, UnsafeRow}
-import org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider.{STATE_ENCODING_NUM_VERSION_BYTES, STATE_ENCODING_VERSION}
+import org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProviderNew.{STATE_ENCODING_NUM_VERSION_BYTES, STATE_ENCODING_VERSION}
 import org.apache.spark.sql.types.{StructField, StructType}
 import org.apache.spark.unsafe.Platform
 
