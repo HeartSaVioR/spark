@@ -26,8 +26,6 @@ import scala.collection.JavaConverters._
 import scala.util.Try
 
 import org.apache.hadoop.conf.Configuration
-import org.json4s.NoTypeHints
-import org.json4s.jackson.Serialization
 import org.rocksdb.{RocksDB => NativeRocksDB, _}
 import org.rocksdb.TickerType._
 
@@ -87,7 +85,8 @@ class RocksDBNew(
 
   @volatile private var db: NativeRocksDB = _
   @volatile private var loadedVersion = -1L   // -1 = nothing valid is loaded
-  @volatile private var numKeysOnLatestCompact = 0L
+  @volatile private var numKeysOnLoadedVersion = 0L
+  @volatile private var numKeysOnWritingVersion = 0L
   @volatile private var fileManagerMetrics = RocksDBFileManagerMetrics.EMPTY_METRICS
 
   @GuardedBy("acquireLock")
@@ -110,7 +109,20 @@ class RocksDBNew(
         closeDB()
         val metadata = fileManager.loadCheckpointFromDfs(version, workingDir)
         openDB()
-        numKeysOnLatestCompact = metadata.numKeys
+
+        val numKeys = if (!conf.trackTotalNumberOfRows) {
+          // we don't track the total number of rows - discard the number being track
+          -1L
+        } else if (metadata.numKeys < 0) {
+          // we track the total number of rows, but the snapshot doesn't have tracking number
+          // need to count keys now
+          countKeys()
+        } else {
+          metadata.numKeys
+        }
+        numKeysOnWritingVersion = numKeys
+        numKeysOnLoadedVersion = numKeys
+
         loadedVersion = version
         fileManagerMetrics = fileManager.latestLoadCheckpointMetrics
       }
@@ -142,6 +154,12 @@ class RocksDBNew(
    * @note This update is not committed to disk until commit() is called.
    */
   def put(key: Array[Byte], value: Array[Byte]): Unit = {
+    if (conf.trackTotalNumberOfRows) {
+      val oldValue = writeBatch.getFromBatchAndDB(db, readOptions, key)
+      if (oldValue == null) {
+        numKeysOnWritingVersion += 1
+      }
+    }
     writeBatch.put(key, value)
   }
 
@@ -150,6 +168,12 @@ class RocksDBNew(
    * @note This update is not committed to disk until commit() is called.
    */
   def remove(key: Array[Byte]): Unit = {
+    if (conf.trackTotalNumberOfRows) {
+      val value = writeBatch.getFromBatchAndDB(db, readOptions, key)
+      if (value != null) {
+        numKeysOnWritingVersion -= 1
+      }
+    }
     writeBatch.remove(key)
   }
 
@@ -181,6 +205,29 @@ class RocksDBNew(
       }
       override protected def close(): Unit = { iter.close() }
     }
+  }
+
+  private def countKeys(): Long = {
+    // This is being called when opening DB, so doesn't need to deal with writeBatch.
+    val iter = db.newIterator()
+    logInfo(s"Counting keys - getting iterator from version $loadedVersion")
+    iter.seekToFirst()
+
+    // Attempt to close this iterator if there is a task failure, or a task interruption.
+    // This is a hack because it assumes that the RocksDB is running inside a task.
+    Option(TaskContext.get()).foreach { tc =>
+      tc.addTaskCompletionListener[Unit] { _ => iter.close() }
+    }
+
+    var keys = 0L
+    while (iter.isValid) {
+      keys += 1
+      iter.next()
+    }
+
+    iter.close()
+
+    keys
   }
 
   def prefixScan(prefix: Array[Byte]): Iterator[ByteArrayPair] = {
@@ -231,14 +278,9 @@ class RocksDBNew(
       logInfo(s"Flushing updates for $newVersion")
       val flushTimeMs = timeTakenMs { db.flush(flushOptions) }
 
-      val compactTimeMs = if (newVersion % conf.compactIntervalOnCommit == 0) {
+      val compactTimeMs = if (conf.compactOnCommit) {
         logInfo("Compacting")
-        val time = timeTakenMs { db.compactRange() }
-
-        val approxNumKeys = db.getLongProperty("rocksdb.estimate-num-keys")
-        numKeysOnLatestCompact = approxNumKeys
-
-        time
+        timeTakenMs { db.compactRange() }
       } else 0
 
       logInfo("Pausing background work")
@@ -254,8 +296,9 @@ class RocksDBNew(
 
       logInfo(s"Syncing checkpoint for $newVersion to DFS")
       val fileSyncTimeMs = timeTakenMs {
-        fileManager.saveCheckpointToDfs(checkpointDir, newVersion, numKeysOnLatestCompact)
+        fileManager.saveCheckpointToDfs(checkpointDir, newVersion, numKeysOnWritingVersion)
       }
+      numKeysOnLoadedVersion = numKeysOnWritingVersion
       loadedVersion = newVersion
       fileManagerMetrics = fileManager.latestSaveCheckpointMetrics
       commitLatencyMs ++= Map(
@@ -285,6 +328,7 @@ class RocksDBNew(
   def rollback(): Unit = {
     closePrefixScanIterators()
     writeBatch.clear()
+    numKeysOnWritingVersion = numKeysOnLoadedVersion
     release()
     logInfo(s"Rolled back to $loadedVersion")
   }
@@ -321,7 +365,7 @@ class RocksDBNew(
   def getLatestVersion(): Long = fileManager.getLatestVersion()
 
   /** Get current instantaneous statistics */
-  def metrics: RocksDBMetricsNew = {
+  def metrics: RocksDBMetrics = {
     import HistogramType._
     val totalSSTFilesBytes = getDBProperty("rocksdb.total-sst-files-size")
     val readerMemUsage = getDBProperty("rocksdb.estimate-table-readers-mem")
@@ -356,8 +400,9 @@ class RocksDBNew(
       nativeStats.getTickerCount(typ)
     }
 
-    RocksDBMetricsNew(
-      numKeysOnLatestCompact,
+    RocksDBMetrics(
+      numKeysOnLoadedVersion,
+      numKeysOnWritingVersion,
       readerMemUsage + memTableMemUsage,
       totalSSTFilesBytes,
       nativeOpsLatencyMicros.toMap,
@@ -474,14 +519,15 @@ class RocksDBNew(
  * Configurations for optimizing RocksDB
  */
 case class RocksDBConfNew(
-  minVersionsToRetain: Int,
-  compactIntervalOnCommit: Int,
-  pauseBackgroundWorkForCommit: Boolean,
-  blockSizeKB: Long,
-  blockCacheSizeMB: Long,
-  lockAcquireTimeoutMs: Long,
-  resetStatsOnLoad : Boolean,
-  formatVersion: Int)
+    minVersionsToRetain: Int,
+    compactOnCommit: Boolean,
+    pauseBackgroundWorkForCommit: Boolean,
+    blockSizeKB: Long,
+    blockCacheSizeMB: Long,
+    lockAcquireTimeoutMs: Long,
+    resetStatsOnLoad : Boolean,
+    formatVersion: Int,
+    trackTotalNumberOfRows: Boolean)
 
 object RocksDBConfNew {
   /** Common prefix of all confs in SQLConf that affects RocksDB */
@@ -493,7 +539,6 @@ object RocksDBConfNew {
 
   // Configuration that specifies whether to compact the RocksDB data every time data is committed
   private val COMPACT_ON_COMMIT_CONF = ConfEntry("compactOnCommit", "false")
-  private val COMPACT_INTERVAL_ON_COMMIT_CONF = ConfEntry("compactIntervalOnCommit", "10")
   private val PAUSE_BG_WORK_FOR_COMMIT_CONF = ConfEntry("pauseBackgroundWorkForCommit", "true")
   private val BLOCK_SIZE_KB_CONF = ConfEntry("blockSizeKB", "4")
   private val BLOCK_CACHE_SIZE_MB_CONF = ConfEntry("blockCacheSizeMB", "8")
@@ -511,6 +556,9 @@ object RocksDBConfNew {
   // Note: this is also defined in `SQLConf.STATE_STORE_ROCKSDB_FORMAT_VERSION`. These two
   // places should be updated together.
   private val FORMAT_VERSION = ConfEntry("formatVersion", "5")
+
+  // FIXME: docs
+  private val TRACK_TOTAL_NUMBER_OF_ROWS = ConfEntry("trackTotalNumberOfRows", "true")
 
   def apply(storeConf: StateStoreConf): RocksDBConfNew = {
     val confs = CaseInsensitiveMap[String](storeConf.confs)
@@ -537,34 +585,15 @@ object RocksDBConfNew {
 
     RocksDBConfNew(
       storeConf.minVersionsToRetain,
-      getPositiveIntConf(COMPACT_INTERVAL_ON_COMMIT_CONF),
+      getBooleanConf(COMPACT_ON_COMMIT_CONF),
       getBooleanConf(PAUSE_BG_WORK_FOR_COMMIT_CONF),
       getPositiveLongConf(BLOCK_SIZE_KB_CONF),
       getPositiveLongConf(BLOCK_CACHE_SIZE_MB_CONF),
       getPositiveLongConf(LOCK_ACQUIRE_TIMEOUT_MS_CONF),
       getBooleanConf(RESET_STATS_ON_LOAD),
-      getPositiveIntConf(FORMAT_VERSION))
+      getPositiveIntConf(FORMAT_VERSION),
+      getBooleanConf(TRACK_TOTAL_NUMBER_OF_ROWS))
   }
 
   def apply(): RocksDBConfNew = apply(new StateStoreConf())
-}
-
-
-/** Class to represent stats from each commit. */
-case class RocksDBMetricsNew(
-    approxNumKeys: Long,
-    memUsageBytes: Long,
-    totalSSTFilesBytes: Long,
-    nativeOpsHistograms: Map[String, RocksDBNativeHistogram],
-    lastCommitLatencyMs: Map[String, Long],
-    filesCopied: Long,
-    bytesCopied: Long,
-    filesReused: Long,
-    zipFileBytesUncompressed: Option[Long],
-    nativeOpsMetrics: Map[String, Long]) {
-  def json: String = Serialization.write(this)(RocksDBMetricsNew.format)
-}
-
-object RocksDBMetricsNew {
-  val format = Serialization.formats(NoTypeHints)
 }

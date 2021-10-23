@@ -584,7 +584,7 @@ case class RocksDBMetrics(
     filesReused: Long,
     zipFileBytesUncompressed: Option[Long],
     nativeOpsMetrics: Map[String, Long]) {
-  def json: String = Serialization.write(this)(RocksDBMetricsNew.format)
+  def json: String = Serialization.write(this)(RocksDBMetrics.format)
 }
 
 object RocksDBMetrics {
@@ -594,7 +594,7 @@ object RocksDBMetrics {
 /** Class to wrap RocksDB's native histogram */
 case class RocksDBNativeHistogram(
     sum: Long, avg: Double, stddev: Double, median: Double, p95: Double, p99: Double, count: Long) {
-  def json: String = Serialization.write(this)(RocksDBMetricsNew.format)
+  def json: String = Serialization.write(this)(RocksDBMetrics.format)
 }
 
 object RocksDBNativeHistogram {
