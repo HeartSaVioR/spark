@@ -355,14 +355,18 @@ class RocksDBSuite extends SparkFunSuite {
       RocksDBCheckpointMetadata(Seq.empty, 0L),
       """{"sstFiles":[],"numKeys":0}"""
     )
-    // shouldn't include the "logFiles" field in json when it's empty
+    // shouldn't include the "logFiles" & "customMetadata" field in json when it's empty
     checkJsonRoundtrip(
       RocksDBCheckpointMetadata(sstFiles, 12345678901234L),
       """{"sstFiles":[{"localFileName":"00001.sst","dfsSstFileName":"00001-uuid.sst","sizeBytes":12345678901234}],"numKeys":12345678901234}"""
     )
+    // shouldn't include the "customMetadata" field in json when it's empty
     checkJsonRoundtrip(
-      RocksDBCheckpointMetadata(sstFiles, logFiles, 12345678901234L),
+      RocksDBCheckpointMetadata(sstFiles, logFiles, 12345678901234L, Map.empty),
       """{"sstFiles":[{"localFileName":"00001.sst","dfsSstFileName":"00001-uuid.sst","sizeBytes":12345678901234}],"logFiles":[{"localFileName":"00001.log","dfsLogFileName":"00001-uuid.log","sizeBytes":12345678901234}],"numKeys":12345678901234}""")
+
+    // FIXME: test customMetadata here
+
     // scalastyle:on line.size.limit
   }
 

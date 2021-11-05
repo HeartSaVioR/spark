@@ -22,18 +22,13 @@ import java.nio.ByteOrder
 
 import org.apache.spark.sql.catalyst.expressions.{BoundReference, JoinedRow, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider.{STATE_ENCODING_NUM_VERSION_BYTES, STATE_ENCODING_VERSION}
-import org.apache.spark.sql.types.{StructField, StructType, TimestampType}
+import org.apache.spark.sql.types.{StructField, StructType}
 import org.apache.spark.unsafe.Platform
 
 sealed trait RocksDBStateEncoder {
   def supportPrefixKeyScan: Boolean
   def encodePrefixKey(prefixKey: UnsafeRow): Array[Byte]
   def extractPrefixKey(key: UnsafeRow): UnsafeRow
-
-  def supportEventTimeIndex: Boolean
-  def extractEventTime(key: UnsafeRow): Long
-  def encodeEventTimeIndexKey(timestamp: Long, encodedKey: Array[Byte]): Array[Byte]
-  def decodeEventTimeIndexKey(eventTimeBytes: Array[Byte]): (Long, Array[Byte])
 
   def encodeKey(row: UnsafeRow): Array[Byte]
   def encodeValue(row: UnsafeRow): Array[Byte]
@@ -47,13 +42,11 @@ object RocksDBStateEncoder {
   def getEncoder(
       keySchema: StructType,
       valueSchema: StructType,
-      numColsPrefixKey: Int,
-      eventTimeColIdx: Array[Int]): RocksDBStateEncoder = {
+      numColsPrefixKey: Int): RocksDBStateEncoder = {
     if (numColsPrefixKey > 0) {
-      // FIXME: need to deal with prefix case as well
       new PrefixKeyScanStateEncoder(keySchema, valueSchema, numColsPrefixKey)
     } else {
-      new NoPrefixKeyStateEncoder(keySchema, valueSchema, eventTimeColIdx)
+      new NoPrefixKeyStateEncoder(keySchema, valueSchema)
     }
   }
 
@@ -228,23 +221,6 @@ class PrefixKeyScanStateEncoder(
   }
 
   override def supportPrefixKeyScan: Boolean = true
-
-  override def supportEventTimeIndex: Boolean = false
-
-  // FIXME: fix me!
-  def extractEventTime(key: UnsafeRow): Long = {
-    throw new IllegalStateException("This encoder doesn't support event time index!")
-  }
-
-  // FIXME: fix me!
-  def encodeEventTimeIndexKey(timestamp: Long, encodedKey: Array[Byte]): Array[Byte] = {
-    throw new IllegalStateException("This encoder doesn't support event time index!")
-  }
-
-  // FIXME: fix me!
-  def decodeEventTimeIndexKey(eventTimeBytes: Array[Byte]): (Long, Array[Byte]) = {
-    throw new IllegalStateException("This encoder doesn't support event time index!")
-  }
 }
 
 /**
@@ -259,8 +235,7 @@ class PrefixKeyScanStateEncoder(
  */
 class NoPrefixKeyStateEncoder(
     keySchema: StructType,
-    valueSchema: StructType,
-    eventTimeColIdx: Array[Int]) extends RocksDBStateEncoder {
+    valueSchema: StructType) extends RocksDBStateEncoder {
 
   import RocksDBStateEncoder._
 
@@ -268,32 +243,6 @@ class NoPrefixKeyStateEncoder(
   private val keyRow = new UnsafeRow(keySchema.size)
   private val valueRow = new UnsafeRow(valueSchema.size)
   private val rowTuple = new UnsafeRowPair()
-
-  validateColumnTypeOnEventTimeColumn()
-
-  private def validateColumnTypeOnEventTimeColumn(): Unit = {
-    if (eventTimeColIdx.nonEmpty) {
-      var curSchema: StructType = keySchema
-      eventTimeColIdx.dropRight(1).foreach { idx =>
-        curSchema(idx).dataType match {
-          case stType: StructType =>
-            curSchema = stType
-          case _ =>
-            // FIXME: better error message
-            throw new IllegalStateException("event time column is not properly specified! " +
-              s"index: ${eventTimeColIdx.mkString("(", ", ", ")")} / key schema: $keySchema")
-        }
-      }
-
-      curSchema(eventTimeColIdx.last).dataType match {
-        case _: TimestampType =>
-        case _ =>
-          // FIXME: better error message
-          throw new IllegalStateException("event time column is not properly specified! " +
-            s"index: ${eventTimeColIdx.mkString("(", ", ", ")")} / key schema: $keySchema")
-      }
-    }
-  }
 
   override def encodeKey(row: UnsafeRow): Array[Byte] = encodeUnsafeRow(row)
 
@@ -336,42 +285,5 @@ class NoPrefixKeyStateEncoder(
 
   override def encodePrefixKey(prefixKey: UnsafeRow): Array[Byte] = {
     throw new IllegalStateException("This encoder doesn't support prefix key!")
-  }
-
-  override def supportEventTimeIndex: Boolean = eventTimeColIdx.nonEmpty
-
-  override def extractEventTime(key: UnsafeRow): Long = {
-    var curRow: UnsafeRow = key
-    var curSchema: StructType = keySchema
-
-    eventTimeColIdx.dropRight(1).foreach { idx =>
-      // validation is done in initialization phase
-      curSchema = curSchema(idx).dataType.asInstanceOf[StructType]
-      curRow = curRow.getStruct(idx, curSchema.length)
-    }
-
-    curRow.getLong(eventTimeColIdx.last) / 1000
-  }
-
-  override def encodeEventTimeIndexKey(timestamp: Long, encodedKey: Array[Byte]): Array[Byte] = {
-    val newKey = new Array[Byte](8 + encodedKey.length)
-
-    Platform.putLong(newKey, Platform.BYTE_ARRAY_OFFSET,
-      BinarySortable.encodeToBinarySortableLong(timestamp))
-    Platform.copyMemory(encodedKey, Platform.BYTE_ARRAY_OFFSET, newKey,
-      Platform.BYTE_ARRAY_OFFSET + 8, encodedKey.length)
-
-    newKey
-  }
-
-  override def decodeEventTimeIndexKey(eventTimeBytes: Array[Byte]): (Long, Array[Byte]) = {
-    val encoded = Platform.getLong(eventTimeBytes, Platform.BYTE_ARRAY_OFFSET)
-    val timestamp = BinarySortable.decodeBinarySortableLong(encoded)
-
-    val key = new Array[Byte](eventTimeBytes.length - 8)
-    Platform.copyMemory(eventTimeBytes, Platform.BYTE_ARRAY_OFFSET + 8,
-      key, Platform.BYTE_ARRAY_OFFSET, eventTimeBytes.length - 8)
-
-    (timestamp, key)
   }
 }

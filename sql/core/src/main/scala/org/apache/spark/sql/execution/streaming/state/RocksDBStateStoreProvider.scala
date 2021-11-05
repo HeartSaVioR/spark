@@ -24,15 +24,14 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.spark.{SparkConf, SparkEnv}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
-import org.apache.spark.sql.types.StructType
-import org.apache.spark.unsafe.Platform
+import org.apache.spark.sql.types.{StructType, TimestampType}
 import org.apache.spark.util.{NextIterator, Utils}
 
 private[sql] class RocksDBStateStoreProvider
   extends StateStoreProvider with Logging with Closeable {
   import RocksDBStateStoreProvider._
 
-  class RocksDBStateStore(lastVersion: Long) extends StateStore {
+  class RocksDBStateStore(lastVersion: Long, eventTimeColIdx: Array[Int]) extends StateStore {
     /** Trait and classes representing the internal state of the store */
     trait STATE
     case object UPDATING extends STATE
@@ -41,6 +40,40 @@ private[sql] class RocksDBStateStoreProvider
 
     @volatile private var state: STATE = UPDATING
     @volatile private var isValidated = false
+
+    private val supportEventTimeIndex: Boolean = eventTimeColIdx.nonEmpty
+
+    if (supportEventTimeIndex) {
+      validateColumnTypeOnEventTimeColumn()
+    }
+
+    private def validateColumnTypeOnEventTimeColumn(): Unit = {
+      require(eventTimeColIdx.nonEmpty)
+
+      var curSchema: StructType = keySchema
+      eventTimeColIdx.dropRight(1).foreach { idx =>
+        curSchema(idx).dataType match {
+          case stType: StructType =>
+            curSchema = stType
+          case _ =>
+            // FIXME: better error message
+            throw new IllegalStateException("event time column is not properly specified! " +
+              s"index: ${eventTimeColIdx.mkString("(", ", ", ")")} / key schema: $keySchema")
+        }
+      }
+
+      curSchema(eventTimeColIdx.last).dataType match {
+        case _: TimestampType =>
+        case _ =>
+          // FIXME: better error message
+          throw new IllegalStateException("event time column is not properly specified! " +
+            s"index: ${eventTimeColIdx.mkString("(", ", ", ")")} / key schema: $keySchema")
+      }
+    }
+
+    private var lowestEventTime: Long = Option(rocksDB.getCustomMetadata())
+      .flatMap(_.get(METADATA_KEY_LOWEST_EVENT_TIME).map(_.toLong))
+      .getOrElse(INVALID_LOWEST_EVENT_TIME_VALUE)
 
     override def id: StateStoreId = RocksDBStateStoreProvider.this.stateStoreId
 
@@ -66,19 +99,29 @@ private[sql] class RocksDBStateStoreProvider
       val encodedValue = encoder.encodeValue(value)
       rocksDB.put(encodedKey, encodedValue)
 
-      if (encoder.supportEventTimeIndex) {
-        val timestamp = encoder.extractEventTime(key)
-        val tsKey = encoder.encodeEventTimeIndexKey(timestamp, encodedKey)
-
-        rocksDB.put(CF_EVENT_TIME_INDEX, tsKey, Array.empty)
+      if (supportEventTimeIndex) {
+        val eventTimeValue = extractEventTime(key)
+        if (lowestEventTime != INVALID_LOWEST_EVENT_TIME_VALUE
+          && lowestEventTime > eventTimeValue) {
+          lowestEventTime = eventTimeValue
+        }
       }
     }
 
     override def remove(key: UnsafeRow): Unit = {
       verify(state == UPDATING, "Cannot remove after already committed or aborted")
       verify(key != null, "Key cannot be null")
-      // FIXME: this should reflect the index
+
       rocksDB.remove(encoder.encodeKey(key))
+      if (supportEventTimeIndex) {
+        val eventTimeValue = extractEventTime(key)
+        if (lowestEventTime == eventTimeValue) {
+          // We can't track the next lowest event time without scanning entire keys.
+          // Mark the lowest event time value as invalid, so that scan happens in evict phase and
+          // the value is correctly updated later.
+          lowestEventTime = INVALID_LOWEST_EVENT_TIME_VALUE
+        }
+      }
     }
 
     override def iterator(): Iterator[UnsafeRowPair] = {
@@ -100,8 +143,89 @@ private[sql] class RocksDBStateStoreProvider
       rocksDB.prefixScan(prefix).map(kv => encoder.decode(kv))
     }
 
+    /** FIXME: method doc */
+    override def evictOnWatermark(
+      watermarkMs: Long,
+      altPred: UnsafeRowPair => Boolean): Iterator[UnsafeRowPair] = {
+      if (supportEventTimeIndex) {
+        // convert lowestEventTime to milliseconds, and compare to watermarkMs
+        // retract 1 ms to avoid edge-case on conversion from microseconds to milliseconds
+        if (lowestEventTime != INVALID_LOWEST_EVENT_TIME_VALUE
+          && ((lowestEventTime / 1000) - 1 > watermarkMs)) {
+          Iterator.empty
+        } else {
+          // start with invalidating the lowest event time
+          lowestEventTime = INVALID_LOWEST_EVENT_TIME_VALUE
+
+          new NextIterator[UnsafeRowPair] {
+            private val iter = rocksDB.iterator()
+
+            // here we use Long.MaxValue as invalid value
+            private var lowestEventTimeInIter = Long.MaxValue
+
+            override protected def getNext(): UnsafeRowPair = {
+              var result: UnsafeRowPair = null
+              while (result == null && iter.hasNext) {
+                val kv = iter.next()
+                val rowPair = encoder.decode(kv)
+                if (altPred(rowPair)) {
+                  rocksDB.remove(kv.key)
+                  result = rowPair
+                } else {
+                  val eventTime = extractEventTime(rowPair.key)
+                  if (lowestEventTimeInIter > eventTime) {
+                    lowestEventTimeInIter = eventTime
+                  }
+                }
+              }
+
+              if (result == null) {
+                finished = true
+                null
+              } else {
+                result
+              }
+            }
+
+            override protected def close(): Unit = {
+              if (lowestEventTimeInIter != Long.MaxValue) {
+                lowestEventTime = lowestEventTimeInIter
+              }
+            }
+          }
+        }
+      } else {
+        rocksDB.iterator().flatMap { kv =>
+          val rowPair = encoder.decode(kv)
+          if (altPred(rowPair)) {
+            rocksDB.remove(kv.key)
+            Some(rowPair)
+          } else {
+            None
+          }
+        }
+      }
+    }
+
+    private def extractEventTime(key: UnsafeRow): Long = {
+      var curRow: UnsafeRow = key
+      var curSchema: StructType = keySchema
+
+      eventTimeColIdx.dropRight(1).foreach { idx =>
+        // validation is done in initialization phase
+        curSchema = curSchema(idx).dataType.asInstanceOf[StructType]
+        curRow = curRow.getStruct(idx, curSchema.length)
+      }
+
+      curRow.getLong(eventTimeColIdx.last)
+    }
+
     override def commit(): Long = synchronized {
       verify(state == UPDATING, "Cannot commit after already committed or aborted")
+
+      // set the metadata to RocksDB instance so that it can be committed as well
+      rocksDB.setCustomMetadata(Map(METADATA_KEY_LOWEST_EVENT_TIME -> lowestEventTime.toString))
+
       val newVersion = rocksDB.commit()
       state = COMMITTED
       logInfo(s"Committed $newVersion for $id")
@@ -173,68 +297,6 @@ private[sql] class RocksDBStateStoreProvider
 
     /** Return the [[RocksDB]] instance in this store. This is exposed mainly for testing. */
     def dbInstance(): RocksDB = rocksDB
-
-    /** FIXME: method doc */
-    override def evictOnWatermark(
-        watermarkMs: Long,
-        altPred: UnsafeRowPair => Boolean): Iterator[UnsafeRowPair] = {
-
-      if (encoder.supportEventTimeIndex) {
-        val kv = new ByteArrayPair()
-
-        // FIXME: DEBUG
-        // logWarning(s"DEBUG: start iterating event time index, watermark $watermarkMs")
-
-        new NextIterator[UnsafeRowPair] {
-          private val iter = rocksDB.iterator(CF_EVENT_TIME_INDEX)
-          override protected def getNext(): UnsafeRowPair = {
-            if (iter.hasNext) {
-              val pair = iter.next()
-
-              val encodedTs = Platform.getLong(pair.key, Platform.BYTE_ARRAY_OFFSET)
-              val decodedTs = BinarySortable.decodeBinarySortableLong(encodedTs)
-
-              // FIXME: DEBUG
-              // logWarning(s"DEBUG: decoded TS: $decodedTs")
-
-              if (decodedTs > watermarkMs) {
-                finished = true
-                null
-              } else {
-                // FIXME: can we leverage deleteRange to bulk delete on index?
-                rocksDB.remove(CF_EVENT_TIME_INDEX, pair.key)
-                val (_, encodedKey) = encoder.decodeEventTimeIndexKey(pair.key)
-                val value = rocksDB.get(encodedKey)
-                if (value == null) {
-                  throw new IllegalStateException("Event time index has been broken!")
-                }
-                kv.set(encodedKey, value)
-                val rowPair = encoder.decode(kv)
-                rocksDB.remove(encodedKey)
-                rowPair
-              }
-            } else {
-              finished = true
-              null
-            }
-          }
-
-          override protected def close(): Unit = {
-            iter.closeIfNeeded()
-          }
-        }
-      } else {
-        rocksDB.iterator().flatMap { kv =>
-          val rowPair = encoder.decode(kv)
-          if (altPred(rowPair)) {
-            rocksDB.remove(kv.key)
-            Some(rowPair)
-          } else {
-            None
-          }
-        }
-      }
-    }
   }
 
   override def init(
@@ -257,7 +319,7 @@ private[sql] class RocksDBStateStoreProvider
     this.operatorContext = operatorContext
 
     this.encoder = RocksDBStateEncoder.getEncoder(keySchema, valueSchema,
-      operatorContext.numColsPrefixKey, operatorContext.eventTimeColIdx)
+      operatorContext.numColsPrefixKey)
 
     rocksDB // lazy initialization
   }
@@ -267,7 +329,7 @@ private[sql] class RocksDBStateStoreProvider
   override def getStore(version: Long): StateStore = {
     require(version >= 0, "Version cannot be less than 0")
     rocksDB.load(version)
-    new RocksDBStateStore(version)
+    new RocksDBStateStore(version, operatorContext.eventTimeColIdx)
   }
 
   override def doMaintenance(): Unit = {
@@ -298,7 +360,6 @@ private[sql] class RocksDBStateStoreProvider
     val sparkConf = Option(SparkEnv.get).map(_.conf).getOrElse(new SparkConf)
     val localRootDir = Utils.createTempDir(Utils.getLocalDir(sparkConf), storeIdStr)
     new RocksDB(dfsRootDir, RocksDBConf(storeConf),
-      columnFamilies = Seq("default", RocksDBStateStoreProvider.CF_EVENT_TIME_INDEX),
       localRootDir = localRootDir,
       hadoopConf = hadoopConf, loggingId = storeIdStr)
   }
@@ -315,8 +376,8 @@ object RocksDBStateStoreProvider {
   val STATE_ENCODING_NUM_VERSION_BYTES = 1
   val STATE_ENCODING_VERSION: Byte = 0
 
-  // reserved column families
-  val CF_EVENT_TIME_INDEX: String = "__event_time_idx"
+  val INVALID_LOWEST_EVENT_TIME_VALUE: Long = Long.MinValue
+  val METADATA_KEY_LOWEST_EVENT_TIME: String = "lowestEventTimeInState"
 
   // Native operation latencies report as latency in microseconds
   // as SQLMetrics support millis. Convert the value to millis

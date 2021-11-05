@@ -66,7 +66,7 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
   private def runEvictBenchmark(): Unit = {
     runBenchmark("evict rows") {
       val numOfRows = Seq(10000) // Seq(1000, 10000, 100000)
-      val numOfTimestamps = Seq(10, 100, 1000)
+      val numOfTimestamps = Seq(100, 1000)
       val numOfEvictionRates = Seq(50, 25, 10, 5, 1, 0) // Seq(100, 75, 50, 25, 1, 0)
 
       numOfRows.foreach { numOfRow =>
@@ -116,7 +116,7 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
               val rocksDBStore = rocksDBProvider.getStore(committedVersion)
 
               timer.startTiming()
-              evictAsFullScanAndRemove(rocksDBStore, maxTimestampToEvictInMillis)
+              evictAsFullScanAndRemove(rocksDBStore, maxTimestampToEvictInMillis, numOfRowsToEvict)
               timer.stopTiming()
 
               rocksDBStore.abort()
@@ -126,7 +126,7 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
               val rocksDBStore = rocksDBProvider.getStore(committedVersion)
 
               timer.startTiming()
-              evictAsNewEvictApi(rocksDBStore, maxTimestampToEvictInMillis)
+              evictAsNewEvictApi(rocksDBStore, maxTimestampToEvictInMillis, numOfRowsToEvict)
               timer.stopTiming()
 
               rocksDBStore.abort()
@@ -487,20 +487,29 @@ object StateStoreBenchmark extends SqlBasedBenchmark {
 
   private def evictAsFullScanAndRemove(
       store: StateStore,
-      maxTimestampToEvict: Long): Unit = {
+      maxTimestampToEvict: Long,
+      expectedNumOfRows: Long): Unit = {
+    var removedRows: Long = 0
     store.iterator().foreach { r =>
-      if (r.key.getLong(1) < maxTimestampToEvict) {
+      if (r.key.getLong(1) / 1000 <= maxTimestampToEvict) {
         store.remove(r.key)
+        removedRows += 1
       }
     }
+    assert(removedRows == expectedNumOfRows,
+      s"expected: $expectedNumOfRows actual: $removedRows")
   }
 
   private def evictAsNewEvictApi(
       store: StateStore,
-      maxTimestampToEvict: Long): Unit = {
+      maxTimestampToEvict: Long,
+      expectedNumOfRows: Long): Unit = {
+    var removedRows: Long = 0
     store.evictOnWatermark(maxTimestampToEvict, pair => {
-      pair.key.getLong(1) < maxTimestampToEvict
-    }).foreach { _ => }
+      pair.key.getLong(1) / 1000 <= maxTimestampToEvict
+    }).foreach { _ => removedRows += 1 }
+    assert(removedRows == expectedNumOfRows,
+      s"expected: $expectedNumOfRows actual: $removedRows")
   }
 
   private def fullScanAndCompareTimestamp(

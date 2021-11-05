@@ -152,11 +152,15 @@ class RocksDBFileManager(
   def latestSaveCheckpointMetrics: RocksDBFileManagerMetrics = saveCheckpointMetrics
 
   /** Save all the files in given local checkpoint directory as a committed version in DFS */
-  def saveCheckpointToDfs(checkpointDir: File, version: Long, numKeys: Long): Unit = {
+  def saveCheckpointToDfs(
+      checkpointDir: File,
+      version: Long,
+      numKeys: Long,
+      customMetadata: Map[String, String] = Map.empty): Unit = {
     logFilesInDir(checkpointDir, s"Saving checkpoint files for version $version")
     val (localImmutableFiles, localOtherFiles) = listRocksDBFiles(checkpointDir)
     val rocksDBFiles = saveImmutableFilesToDfs(version, localImmutableFiles)
-    val metadata = RocksDBCheckpointMetadata(rocksDBFiles, numKeys)
+    val metadata = RocksDBCheckpointMetadata(rocksDBFiles, numKeys, customMetadata)
     val metadataFile = localMetadataFile(checkpointDir)
     metadata.writeToFile(metadataFile)
     logInfo(s"Written metadata for version $version:\n${metadata.prettyJson}")
@@ -184,7 +188,7 @@ class RocksDBFileManager(
     val metadata = if (version == 0) {
       if (localDir.exists) Utils.deleteRecursively(localDir)
       localDir.mkdirs()
-      RocksDBCheckpointMetadata(Seq.empty, 0)
+      RocksDBCheckpointMetadata(Seq.empty, 0, Map.empty)
     } else {
       // Delete all non-immutable files in local dir, and unzip new ones from DFS commit file
       listRocksDBFiles(localDir)._2.foreach(_.delete())
@@ -540,12 +544,20 @@ object RocksDBFileManagerMetrics {
 case class RocksDBCheckpointMetadata(
     sstFiles: Seq[RocksDBSstFile],
     logFiles: Seq[RocksDBLogFile],
-    numKeys: Long) {
+    numKeys: Long,
+    customMetadata: Map[String, String]) {
   import RocksDBCheckpointMetadata._
 
   def json: String = {
-    // We turn this field into a null to avoid write a empty logFiles field in the json.
-    val nullified = if (logFiles.isEmpty) this.copy(logFiles = null) else this
+    // We turn the field into a null to avoid write below fields in the json if they are empty:
+    // - logFiles
+    // - customMetadata
+    val nullified = {
+      var cur = this
+      cur = if (logFiles.isEmpty) cur.copy(logFiles = null) else cur
+      cur = if (customMetadata.isEmpty) cur.copy(customMetadata = null) else cur
+      cur
+    }
     mapper.writeValueAsString(nullified)
   }
 
@@ -593,11 +605,18 @@ object RocksDBCheckpointMetadata {
     }
   }
 
-  def apply(rocksDBFiles: Seq[RocksDBImmutableFile], numKeys: Long): RocksDBCheckpointMetadata = {
+  def apply(
+      rocksDBFiles: Seq[RocksDBImmutableFile],
+      numKeys: Long): RocksDBCheckpointMetadata = apply(rocksDBFiles, numKeys, Map.empty)
+
+  def apply(
+      rocksDBFiles: Seq[RocksDBImmutableFile],
+      numKeys: Long,
+      customMetadata: Map[String, String]): RocksDBCheckpointMetadata = {
     val sstFiles = rocksDBFiles.collect { case file: RocksDBSstFile => file }
     val logFiles = rocksDBFiles.collect { case file: RocksDBLogFile => file }
 
-    RocksDBCheckpointMetadata(sstFiles, logFiles, numKeys)
+    RocksDBCheckpointMetadata(sstFiles, logFiles, numKeys, customMetadata)
   }
 }
 
