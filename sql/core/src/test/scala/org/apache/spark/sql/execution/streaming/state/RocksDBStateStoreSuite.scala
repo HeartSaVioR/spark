@@ -128,6 +128,8 @@ class RocksDBStateStoreSuite extends StateStoreSuiteBase[RocksDBStateStoreProvid
     }
   }
 
+  // FIXME: test with evictOnWatermark
+
   override def newStoreProvider(): RocksDBStateStoreProvider = {
     newStoreProvider(StateStoreId(newDir(), Random.nextInt(), 0))
   }

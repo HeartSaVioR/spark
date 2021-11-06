@@ -607,10 +607,6 @@ object RocksDBCheckpointMetadata {
 
   def apply(
       rocksDBFiles: Seq[RocksDBImmutableFile],
-      numKeys: Long): RocksDBCheckpointMetadata = apply(rocksDBFiles, numKeys, Map.empty)
-
-  def apply(
-      rocksDBFiles: Seq[RocksDBImmutableFile],
       numKeys: Long,
       customMetadata: Map[String, String]): RocksDBCheckpointMetadata = {
     val sstFiles = rocksDBFiles.collect { case file: RocksDBSstFile => file }

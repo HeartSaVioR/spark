@@ -352,21 +352,21 @@ class RocksDBSuite extends SparkFunSuite {
     // scalastyle:off line.size.limit
     // should always include sstFiles and numKeys
     checkJsonRoundtrip(
-      RocksDBCheckpointMetadata(Seq.empty, 0L),
+      RocksDBCheckpointMetadata(Seq.empty, 0L, Map.empty),
       """{"sstFiles":[],"numKeys":0}"""
     )
     // shouldn't include the "logFiles" & "customMetadata" field in json when it's empty
     checkJsonRoundtrip(
-      RocksDBCheckpointMetadata(sstFiles, 12345678901234L),
+      RocksDBCheckpointMetadata(sstFiles, 12345678901234L, Map.empty),
       """{"sstFiles":[{"localFileName":"00001.sst","dfsSstFileName":"00001-uuid.sst","sizeBytes":12345678901234}],"numKeys":12345678901234}"""
     )
     // shouldn't include the "customMetadata" field in json when it's empty
     checkJsonRoundtrip(
       RocksDBCheckpointMetadata(sstFiles, logFiles, 12345678901234L, Map.empty),
       """{"sstFiles":[{"localFileName":"00001.sst","dfsSstFileName":"00001-uuid.sst","sizeBytes":12345678901234}],"logFiles":[{"localFileName":"00001.log","dfsLogFileName":"00001-uuid.log","sizeBytes":12345678901234}],"numKeys":12345678901234}""")
-
-    // FIXME: test customMetadata here
-
+    checkJsonRoundtrip(
+      RocksDBCheckpointMetadata(sstFiles, logFiles, 12345678901234L, Map("key1" -> "value1", "key2" -> "value2")),
+      """{"sstFiles":[{"localFileName":"00001.sst","dfsSstFileName":"00001-uuid.sst","sizeBytes":12345678901234}],"logFiles":[{"localFileName":"00001.log","dfsLogFileName":"00001-uuid.log","sizeBytes":12345678901234}],"numKeys":12345678901234,"customMetadata":{"key1":"value1","key2":"value2"}}""")
     // scalastyle:on line.size.limit
   }
 
@@ -453,6 +453,37 @@ class RocksDBSuite extends SparkFunSuite {
         assert(metrics.nativeOpsHistograms("compaction").count > 0)
         assert(metrics.nativeOpsMetrics("totalBytesReadByCompaction") > 0)
         assert(metrics.nativeOpsMetrics("totalBytesWrittenByCompaction") > 0)
+      }
+    }
+  }
+
+  test("custom metadata") {
+    withTempDir { dir =>
+      val remoteDir = dir.getCanonicalPath
+      withDB(remoteDir) { db =>
+        db.load(0)
+        assert(db.getCustomMetadata() === Map.empty)
+
+        db.put("a", "5")
+        db.put("b", "5")
+        db.setCustomMetadata(Map("key1" -> "value1", "key2" -> "value2"))
+        assert(db.getCustomMetadata() === Map("key1" -> "value1", "key2" -> "value2"))
+
+        db.commit()
+        assert(db.getCustomMetadata() === Map("key1" -> "value1", "key2" -> "value2"))
+      }
+
+      withDB(remoteDir) { db =>
+        db.load(1)
+        assert(db.getCustomMetadata() === Map("key1" -> "value1", "key2" -> "value2"))
+
+        db.put("c", "6")
+        db.setCustomMetadata(Map("key3" -> "value3"))
+
+        db.rollback()
+
+        // The custom metadata remains unchanged
+        assert(db.getCustomMetadata() === Map("key1" -> "value1", "key2" -> "value2"))
       }
     }
   }
