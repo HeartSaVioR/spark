@@ -56,7 +56,6 @@ private[sql] class RocksDBStateStoreProvider
           case stType: StructType =>
             curSchema = stType
           case _ =>
-            // FIXME: better error message
             throw new IllegalStateException("event time column is not properly specified! " +
               s"index: ${eventTimeColIdx.mkString("(", ", ", ")")} / key schema: $keySchema")
         }
@@ -65,7 +64,6 @@ private[sql] class RocksDBStateStoreProvider
       curSchema(eventTimeColIdx.last).dataType match {
         case _: TimestampType =>
         case _ =>
-          // FIXME: better error message
           throw new IllegalStateException("event time column is not properly specified! " +
             s"index: ${eventTimeColIdx.mkString("(", ", ", ")")} / key schema: $keySchema")
       }
@@ -74,6 +72,8 @@ private[sql] class RocksDBStateStoreProvider
     private var lowestEventTime: Long = Option(rocksDB.getCustomMetadata())
       .flatMap(_.get(METADATA_KEY_LOWEST_EVENT_TIME).map(_.toLong))
       .getOrElse(INVALID_LOWEST_EVENT_TIME_VALUE)
+
+    private[sql] def getLowestEventTime(): Long = lowestEventTime
 
     override def id: StateStoreId = RocksDBStateStoreProvider.this.stateStoreId
 
