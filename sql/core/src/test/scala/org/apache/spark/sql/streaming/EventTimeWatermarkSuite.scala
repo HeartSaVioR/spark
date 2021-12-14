@@ -285,6 +285,44 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
       assertEventStats(min = 50, max = 50, avg = 50, wtrmark = 40))
   }
 
+  test("DEBUG: multiple aggregations, append mode") {
+    withSQLConf("spark.sql.streaming.unsupportedOperationCheck" -> "false") {
+      val inputData = MemoryStream[Int]
+
+      val windowedAggregation = inputData.toDF()
+        .withColumn("eventTime", timestamp_seconds($"value"))
+        .withWatermark("eventTime", "10 seconds")
+        .groupBy(window($"eventTime", "5 seconds") as 'window)
+        .agg(count("*") as 'count)
+        .withWindowTimeColumn("window_time", $"window")
+        .groupBy(window($"window_time", "10 seconds"))
+        .agg(count("*") as 'count)
+        .select($"window".getField("start").cast("long").as[Long], $"count".as[Long])
+
+      testStream(windowedAggregation)(
+        AddData(inputData, 10, 11, 12, 13, 14, 15),
+        CheckNewAnswer(),         // [10, 15) 5, [15, 20) 1 ... None
+        assertNumStateRows(2),
+        assertNumRowsDroppedByWatermark(0),
+        AddData(inputData, 25),   // Advance watermark to 15 seconds
+        CheckNewAnswer(),         // [15, 20) 1, [25, 30) 1 ... [10, 20) 1
+        // FIXME: check multiple stateful operators
+        assertNumStateRows(3),
+        assertNumRowsDroppedByWatermark(0),
+        AddData(inputData, 10),   // Should not emit anything as data less than watermark
+        CheckNewAnswer(),
+        // FIXME: check multiple stateful operators
+        assertNumStateRows(3),
+        assertNumRowsDroppedByWatermark(1),
+        AddData(inputData, 35),   // Advance watermark to 25 seconds
+        CheckNewAnswer((10, 1)),   // [25, 30) 1, [35, 40) 1 ... None
+        // FIXME: check multiple stateful operators
+        assertNumStateRows(2),
+        assertNumRowsDroppedByWatermark(0)
+      )
+    }
+  }
+
   test("append mode") {
     val inputData = MemoryStream[Int]
 
@@ -847,7 +885,7 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
   private def assertNumStateRows(numTotalRows: Long): AssertOnQuery = AssertOnQuery { q =>
     q.processAllAvailable()
     val progressWithData = q.recentProgress.lastOption.get
-    assert(progressWithData.stateOperators(0).numRowsTotal === numTotalRows)
+    assert(progressWithData.stateOperators.map(_.numRowsTotal).sum === numTotalRows)
     true
   }
 
@@ -860,7 +898,7 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
       // 2) empty input batch
       p.inputRowsPerSecond == 0
     }.lastOption.get
-    assert(progressWithData.stateOperators(0).numRowsDroppedByWatermark
+    assert(progressWithData.stateOperators.map(_.numRowsDroppedByWatermark).sum
       === numRowsDroppedByWatermark)
     true
   }

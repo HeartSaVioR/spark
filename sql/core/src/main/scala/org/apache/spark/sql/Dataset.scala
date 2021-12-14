@@ -58,6 +58,7 @@ import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, DataSourceV2ScanRelation, FileTable}
 import org.apache.spark.sql.execution.python.EvaluatePython
 import org.apache.spark.sql.execution.stat.StatFunctions
+import org.apache.spark.sql.functions.expr
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.DataStreamWriter
 import org.apache.spark.sql.types._
@@ -2457,6 +2458,34 @@ class Dataset[T] private[sql](
     withPlan {
       Generate(generator, unrequiredChildIndex = Nil, outer = false,
         qualifier = None, generatorOutput = Nil, logicalPlan)
+    }
+  }
+
+  def withWindowTimeColumn(colName: String, windowCol: Column): DataFrame = {
+    val resolver = sparkSession.sessionState.analyzer.resolver
+    val output = queryExecution.analyzed.output
+
+    output.find { field => resolver(field.name, windowCol.named.name) } match {
+      case Some(attr) =>
+        val windowMetadata = attr.metadata
+
+        // FIXME: need to verify this holds true for batch query as well
+        if (!windowMetadata.contains(TimeWindow.marker) &&
+            !windowMetadata.contains(SessionWindow.marker)) {
+          // TODO: apply error framework?
+          throw new AnalysisException("withWindowTimeColumn is only applicable with " +
+            "time window column!")
+        }
+
+        // NOTE: "window.end" is "exclusive" upper bound of window, so if we use this value as
+        // it is, it is going to be bound to the different window even we apply the same window
+        // spec. Decrease 1 microsecond from window.end to let the window_time bound to the
+        // same window range again.
+        this.withColumn(colName, expr("window.end - interval 1 microsecond"), windowMetadata)
+
+      case _ =>
+        // TODO: apply error framework?
+        throw new AnalysisException(s"No such time window column $colName")
     }
   }
 

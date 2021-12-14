@@ -3816,6 +3816,11 @@ object TimeWindowing extends Rule[LogicalPlan] {
           case _ => Metadata.empty
         }
 
+        val newMetadata = new MetadataBuilder()
+          .withMetadata(metadata)
+          .putBoolean(TimeWindow.marker, true)
+          .build()
+
         def getWindow(i: Int, overlappingWindows: Int, dataType: DataType): Expression = {
           val division = (PreciseTimestampConversion(
             window.timeColumn, dataType, LongType) - window.startTime) / window.slideDuration
@@ -3835,11 +3840,11 @@ object TimeWindowing extends Rule[LogicalPlan] {
         }
 
         val windowAttr = AttributeReference(
-          WINDOW_COL_NAME, window.dataType, metadata = metadata)()
+          WINDOW_COL_NAME, window.dataType, metadata = newMetadata)()
 
         if (window.windowDuration == window.slideDuration) {
           val windowStruct = Alias(getWindow(0, 1, window.timeColumn.dataType), WINDOW_COL_NAME)(
-            exprId = windowAttr.exprId, explicitMetadata = Some(metadata))
+            exprId = windowAttr.exprId, explicitMetadata = Some(newMetadata))
 
           val replacedPlan = p transformExpressions {
             case t: TimeWindow => windowAttr
