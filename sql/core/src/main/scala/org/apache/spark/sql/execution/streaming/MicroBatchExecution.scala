@@ -317,9 +317,13 @@ class MicroBatchExecution(
         nextOffsets.metadata.foreach { metadata =>
           OffsetSeqMetadata.setSessionConf(metadata, sparkSessionToRunBatches.conf)
           offsetSeqMetadata = OffsetSeqMetadata(
-            metadata.batchWatermarkMs, metadata.batchTimestampMs, sparkSessionToRunBatches.conf)
+            metadata.batchWatermarkMs, metadata.batchTimestampMs,
+            metadata.operatorWatermarksOnLateEvents, metadata.operatorWatermarksOnEviction,
+            sparkSessionToRunBatches.conf)
           watermarkTracker = WatermarkTracker(sparkSessionToRunBatches.conf)
           watermarkTracker.setWatermark(metadata.batchWatermarkMs)
+          watermarkTracker.setOperatorWatermarks(
+            metadata.operatorWatermarksOnLateEvents, metadata.operatorWatermarksOnEviction)
         }
 
         /* identify the current batch id: if commit log indicates we successfully processed the
@@ -346,6 +350,10 @@ class MicroBatchExecution(
               committedOffsets ++= availableOffsets
               watermarkTracker.setWatermark(
                 math.max(watermarkTracker.currentWatermark, commitMetadata.nextBatchWatermarkMs))
+              // FIXME: why above takes max? how this applies to watermark per operator?
+              watermarkTracker.setOperatorWatermarks(
+                commitMetadata.operatorWatermarksOnLateEvents,
+                commitMetadata.operatorWatermarksOnEviction)
             } else if (latestCommittedBatchId == latestBatchId - 1) {
               availableOffsets.foreach {
                 case (source: Source, end: Offset) =>
@@ -458,9 +466,13 @@ class MicroBatchExecution(
       .map(p => p._1 -> p._2.get).toMap
 
     // Update the query metadata
+    val (opWatermarksOnLateEvents, opWatermarksOnEviction) =
+      watermarkTracker.currentOperatorWatermarks
     offsetSeqMetadata = offsetSeqMetadata.copy(
       batchWatermarkMs = watermarkTracker.currentWatermark,
-      batchTimestampMs = triggerClock.getTimeMillis())
+      batchTimestampMs = triggerClock.getTimeMillis(),
+      operatorWatermarksOnLateEvents = opWatermarksOnLateEvents,
+      operatorWatermarksOnEviction = opWatermarksOnEviction)
 
     // Check whether next batch should be constructed
     val lastExecutionRequiresAnotherBatch = noDataBatchesEnabled &&
@@ -650,7 +662,11 @@ class MicroBatchExecution(
     withProgressLocked {
       sinkCommitProgress = batchSinkProgress
       watermarkTracker.updateWatermark(lastExecution.executedPlan)
-      assert(commitLog.add(currentBatchId, CommitMetadata(watermarkTracker.currentWatermark)),
+      val (opWatermarksOnLateEvents, opWatermarksOnEviction) =
+        watermarkTracker.currentOperatorWatermarks
+      assert(commitLog.add(currentBatchId,
+        CommitMetadata(watermarkTracker.currentWatermark, opWatermarksOnLateEvents,
+          opWatermarksOnEviction)),
         "Concurrent update to the commit log. Multiple streaming jobs detected for " +
           s"$currentBatchId")
       committedOffsets ++= availableOffsets

@@ -92,6 +92,12 @@ class IncrementalExecution(
    */
   private val statefulOperatorId = new AtomicInteger(0)
 
+  /**
+   * FIXME: doc! also this has to start with 1 since we apply * -1 afterwards and we don't want
+   *  this to be 0
+   */
+  private val watermarkOperatorId = new AtomicInteger(1)
+
   /** Get the state info of the next stateful operator */
   private def nextStatefulOperationStateInfo(): StatefulOperatorStateInfo = {
     StatefulOperatorStateInfo(
@@ -100,6 +106,26 @@ class IncrementalExecution(
       statefulOperatorId.getAndIncrement(),
       currentBatchId,
       numStateStores)
+  }
+
+  private def nextWatermarkOperationStateInfo(): StatefulOperatorStateInfo = {
+    StatefulOperatorStateInfo(
+      checkpointLocation,
+      runId,
+      // NOTE: this is to avoid conflict between watermark operator vs stateful operator
+      watermarkOperatorId.getAndIncrement() * -1,
+      currentBatchId,
+      numStateStores)
+  }
+
+  private def getWatermarkOnLateEvents(operatorId: Long): Long = {
+    offsetSeqMetadata.operatorWatermarksOnLateEvents.getOrElse(
+      operatorId, WatermarkTracker.DEFAULT_WATERMARK_MS)
+  }
+
+  private def getWatermarkOnEviction(operatorId: Long): Long = {
+    offsetSeqMetadata.operatorWatermarksOnEviction.getOrElse(
+      operatorId, WatermarkTracker.DEFAULT_WATERMARK_MS)
   }
 
   /** Locates save/restore pairs surrounding aggregation. */
@@ -132,7 +158,10 @@ class IncrementalExecution(
     }
 
     override def apply(plan: SparkPlan): SparkPlan = plan transform {
-      case StateStoreSaveExec(keys, None, None, None, stateFormatVersion,
+      case et: EventTimeWatermarkExec =>
+        et.copy(stateInfo = Some(nextWatermarkOperationStateInfo))
+
+      case StateStoreSaveExec(keys, None, None, None, None, stateFormatVersion,
              UnaryExecNode(agg,
                StateStoreRestoreExec(_, None, _, child))) =>
         val aggStateInfo = nextStatefulOperationStateInfo
@@ -140,7 +169,8 @@ class IncrementalExecution(
           keys,
           Some(aggStateInfo),
           Some(outputMode),
-          Some(offsetSeqMetadata.batchWatermarkMs),
+          Some(getWatermarkOnLateEvents(aggStateInfo.operatorId)),
+          Some(getWatermarkOnEviction(aggStateInfo.operatorId)),
           stateFormatVersion,
           agg.withNewChildren(
             StateStoreRestoreExec(
@@ -149,51 +179,60 @@ class IncrementalExecution(
               stateFormatVersion,
               child) :: Nil))
 
-      case SessionWindowStateStoreSaveExec(keys, session, None, None, None, stateFormatVersion,
-        UnaryExecNode(agg,
-        SessionWindowStateStoreRestoreExec(_, _, None, None, _, child))) =>
-          val aggStateInfo = nextStatefulOperationStateInfo
-          SessionWindowStateStoreSaveExec(
-            keys,
-            session,
-            Some(aggStateInfo),
-            Some(outputMode),
-            Some(offsetSeqMetadata.batchWatermarkMs),
-            stateFormatVersion,
-            agg.withNewChildren(
-              SessionWindowStateStoreRestoreExec(
-                keys,
-                session,
-                Some(aggStateInfo),
-                Some(offsetSeqMetadata.batchWatermarkMs),
-                stateFormatVersion,
-                child) :: Nil))
+      case SessionWindowStateStoreSaveExec(keys, session, None, None, None, None,
+        stateFormatVersion,
+          UnaryExecNode(agg,
+          SessionWindowStateStoreRestoreExec(_, _, None, None, None, _, child))) =>
+            val aggStateInfo = nextStatefulOperationStateInfo
+            SessionWindowStateStoreSaveExec(
+              keys,
+              session,
+              Some(aggStateInfo),
+              Some(outputMode),
+              Some(getWatermarkOnLateEvents(aggStateInfo.operatorId)),
+              Some(getWatermarkOnEviction(aggStateInfo.operatorId)),
+              stateFormatVersion,
+              agg.withNewChildren(
+                SessionWindowStateStoreRestoreExec(
+                  keys,
+                  session,
+                  Some(aggStateInfo),
+                  Some(getWatermarkOnLateEvents(aggStateInfo.operatorId)),
+                  Some(getWatermarkOnEviction(aggStateInfo.operatorId)),
+                  stateFormatVersion,
+                  child) :: Nil))
 
-      case StreamingDeduplicateExec(keys, child, None, None) =>
+      case StreamingDeduplicateExec(keys, child, None, None, None) =>
+        val stateInfo = nextStatefulOperationStateInfo
         StreamingDeduplicateExec(
           keys,
           child,
-          Some(nextStatefulOperationStateInfo),
-          Some(offsetSeqMetadata.batchWatermarkMs))
+          Some(stateInfo),
+          Some(getWatermarkOnLateEvents(stateInfo.operatorId)),
+          Some(getWatermarkOnEviction(stateInfo.operatorId)))
 
       case m: FlatMapGroupsWithStateExec =>
         // We set this to true only for the first batch of the streaming query.
         val hasInitialState = (currentBatchId == 0L && m.hasInitialState)
+        val stateInfo = nextStatefulOperationStateInfo
         m.copy(
-          stateInfo = Some(nextStatefulOperationStateInfo),
+          stateInfo = Some(stateInfo),
           batchTimestampMs = Some(offsetSeqMetadata.batchTimestampMs),
-          eventTimeWatermark = Some(offsetSeqMetadata.batchWatermarkMs),
+          eventTimeWatermarkOnLateEvents = Some(getWatermarkOnLateEvents(stateInfo.operatorId)),
+          eventTimeWatermarkOnEviction = Some(getWatermarkOnEviction(stateInfo.operatorId)),
           hasInitialState = hasInitialState
         )
 
       case j: StreamingSymmetricHashJoinExec =>
+        val stateInfo = nextStatefulOperationStateInfo
         j.copy(
-          stateInfo = Some(nextStatefulOperationStateInfo),
-          eventTimeWatermark = Some(offsetSeqMetadata.batchWatermarkMs),
+          stateInfo = Some(stateInfo),
+          eventTimeWatermarkOnLateEvents = Some(getWatermarkOnLateEvents(stateInfo.operatorId)),
+          eventTimeWatermarkOnEviction = Some(getWatermarkOnEviction(stateInfo.operatorId)),
           stateWatermarkPredicates =
             StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
               j.left.output, j.right.output, j.leftKeys, j.rightKeys, j.condition.full,
-              Some(offsetSeqMetadata.batchWatermarkMs)))
+              Some(getWatermarkOnEviction(stateInfo.operatorId))))
 
       case l: StreamingGlobalLimitExec =>
         l.copy(

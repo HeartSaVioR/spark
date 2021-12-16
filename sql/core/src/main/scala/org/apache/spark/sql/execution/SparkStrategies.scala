@@ -360,7 +360,7 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
       case _ if !plan.isStreaming => Nil
 
       case EventTimeWatermark(columnName, delay, child) =>
-        EventTimeWatermarkExec(columnName, delay, planLater(child)) :: Nil
+        EventTimeWatermarkExec(columnName, delay, None, planLater(child)) :: Nil
 
       case PhysicalAggregation(
         namedGroupingExpressions, aggregateExpressions, rewrittenResultExpressions, child) =>
@@ -629,7 +629,8 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
         val execPlan = FlatMapGroupsWithStateExec(
           func, keyDeser, valueDeser, sDeser, groupAttr, stateGroupAttr, dataAttr, sda, outputAttr,
           None, stateEnc, stateVersion, outputMode, timeout, batchTimestampMs = None,
-          eventTimeWatermark = None, planLater(initialState), hasInitialState, planLater(child)
+          eventTimeWatermarkOnLateEvents = None, eventTimeWatermarkOnEviction = None,
+          planLater(initialState), hasInitialState, planLater(child)
         )
         execPlan :: Nil
       case _ =>

@@ -83,6 +83,8 @@ object OffsetSeq {
 case class OffsetSeqMetadata(
     batchWatermarkMs: Long = 0,
     batchTimestampMs: Long = 0,
+    operatorWatermarksOnLateEvents: Map[Long, Long] = Map.empty,
+    operatorWatermarksOnEviction: Map[Long, Long] = Map.empty,
     conf: Map[String, String] = Map.empty) {
   def json: String = Serialization.write(this)(OffsetSeqMetadata.format)
 }
@@ -126,9 +128,12 @@ object OffsetSeqMetadata extends Logging {
   def apply(
       batchWatermarkMs: Long,
       batchTimestampMs: Long,
+      operatorWatermarksOnLateEvents: Map[Long, Long],
+      operatorWatermarksOnEviction: Map[Long, Long],
       sessionConf: RuntimeConfig): OffsetSeqMetadata = {
     val confs = relevantSQLConfs.map { conf => conf.key -> sessionConf.get(conf.key) }.toMap
-    OffsetSeqMetadata(batchWatermarkMs, batchTimestampMs, confs)
+    OffsetSeqMetadata(batchWatermarkMs, batchTimestampMs, operatorWatermarksOnLateEvents,
+      operatorWatermarksOnEviction, confs)
   }
 
   /** Set the SparkSession configuration with the values in the metadata */

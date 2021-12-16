@@ -45,7 +45,7 @@ import org.apache.spark.util.{CompletionIterator, SerializableConfiguration}
  * @param outputMode the output mode of `func`
  * @param timeoutConf used to timeout groups that have not received data in a while
  * @param batchTimestampMs processing timestamp of the current batch.
- * @param eventTimeWatermark event time watermark for the current batch
+ * @param eventTimeWatermarks event time watermark for the current batch
  * @param initialState the user specified initial state
  * @param hasInitialState indicates whether the initial state is provided or not
  * @param child the physical plan for the underlying data
@@ -66,7 +66,8 @@ case class FlatMapGroupsWithStateExec(
     outputMode: OutputMode,
     timeoutConf: GroupStateTimeout,
     batchTimestampMs: Option[Long],
-    eventTimeWatermark: Option[Long],
+    eventTimeWatermarkOnLateEvents: Option[Long],
+    eventTimeWatermarkOnEviction: Option[Long],
     initialState: SparkPlan,
     hasInitialState: Boolean,
     child: SparkPlan
@@ -117,7 +118,12 @@ case class FlatMapGroupsWithStateExec(
         true  // Always run batches to process timeouts
       case EventTimeTimeout =>
         // Process another non-data batch only if the watermark has changed in this executed plan
-        eventTimeWatermark.isDefined && newMetadata.batchWatermarkMs > eventTimeWatermark.get
+        // FIXME: need to consider watermark per operator
+        eventTimeWatermarkOnEviction.isDefined &&
+          newMetadata.operatorWatermarksOnEviction.contains(getStateInfo.operatorId) &&
+          newMetadata.operatorWatermarksOnEviction(getStateInfo.operatorId) >
+            eventTimeWatermarkOnEviction.get
+
       case _ =>
         false
     }
@@ -146,7 +152,7 @@ case class FlatMapGroupsWithStateExec(
     var timeoutProcessingStartTimeNs = currentTimeNs
 
     // If timeout is based on event time, then filter late data based on watermark
-    val filteredIter = watermarkPredicateForData match {
+    val filteredIter = watermarkPredicateForDataOnLateEvents match {
       case Some(predicate) if timeoutConf == EventTimeTimeout =>
         applyRemovingRowsOlderThanWatermark(iter, predicate)
       case _ =>
@@ -202,8 +208,13 @@ case class FlatMapGroupsWithStateExec(
       case ProcessingTimeTimeout =>
         require(batchTimestampMs.nonEmpty)
       case EventTimeTimeout =>
-        require(eventTimeWatermark.nonEmpty) // watermark value has been populated
-        require(watermarkExpression.nonEmpty) // input schema has watermark attribute
+        // watermark value has been populated
+        require(eventTimeWatermarkOnLateEvents.nonEmpty)
+        require(eventTimeWatermarkOnEviction.nonEmpty)
+
+        // input schema has watermark attribute
+        require(watermarkExpressionOnLateEvents.nonEmpty)
+        require(watermarkExpressionOnEviction.nonEmpty)
       case _ =>
     }
 
@@ -329,7 +340,7 @@ case class FlatMapGroupsWithStateExec(
       if (isTimeoutEnabled) {
         val timeoutThreshold = timeoutConf match {
           case ProcessingTimeTimeout => batchTimestampMs.get
-          case EventTimeTimeout => eventTimeWatermark.get
+          case EventTimeTimeout => eventTimeWatermarkOnEviction.get
           case _ =>
             throw new IllegalStateException(
               s"Cannot filter timed out keys for $timeoutConf")
@@ -362,7 +373,7 @@ case class FlatMapGroupsWithStateExec(
       val groupState = GroupStateImpl.createForStreaming(
         Option(stateData.stateObj),
         batchTimestampMs.getOrElse(NO_TIMESTAMP),
-        eventTimeWatermark.getOrElse(NO_TIMESTAMP),
+        eventTimeWatermarkOnEviction.getOrElse(NO_TIMESTAMP),
         timeoutConf,
         hasTimedOut,
         watermarkPresent)
@@ -399,6 +410,12 @@ case class FlatMapGroupsWithStateExec(
   override protected def withNewChildrenInternal(
       newLeft: SparkPlan, newRight: SparkPlan): FlatMapGroupsWithStateExec =
     copy(child = newLeft, initialState = newRight)
+
+  // FIXME: This is not supported as of now. We don't know the semantic of user function.
+  // FIXME: should we require user function to produce watermark as well? We should check
+  //  the event time column for the output schema as well, so that it is realistic to do.
+  override def produceWatermark(minInputWatermarkMs: Long): Long =
+    WatermarkTracker.DEFAULT_WATERMARK_MS
 }
 
 object FlatMapGroupsWithStateExec {

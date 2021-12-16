@@ -130,7 +130,8 @@ case class StreamingSymmetricHashJoinExec(
     joinType: JoinType,
     condition: JoinConditionSplitPredicates,
     stateInfo: Option[StatefulOperatorStateInfo],
-    eventTimeWatermark: Option[Long],
+    eventTimeWatermarkOnLateEvents: Option[Long],
+    eventTimeWatermarkOnEviction: Option[Long],
     stateWatermarkPredicates: JoinStateWatermarkPredicates,
     stateFormatVersion: Int,
     left: SparkPlan,
@@ -147,7 +148,8 @@ case class StreamingSymmetricHashJoinExec(
 
     this(
       leftKeys, rightKeys, joinType, JoinConditionSplitPredicates(condition, left, right),
-      stateInfo = None, eventTimeWatermark = None,
+      stateInfo = None, eventTimeWatermarkOnLateEvents = None,
+      eventTimeWatermarkOnEviction = None,
       stateWatermarkPredicates = JoinStateWatermarkPredicates(), stateFormatVersion, left, right)
   }
 
@@ -215,7 +217,10 @@ case class StreamingSymmetricHashJoinExec(
 
     // Latest watermark value is more than that used in this previous executed plan
     val watermarkHasChanged =
-      eventTimeWatermark.isDefined && newMetadata.batchWatermarkMs > eventTimeWatermark.get
+      eventTimeWatermarkOnEviction.isDefined &&
+        newMetadata.operatorWatermarksOnEviction.contains(getStateInfo.operatorId) &&
+        newMetadata.operatorWatermarksOnEviction(getStateInfo.operatorId) >
+          eventTimeWatermarkOnEviction.get
 
     watermarkUsedForStateCleanup && watermarkHasChanged
   }
@@ -511,7 +516,9 @@ case class StreamingSymmetricHashJoinExec(
 
       val watermarkAttribute = inputAttributes.find(_.metadata.contains(delayKey))
       val nonLateRows =
-        WatermarkSupport.watermarkExpression(watermarkAttribute, eventTimeWatermark) match {
+        WatermarkSupport.watermarkExpression(watermarkAttribute,
+          eventTimeWatermarkOnEviction) match {
+
           case Some(watermarkExpr) =>
             val predicate = Predicate.create(watermarkExpr, inputAttributes)
             applyRemovingRowsOlderThanWatermark(inputIter, predicate)
@@ -632,4 +639,10 @@ case class StreamingSymmetricHashJoinExec(
   override protected def withNewChildrenInternal(
       newLeft: SparkPlan, newRight: SparkPlan): StreamingSymmetricHashJoinExec =
     copy(left = newLeft, right = newRight)
+
+  // This actually depends on the condition of join, since the evict conditions are very different
+  // for the condition of join.
+  // FIXME: try to deduce the right watermark value for all cases if possible.
+  override def produceWatermark(minInputWatermarkMs: Long): Long =
+    WatermarkTracker.DEFAULT_WATERMARK_MS
 }

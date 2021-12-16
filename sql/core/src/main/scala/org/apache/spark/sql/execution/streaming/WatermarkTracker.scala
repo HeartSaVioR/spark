@@ -79,14 +79,31 @@ case object MaxWatermark extends MultipleWatermarkPolicy {
 
 /** Tracks the watermark value of a streaming query based on a given `policy` */
 case class WatermarkTracker(policy: MultipleWatermarkPolicy) extends Logging {
+  import WatermarkTracker._
+
+  // FIXME: we won't use this anymore, but need to consider about backward compatibility as well...
   private val operatorToWatermarkMap = mutable.HashMap[Int, Long]()
   private var globalWatermarkMs: Long = 0
+
+  private val statefulOperatorToWatermarkOnLateEvents = mutable.HashMap[Long, Long]()
+  private val statefulOperatorToWatermarkOnEviction = mutable.HashMap[Long, Long]()
+
+  def setOperatorWatermarks(
+      operatorWatermarksOnLateEvents: Map[Long, Long],
+      operatorWatermarksOnEviction: Map[Long, Long]): Unit = synchronized {
+    statefulOperatorToWatermarkOnLateEvents.clear()
+    statefulOperatorToWatermarkOnEviction.clear()
+    statefulOperatorToWatermarkOnLateEvents ++= operatorWatermarksOnLateEvents
+    statefulOperatorToWatermarkOnEviction ++= operatorWatermarksOnEviction
+  }
 
   def setWatermark(newWatermarkMs: Long): Unit = synchronized {
     globalWatermarkMs = newWatermarkMs
   }
 
-  def updateWatermark(executedPlan: SparkPlan): Unit = synchronized {
+  // FIXME: temporarily left to make tests pass... we need to fix all tests depending on
+  //  global watermark, but then we will also need to expose watermark information per operator
+  private def updateGlobalWatermark(executedPlan: SparkPlan): Unit = synchronized {
     val watermarkOperators = executedPlan.collect {
       case e: EventTimeWatermarkExec => e
     }
@@ -120,10 +137,132 @@ case class WatermarkTracker(policy: MultipleWatermarkPolicy) extends Logging {
     }
   }
 
+  def updateWatermark(executedPlan: SparkPlan): Unit = synchronized {
+    updateGlobalWatermark(executedPlan)
+
+    // FIXME: need to find a way to retain backward compatibility, like when global watermark is
+    //  only available in the checkpoint.
+
+    val statefulOperatorIdToNodeId = mutable.HashMap[Long, Int]()
+    val nodeToOutputWatermark = mutable.HashMap[Int, (Long, Long)]()
+    val nextStatefulOperatorToWatermark = mutable.HashMap[Long, (Long, Long)]()
+
+    // This calculation relies on post-order traversal of the query plan.
+    executedPlan.transformUp {
+      case node: EventTimeWatermarkExec =>
+        val stOpId = node.stateInfo.get.operatorId
+        statefulOperatorIdToNodeId.put(stOpId, node.id)
+
+        val oldWatermarkMs = statefulOperatorToWatermarkOnEviction
+          .getOrElse(stOpId, DEFAULT_WATERMARK_MS)
+
+        val newWatermarkMs = if (node.eventTimeStats.value.count > 0) {
+          logDebug(s"Observed event time stats from watermark op " +
+            s"${stOpId * -1}: ${node.eventTimeStats.value}")
+          node.eventTimeStats.value.max - node.delayMs
+        } else {
+          DEFAULT_WATERMARK_MS
+        }
+
+        val finalWatermarkMs = Math.max(oldWatermarkMs, newWatermarkMs)
+        nextStatefulOperatorToWatermark.put(stOpId, (finalWatermarkMs, finalWatermarkMs))
+        nodeToOutputWatermark.put(node.id, (finalWatermarkMs, finalWatermarkMs))
+        node
+
+      case node: StateStoreWriter =>
+        val stOpId = node.stateInfo.get.operatorId
+        statefulOperatorIdToNodeId.put(stOpId, node.id)
+
+        val oldWatermarkMs = statefulOperatorToWatermarkOnEviction
+          .getOrElse(stOpId, DEFAULT_WATERMARK_MS)
+
+        val inputWatermarks = node.children.map { child =>
+          nodeToOutputWatermark.getOrElse(child.id, {
+            throw new IllegalStateException(
+              s"watermark for the node ${child.id} should be registered")
+          })
+        }.filter { case (prev, curr) =>
+          // This path is to exclude children from watermark calculation
+          // which don't have watermark information
+          prev >= 0 && curr >= 0
+        }
+
+        val (minPrevInputWatermarkMs, minCurrInputWatermarkMs) = if (inputWatermarks.nonEmpty) {
+          (inputWatermarks.map(_._1).min, inputWatermarks.map(_._2).min)
+        } else {
+          (DEFAULT_WATERMARK_MS, DEFAULT_WATERMARK_MS)
+        }
+
+        nextStatefulOperatorToWatermark.put(stOpId,
+          (minPrevInputWatermarkMs, minCurrInputWatermarkMs))
+        val newWatermarkMs = node.produceWatermark(minCurrInputWatermarkMs)
+        val finalWatermarkMs = Math.max(oldWatermarkMs, newWatermarkMs)
+        nodeToOutputWatermark.put(node.id, (oldWatermarkMs, finalWatermarkMs))
+        node
+
+      case node =>
+        // pass-through, but also consider multiple children like the case of union
+        val inputWatermarks = node.children.map { child =>
+          nodeToOutputWatermark.getOrElse(child.id, {
+            throw new IllegalStateException(
+              s"watermark for the node ${child.id} should be registered")
+          })
+        }.filter { case (prev, curr) =>
+          // This path is to exclude children from watermark calculation
+          // which don't have watermark information
+          prev >= 0 && curr >= 0
+        }
+
+        val finalWatermarkMs = if (inputWatermarks.nonEmpty) {
+          val minPrevInputWatermarkMs = inputWatermarks.map(_._1).min
+          val minCurrInputWatermarkMs = inputWatermarks.map(_._2).min
+
+          (minPrevInputWatermarkMs, minCurrInputWatermarkMs)
+        } else {
+          (NO_WATERMARK_MS, NO_WATERMARK_MS)
+        }
+
+        nodeToOutputWatermark.put(node.id, finalWatermarkMs)
+        node
+    }
+
+    logWarning("DEBUG: watermark update ----------------------------------")
+    logWarning("BEFORE ===================================================")
+    logWarning(s"late events: $statefulOperatorToWatermarkOnLateEvents")
+    logWarning(s"eviction: $statefulOperatorToWatermarkOnEviction")
+
+    statefulOperatorToWatermarkOnLateEvents.clear()
+    statefulOperatorToWatermarkOnLateEvents ++= nextStatefulOperatorToWatermark.mapValues(_._1)
+
+    statefulOperatorToWatermarkOnEviction.clear()
+    statefulOperatorToWatermarkOnEviction ++= nextStatefulOperatorToWatermark.mapValues(_._2)
+
+    logWarning("AFTER ===================================================")
+    logWarning(s"late events: $statefulOperatorToWatermarkOnLateEvents")
+    logWarning(s"eviction: $statefulOperatorToWatermarkOnEviction")
+  }
+
+  def operatorWatermarkOnLateEvents(id: Long): Option[Long] = synchronized {
+    statefulOperatorToWatermarkOnLateEvents.get(id)
+  }
+
+  def operatorWatermarkOnEviction(id: Long): Option[Long] = synchronized {
+    statefulOperatorToWatermarkOnEviction.get(id)
+  }
+
   def currentWatermark: Long = synchronized { globalWatermarkMs }
+
+  def currentOperatorWatermarks: (Map[Long, Long], Map[Long, Long]) = synchronized {
+    (statefulOperatorToWatermarkOnLateEvents.toMap, statefulOperatorToWatermarkOnEviction.toMap)
+  }
 }
 
 object WatermarkTracker {
+  // FIXME: proper default value? this has to be equal or higher than 0 due to
+  //  check condition of FlatMapGroupsWithState.
+  val DEFAULT_WATERMARK_MS = 0L
+  val NO_WATERMARK_MS = -1L
+
   def apply(conf: RuntimeConfig): WatermarkTracker = {
     // If the session has been explicitly configured to use non-default policy then use it,
     // otherwise use the default `min` policy as thats the safe thing to do.
