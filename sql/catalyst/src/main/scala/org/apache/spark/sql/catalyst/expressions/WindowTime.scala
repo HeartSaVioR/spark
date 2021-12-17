@@ -31,7 +31,7 @@ import org.apache.spark.sql.types._
   """,
   examples = """
     Examples:
-      > SELECT a, window.start, window.end, window_time(window), count(*) as cnt FROM VALUES ('A1', '2021-01-01 00:00:00'), ('A1', '2021-01-01 00:04:30'), ('A1', '2021-01-01 00:06:00'), ('A2', '2021-01-01 00:01:00') AS tab(a, b) GROUP by a, _FUNC_(b, '5 minutes') ORDER BY a, start;
+      > SELECT a, window.start, window.end, _FUNC_(window), count(*) as cnt FROM VALUES ('A1', '2021-01-01 00:00:00'), ('A1', '2021-01-01 00:04:30'), ('A1', '2021-01-01 00:06:00'), ('A2', '2021-01-01 00:01:00') AS tab(a, b) GROUP by a, window(b, '5 minutes') ORDER BY a, start;
         A1	2021-01-01 00:00:00	2021-01-01 00:05:00 2021-01-01 00:04:59	2
         A1	2021-01-01 00:05:00	2021-01-01 00:10:00 2021-01-01 00:09:59	1
         A2	2021-01-01 00:00:00	2021-01-01 00:05:00 2021-01-01 00:04:59	1
