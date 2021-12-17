@@ -3788,6 +3788,10 @@ object functions {
     }.as("session_window")
   }
 
+  def window_time(windowColumn: Column): Column = withExpr {
+    WindowTime(windowColumn.expr)
+  }
+
   /**
    * Creates timestamp from the number of seconds since UTC epoch.
    * @group datetime_funcs

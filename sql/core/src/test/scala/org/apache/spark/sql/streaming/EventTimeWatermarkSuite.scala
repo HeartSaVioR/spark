@@ -36,7 +36,7 @@ import org.apache.spark.sql.catalyst.util.DateTimeConstants._
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.UTC
 import org.apache.spark.sql.execution.streaming._
 import org.apache.spark.sql.execution.streaming.sources.MemorySink
-import org.apache.spark.sql.functions.{count, expr, sum, timestamp_seconds, window}
+import org.apache.spark.sql.functions.{count, expr, sum, timestamp_seconds, window, window_time}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.OutputMode._
 import org.apache.spark.util.Utils
@@ -840,8 +840,7 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
         .withWatermark("eventTime", "0 seconds")
         .groupBy(window($"eventTime", "5 seconds") as 'window)
         .agg(count("*") as 'count)
-        .withWindowTimeColumn("window_time", $"window")
-        .groupBy(window($"window_time", "10 seconds"))
+        .groupBy(window(window_time($"window"), "10 seconds"))
         .agg(count("*") as 'count, sum("count") as 'sum)
         .select($"window".getField("start").cast("long").as[Long],
           $"count".as[Long], $"sum".as[Long])
@@ -883,11 +882,9 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
         .withWatermark("eventTime", "0 seconds")
         .groupBy(window($"eventTime", "5 seconds") as 'window)
         .agg(count("*") as 'count)
-        .withWindowTimeColumn("window_time", $"window")
-        .groupBy(window($"window_time", "10 seconds"))
+        .groupBy(window(window_time($"window"), "10 seconds"))
         .agg(count("*") as 'count, sum("count") as 'sum)
-        .withWindowTimeColumn("window_time", $"window")
-        .groupBy(window($"window_time", "20 seconds"))
+        .groupBy(window(window_time($"window"), "20 seconds"))
         .agg(count("*") as 'count, sum("sum") as 'sum)
         .select(
           $"window".getField("start").cast("long").as[Long],

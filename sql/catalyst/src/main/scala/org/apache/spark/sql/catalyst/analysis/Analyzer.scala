@@ -307,6 +307,7 @@ class Analyzer(override val catalogManager: CatalogManager)
       ResolveAggregateFunctions ::
       TimeWindowing ::
       SessionWindowing ::
+      ResolveWindowTime ::
       ResolveInlineTables ::
       ResolveHigherOrderFunctions(catalogManager) ::
       ResolveLambdaVariables ::
@@ -3967,6 +3968,66 @@ object SessionWindowing extends Rule[LogicalPlan] {
             Project(sessionStruct +: child.output, child)) :: Nil)
       } else if (numWindowExpr > 1) {
         throw QueryCompilationErrors.multiTimeWindowExpressionsNotSupportedError(p)
+      } else {
+        p // Return unchanged. Analyzer will throw exception later
+      }
+  }
+}
+
+object ResolveWindowTime extends Rule[LogicalPlan] {
+  override def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsUp {
+    case p: LogicalPlan if p.children.size == 1 =>
+      val child = p.children.head
+      val windowTimeExpressions =
+        p.expressions.flatMap(_.collect { case w: WindowTime => w }).toSet
+
+      if (windowTimeExpressions.nonEmpty &&
+          windowTimeExpressions.head.windowColumn.resolved &&
+          windowTimeExpressions.head.checkInputDataTypes().isSuccess) {
+
+        val windowTime = windowTimeExpressions.head
+
+        val metadata = windowTime.windowColumn match {
+          case a: Attribute => a.metadata
+          case _ => Metadata.empty
+        }
+
+        if (!metadata.contains(TimeWindow.marker) &&
+            !metadata.contains(SessionWindow.marker)) {
+          // FIXME: better message? error framework?
+          throw new AnalysisException("input should be window column!")
+        }
+
+        val newMetadata = new MetadataBuilder()
+          .withMetadata(metadata)
+          .remove(TimeWindow.marker)
+          .remove(SessionWindow.marker)
+          .build()
+
+        val attr = AttributeReference(
+          "window_time", windowTime.dataType, metadata = newMetadata)()
+
+        // NOTE: "window.end" is "exclusive" upper bound of window, so if we use this value as
+        // it is, it is going to be bound to the different window even we apply the same window
+        // spec. Decrease 1 microsecond from window.end to let the window_time bound to the
+        // same window range again.
+        val subtractExpr =
+          PreciseTimestampConversion(
+            Subtract(PreciseTimestampConversion(
+              // FIXME: better handling of window.end
+              GetStructField(windowTime.windowColumn, 1),
+              windowTime.dataType, LongType), Literal(1L)),
+            LongType,
+            windowTime.dataType)
+
+        val newColumn = Alias(subtractExpr, "window_time")(
+          exprId = attr.exprId, explicitMetadata = Some(newMetadata))
+
+        val replacedPlan = p transformExpressions {
+          case w: WindowTime => attr
+        }
+
+        replacedPlan.withNewChildren(Project(newColumn +: child.output, child) :: Nil)
       } else {
         p // Return unchanged. Analyzer will throw exception later
       }
