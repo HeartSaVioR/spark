@@ -118,7 +118,6 @@ case class FlatMapGroupsWithStateExec(
         true  // Always run batches to process timeouts
       case EventTimeTimeout =>
         // Process another non-data batch only if the watermark has changed in this executed plan
-        // FIXME: need to consider watermark per operator
         eventTimeWatermarkOnEviction.isDefined &&
           newMetadata.operatorWatermarksOnEviction.contains(getStateInfo.operatorId) &&
           newMetadata.operatorWatermarksOnEviction(getStateInfo.operatorId) >

@@ -19,6 +19,7 @@ package org.apache.spark.sql.streaming
 
 import java.{util => ju}
 import java.io.File
+import java.sql.Timestamp
 import java.text.SimpleDateFormat
 import java.util.{Calendar, Date, Locale}
 import java.util.concurrent.TimeUnit._
@@ -35,7 +36,7 @@ import org.apache.spark.sql.catalyst.util.DateTimeConstants._
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.UTC
 import org.apache.spark.sql.execution.streaming._
 import org.apache.spark.sql.execution.streaming.sources.MemorySink
-import org.apache.spark.sql.functions.{count, sum, timestamp_seconds, window}
+import org.apache.spark.sql.functions.{count, expr, sum, timestamp_seconds, window}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.OutputMode._
 import org.apache.spark.util.Utils
@@ -830,7 +831,7 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
   // FIXME: START temporary tests for multiple stateful operators
   /////////////////////////////////////////////////////////////////////////////////////
 
-  test("DEBUG: multiple aggregations, append mode, case 1") {
+  test("WIP: multiple aggregations, append mode, case 1") {
     withSQLConf("spark.sql.streaming.unsupportedOperationCheck" -> "false") {
       val inputData = MemoryStream[Int]
 
@@ -873,7 +874,7 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
     }
   }
 
-  test("DEBUG: multiple aggregations, append mode, case 2") {
+  test("WIP: multiple aggregations, append mode, case 2") {
     withSQLConf("spark.sql.streaming.unsupportedOperationCheck" -> "false") {
       val inputData = MemoryStream[Int]
 
@@ -960,9 +961,144 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
     }
   }
 
-  // FIXME: add test => stream deduplication, then aggregate (no need to redefine watermark)
+  test("WIP: stream deduplication -> aggregation, append mode") {
+    withSQLConf("spark.sql.streaming.unsupportedOperationCheck" -> "false") {
+      val inputData = MemoryStream[Int]
 
-  // FIXME: add test => stream-stream left outer join, then aggregate (redefining watermark)
+      val deduplication = inputData.toDF()
+        .withColumn("eventTime", timestamp_seconds($"value"))
+        .withWatermark("eventTime", "10 seconds")
+        .dropDuplicates("value", "eventTime")
+
+     val windowedAggregation = deduplication
+        .groupBy(window($"eventTime", "5 seconds") as 'window)
+        .agg(count("*") as 'count, sum("value") as 'sum)
+        .select($"window".getField("start").cast("long").as[Long],
+          $"count".as[Long])
+
+      testStream(windowedAggregation)(
+        // FIXME: we should revisit our watermark condition... we don't allow watermark to be
+        //  set to negative and ensure it's at least 0, but then the inputs with timestamp 0
+        //  as event time can be dropped.
+        AddData(inputData, 1 to 15: _*),
+        // op1 W (0, 0)
+        // input: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+        // deduplicated: None
+        // output: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+        // state: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+        // op2 W (0, 0)
+        // agg: [0, 5) 4, [5, 10) 5 [10, 15) 5, [15, 20) 1
+        // output: None
+        // state: [0, 5) 4, [5, 10) 5 [10, 15) 5, [15, 20) 1
+
+        // no-data batch triggered
+
+        // op1 W (5, 5)
+        // agg: None
+        // output: None
+        // state: 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+        // op2 W (0, 5)
+        // agg: None
+        // output: [0, 5) 4
+        // state: [5, 10) 5 [10, 15) 5, [15, 20) 1
+        CheckNewAnswer((0, 4)),
+        assertNumStateRows(13),
+        assertNumRowsDroppedByWatermark(0)
+      )
+    }
+  }
+
+
+  test("WIP: stream-stream left outer join -> aggregation, append mode") {
+    withSQLConf("spark.sql.streaming.unsupportedOperationCheck" -> "false") {
+      val input1 = MemoryStream[(Timestamp, String, String)]
+      val df1 = input1.toDF
+        .selectExpr("_1 as eventTime", "_2 as id", "_3 as comment")
+        .withWatermark(s"eventTime", "2 minutes")
+
+      val input2 = MemoryStream[(Timestamp, String, String)]
+      val df2 = input2.toDF
+        .selectExpr("_1 as eventTime", "_2 as id", "_3 as name")
+        .withWatermark(s"eventTime", "4 minutes")
+
+      val joined = df1.as("left")
+        .join(df2.as("right"),
+          expr("""
+                 |left.id = right.id AND left.eventTime BETWEEN
+                 |  right.eventTime - INTERVAL 30 seconds AND
+                 |  right.eventTime + INTERVAL 30 seconds
+             """.stripMargin),
+          joinType = "leftOuter")
+
+      val windowAggregation = joined
+        // Just to test the behavior on redefining event time after stateful operator
+        .withColumn("newEventTime", $"left.eventTime")
+        .withWatermark("newEventTime", "10 seconds")
+        .groupBy(window($"newEventTime", "30 seconds"))
+        .agg(count("*").as("cnt"))
+        .selectExpr("window.start AS window_start", "window.end AS window_end", "cnt")
+
+      val inputDataForInput1AtBatch1 = Seq(
+        (Timestamp.valueOf("2020-01-01 00:00:00"), "abc", "has no join partner"),
+        (Timestamp.valueOf("2020-01-02 00:00:00"), "abc", "joined with A"),
+        (Timestamp.valueOf("2020-01-02 01:00:00"), "abc", "joined with B"))
+
+      val inputDataForInput2AtBatch1 = Seq(
+        (Timestamp.valueOf("2020-01-02 00:00:10"), "abc", "A"),
+        (Timestamp.valueOf("2020-01-02 00:59:59"), "abc", "B"),
+        (Timestamp.valueOf("2020-01-02 02:00:00"), "abc", "C"))
+
+      val inputDataForInput1AtBatch2 = Seq(
+        (Timestamp.valueOf("2020-01-05 00:00:00"), "abc", "joined with D")
+      )
+
+      val inputDataForInput2AtBatch2 = Seq(
+        (Timestamp.valueOf("2020-01-05 00:00:10"), "abc", "D")
+      )
+
+      val expectedOutputAtBatch1 = Seq(
+        // joined result from data batch
+        // (Timestamp.valueOf("2020-01-02 00:00:00"), "abc", "joined with A",
+        //  Timestamp.valueOf("2020-01-02 00:00:10"), "abc", "A")
+        // (Timestamp.valueOf("2020-01-02 01:00:00"), "abc", "joined with B",
+        //  Timestamp.valueOf("2020-01-02 00:59:59"), "abc", "B")
+
+        // watermark calculated to '2020-01-02 00:50:00' in second withWatermark
+
+        // windowed aggregation result
+        (Timestamp.valueOf("2020-01-02 00:00:00"), Timestamp.valueOf("2020-01-02 00:00:30"), 1)
+        // state row in aggregation
+        // (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
+
+        // joined result from no-data batch
+        // (Timestamp.valueOf("2020-01-01 00:00:00"), "abc", "has no join partner",
+        //  null, null, null)
+        // <= windowed aggregation will drop this result
+        // state row in aggregation
+        // (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
+      )
+
+      val expectedOutputAtBatch2 = Seq(
+        // joined result from data batch
+        // (Timestamp.valueOf("2020-01-05 00:00:00"), "abc", "joined with D",
+        //  Timestamp.valueOf("2020-01-05 00:00:10"), "abc", "D")
+
+        // watermark calculated to '2020-01-04 23:50:00' in second withWatermark
+
+        // windowed aggregation result
+        (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
+        // state row in aggregation
+        // (Timestamp.valueOf("2020-01-05 00:00:00"), Timestamp.valueOf("2020-01-05 01:00:30"), 1)
+      )
+
+      testStream(windowAggregation)(
+        MultiAddData((input1, inputDataForInput1AtBatch1), (input2, inputDataForInput2AtBatch1)),
+        CheckNewAnswer(expectedOutputAtBatch1.head, expectedOutputAtBatch1.tail: _*),
+        MultiAddData((input1, inputDataForInput1AtBatch2), (input2, inputDataForInput2AtBatch2)),
+        CheckNewAnswer(expectedOutputAtBatch2.head, expectedOutputAtBatch2.tail: _*)
+      )
+    }
+  }
 
   /////////////////////////////////////////////////////////////////////////////////////
   // FIXME: END temporary tests for multiple stateful operators
