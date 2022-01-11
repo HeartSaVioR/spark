@@ -840,7 +840,7 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
         .withWatermark("eventTime", "0 seconds")
         .groupBy(window($"eventTime", "5 seconds") as 'window)
         .agg(count("*") as 'count)
-        .groupBy(window(window_time($"window"), "10 seconds"))
+        .groupBy(window($"window", "10 seconds"))
         .agg(count("*") as 'count, sum("count") as 'sum)
         .select($"window".getField("start").cast("long").as[Long],
           $"count".as[Long], $"sum".as[Long])
@@ -882,7 +882,7 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
         .withWatermark("eventTime", "0 seconds")
         .groupBy(window($"eventTime", "5 seconds") as 'window)
         .agg(count("*") as 'count)
-        .groupBy(window(window_time($"window"), "10 seconds"))
+        .groupBy(window($"window", "10 seconds"))
         .agg(count("*") as 'count, sum("count") as 'sum)
         .groupBy(window(window_time($"window"), "20 seconds"))
         .agg(count("*") as 'count, sum("sum") as 'sum)

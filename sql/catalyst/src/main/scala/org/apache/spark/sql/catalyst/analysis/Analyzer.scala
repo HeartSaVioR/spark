@@ -3812,6 +3812,12 @@ object TimeWindowing extends Rule[LogicalPlan] {
 
         val window = windowExpressions.head
 
+        if (StructType.acceptsType(window.timeColumn.dataType)) {
+          return p transformExpressions {
+            case t: TimeWindow => t.copy(timeColumn = WindowTime(window.timeColumn))
+          }
+        }
+
         val metadata = window.timeColumn match {
           case a: Attribute => a.metadata
           case _ => Metadata.empty
@@ -3919,6 +3925,12 @@ object SessionWindowing extends Rule[LogicalPlan] {
           sessionExpressions.head.checkInputDataTypes().isSuccess) {
 
         val session = sessionExpressions.head
+
+        if (StructType.acceptsType(session.timeColumn.dataType)) {
+          return p transformExpressions {
+            case t: SessionWindow => t.copy(timeColumn = WindowTime(session.timeColumn))
+          }
+        }
 
         val metadata = session.timeColumn match {
           case a: Attribute => a.metadata
