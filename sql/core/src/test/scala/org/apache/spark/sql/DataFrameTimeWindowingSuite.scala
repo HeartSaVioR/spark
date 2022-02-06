@@ -464,6 +464,20 @@ class DataFrameTimeWindowingSuite extends QueryTest with SharedSparkSession {
     }
   }
 
+  test("TESTING ... ") {
+    val df = Seq(
+      ("1970-01-01 12:05:00", 1)).toDF("time", "value")
+
+    checkAnswer(
+      df.select(window($"time", "12 minutes", "5 minutes", "2 minutes"), $"value")
+        .orderBy($"window.start".asc)
+        .select($"window.start".cast(StringType), $"window.end".cast(StringType), $"value"),
+      Seq(
+        Row("1970-01-01 11:57:00", "1970-01-01 12:09:00", 1),
+        Row("1970-01-01 12:02:00", "1970-01-01 12:14:00", 1))
+    )
+  }
+
   test("SPARK-36091: Support TimestampNTZ type in expression TimeWindow") {
     val df1 = Seq(
       ("2016-03-27 19:39:30", 1, "a"),

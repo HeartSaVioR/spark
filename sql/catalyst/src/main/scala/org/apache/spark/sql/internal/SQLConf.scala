@@ -1679,6 +1679,12 @@ object SQLConf {
       .checkValue(v => Set(1, 2).contains(v), "Valid versions are 1 and 2")
       .createWithDefault(2)
 
+  val TIME_WINDOW_NEW_LOGIC =
+    buildConf("spark.sql.streaming.timeWindow.apply.new.logic")
+      .internal()
+      .booleanConf
+      .createWithDefault(false)
+
   val STREAMING_SESSION_WINDOW_MERGE_SESSIONS_IN_LOCAL_PARTITION =
     buildConf("spark.sql.streaming.sessionWindow.merge.sessions.in.local.partition")
       .internal()

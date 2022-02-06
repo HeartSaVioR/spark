@@ -51,7 +51,7 @@ import org.apache.spark.sql.connector.expressions.{FieldReference, IdentityTrans
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.internal.SQLConf.{PartitionOverwriteMode, StoreAssignmentPolicy}
+import org.apache.spark.sql.internal.SQLConf.{PartitionOverwriteMode, StoreAssignmentPolicy, TIME_WINDOW_NEW_LOGIC}
 import org.apache.spark.sql.internal.connector.V1Function
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.types.DayTimeIntervalType.DAY
@@ -3832,6 +3832,9 @@ object TimeWindowing extends Rule[LogicalPlan] {
   private final val WINDOW_START = "start"
   private final val WINDOW_END = "end"
 
+  def apply(plan: LogicalPlan): LogicalPlan =
+    apply0(plan, plan.conf.getConf(TIME_WINDOW_NEW_LOGIC))
+
   /**
    * Generates the logical plan for generating window ranges on a timestamp column. Without
    * knowing what the timestamp value is, it's non-trivial to figure out deterministically how many
@@ -3860,7 +3863,9 @@ object TimeWindowing extends Rule[LogicalPlan] {
    * @return the logical plan that will generate the time windows using the Expand operator, with
    *         the Filter operator for correctness and Project for usability.
    */
-  def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsUpWithPruning(
+  def apply0(
+      plan: LogicalPlan,
+      useNewLogic: Boolean): LogicalPlan = plan.resolveOperatorsUpWithPruning(
     _.containsPattern(TIME_WINDOW), ruleId) {
     case p: LogicalPlan if p.children.size == 1 =>
       val child = p.children.head
@@ -3885,18 +3890,36 @@ object TimeWindowing extends Rule[LogicalPlan] {
         }
 
         def getWindow(i: Int, overlappingWindows: Int, dataType: DataType): Expression = {
-          val timestamp = PreciseTimestampConversion(window.timeColumn, dataType, LongType)
-          val lastStart = timestamp - (timestamp - window.startTime
-            + window.slideDuration) % window.slideDuration
-          val windowStart = lastStart - i * window.slideDuration
-          val windowEnd = windowStart + window.windowDuration
+          if (useNewLogic) {
+            val timestamp = PreciseTimestampConversion(window.timeColumn, dataType, LongType)
+            val lastStart = timestamp - (timestamp - window.startTime
+              + window.slideDuration) % window.slideDuration
+            val windowStart = lastStart - i * window.slideDuration
+            val windowEnd = windowStart + window.windowDuration
 
-          CreateNamedStruct(
-            Literal(WINDOW_START) ::
-              PreciseTimestampConversion(windowStart, LongType, dataType) ::
-              Literal(WINDOW_END) ::
-              PreciseTimestampConversion(windowEnd, LongType, dataType) ::
-              Nil)
+            CreateNamedStruct(
+              Literal(WINDOW_START) ::
+                PreciseTimestampConversion(windowStart, LongType, dataType) ::
+                Literal(WINDOW_END) ::
+                PreciseTimestampConversion(windowEnd, LongType, dataType) ::
+                Nil)
+          } else {
+            val division = (PreciseTimestampConversion(
+              window.timeColumn, dataType, LongType) - window.startTime) / window.slideDuration
+            val ceil = Ceil(division)
+            // if the division is equal to the ceiling, our record is the start of a window
+            val windowId = CaseWhen(Seq((ceil === division, ceil + 1)), Some(ceil))
+            val windowStart = (windowId + i - overlappingWindows) *
+              window.slideDuration + window.startTime
+            val windowEnd = windowStart + window.windowDuration
+
+            CreateNamedStruct(
+              Literal(WINDOW_START) ::
+                PreciseTimestampConversion(windowStart, LongType, dataType) ::
+                Literal(WINDOW_END) ::
+                PreciseTimestampConversion(windowEnd, LongType, dataType) ::
+                Nil)
+          }
         }
 
         val windowAttr = AttributeReference(
