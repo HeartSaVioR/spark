@@ -136,6 +136,13 @@ class IncrementalExecution(
              UnaryExecNode(agg,
                StateStoreRestoreExec(_, None, _, child))) =>
         val aggStateInfo = nextStatefulOperationStateInfo
+        // FIXME: load the previous output partitioning if any... we have to put this to the
+        //  operator and let operator reflect the previous output partitioning in the required
+        //  child distribution...
+        // FIXME: if there is no previous output partitioning, we blindly believe that current
+        //  keys in the plan are matched with previous output partitioning. We may need to discuss
+        //  whether we need to provide a way to check the rows in current state, or just silently
+        //  fix it and give up already messed-up rows...
         StateStoreSaveExec(
           keys,
           Some(aggStateInfo),
