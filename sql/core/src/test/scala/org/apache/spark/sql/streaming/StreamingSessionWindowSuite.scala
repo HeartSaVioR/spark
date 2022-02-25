@@ -28,6 +28,7 @@ import org.apache.spark.sql.execution.streaming.MemoryStream
 import org.apache.spark.sql.execution.streaming.state.{HDFSBackedStateStoreProvider, RocksDBStateStoreProvider}
 import org.apache.spark.sql.functions.{count, session_window, sum}
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.util.Utils
 
 class StreamingSessionWindowSuite extends StreamTest
   with BeforeAndAfter with Matchers with Logging {
@@ -350,6 +351,74 @@ class StreamingSessionWindowSuite extends StreamTest
         ("hello", 40, 42, 2, 2)
       )
     )
+  }
+
+  test("SPARK-38204: session window aggregation should require StatefulOpClusteredDistribution " +
+    "from children if the query starts from checkpoint in prior to 3.3") {
+
+    // exclude partial merging session to simplify test
+    withSQLConf(
+      SQLConf.STREAMING_SESSION_WINDOW_MERGE_SESSIONS_IN_LOCAL_PARTITION.key -> "false") {
+
+      val inputData = MemoryStream[(String, String, Long)]
+
+      // Split the lines into words, treat words as sessionId of events
+      val events = inputData.toDF()
+        .select($"_1".as("value"), $"_2".as("userId"), $"_3".as("timestamp"))
+        .withColumn("eventTime", $"timestamp".cast("timestamp"))
+        .withWatermark("eventTime", "30 seconds")
+        .selectExpr("explode(split(value, ' ')) AS sessionId", "userId", "eventTime")
+
+      val sessionUpdates = events
+        .repartition($"userId")
+        .groupBy(session_window($"eventTime", "10 seconds") as 'session, 'sessionId, 'userId)
+        .agg(count("*").as("numEvents"))
+        .selectExpr("sessionId", "userId", "CAST(session.start AS LONG)",
+          "CAST(session.end AS LONG)",
+          "CAST(session.end AS LONG) - CAST(session.start AS LONG) AS durationMs",
+          "numEvents")
+
+      val checkpointDir = Utils.createTempDir().getCanonicalFile
+
+      /*
+      val resourceUri = this.getClass.getResource(
+        "/structured-streaming/checkpoint-version-3.2.0-streaming-aggregate-with-repartition/").toURI
+
+      val checkpointDir = new File(resourceUri)
+       */
+      logWarning(s"checkpoint dir: ${checkpointDir.getAbsolutePath}")
+
+      /*
+      val checkpointDir = Utils.createTempDir().getCanonicalFile
+      // Copy the checkpoint to a temp dir to prevent changes to the original.
+      // Not doing this will lead to the test passing on the first run, but fail subsequent runs.
+      FileUtils.copyDirectory(new File(resourceUri), checkpointDir)
+
+      inputData.addData(
+        ("hello world spark streaming", "key1", 40L),
+        ("world hello structured streaming", "key2", 41L)
+      )
+      inputData.addData(3, 2)
+
+      // watermark: 11
+      // current sessions
+      // ("hello", 40, 42, 2, 2),
+      // ("streaming", 40, 51, 11, 2),
+      // ("spark", 40, 50, 10, 1),
+      CheckNewAnswer()
+       */
+
+      testStream(sessionUpdates, OutputMode.Append())(
+        StartStream(checkpointLocation = checkpointDir.getAbsolutePath),
+        AddData(inputData,
+          ("hello world spark streaming", "key1", 40L),
+          ("world hello structured streaming", "key2", 41L)),
+        CheckNewAnswer(),
+        Execute { query =>
+          logWarning(s"physical plan: ${query.lastExecution.executedPlan}")
+        }
+      )
+    }
   }
 
   testWithAllOptions("append mode - session window - no key") {

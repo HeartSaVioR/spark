@@ -157,7 +157,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
     // test one shuffled hash join
     val oneJoinDF = df1.join(df2.hint("SHUFFLE_HASH"), $"k1" === $"k2")
     assert(oneJoinDF.queryExecution.executedPlan.collect {
-      case WholeStageCodegenExec(_ : ShuffledHashJoinExec) => true
+      case WholeStageCodegenExec(_: ShuffledHashJoinExec) => true
     }.size === 1)
     checkAnswer(oneJoinDF, Seq(Row(0, 0), Row(1, 1), Row(2, 2), Row(3, 3), Row(4, 4)))
 
@@ -165,7 +165,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
     val twoJoinsDF = df1.join(df2.hint("SHUFFLE_HASH"), $"k1" === $"k2")
       .join(df3.hint("SHUFFLE_HASH"), $"k1" === $"k3")
     assert(twoJoinsDF.queryExecution.executedPlan.collect {
-      case WholeStageCodegenExec(_ : ShuffledHashJoinExec) => true
+      case WholeStageCodegenExec(_: ShuffledHashJoinExec) => true
     }.size === 2)
     checkAnswer(twoJoinsDF,
       Seq(Row(0, 0, 0), Row(1, 1, 1), Row(2, 2, 2), Row(3, 3, 3), Row(4, 4, 4)))
@@ -179,7 +179,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
     // test one left outer sort merge join
     val oneLeftOuterJoinDF = df1.join(df2.hint("SHUFFLE_MERGE"), $"k1" === $"k2", "left_outer")
     assert(oneLeftOuterJoinDF.queryExecution.executedPlan.collect {
-      case WholeStageCodegenExec(_ : SortMergeJoinExec) => true
+      case WholeStageCodegenExec(_: SortMergeJoinExec) => true
     }.size === 1)
     checkAnswer(oneLeftOuterJoinDF, Seq(Row(0, 0), Row(1, 1), Row(2, 2), Row(3, 3), Row(4, null),
       Row(5, null), Row(6, null), Row(7, null), Row(8, null), Row(9, null)))
@@ -187,7 +187,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
     // test one right outer sort merge join
     val oneRightOuterJoinDF = df2.join(df3.hint("SHUFFLE_MERGE"), $"k2" === $"k3", "right_outer")
     assert(oneRightOuterJoinDF.queryExecution.executedPlan.collect {
-      case WholeStageCodegenExec(_ : SortMergeJoinExec) => true
+      case WholeStageCodegenExec(_: SortMergeJoinExec) => true
     }.size === 1)
     checkAnswer(oneRightOuterJoinDF, Seq(Row(0, 0), Row(1, 1), Row(2, 2), Row(3, 3), Row(null, 4),
       Row(null, 5)))
@@ -196,7 +196,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
     val twoJoinsDF = df3.join(df2.hint("SHUFFLE_MERGE"), $"k3" === $"k2", "left_outer")
       .join(df1.hint("SHUFFLE_MERGE"), $"k3" === $"k1", "right_outer")
     assert(twoJoinsDF.queryExecution.executedPlan.collect {
-      case WholeStageCodegenExec(_ : SortMergeJoinExec) => true
+      case WholeStageCodegenExec(_: SortMergeJoinExec) => true
     }.size === 2)
     checkAnswer(twoJoinsDF,
       Seq(Row(0, 0, 0), Row(1, 1, 1), Row(2, 2, 2), Row(3, 3, 3), Row(4, null, 4), Row(5, null, 5),
@@ -211,7 +211,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
     // test one left semi sort merge join
     val oneJoinDF = df1.join(df2.hint("SHUFFLE_MERGE"), $"k1" === $"k2", "left_semi")
     assert(oneJoinDF.queryExecution.executedPlan.collect {
-      case WholeStageCodegenExec(ProjectExec(_, _ : SortMergeJoinExec)) => true
+      case WholeStageCodegenExec(ProjectExec(_, _: SortMergeJoinExec)) => true
     }.size === 1)
     checkAnswer(oneJoinDF, Seq(Row(0), Row(1), Row(2), Row(3)))
 
@@ -219,8 +219,8 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
     val twoJoinsDF = df3.join(df2.hint("SHUFFLE_MERGE"), $"k3" === $"k2", "left_semi")
       .join(df1.hint("SHUFFLE_MERGE"), $"k3" === $"k1", "left_semi")
     assert(twoJoinsDF.queryExecution.executedPlan.collect {
-      case WholeStageCodegenExec(ProjectExec(_, _ : SortMergeJoinExec)) |
-           WholeStageCodegenExec(_ : SortMergeJoinExec) => true
+      case WholeStageCodegenExec(ProjectExec(_, _: SortMergeJoinExec)) |
+           WholeStageCodegenExec(_: SortMergeJoinExec) => true
     }.size === 2)
     checkAnswer(twoJoinsDF, Seq(Row(0), Row(1), Row(2), Row(3)))
   }
@@ -233,7 +233,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
     // test one left anti sort merge join
     val oneJoinDF = df1.join(df2.hint("SHUFFLE_MERGE"), $"k1" === $"k2", "left_anti")
     assert(oneJoinDF.queryExecution.executedPlan.collect {
-      case WholeStageCodegenExec(ProjectExec(_, _ : SortMergeJoinExec)) => true
+      case WholeStageCodegenExec(ProjectExec(_, _: SortMergeJoinExec)) => true
     }.size === 1)
     checkAnswer(oneJoinDF, Seq(Row(4), Row(5), Row(6), Row(7), Row(8), Row(9)))
 
@@ -241,8 +241,8 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
     val twoJoinsDF = df1.join(df2.hint("SHUFFLE_MERGE"), $"k1" === $"k2", "left_anti")
       .join(df3.hint("SHUFFLE_MERGE"), $"k1" === $"k3", "left_anti")
     assert(twoJoinsDF.queryExecution.executedPlan.collect {
-      case WholeStageCodegenExec(ProjectExec(_, _ : SortMergeJoinExec)) |
-           WholeStageCodegenExec(_ : SortMergeJoinExec) => true
+      case WholeStageCodegenExec(ProjectExec(_, _: SortMergeJoinExec)) |
+           WholeStageCodegenExec(_: SortMergeJoinExec) => true
     }.size === 2)
     checkAnswer(twoJoinsDF, Seq(Row(6), Row(7), Row(8), Row(9)))
   }
@@ -257,7 +257,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
         // test broadcast nested loop join without condition
         val oneJoinDF = df1.join(df2)
         var hasJoinInCodegen = oneJoinDF.queryExecution.executedPlan.collect {
-          case WholeStageCodegenExec(_ : BroadcastNestedLoopJoinExec) => true
+          case WholeStageCodegenExec(_: BroadcastNestedLoopJoinExec) => true
         }.size === 1
         assert(hasJoinInCodegen == codegenEnabled)
         checkAnswer(oneJoinDF,
@@ -267,7 +267,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
         // test broadcast nested loop join with condition
         val oneJoinDFWithCondition = df1.join(df2, $"k1" + 1 =!= $"k2")
         hasJoinInCodegen = oneJoinDFWithCondition.queryExecution.executedPlan.collect {
-          case WholeStageCodegenExec(_ : BroadcastNestedLoopJoinExec) => true
+          case WholeStageCodegenExec(_: BroadcastNestedLoopJoinExec) => true
         }.size === 1
         assert(hasJoinInCodegen == codegenEnabled)
         checkAnswer(oneJoinDFWithCondition,
@@ -278,7 +278,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
         val twoJoinsDF = df1.join(df2, $"k1" < $"k2").crossJoin(df3)
         hasJoinInCodegen = twoJoinsDF.queryExecution.executedPlan.collect {
           case WholeStageCodegenExec(BroadcastNestedLoopJoinExec(
-            _: BroadcastNestedLoopJoinExec, _, _, _, _)) => true
+          _: BroadcastNestedLoopJoinExec, _, _, _, _)) => true
         }.size === 1
         assert(hasJoinInCodegen == codegenEnabled)
         checkAnswer(twoJoinsDF,
@@ -317,7 +317,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
           .join(df3, $"k1" <= $"k3", "left_outer")
         hasJoinInCodegen = twoJoinsDF.queryExecution.executedPlan.collect {
           case WholeStageCodegenExec(BroadcastNestedLoopJoinExec(
-            _: BroadcastNestedLoopJoinExec, _, _, _, _)) => true
+          _: BroadcastNestedLoopJoinExec, _, _, _, _)) => true
         }.size === 1
         assert(hasJoinInCodegen == codegenEnabled)
         checkAnswer(twoJoinsDF,
@@ -344,7 +344,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
         // test left semi join
         val semiJoinDF = df1.join(df2, $"k1" + 1 <= $"k2", "left_semi")
         var hasJoinInCodegen = semiJoinDF.queryExecution.executedPlan.collect {
-          case WholeStageCodegenExec(ProjectExec(_, _ : BroadcastNestedLoopJoinExec)) => true
+          case WholeStageCodegenExec(ProjectExec(_, _: BroadcastNestedLoopJoinExec)) => true
         }.size === 1
         assert(hasJoinInCodegen == codegenEnabled)
         checkAnswer(semiJoinDF, Seq(Row(0), Row(1)))
@@ -352,7 +352,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
         // test left anti join
         val antiJoinDF = df1.join(df2, $"k1" + 1 <= $"k2", "left_anti")
         hasJoinInCodegen = antiJoinDF.queryExecution.executedPlan.collect {
-          case WholeStageCodegenExec(ProjectExec(_, _ : BroadcastNestedLoopJoinExec)) => true
+          case WholeStageCodegenExec(ProjectExec(_, _: BroadcastNestedLoopJoinExec)) => true
         }.size === 1
         assert(hasJoinInCodegen == codegenEnabled)
         checkAnswer(antiJoinDF, Seq(Row(2), Row(3)))
@@ -386,7 +386,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
     val plan = ds.queryExecution.executedPlan
     assert(plan.find(p =>
       p.isInstanceOf[WholeStageCodegenExec] &&
-      p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[SerializeFromObjectExec]).isDefined)
+        p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[SerializeFromObjectExec]).isDefined)
     assert(ds.collect() === 0.until(10).map(_.toString).toArray)
   }
 
@@ -404,7 +404,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
     val plan = ds.queryExecution.executedPlan
     assert(plan.find(p =>
       p.isInstanceOf[WholeStageCodegenExec] &&
-      p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[FilterExec]).isDefined)
+        p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[FilterExec]).isDefined)
     assert(ds.collect() === Array(0, 6))
   }
 
@@ -417,7 +417,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
     val planInt = dsIntFilter.queryExecution.executedPlan
     assert(planInt.collect {
       case WholeStageCodegenExec(FilterExec(_,
-          ColumnarToRowExec(InputAdapter(_: InMemoryTableScanExec)))) => ()
+      ColumnarToRowExec(InputAdapter(_: InMemoryTableScanExec)))) => ()
     }.length == 1)
     assert(dsIntFilter.collect() === Array(1, 2))
 
@@ -475,7 +475,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
       "cast(id & 1023 as int) as k3")
 
     val ds = spark.range(10)
-      .selectExpr(keyExp:::caseExp: _*)
+      .selectExpr(keyExp ::: caseExp: _*)
       .groupBy("k1", "k2", "k3")
       .sum()
     val plan = ds.queryExecution.executedPlan
@@ -512,7 +512,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
     import testImplicits._
     withTempPath { dir =>
       val path = dir.getCanonicalPath
-      val df = spark.range(10).select(Seq.tabulate(201) {i => ('id + i).as(s"c$i")} : _*)
+      val df = spark.range(10).select(Seq.tabulate(201) { i => ('id + i).as(s"c$i") }: _*)
       df.write.mode(SaveMode.Overwrite).parquet(path)
 
       withSQLConf(SQLConf.WHOLESTAGE_MAX_NUM_FIELDS.key -> "202",
@@ -529,7 +529,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
 
   test("Control splitting consume function by operators with config") {
     import testImplicits._
-    val df = spark.range(10).select(Seq.tabulate(2) {i => ('id + i).as(s"c$i")} : _*)
+    val df = spark.range(10).select(Seq.tabulate(2) { i => ('id + i).as(s"c$i") }: _*)
 
     Seq(true, false).foreach { config =>
       withSQLConf(SQLConf.WHOLESTAGE_SPLIT_CONSUME_FUNC_BY_OPERATOR.key -> s"$config") {
@@ -551,11 +551,11 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
     Seq((128, false), (127, true)).foreach { case (columnNum, hasSplit) =>
       withTempPath { dir =>
         val path = dir.getCanonicalPath
-        spark.range(10).select(Seq.tabulate(columnNum) {i => lit(i).as(s"c$i")} : _*)
+        spark.range(10).select(Seq.tabulate(columnNum) { i => lit(i).as(s"c$i") }: _*)
           .write.mode(SaveMode.Overwrite).parquet(path)
 
         withSQLConf(SQLConf.WHOLESTAGE_MAX_NUM_FIELDS.key -> "255",
-            SQLConf.WHOLESTAGE_SPLIT_CONSUME_FUNC_BY_OPERATOR.key -> "true") {
+          SQLConf.WHOLESTAGE_SPLIT_CONSUME_FUNC_BY_OPERATOR.key -> "true") {
           val projection = Seq.tabulate(columnNum)(i => s"c$i + c$i as newC$i")
           val df = spark.read.parquet(path).selectExpr(projection: _*)
 
@@ -641,18 +641,18 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
         .join(baseTable, "idx")
       assert(distinctWithId.queryExecution.executedPlan.collectFirst {
         case WholeStageCodegenExec(
-          ProjectExec(_, BroadcastHashJoinExec(_, _, _, _, _, _: HashAggregateExec, _, _))) => true
+        ProjectExec(_, BroadcastHashJoinExec(_, _, _, _, _, _: HashAggregateExec, _, _))) => true
       }.isDefined)
       checkAnswer(distinctWithId, Seq(Row(1, 0), Row(1, 0)))
 
       // BroadcastHashJoinExec with a HashAggregateExec child containing a Final mode aggregate
       // expression
       val groupByWithId =
-        baseTable.groupBy("idx").sum().withColumn("id", monotonically_increasing_id())
+      baseTable.groupBy("idx").sum().withColumn("id", monotonically_increasing_id())
         .join(baseTable, "idx")
       assert(groupByWithId.queryExecution.executedPlan.collectFirst {
         case WholeStageCodegenExec(
-          ProjectExec(_, BroadcastHashJoinExec(_, _, _, _, _, _: HashAggregateExec, _, _))) => true
+        ProjectExec(_, BroadcastHashJoinExec(_, _, _, _, _, _: HashAggregateExec, _, _))) => true
       }.isDefined)
       checkAnswer(groupByWithId, Seq(Row(1, 2, 0), Row(1, 2, 0)))
     }
@@ -681,7 +681,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
     assert(
       executedPlan.find {
         case WholeStageCodegenExec(
-          HashAggregateExec(_, _, _, _, _, _, _: LocalTableScanExec)) => true
+        HashAggregateExec(_, _, _, _, _, _, _: LocalTableScanExec)) => true
         case _ => false
       }.isDefined,
       "LocalTableScanExec should be within a WholeStageCodegen domain.")
@@ -689,9 +689,9 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
 
   test("Give up splitting aggregate code if a parameter length goes over the limit") {
     withSQLConf(
-        SQLConf.CODEGEN_SPLIT_AGGREGATE_FUNC.key -> "true",
-        SQLConf.CODEGEN_METHOD_SPLIT_THRESHOLD.key -> "1",
-        "spark.sql.CodeGenerator.validParamLength" -> "0") {
+      SQLConf.CODEGEN_SPLIT_AGGREGATE_FUNC.key -> "true",
+      SQLConf.CODEGEN_METHOD_SPLIT_THRESHOLD.key -> "1",
+      "spark.sql.CodeGenerator.validParamLength" -> "0") {
       withTable("t") {
         val expectedErrMsg = "Failed to split aggregate code into small functions"
         Seq(
@@ -710,9 +710,9 @@ class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
 
   test("Give up splitting subexpression code if a parameter length goes over the limit") {
     withSQLConf(
-        SQLConf.CODEGEN_SPLIT_AGGREGATE_FUNC.key -> "false",
-        SQLConf.CODEGEN_METHOD_SPLIT_THRESHOLD.key -> "1",
-        "spark.sql.CodeGenerator.validParamLength" -> "0") {
+      SQLConf.CODEGEN_SPLIT_AGGREGATE_FUNC.key -> "false",
+      SQLConf.CODEGEN_METHOD_SPLIT_THRESHOLD.key -> "1",
+      "spark.sql.CodeGenerator.validParamLength" -> "0") {
       withTable("t") {
         val expectedErrMsg = "Failed to split subexpression code into small functions"
         Seq(

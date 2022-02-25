@@ -1588,6 +1588,161 @@ class FlatMapGroupsWithStateSuite extends StateStoreMetricsTest {
     )
   }
 
+  test("SPARK-38204: flatMapGroupsWithState should require StatefulOpClusteredDistribution " +
+    "from children - with initialState") {
+    // function will return -1 on timeout and returns count of the state otherwise
+    val stateFunc =
+      (key: (String, String), values: Iterator[(String, String, Long)],
+        state: GroupState[RunningCount]) => {
+
+        if (state.hasTimedOut) {
+          state.remove()
+          Iterator((key, "-1"))
+        } else {
+          val count = state.getOption.map(_.count).getOrElse(0L) + values.size
+          state.update(RunningCount(count))
+          state.setTimeoutDuration("10 seconds")
+          Iterator((key, count.toString))
+        }
+      }
+
+    val clock = new StreamManualClock
+    val inputData = MemoryStream[(String, String, Long)]
+    val initialState = Seq(("c", "c", new RunningCount(2)))
+      .toDS()
+      .repartition($"_1")
+      .groupByKey(a => (a._1, a._2)).mapValues(_._3)
+    val result =
+      inputData.toDF().toDF("key1", "key2", "time")
+        .selectExpr("key1", "key2", "timestamp_seconds(time) as timestamp")
+        .withWatermark("timestamp", "10 second")
+        .as[(String, String, Long)]
+        .repartition($"_1")
+        .groupByKey(x => (x._1, x._2))
+        .flatMapGroupsWithState(Update, ProcessingTimeTimeout(), initialState)(stateFunc)
+        .select($"_1._1".as("key1"), $"_1._2".as("key2"), $"_2".as("cnt"))
+
+    val checkpointDir = Utils.createTempDir().getCanonicalFile
+
+    logWarning(s"checkpoint dir: ${checkpointDir.getAbsolutePath}")
+
+    /*
+      Note: The checkpoint was generated using the following input in Spark version 3.2.0
+      AddData(inputData, ("a", "a", 1L)),
+      AdvanceManualClock(1 * 1000), // a and c are processed here for the first time.
+      CheckNewAnswer((("a", "a"), "1"), (("c", "c"), "2")),
+
+      Note2: The following is the physical plan of the query in Spark version 3.2.0 (convenience for checking backward compatibility)
+     */
+
+    testStream(result, Update)(
+      StartStream(Trigger.ProcessingTime("1 second"),
+        checkpointLocation = checkpointDir.getAbsolutePath,
+        triggerClock = clock),
+      AddData(inputData, ("a", "a", 1L)),
+      AdvanceManualClock(1 * 1000), // a and c are processed here for the first time.
+      CheckNewAnswer(("a", "a", "1"), ("c", "c", "2")),
+      Execute { query =>
+        logWarning(s"physical plan: ${query.lastExecution.executedPlan}")
+      }
+      /*
+      Execute { query =>
+        val numPartitions = query.lastExecution.numStateStores
+
+        val flatMapGroupsWithStateExecs = query.lastExecution.executedPlan.collect {
+          case f: FlatMapGroupsWithStateExec => f
+        }
+
+        assert(flatMapGroupsWithStateExecs.length === 1)
+        assert(requireStatefulOpClusteredDistribution(
+          flatMapGroupsWithStateExecs.head, Seq(Seq("_1", "_2"), Seq("_1", "_2")), numPartitions))
+        assert(hasDesiredHashPartitioningInChildren(
+          flatMapGroupsWithStateExecs.head, Seq(Seq("_1"), Seq("_1", "_2")), numPartitions))
+      }
+       */
+    )
+  }
+
+
+  test("SPARK-38204: flatMapGroupsWithState should require ClusteredDistribution " +
+    "from children if the query starts from checkpoint in 3.2.x - without initial state") {
+    // function will return -1 on timeout and returns count of the state otherwise
+    val stateFunc =
+      (key: (String, String), values: Iterator[(String, String, Long)],
+        state: GroupState[RunningCount]) => {
+
+        if (state.hasTimedOut) {
+          state.remove()
+          Iterator((key, "-1"))
+        } else {
+          val count = state.getOption.map(_.count).getOrElse(0L) + values.size
+          state.update(RunningCount(count))
+          state.setTimeoutDuration("10 seconds")
+          Iterator((key, count.toString))
+        }
+      }
+
+    val clock = new StreamManualClock
+    val inputData = MemoryStream[(String, String, Long)]
+    val result =
+      inputData.toDF().toDF("key1", "key2", "time")
+        .selectExpr("key1", "key2", "timestamp_seconds(time) as timestamp")
+        .withWatermark("timestamp", "10 second")
+        .as[(String, String, Long)]
+        .repartition($"_1")
+        .groupByKey(x => (x._1, x._2))
+        .flatMapGroupsWithState(Update, ProcessingTimeTimeout())(stateFunc)
+        .select($"_1._1".as("key1"), $"_1._2".as("key2"), $"_2".as("cnt"))
+
+    val checkpointDir = Utils.createTempDir().getCanonicalFile
+
+    logWarning(s"checkpoint dir: ${checkpointDir.getAbsolutePath}")
+
+    testStream(result, Update)(
+      StartStream(Trigger.ProcessingTime("1 second"),
+        checkpointLocation = checkpointDir.getAbsolutePath,
+        triggerClock = clock),
+
+      AddData(inputData, ("a", "a", 1L)),
+      AdvanceManualClock(1 * 1000), // a is processed here for the first time.
+      CheckNewAnswer(("a", "a", "1")),
+      Execute { query =>
+        logWarning(s"physical plan: ${query.lastExecution.executedPlan}")
+      }
+
+      // scalastyle:off line.size.limit
+      /*
+        Note: The checkpoint was generated using the following input in Spark version 3.2.0
+        AddData(inputData, ("a", "a", 1L)),
+        AdvanceManualClock(1 * 1000), // a is processed here for the first time.
+        CheckNewAnswer(("a", "a", "1")),
+
+        Note2: The following is the physical plan of the query in Spark version 3.2.0 (convenience for checking backward compatibility)
+       */
+      // scalastyle:on line.size.limit
+
+        /*
+      AddData(inputData, ("a", "b", 1L)),
+      AdvanceManualClock(1 * 1000),
+      CheckNewAnswer(("a", "b", "1")),
+
+      Execute { query =>
+        val numPartitions = query.lastExecution.numStateStores
+
+        val flatMapGroupsWithStateExecs = query.lastExecution.executedPlan.collect {
+          case f: FlatMapGroupsWithStateExec => f
+        }
+
+        assert(flatMapGroupsWithStateExecs.length === 1)
+        assert(requireClusteredDistribution(flatMapGroupsWithStateExecs.head,
+          Seq(Seq("_1", "_2"), Seq("_1", "_2")), Some(numPartitions)))
+        assert(hasDesiredHashPartitioningInChildren(
+          flatMapGroupsWithStateExecs.head, Seq(Seq("_1", "_2"), Seq("_1", "_2")), numPartitions))
+      }
+         */
+    )
+  }
+
   def testWithTimeout(timeoutConf: GroupStateTimeout): Unit = {
     test("SPARK-20714: watermark does not fail query when timeout = " + timeoutConf) {
       // Function to maintain running count up to 2, and then remove the count
