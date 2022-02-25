@@ -712,6 +712,44 @@ class StreamingAggregationSuite extends StateStoreMetricsTest with Assertions {
     )
   }
 
+  test("SPARK-38204: streaming aggregation should not require StatefulOpClusteredDistribution " +
+    "from children if the query starts from checkpoint in prior to 3.3") {
+
+    val inputData = MemoryStream[Int]
+    val df1 = inputData.toDF().select('value as 'key1, 'value * 2 as 'key2, 'value * 3 as 'value)
+    val agg = df1.repartition('key1).groupBy('key1, 'key2).agg(count('*))
+
+    val checkpointDir = Utils.createTempDir().getCanonicalFile
+
+    /*
+    val resourceUri = this.getClass.getResource(
+      "/structured-streaming/checkpoint-version-3.2.0-streaming-aggregate-with-repartition/").toURI
+
+    val checkpointDir = new File(resourceUri)
+     */
+    logWarning(s"checkpoint dir: ${checkpointDir.getAbsolutePath}")
+
+    /*
+    val checkpointDir = Utils.createTempDir().getCanonicalFile
+    // Copy the checkpoint to a temp dir to prevent changes to the original.
+    // Not doing this will lead to the test passing on the first run, but fail subsequent runs.
+    FileUtils.copyDirectory(new File(resourceUri), checkpointDir)
+
+    inputData.addData(3)
+    inputData.addData(3, 2)
+     */
+
+    testStream(agg, Update)(
+      StartStream(checkpointLocation = checkpointDir.getAbsolutePath),
+      AddData(inputData, 3),
+      CheckLastBatch((3, 6, 1)),
+      AddData(inputData, 3, 2),
+      CheckLastBatch((3, 6, 2), (2, 4, 1)),
+      Execute { query =>
+        logWarning(s"physical plan: ${query.lastExecution.executedPlan}")
+      }
+    )
+  }
 
   /** Add blocks of data to the `BlockRDDBackedSource`. */
   case class AddBlockData(source: BlockRDDBackedSource, data: Seq[Int]*) extends AddData {

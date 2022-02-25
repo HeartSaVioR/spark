@@ -25,6 +25,7 @@ import org.apache.spark.sql.execution.streaming.{MemoryStream, StreamingDeduplic
 import org.apache.spark.sql.execution.streaming.state.StateStore
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.util.Utils
 
 class StreamingDeduplicationSuite extends StateStoreMetricsTest {
 
@@ -287,5 +288,45 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest {
 
     testWithFlag(true)
     testWithFlag(false)
+  }
+
+  test("SPARK-38204: streaming deduplication should require ClusteredDistribution " +
+    "from children if the query starts from checkpoint in prior to 3.3") {
+
+    val inputData = MemoryStream[Int]
+    val df1 = inputData.toDF().select('value as 'key1, 'value * 2 as 'key2, 'value * 3 as 'value)
+    val dedup = df1.repartition('key1).dropDuplicates("key1", "key2")
+
+    val checkpointDir = Utils.createTempDir().getCanonicalFile
+
+    /*
+    val resourceUri = this.getClass.getResource(
+      "/structured-streaming/checkpoint-version-3.2.0-streaming-aggregate-with-repartition/").toURI
+
+    val checkpointDir = new File(resourceUri)
+     */
+    logWarning(s"checkpoint dir: ${checkpointDir.getAbsolutePath}")
+
+    /*
+    val checkpointDir = Utils.createTempDir().getCanonicalFile
+    // Copy the checkpoint to a temp dir to prevent changes to the original.
+    // Not doing this will lead to the test passing on the first run, but fail subsequent runs.
+    FileUtils.copyDirectory(new File(resourceUri), checkpointDir)
+
+    inputData.addData(1, 1, 2)
+    inputData.addData(3, 4)
+    */
+
+    testStream(dedup, Update)(
+      StartStream(checkpointLocation = checkpointDir.getAbsolutePath),
+
+      AddData(inputData, 1, 1, 2),
+      CheckLastBatch((1, 2, 3), (2, 4, 6)),
+      AddData(inputData, 3, 4),
+      CheckLastBatch((3, 6, 9), (4, 8, 12)),
+      Execute { query =>
+        logWarning(s"physical plan: ${query.lastExecution.executedPlan}")
+      }
+    )
   }
 }
