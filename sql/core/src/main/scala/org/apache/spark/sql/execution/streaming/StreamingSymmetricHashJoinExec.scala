@@ -642,7 +642,17 @@ case class StreamingSymmetricHashJoinExec(
 
   // This actually depends on the condition of join, since the evict conditions are very different
   // for the condition of join.
-  // FIXME: try to deduce the right watermark value for all cases if possible.
-  override def produceWatermark(minInputWatermarkMs: Long): Long =
-    WatermarkTracker.DEFAULT_WATERMARK_MS
+  override def produceWatermark(minInputWatermarkMs: Long): Long = {
+    val (leftStateWatermark, rightStateWatermark) =
+      StreamingSymmetricHashJoinHelper.getStateWatermark(
+      left.output, right.output, leftKeys, rightKeys, condition.full, Some(minInputWatermarkMs))
+
+    (leftStateWatermark, rightStateWatermark) match {
+      case (Some(lw), Some(rw)) => Math.min(lw, rw)
+
+      // FIXME: how to deal with (Some(lw), None) and (None, Some(rw))? are they even valid cases?
+
+      case _ => WatermarkTracker.DEFAULT_WATERMARK_MS
+    }
+  }
 }

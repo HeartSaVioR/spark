@@ -584,7 +584,7 @@ class StreamingInnerJoinSuite extends StreamingJoinSuite {
       Execute { query =>
         // Verify the query plan
         assert(query.lastExecution.executedPlan.collect {
-          case j @ StreamingSymmetricHashJoinExec(_, _, _, _, _, _, _, _,
+          case j @ StreamingSymmetricHashJoinExec(_, _, _, _, _, _, _, _, _,
             _: ShuffleExchangeExec, ShuffleExchangeExec(_, _: ShuffleExchangeExec, _)) => j
         }.size == 1)
       })

@@ -130,6 +130,60 @@ object StreamingSymmetricHashJoinHelper extends Logging {
     }
   }
 
+  def getStateWatermark(
+      leftAttributes: Seq[Attribute],
+      rightAttributes: Seq[Attribute],
+      leftKeys: Seq[Expression],
+      rightKeys: Seq[Expression],
+      condition: Option[Expression],
+      eventTimeWatermarkOnEviction: Option[Long]): (Option[Long], Option[Long]) = {
+    // Join keys of both sides generate rows of the same fields, that is, same sequence of data
+    // types. If one side (say left side) has a column (say timestamp) that has a watermark on it,
+    // then it will never consider joining keys that are < state key watermark (i.e. event time
+    // watermark). On the other side (i.e. right side), even if there is no watermark defined,
+    // there has to be an equivalent column (i.e., timestamp). And any right side data that has the
+    // timestamp < watermark will not match will not match with left side data, as the left side get
+    // filtered with the explicitly defined watermark. So, the watermark in timestamp column in
+    // left side keys effectively causes the timestamp on the right side to have a watermark.
+    // We will use the ordinal of the left timestamp in the left keys to find the corresponding
+    // right timestamp in the right keys.
+    val joinKeyOrdinalForWatermark: Option[Int] = {
+      leftKeys.zipWithIndex.collectFirst {
+        case (ne: NamedExpression, index) if ne.metadata.contains(delayKey) => index
+      } orElse {
+        rightKeys.zipWithIndex.collectFirst {
+          case (ne: NamedExpression, index) if ne.metadata.contains(delayKey) => index
+        }
+      }
+    }
+
+    def getOneSideStateWatermark(
+        oneSideInputAttributes: Seq[Attribute],
+        otherSideInputAttributes: Seq[Attribute]): Option[Long] = {
+      val isWatermarkDefinedOnInput = oneSideInputAttributes.exists(_.metadata.contains(delayKey))
+      val isWatermarkDefinedOnJoinKey = joinKeyOrdinalForWatermark.isDefined
+
+      if (isWatermarkDefinedOnJoinKey) { // case 1 and 3 in the StreamingSymmetricHashJoinExec docs
+        eventTimeWatermarkOnEviction
+      } else if (isWatermarkDefinedOnInput) { // case 2 in the StreamingSymmetricHashJoinExec docs
+        StreamingJoinHelper.getStateValueWatermark(
+          attributesToFindStateWatermarkFor = AttributeSet(oneSideInputAttributes),
+          attributesWithEventWatermark = AttributeSet(otherSideInputAttributes),
+          condition,
+          eventTimeWatermarkOnEviction)
+      } else {
+        None
+      }
+    }
+
+    val leftStateWatermark =
+      getOneSideStateWatermark(leftAttributes, rightAttributes)
+    val rightStateWatermark =
+      getOneSideStateWatermark(rightAttributes, leftAttributes)
+
+    (leftStateWatermark, rightStateWatermark)
+  }
+
   /** Get the predicates defining the state watermarks for both sides of the join */
   def getStateWatermarkPredicates(
       leftAttributes: Seq[Attribute],

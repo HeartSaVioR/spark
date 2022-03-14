@@ -144,7 +144,7 @@ case class WatermarkTracker(policy: MultipleWatermarkPolicy) extends Logging {
     //  only available in the checkpoint.
 
     val statefulOperatorIdToNodeId = mutable.HashMap[Long, Int]()
-    val nodeToOutputWatermark = mutable.HashMap[Int, (Long, Long)]()
+    val nodeToOutputWatermark = mutable.HashMap[Int, Long]()
     val nextStatefulOperatorToWatermark = mutable.HashMap[Long, (Long, Long)]()
 
     // This calculation relies on post-order traversal of the query plan.
@@ -165,8 +165,8 @@ case class WatermarkTracker(policy: MultipleWatermarkPolicy) extends Logging {
         }
 
         val finalWatermarkMs = Math.max(oldWatermarkMs, newWatermarkMs)
-        nextStatefulOperatorToWatermark.put(stOpId, (finalWatermarkMs, finalWatermarkMs))
-        nodeToOutputWatermark.put(node.id, (finalWatermarkMs, finalWatermarkMs))
+        nextStatefulOperatorToWatermark.put(stOpId, (oldWatermarkMs, finalWatermarkMs))
+        nodeToOutputWatermark.put(node.id, finalWatermarkMs)
         node
 
       case node: StateStoreWriter =>
@@ -181,23 +181,23 @@ case class WatermarkTracker(policy: MultipleWatermarkPolicy) extends Logging {
             throw new IllegalStateException(
               s"watermark for the node ${child.id} should be registered")
           })
-        }.filter { case (prev, curr) =>
+        }.filter { case curr =>
           // This path is to exclude children from watermark calculation
           // which don't have watermark information
-          prev >= 0 && curr >= 0
+          curr >= 0
         }
 
-        val (minPrevInputWatermarkMs, minCurrInputWatermarkMs) = if (inputWatermarks.nonEmpty) {
-          (inputWatermarks.map(_._1).min, inputWatermarks.map(_._2).min)
+        val minCurrInputWatermarkMs = if (inputWatermarks.nonEmpty) {
+          inputWatermarks.min
         } else {
-          (DEFAULT_WATERMARK_MS, DEFAULT_WATERMARK_MS)
+          DEFAULT_WATERMARK_MS
         }
 
-        nextStatefulOperatorToWatermark.put(stOpId,
-          (minPrevInputWatermarkMs, minCurrInputWatermarkMs))
         val newWatermarkMs = node.produceWatermark(minCurrInputWatermarkMs)
         val finalWatermarkMs = Math.max(oldWatermarkMs, newWatermarkMs)
-        nodeToOutputWatermark.put(node.id, (oldWatermarkMs, finalWatermarkMs))
+        nodeToOutputWatermark.put(node.id, finalWatermarkMs)
+        nextStatefulOperatorToWatermark.put(stOpId,
+          (oldWatermarkMs, newWatermarkMs))
         node
 
       case node =>
@@ -207,19 +207,17 @@ case class WatermarkTracker(policy: MultipleWatermarkPolicy) extends Logging {
             throw new IllegalStateException(
               s"watermark for the node ${child.id} should be registered")
           })
-        }.filter { case (prev, curr) =>
+        }.filter { case curr =>
           // This path is to exclude children from watermark calculation
           // which don't have watermark information
-          prev >= 0 && curr >= 0
+          curr >= 0
         }
 
         val finalWatermarkMs = if (inputWatermarks.nonEmpty) {
-          val minPrevInputWatermarkMs = inputWatermarks.map(_._1).min
-          val minCurrInputWatermarkMs = inputWatermarks.map(_._2).min
-
-          (minPrevInputWatermarkMs, minCurrInputWatermarkMs)
+          val minCurrInputWatermarkMs = inputWatermarks.min
+          minCurrInputWatermarkMs
         } else {
-          (NO_WATERMARK_MS, NO_WATERMARK_MS)
+          NO_WATERMARK_MS
         }
 
         nodeToOutputWatermark.put(node.id, finalWatermarkMs)

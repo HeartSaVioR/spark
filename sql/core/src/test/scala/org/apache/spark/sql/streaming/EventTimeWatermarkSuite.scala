@@ -1005,8 +1005,14 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
     }
   }
 
+  // FIXME: add test for time window aggregation in both sides -> stream-stream time window
+  //  equality join, append mode
 
-  test("WIP: stream-stream left outer join -> aggregation, append mode") {
+  // FIXME: stream-stream time interval inner join -> aggregation, append mode
+
+  // FIXME: stream-stream time interval full outer join -> aggregation, append mode
+
+  test("WIP: stream-stream time interval left outer join -> aggregation, append mode") {
     withSQLConf("spark.sql.streaming.unsupportedOperationCheck" -> "false") {
       val input1 = MemoryStream[(Timestamp, String, String)]
       val df1 = input1.toDF
@@ -1022,16 +1028,17 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
         .join(df2.as("right"),
           expr("""
                  |left.id = right.id AND left.eventTime BETWEEN
-                 |  right.eventTime - INTERVAL 30 seconds AND
+                 |  right.eventTime - INTERVAL 40 seconds AND
                  |  right.eventTime + INTERVAL 30 seconds
              """.stripMargin),
           joinType = "leftOuter")
 
       val windowAggregation = joined
         // Just to test the behavior on redefining event time after stateful operator
-        .withColumn("newEventTime", $"left.eventTime")
-        .withWatermark("newEventTime", "10 seconds")
-        .groupBy(window($"newEventTime", "30 seconds"))
+        // FIXME: below should not be needed
+        // .withColumn("newEventTime", $"left.eventTime")
+        // .withWatermark("newEventTime", "10 seconds")
+        .groupBy(window($"left.eventTime", "30 seconds"))
         .agg(count("*").as("cnt"))
         .selectExpr("window.start AS window_start", "window.end AS window_end", "cnt")
 
@@ -1060,18 +1067,37 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
         // (Timestamp.valueOf("2020-01-02 01:00:00"), "abc", "joined with B",
         //  Timestamp.valueOf("2020-01-02 00:59:59"), "abc", "B")
 
-        // watermark calculated to '2020-01-02 00:50:00' in second withWatermark
-
-        // windowed aggregation result
-        (Timestamp.valueOf("2020-01-02 00:00:00"), Timestamp.valueOf("2020-01-02 00:00:30"), 1)
         // state row in aggregation
+        // (Timestamp.valueOf("2020-01-02 00:00:00"), Timestamp.valueOf("2020-01-02 00:00:30"), 1)
         // (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
 
-        // joined result from no-data batch
+        // no-data batch
+
+        // watermark in left input: 2020-01-02 00:58:00
+        // watermark in right input: 2020-01-02 01:56:00
+
+        // state watermark on stream-stream join
+        // min watermark on filter: 0
+        // min watermark on eviction: 2020-01-02 00:58:00
+        // state watermark on eviction: 2020-01-02 00:57:20
+        //
+        // joined result from no-data batch (eviction)
         // (Timestamp.valueOf("2020-01-01 00:00:00"), "abc", "has no join partner",
         //  null, null, null)
-        // <= windowed aggregation will drop this result
+
+        // streaming aggregation
+        // watermark: 2021-01-02 00:57:30
+        //
         // state row in aggregation
+        // (Timestamp.valueOf("2020-01-01 00:00:00"), Timestamp.valueOf("2020-01-01 00:00:30"), 1)
+        // (Timestamp.valueOf("2020-01-02 00:00:00"), Timestamp.valueOf("2020-01-02 00:00:30"), 1)
+        // (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
+        //
+        // output
+        (Timestamp.valueOf("2020-01-01 00:00:00"), Timestamp.valueOf("2020-01-01 00:00:30"), 1),
+        (Timestamp.valueOf("2020-01-02 00:00:00"), Timestamp.valueOf("2020-01-02 00:00:30"), 1)
+
+        // state row in aggregation after eviction
         // (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
       )
 
@@ -1080,11 +1106,34 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
         // (Timestamp.valueOf("2020-01-05 00:00:00"), "abc", "joined with D",
         //  Timestamp.valueOf("2020-01-05 00:00:10"), "abc", "D")
 
-        // watermark calculated to '2020-01-04 23:50:00' in second withWatermark
-
-        // windowed aggregation result
-        (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
         // state row in aggregation
+        // (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
+        // (Timestamp.valueOf("2020-01-05 00:00:00"), Timestamp.valueOf("2020-01-05 01:00:30"), 1)
+
+        // no-data batch
+
+        // watermark in left input: 2020-01-04 23:58:00 - 2 mins
+        // watermark in right input: 2020-01-04 23:56:10 - 4 mins
+
+        // state watermark on stream-stream join
+        // min watermark on filter: 2020-01-02 00:57:30
+        // min watermark on eviction: 2020-01-04 23:56:10
+        // state watermark on eviction: 2020-01-04 23:55:30
+        //
+        // joined result from no-data batch (eviction)
+        // none
+
+        // streaming aggregation
+        // watermark: 2020-01-04 23:55:40
+        //
+        // state row in aggregation
+        // (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
+        // (Timestamp.valueOf("2020-01-05 00:00:00"), Timestamp.valueOf("2020-01-05 01:00:30"), 1)
+        //
+        // output
+        (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
+
+        // state row in aggregation after eviction
         // (Timestamp.valueOf("2020-01-05 00:00:00"), Timestamp.valueOf("2020-01-05 01:00:30"), 1)
       )
 
