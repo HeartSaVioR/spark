@@ -281,55 +281,63 @@ class StreamingInnerJoinSuite extends StreamingJoinSuite {
   }
 
   test("stream stream inner join on windows - with watermark") {
-    val input1 = MemoryStream[Int]
-    val input2 = MemoryStream[Int]
+    withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> "1") {
+      val input1 = MemoryStream[Int]
+      val input2 = MemoryStream[Int]
 
-    val df1 = input1.toDF
-      .select('value as "key", timestamp_seconds($"value") as "timestamp",
-        ('value * 2) as "leftValue")
-      .withWatermark("timestamp", "10 seconds")
-      .select('key, window('timestamp, "10 second"), 'leftValue)
+      val df1 = input1.toDF
+        .select('value as "key", timestamp_seconds($"value") as "timestamp",
+          ('value * 2) as "leftValue")
+        .withWatermark("timestamp", "10 seconds")
+        .select('key, window('timestamp, "10 second"), 'leftValue)
 
-    val df2 = input2.toDF
-      .select('value as "key", timestamp_seconds($"value") as "timestamp",
-        ('value * 3) as "rightValue")
-      .select('key, window('timestamp, "10 second"), 'rightValue)
+      val df2 = input2.toDF
+        .select('value as "key", timestamp_seconds($"value") as "timestamp",
+          ('value * 3) as "rightValue")
+        .select('key, window('timestamp, "10 second"), 'rightValue)
 
-    val joined = df1.join(df2, Seq("key", "window"))
-      .select('key, $"window.end".cast("long"), 'leftValue, 'rightValue)
+      val joined = df1.join(df2, Seq("key", "window"))
+        .select('key, $"window.end".cast("long"), 'leftValue, 'rightValue)
 
-    testStream(joined)(
-      AddData(input1, 1),
-      CheckAnswer(),
-      assertNumStateRows(total = 1, updated = 1),
+      testStream(joined)(
+        AddData(input1, 1),
+        CheckAnswer(),
+        assertNumStateRows(total = 1, updated = 1),
 
-      AddData(input2, 1),
-      CheckAnswer((1, 10, 2, 3)),
-      assertNumStateRows(total = 2, updated = 1),
-      StopStream,
-      StartStream(),
+        AddData(input2, 1),
+        CheckAnswer((1, 10, 2, 3)),
+        assertNumStateRows(total = 2, updated = 1),
+        StopStream,
+        StartStream(),
 
-      AddData(input1, 25),
-      CheckNewAnswer(),   // watermark = 15, no-data-batch should remove 2 rows having window=[0,10]
-      assertNumStateRows(total = 1, updated = 1),
+        AddData(input1, 25),
+        // watermark for late event = 0 -> 15
+        // watermark for eviction = 15
+        // no-data-batch should remove 2 rows having window=[0,10]
+        CheckNewAnswer(),
+        assertNumStateRows(total = 1, updated = 1),
 
-      AddData(input2, 25),
-      CheckNewAnswer((25, 30, 50, 75)),
-      assertNumStateRows(total = 2, updated = 1),
-      StopStream,
-      StartStream(),
+        AddData(input2, 25),
+        CheckNewAnswer((25, 30, 50, 75)),
+        assertNumStateRows(total = 2, updated = 1),
+        StopStream,
+        StartStream(),
 
-      AddData(input2, 1),
-      CheckNewAnswer(),                             // Should not join as < 15 removed
-      assertNumStateRows(total = 2, updated = 0),   // row not add as 1 < state key watermark = 15
+        AddData(input2, 1),
+        CheckNewAnswer(),                             // Should not join as < 15 removed
+        // assertNumStateRows(total = 2, updated = 0),   // row not add as 1 < state key watermark = 15
+        assertNumStateRows(total = 2, updated = 1),   // row is added and then evicted
 
-      AddData(input1, 5),
-      CheckNewAnswer(),                             // Same reason as above
-      assertNumStateRows(total = 2, updated = 0, droppedByWatermark = 1)
-    )
+        AddData(input1, 5),
+        CheckNewAnswer(),                             // Same reason as above
+        assertNumStateRows(total = 2, updated = 0, droppedByWatermark = 1)
+      )
+    }
   }
 
   test("stream stream inner join with time range - with watermark - one side condition") {
+    // FIXME: test is failing...
+
     import org.apache.spark.sql.functions._
 
     val leftInput = MemoryStream[(Int, Int)]
@@ -368,6 +376,7 @@ class StreamingInnerJoinSuite extends StreamingJoinSuite {
       // so left side going to only receive data where leftTime > 20
       // right side state constraint:    20 < leftTime < rightTime - 5   ==>   rightTime > 25
       // right state where rightTime <= 25 will be cleared, (1, 11) and (1, 10) removed
+      // FIXME: total 6, updated 1, why?
       assertNumStateRows(total = 4, updated = 1),
 
       // New data to right input should match with left side (1, 3) and (1, 5), as left state should
@@ -389,6 +398,8 @@ class StreamingInnerJoinSuite extends StreamingJoinSuite {
   }
 
   test("stream stream inner join with time range - with watermark - two side conditions") {
+    // FIXME: test is failing...
+
     import org.apache.spark.sql.functions._
 
     val leftInput = MemoryStream[(Int, Int)]
@@ -591,6 +602,8 @@ class StreamingInnerJoinSuite extends StreamingJoinSuite {
   }
 
   test("SPARK-26187 restore the stream-stream inner join query from Spark 2.4") {
+    // FIXME: test is failing...
+
     val inputStream = MemoryStream[(Int, Long)]
     val df = inputStream.toDS()
       .select(col("_1").as("value"), timestamp_seconds($"_2").as("timestamp"))
@@ -635,6 +648,7 @@ class StreamingInnerJoinSuite extends StreamingJoinSuite {
       AddData(inputStream, (6, 6L), (7, 7L), (8, 8L), (9, 9L), (10, 10L)),
       // batch 2: same result as above test
       CheckNewAnswer((6, 6L, 6, 6L), (8, 8L, 8, 8L), (10, 10L, 10, 10L)),
+      // FIXME: total 13, updated 6 - why?
       assertNumStateRows(11, 6),
       Execute { query =>
         // Verify state format = 1
@@ -800,6 +814,7 @@ class StreamingOuterJoinSuite extends StreamingJoinSuite {
     )
   }
 
+  // FIXME: both left outer and right outer tests are failing...
   Seq(
     ("left_outer", Row(3, null, 5, null)),
     ("right_outer", Row(null, 2, null, 5))
@@ -914,6 +929,7 @@ class StreamingOuterJoinSuite extends StreamingJoinSuite {
   }
 
   test("SPARK-26187 self left outer join should not return outer nulls for already matched rows") {
+    // FIXME: test is failing...
     val (inputStream, query) = setupSelfJoin("left_outer")
 
     testStream(query)(
@@ -957,6 +973,7 @@ class StreamingOuterJoinSuite extends StreamingJoinSuite {
   }
 
   test("SPARK-26187 self right outer join should not return outer nulls for already matched rows") {
+    // FIXME: test is failing...
     val inputStream = MemoryStream[(Int, Long)]
 
     val df = inputStream.toDS()
@@ -1376,6 +1393,8 @@ class StreamingFullOuterJoinSuite extends StreamingJoinSuite {
   }
 
   test("full outer join with watermark range condition") {
+    // FIXME: test is failing...
+
     val (leftInput, rightInput, joined) = setupJoinWithRangeCondition("full_outer")
 
     testStream(joined)(
@@ -1422,6 +1441,8 @@ class StreamingFullOuterJoinSuite extends StreamingJoinSuite {
   }
 
   test("self full outer join") {
+    // FIXME: test is failing...
+
     val (inputStream, query) = setupSelfJoin("full_outer")
 
     testStream(query)(
@@ -1580,6 +1601,8 @@ class StreamingLeftSemiJoinSuite extends StreamingJoinSuite {
   }
 
   test("left semi join with watermark range condition") {
+    // FIXME: test is failing...
+
     val (leftInput, rightInput, joined) = setupJoinWithRangeCondition("left_semi")
 
     testStream(joined)(
@@ -1625,6 +1648,8 @@ class StreamingLeftSemiJoinSuite extends StreamingJoinSuite {
   }
 
   test("self left semi join") {
+    // FIXME: test is failing...
+
     val (inputStream, query) = setupSelfJoin("left_semi")
 
     testStream(query)(

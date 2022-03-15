@@ -222,6 +222,14 @@ case class StreamingSymmetricHashJoinExec(
         newMetadata.operatorWatermarksOnEviction(getStateInfo.operatorId) >
           eventTimeWatermarkOnEviction.get
 
+    /*
+    logWarning(s"DEBUG: left keys $leftKeys / right keys $rightKeys / " +
+      s"watermarkUsedForStateCleanup $watermarkUsedForStateCleanup / " +
+      s"watermarkHasChanged $watermarkHasChanged / " +
+      s"eventTimeWatermarkOnLateEvents $eventTimeWatermarkOnLateEvents / " +
+      s"eventTimeWatermarkOnEviction $eventTimeWatermarkOnEviction / " +
+      s"newMetadata $newMetadata")
+     */
     watermarkUsedForStateCleanup && watermarkHasChanged
   }
 
@@ -241,9 +249,11 @@ case class StreamingSymmetricHashJoinExec(
       throw new IllegalStateException(s"Cannot execute join as state info was not specified\n$this")
     }
 
+    // /*
     logWarning(s"DEBUG: left keys $leftKeys / right keys $rightKeys / " +
       s"watermark for late row $eventTimeWatermarkOnLateEvents / watermark for eviction " +
       s"$eventTimeWatermarkOnEviction")
+    // */
 
     val numOutputRows = longMetric("numOutputRows")
     val numUpdatedStateRows = longMetric("numUpdatedStateRows")
@@ -327,17 +337,38 @@ case class StreamingSymmetricHashJoinExec(
           }
         }
 
-        // NOTE: we need to make sure `outerOutputIter` is evaluated "after" exhausting all of
-        // elements in `innerOutputIter`, because evaluation of `innerOutputIter` may update
-        // the match flag which the logic for outer join is relying on.
-        val removedRowIter = leftSideJoiner.removeOldState()
-        val outerOutputIter = removedRowIter.filterNot { kv =>
-          stateFormatVersion match {
-            case 1 => matchesWithRightSideState(new UnsafeRowPair(kv.key, kv.value))
-            case 2 => kv.matched
-            case _ => throwBadStateFormatVersionException()
+        // outerOutputIter should be initialized after hashJoinOutputIter
+        val outerOutputIter = new Iterator[JoinedRow] {
+          private lazy val iter: Iterator[JoinedRow] = initializeIterator()
+
+          override def hasNext: Boolean = iter.hasNext
+          override def next(): JoinedRow = iter.next()
+
+          private def initializeIterator(): Iterator[JoinedRow] = {
+            // logWarning("DEBUG: Initializing outer iterator...")
+
+            // NOTE: we need to make sure `outerOutputIter` is evaluated "after" exhausting all of
+            // elements in `innerOutputIter`, because evaluation of `innerOutputIter` may update
+            // the match flag which the logic for outer join is relying on.
+
+            val removedRowIter = leftSideJoiner.removeOldState()
+              .map { row =>
+                // logWarning(s"DEBUG: left keys $leftKeys right keys $rightKeys - removed row $row")
+                row
+              }
+            removedRowIter.filterNot { kv =>
+              stateFormatVersion match {
+                case 1 => matchesWithRightSideState(new UnsafeRowPair(kv.key, kv.value))
+                case 2 => kv.matched
+                case _ => throwBadStateFormatVersionException()
+              }
+            }.map(pair => joinedRow.withLeft(pair.value).withRight(nullRight))
+              .map { joinedRow =>
+                // logWarning(s"DEBUG: left keys $leftKeys right keys $rightKeys - null right joined row $joinedRow")
+                joinedRow
+              }
           }
-        }.map(pair => joinedRow.withLeft(pair.value).withRight(nullRight))
+        }
 
         hashJoinOutputIter ++ outerOutputIter
       case RightOuter =>
@@ -347,14 +378,39 @@ case class StreamingSymmetricHashJoinExec(
             postJoinFilter(joinedRow.withLeft(leftValue).withRight(rightKeyValue.value))
           }
         }
-        val removedRowIter = rightSideJoiner.removeOldState()
-        val outerOutputIter = removedRowIter.filterNot { kv =>
-          stateFormatVersion match {
-            case 1 => matchesWithLeftSideState(new UnsafeRowPair(kv.key, kv.value))
-            case 2 => kv.matched
-            case _ => throwBadStateFormatVersionException()
+
+        // outerOutputIter should be initialized after hashJoinOutputIter
+        val outerOutputIter = new Iterator[JoinedRow] {
+          private lazy val iter: Iterator[JoinedRow] = initializeIterator()
+
+          override def hasNext: Boolean = iter.hasNext
+          override def next(): JoinedRow = iter.next()
+
+          private def initializeIterator(): Iterator[JoinedRow] = {
+            // logWarning("DEBUG: Initializing outer iterator...")
+
+            // NOTE: we need to make sure `outerOutputIter` is evaluated "after" exhausting all of
+            // elements in `innerOutputIter`, because evaluation of `innerOutputIter` may update
+            // the match flag which the logic for outer join is relying on.
+
+            val removedRowIter = rightSideJoiner.removeOldState()
+              .map { row =>
+                // logWarning(s"DEBUG: left keys $leftKeys right keys $rightKeys - removed row $row")
+                row
+              }
+            removedRowIter.filterNot { kv =>
+              stateFormatVersion match {
+                case 1 => matchesWithLeftSideState(new UnsafeRowPair(kv.key, kv.value))
+                case 2 => kv.matched
+                case _ => throwBadStateFormatVersionException()
+              }
+            }.map(pair => joinedRow.withLeft(nullLeft).withRight(pair.value))
+              .map { joinedRow =>
+                // logWarning(s"DEBUG: left keys $leftKeys right keys $rightKeys - null left joined row $joinedRow")
+                joinedRow
+              }
           }
-        }.map(pair => joinedRow.withLeft(nullLeft).withRight(pair.value))
+        }
 
         hashJoinOutputIter ++ outerOutputIter
       case FullOuter =>
@@ -363,10 +419,61 @@ case class StreamingSymmetricHashJoinExec(
             case 2 => kv.matched
             case _ => throwBadStateFormatVersionException()
           }
-        val leftSideOutputIter = leftSideJoiner.removeOldState().filterNot(
-          isKeyToValuePairMatched).map(pair => joinedRow.withLeft(pair.value).withRight(nullRight))
-        val rightSideOutputIter = rightSideJoiner.removeOldState().filterNot(
-          isKeyToValuePairMatched).map(pair => joinedRow.withLeft(nullLeft).withRight(pair.value))
+
+        // outerOutputIter should be initialized after hashJoinOutputIter
+        val leftSideOutputIter = new Iterator[JoinedRow] {
+          private lazy val iter: Iterator[JoinedRow] = initializeIterator()
+
+          override def hasNext: Boolean = iter.hasNext
+          override def next(): JoinedRow = iter.next()
+
+          private def initializeIterator(): Iterator[JoinedRow] = {
+            // logWarning("DEBUG: Initializing outer iterator...")
+
+            // NOTE: we need to make sure `outerOutputIter` is evaluated "after" exhausting all of
+            // elements in `innerOutputIter`, because evaluation of `innerOutputIter` may update
+            // the match flag which the logic for outer join is relying on.
+
+            val removedRowIter = leftSideJoiner.removeOldState()
+              .map { row =>
+                // logWarning(s"DEBUG: left keys $leftKeys right keys $rightKeys - removed row $row")
+                row
+              }
+            removedRowIter.filterNot(isKeyToValuePairMatched)
+              .map(pair => joinedRow.withLeft(pair.value).withRight(nullRight))
+              .map { joinedRow =>
+                // logWarning(s"DEBUG: left keys $leftKeys right keys $rightKeys - null right joined row $joinedRow")
+                joinedRow
+              }
+          }
+        }
+        // outerOutputIter should be initialized after hashJoinOutputIter
+        val rightSideOutputIter = new Iterator[JoinedRow] {
+          private lazy val iter: Iterator[JoinedRow] = initializeIterator()
+
+          override def hasNext: Boolean = iter.hasNext
+          override def next(): JoinedRow = iter.next()
+
+          private def initializeIterator(): Iterator[JoinedRow] = {
+            // logWarning("DEBUG: Initializing outer iterator...")
+
+            // NOTE: we need to make sure `outerOutputIter` is evaluated "after" exhausting all of
+            // elements in `innerOutputIter`, because evaluation of `innerOutputIter` may update
+            // the match flag which the logic for outer join is relying on.
+
+            val removedRowIter = rightSideJoiner.removeOldState()
+              .map { row =>
+                // logWarning(s"DEBUG: left keys $leftKeys right keys $rightKeys - removed row $row")
+                row
+              }
+            removedRowIter.filterNot(isKeyToValuePairMatched)
+              .map(pair => joinedRow.withLeft(nullLeft).withRight(pair.value))
+              .map { joinedRow =>
+                // logWarning(s"DEBUG: left keys $leftKeys right keys $rightKeys - null left joined row $joinedRow")
+                joinedRow
+              }
+          }
+        }
 
         hashJoinOutputIter ++ leftSideOutputIter ++ rightSideOutputIter
       case _ => throwBadJoinTypeException()
@@ -529,7 +636,7 @@ case class StreamingSymmetricHashJoinExec(
           case None =>
             inputIter
         }).map { row =>
-          logWarning(s"Non late row: $row")
+          logWarning(s"DEBUG: join keys $joinKeys - non late row: $row")
           row
         }
 
@@ -593,12 +700,16 @@ case class StreamingSymmetricHashJoinExec(
       override def completion(): Unit = {
         val isLeftSemiWithMatch =
           joinType == LeftSemi && joinSide == LeftSide && iteratorNotEmpty
+
         // Add to state store only if both removal predicates do not match,
         // and the row is not matched for left side of left semi join.
-        val shouldAddToState =
-          !stateKeyWatermarkPredicateFunc(key) && !stateValueWatermarkPredicateFunc(thisRow) &&
-          !isLeftSemiWithMatch
-        if (shouldAddToState) {
+        // val shouldAddToState =
+        // !stateKeyWatermarkPredicateFunc(key) && !stateValueWatermarkPredicateFunc(thisRow) &&
+        //   !isLeftSemiWithMatch
+        // FIXME: we did some optimizations to skip adding row into state when it is not needed.
+        //   while we have different criteria, there could be still spots on optimization.
+
+        if (!isLeftSemiWithMatch) {
           joinStateManager.append(key, thisRow, matched = iteratorNotEmpty)
           updatedStateRowsCount += 1
         }
