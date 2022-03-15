@@ -241,6 +241,10 @@ case class StreamingSymmetricHashJoinExec(
       throw new IllegalStateException(s"Cannot execute join as state info was not specified\n$this")
     }
 
+    logWarning(s"DEBUG: left keys $leftKeys / right keys $rightKeys / " +
+      s"watermark for late row $eventTimeWatermarkOnLateEvents / watermark for eviction " +
+      s"$eventTimeWatermarkOnEviction")
+
     val numOutputRows = longMetric("numOutputRows")
     val numUpdatedStateRows = longMetric("numUpdatedStateRows")
     val numTotalStateRows = longMetric("numTotalStateRows")
@@ -516,14 +520,17 @@ case class StreamingSymmetricHashJoinExec(
 
       val watermarkAttribute = inputAttributes.find(_.metadata.contains(delayKey))
       val nonLateRows =
-        WatermarkSupport.watermarkExpression(watermarkAttribute,
-          eventTimeWatermarkOnEviction) match {
+        (WatermarkSupport.watermarkExpression(watermarkAttribute,
+          eventTimeWatermarkOnLateEvents) match {
 
           case Some(watermarkExpr) =>
             val predicate = Predicate.create(watermarkExpr, inputAttributes)
             applyRemovingRowsOlderThanWatermark(inputIter, predicate)
           case None =>
             inputIter
+        }).map { row =>
+          logWarning(s"Non late row: $row")
+          row
         }
 
       val generateFilteredJoinedRow: InternalRow => Iterator[InternalRow] = joinSide match {

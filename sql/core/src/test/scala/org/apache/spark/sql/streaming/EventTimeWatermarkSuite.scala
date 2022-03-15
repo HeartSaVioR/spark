@@ -1034,10 +1034,6 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
           joinType = "leftOuter")
 
       val windowAggregation = joined
-        // Just to test the behavior on redefining event time after stateful operator
-        // FIXME: below should not be needed
-        // .withColumn("newEventTime", $"left.eventTime")
-        // .withWatermark("newEventTime", "10 seconds")
         .groupBy(window($"left.eventTime", "30 seconds"))
         .agg(count("*").as("cnt"))
         .selectExpr("window.start AS window_start", "window.end AS window_end", "cnt")
@@ -1140,8 +1136,12 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
       testStream(windowAggregation)(
         MultiAddData((input1, inputDataForInput1AtBatch1), (input2, inputDataForInput2AtBatch1)),
         CheckNewAnswer(expectedOutputAtBatch1.head, expectedOutputAtBatch1.tail: _*),
+        // FIXME: check the join & aggregation nodes and see the watermark
+        //  for filtering vs eviction
         MultiAddData((input1, inputDataForInput1AtBatch2), (input2, inputDataForInput2AtBatch2)),
         CheckNewAnswer(expectedOutputAtBatch2.head, expectedOutputAtBatch2.tail: _*)
+        // FIXME: check the join & aggregation nodes and see the watermark for
+        //  filtering vs eviction
       )
     }
   }
