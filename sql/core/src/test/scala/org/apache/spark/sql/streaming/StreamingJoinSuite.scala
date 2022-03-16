@@ -1187,10 +1187,10 @@ class StreamingOuterJoinSuite extends StreamingJoinSuite {
     }
   }
 
-  // FIXME: this should be fixed now
-  // NOTE: This test explains the correctness issue on chained stream-stream joins
-  // due to global watermark.
   test("chained stream-stream outer joins with append mode") {
+    // This test verifies the bugfix of watermark between stateful operators, mentioned in
+    // Spark dev@ mailing list: https://lists.apache.org/thread/r0v8qcxlcxz0tgq0fjbzzj0bowyrnsnb
+
     def stream(prefix: String, multiplier: Int): (MemoryStream[Int], DataFrame) = {
       val input = MemoryStream[Int]
       val df = input.toDF
@@ -1253,22 +1253,56 @@ class StreamingOuterJoinSuite extends StreamingJoinSuite {
         // prev watermark: 0
         // input watermark: min(3, 5) = 3
         // state watermark for second join: 3 (equality join)
-        // joined output: (3, 3, null)
-        // left state: (1, null), (2, null)
+        // joined output: (3, 3, null), (1, null, null), (2, null, null)
+        // left state: none
         // right state: 4, 5
 
-        // Here Spark discards right-null rows in first join (1, null) and (2, null)
-        // in second join - as watermark goes to 3 => min(3, 5).
-        ProcessAllAvailable(),
-        Execute { qe =>
-          logWarning(s"DEBUG: ${qe.lastExecution.executedPlan}")
-        },
         CheckNewAnswer(Row(1, null, null), Row(2, null, null), Row(3, 3, null)),
 
-        // Just make sure watermark goes to 6, and (1, null) and (2, null) are
-        // clearly lost.
         TripleMultiAddData(inputA, 6)(inputB, 6)(inputC, 6),
-        // Global watermark = 6
+
+        // batch 2 (data batch):
+        //
+        // first join
+        // prev watermark: 3
+        // input watermark: min(3, 3) = 3
+        // state watermark for first join: 3 (equality join)
+        // joined output: (6, 6)
+        // left state: 6 (matched)
+        // right state: 6
+        //
+        // second join
+        // prev watermark: 3
+        // input watermark: min(3, 5) = 3
+        // state watermark for second join: 3 (equality join)
+        // joined output: (6, 6, 6)
+        // left state: (6, 6) (matched)
+        // right state: 6
+        //
+        // batch 3 (no-data batch):
+        //
+        // watermark calculation
+        //
+        // input A: 6
+        // input B: 6
+        // input C: 6
+        //
+        // first join
+        // prev watermark: 3
+        // input watermark: min(6, 6) = 6
+        // state watermark for first join: 6 (equality join)
+        // joined output: none
+        // left state: none
+        // right state: none
+        //
+        // second join
+        // prev watermark: 3
+        // input watermark: min(6, 6) = 6
+        // state watermark for second join: 6 (equality join)
+        // joined output: none
+        // left state: none
+        // right state: none
+
         CheckNewAnswer(Row(6, 6, 6))
       )
     }
