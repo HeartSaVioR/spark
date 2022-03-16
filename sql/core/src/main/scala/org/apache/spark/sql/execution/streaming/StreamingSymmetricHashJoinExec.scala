@@ -222,14 +222,14 @@ case class StreamingSymmetricHashJoinExec(
         newMetadata.operatorWatermarksOnEviction(getStateInfo.operatorId) >
           eventTimeWatermarkOnEviction.get
 
-    /*
+    ///*
     logWarning(s"DEBUG: left keys $leftKeys / right keys $rightKeys / " +
       s"watermarkUsedForStateCleanup $watermarkUsedForStateCleanup / " +
       s"watermarkHasChanged $watermarkHasChanged / " +
       s"eventTimeWatermarkOnLateEvents $eventTimeWatermarkOnLateEvents / " +
       s"eventTimeWatermarkOnEviction $eventTimeWatermarkOnEviction / " +
       s"newMetadata $newMetadata")
-     */
+    // */
     watermarkUsedForStateCleanup && watermarkHasChanged
   }
 
@@ -767,10 +767,9 @@ case class StreamingSymmetricHashJoinExec(
 
     (leftStateWatermark, rightStateWatermark) match {
       case (Some(lw), Some(rw)) => Math.min(lw, rw)
-
-      // FIXME: how to deal with (Some(lw), None) and (None, Some(rw))? are they even valid cases?
-
-      case _ => WatermarkTracker.DEFAULT_WATERMARK_MS
+      case (Some(lw), None) => lw
+      case (None, Some(rw)) => rw
+      case _ => minInputWatermarkMs
     }
   }
 }

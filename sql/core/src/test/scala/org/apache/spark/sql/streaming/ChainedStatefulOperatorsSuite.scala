@@ -30,6 +30,7 @@ class ChainedStatefulOperatorsSuite
   extends StreamTest with StateStoreMetricsTest with BeforeAndAfter {
 
   import testImplicits._
+  import ChainedStatefulOperatorsSuite._
 
   before {
     SparkSession.setActiveSession(spark)  // set this before force initializing 'joinExec'
@@ -85,7 +86,8 @@ class ChainedStatefulOperatorsSuite
     }
   }
 
-  test("stream-stream time interval left outer join -> aggregation, append mode") {
+  test("stream-stream time interval left outer join (both side condition) ->" +
+    " time window aggregation") {
     withSQLConf("spark.sql.streaming.unsupportedOperationCheck" -> "false") {
       val input1 = MemoryStream[(Timestamp, String, String)]
       val df1 = input1.toDF
@@ -207,4 +209,48 @@ class ChainedStatefulOperatorsSuite
       )
     }
   }
+
+  test("stream-stream time interval left outer join (left side condition) ->" +
+    " time window aggregation") {
+    import java.sql.Timestamp
+
+    withSQLConf("spark.sql.streaming.unsupportedOperationCheck" -> "false") {
+      val adImprStream = MemoryStream[RecordClass]
+      val adClickStream = MemoryStream[RecordClass]
+
+      val adImpr = adImprStream.toDS().withWatermark("ts", "1 hour")
+      val adClick = adClickStream.toDS().withWatermark("ts", "1 hour")
+
+      val stream = adImpr.as("tb1")
+        .join(adClick.as("tb2"),
+          expr("tb1.id == tb2.id AND tb1.ts + interval 5 minutes > tb2.ts"), "leftOuter")
+        .groupBy(window($"tb1.ts", "5 minutes"))
+        .count()
+        .select("window.start", "window.end", "count")
+
+      testStream(stream)(
+        MultiAddData(
+          (adImprStream, Seq(
+            RecordClass(1, Timestamp.valueOf("2022-01-01 01:30:55.888")),
+            RecordClass(2, Timestamp.valueOf("2022-01-01 03:30:55.888")),
+            RecordClass(4, Timestamp.valueOf("2022-01-01 05:30:55.888")))
+          ),
+          (adClickStream, Seq(
+            RecordClass(1, Timestamp.valueOf("2022-01-01 01:31:55.888")),
+            RecordClass(3, Timestamp.valueOf("2022-01-01 02:40:55.888")),
+            RecordClass(6, Timestamp.valueOf("2022-01-01 05:30:55.888")))
+          )
+        ),
+        CheckNewAnswer(
+          (Timestamp.valueOf("2022-01-01 01:30:00"), Timestamp.valueOf("2022-01-01 01:35:00"), 1),
+          (Timestamp.valueOf("2022-01-01 03:30:00"), Timestamp.valueOf("2022-01-01 03:35:00"), 1)
+        )
+      )
+    }
+  }
 }
+
+object ChainedStatefulOperatorsSuite {
+  final case class RecordClass(id: Integer, ts: Timestamp)
+}
+
