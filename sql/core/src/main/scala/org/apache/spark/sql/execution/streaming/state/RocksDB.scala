@@ -30,7 +30,7 @@ import org.apache.hadoop.conf.Configuration
 import org.json4s.NoTypeHints
 import org.json4s.jackson.Serialization
 import org.rocksdb.{RocksDB => NativeRocksDB, _}
-import org.rocksdb.TickerType._
+// import org.rocksdb.TickerType._
 
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
@@ -68,16 +68,12 @@ class RocksDB(
   private val bloomFilter = new BloomFilter()
   private val tableFormatConfig = new BlockBasedTableConfig()
   tableFormatConfig.setBlockSize(conf.blockSizeKB * 1024)
-  tableFormatConfig.setBlockCache(new LRUCache(conf.blockCacheSizeMB * 1024 * 1024))
-  tableFormatConfig.setFilterPolicy(bloomFilter)
-  tableFormatConfig.setFormatVersion(conf.formatVersion)
+  // tableFormatConfig.setFormatVersion(conf.formatVersion)
 
   private val dbOptions = new Options() // options to open the RocksDB
   dbOptions.setCreateIfMissing(true)
   dbOptions.setTableFormatConfig(tableFormatConfig)
   private val dbLogger = createLogger() // for forwarding RocksDB native logs to log4j
-  dbOptions.setStatistics(new Statistics())
-  private val nativeStats = dbOptions.statistics()
 
   private val workingDir = createTempDir("workingDir")
   private val fileManager = new RocksDBFileManager(
@@ -116,9 +112,6 @@ class RocksDB(
         numKeysOnLoadedVersion = metadata.numKeys
         loadedVersion = version
         fileManagerMetrics = fileManager.latestLoadCheckpointMetrics
-      }
-      if (conf.resetStatsOnLoad) {
-        nativeStats.reset
       }
       // reset resources to prevent side-effects from previous loaded version
       closePrefixScanIterators()
@@ -332,6 +325,7 @@ class RocksDB(
 
   /** Get current instantaneous statistics */
   def metrics: RocksDBMetrics = {
+    /*
     import HistogramType._
     val totalSSTFilesBytes = getDBProperty("rocksdb.total-sst-files-size")
     val readerMemUsage = getDBProperty("rocksdb.estimate-table-readers-mem")
@@ -378,6 +372,10 @@ class RocksDB(
       filesReused = fileManagerMetrics.filesReused,
       zipFileBytesUncompressed = fileManagerMetrics.zipFileBytesUncompressed,
       nativeOpsMetrics = nativeOpsMetrics.toMap)
+     */
+    RocksDBMetrics(
+      0, 0, 0, 0, Map(), Map(), 0, 0, 0, None, Map()
+    )
   }
 
   private def acquire(): Unit = acquireLock.synchronized {
@@ -599,6 +597,8 @@ case class RocksDBNativeHistogram(
 
 object RocksDBNativeHistogram {
   def apply(nativeHist: HistogramData): RocksDBNativeHistogram = {
+    RocksDBNativeHistogram(0L, 0.0d, 0.0d, 0.0d, 0.0d, 0.0d, 0L)
+    /*
     RocksDBNativeHistogram(
       nativeHist.getSum,
       nativeHist.getAverage,
@@ -607,6 +607,7 @@ object RocksDBNativeHistogram {
       nativeHist.getPercentile95,
       nativeHist.getPercentile99,
       nativeHist.getCount)
+     */
   }
 }
 
