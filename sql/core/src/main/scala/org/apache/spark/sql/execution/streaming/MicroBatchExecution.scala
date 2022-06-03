@@ -27,12 +27,12 @@ import org.apache.spark.sql.catalyst.streaming.{StreamingRelationV2, WriteToStre
 import org.apache.spark.sql.catalyst.trees.TreePattern.CURRENT_LIKE
 import org.apache.spark.sql.catalyst.util.truncatedString
 import org.apache.spark.sql.connector.catalog.{SupportsRead, SupportsWrite, TableCapability}
-import org.apache.spark.sql.connector.read.streaming.{MicroBatchStream, Offset => OffsetV2, ReadLimit, SparkDataStream, SupportsAdmissionControl, SupportsTriggerAvailableNow}
+import org.apache.spark.sql.connector.read.streaming.{MicroBatchStream, ReadLimit, SparkDataStream, SupportsAdmissionControl, SupportsTriggerAvailableNow, Offset => OffsetV2}
 import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, StreamingDataSourceV2Relation, StreamWriterCommitProgress, WriteToDataSourceV2Exec}
-import org.apache.spark.sql.execution.streaming.sources.WriteToMicroBatchDataSource
+import org.apache.spark.sql.execution.streaming.sources.{WriteToMicroBatchDataSource, WriteToMicroBatchDataSourceV1}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.Trigger
 import org.apache.spark.util.{Clock, Utils}
@@ -79,14 +79,14 @@ class MicroBatchExecution(
 
     import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Implicits._
     val _logicalPlan = analyzedPlan.transform {
-      case streamingRelation @ StreamingRelation(dataSourceV1, sourceName, output) =>
+      case streamingRelation @ StreamingRelation(dataSourceV1, sourceName, output, catalogTable) =>
         toExecutionRelationMap.getOrElseUpdate(streamingRelation, {
           // Materialize source to avoid creating it in every batch
           val metadataPath = s"$resolvedCheckpointRoot/sources/$nextSourceId"
           val source = dataSourceV1.createSource(metadataPath)
           nextSourceId += 1
           logInfo(s"Using Source [$source] from DataSourceV1 named '$sourceName' [$dataSourceV1]")
-          StreamingExecutionRelation(source, output)(sparkSession)
+          StreamingExecutionRelation(source, output, catalogTable)(sparkSession)
         })
 
       case s @ StreamingRelationV2(src, srcName, table: SupportsRead, options, output, _, _, v1) =>
@@ -113,7 +113,9 @@ class MicroBatchExecution(
               v1.get.asInstanceOf[StreamingRelation].dataSource.createSource(metadataPath)
             nextSourceId += 1
             logInfo(s"Using Source [$source] from DataSourceV2 named '$srcName' $dsStr")
-            StreamingExecutionRelation(source, output)(sparkSession)
+            // We don't have a catalog table but may have a table identifier. Given this is about
+            // v1 fallback path, we just give up and set the catalog table as None.
+            StreamingExecutionRelation(source, output, None)(sparkSession)
           })
         }
     }
@@ -168,7 +170,17 @@ class MicroBatchExecution(
           extraOptions,
           outputMode)
 
-      case _ => _logicalPlan
+      case s: Sink =>
+        WriteToMicroBatchDataSourceV1(
+          plan.catalogTable,
+          sink = s,
+          query = _logicalPlan,
+          queryId = id.toString,
+          extraOptions,
+          outputMode)
+
+      case _ =>
+        throw new IllegalArgumentException(s"unknown sink type for $sink")
     }
   }
 
@@ -576,15 +588,22 @@ class MicroBatchExecution(
     // Replace sources in the logical plan with data that has arrived since the last batch.
     val newBatchesPlan = logicalPlan transform {
       // For v1 sources.
-      case StreamingExecutionRelation(source, output) =>
+      case StreamingExecutionRelation(source, output, catalogTable) =>
         newData.get(source).map { dataPlan =>
           val hasFileMetadata = output.exists {
             case FileSourceMetadataAttribute(_) => true
             case _ => false
           }
-          val finalDataPlan = dataPlan match {
-            case l: LogicalRelation if hasFileMetadata => l.withMetadataColumns()
-            case _ => dataPlan
+          val finalDataPlan = dataPlan transform {
+            case l: LogicalRelation =>
+              var newRelation = l
+              if (hasFileMetadata) {
+                newRelation = newRelation.withMetadataColumns()
+              }
+              catalogTable.foreach { table =>
+                newRelation = newRelation.copy(catalogTable = Some(table))
+              }
+              newRelation
           }
           val maxFields = SQLConf.get.maxToStringFields
           assert(output.size == finalDataPlan.output.size,
@@ -627,7 +646,8 @@ class MicroBatchExecution(
     }
 
     val triggerLogicalPlan = sink match {
-      case _: Sink => newAttributePlan
+      case _: Sink =>
+        newAttributePlan.asInstanceOf[WriteToMicroBatchDataSourceV1].withNewBatchId(currentBatchId)
       case _: SupportsWrite =>
         newAttributePlan.asInstanceOf[WriteToMicroBatchDataSource].withNewBatchId(currentBatchId)
       case _ => throw new IllegalArgumentException(s"unknown sink type for $sink")

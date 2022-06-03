@@ -21,7 +21,6 @@ import java.io.File
 import java.util
 
 import org.scalatest.BeforeAndAfter
-
 import org.apache.spark.sql.{AnalysisException, Row}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException
@@ -31,7 +30,7 @@ import org.apache.spark.sql.connector.{FakeV2Provider, InMemoryTableSessionCatal
 import org.apache.spark.sql.connector.catalog.{Identifier, InMemoryTableCatalog, SupportsRead, Table, TableCapability, V2TableWithV1Fallback}
 import org.apache.spark.sql.connector.expressions.Transform
 import org.apache.spark.sql.connector.read.ScanBuilder
-import org.apache.spark.sql.execution.streaming.{MemoryStream, MemoryStreamScanBuilder}
+import org.apache.spark.sql.execution.streaming.{MemoryStream, MemoryStreamScanBuilder, StreamingQueryWrapper}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.StreamTest
 import org.apache.spark.sql.streaming.sources.FakeScanBuilder
@@ -320,6 +319,67 @@ class DataStreamTableAPISuite extends StreamTest with BeforeAndAfter {
       }
       assert(exc.getMessage.contains("The input source(parquet) is different from the table " +
         s"$tableName's data source provider(json)"))
+    }
+  }
+
+  test("explain with catalog table") {
+    val tblSourceName = "tbl_src"
+    val tblTargetName = "tbl_target"
+    val tblSourceQualified = s"`default`.`$tblSourceName`"
+    val tblTargetQualified = s"`default`.`$tblTargetName`"
+
+    withTable(tblSourceQualified, tblTargetQualified) {
+      withTempDir { dir =>
+        // To make sure we don't get affected by abnormally terminated test
+        sql(s"DROP TABLE IF EXISTS $tblSourceQualified")
+        sql(s"DROP TABLE IF EXISTS $tblTargetQualified")
+
+        sql(s"CREATE TABLE $tblSourceQualified (col1 string, col2 integer) USING parquet")
+        sql(s"CREATE TABLE $tblTargetQualified (col1 string, col2 integer) USING parquet")
+
+        sql(s"INSERT INTO $tblSourceQualified VALUES ('a', 1)")
+        sql(s"INSERT INTO $tblSourceQualified VALUES ('b', 2)")
+        sql(s"INSERT INTO $tblSourceQualified VALUES ('c', 3)")
+
+        val df = spark.readStream.table(tblSourceQualified)
+        val sq = df.writeStream
+          .format("parquet")
+          .option("checkpointLocation", dir.getCanonicalPath)
+          .toTable(tblTargetQualified)
+          .asInstanceOf[StreamingQueryWrapper].streamingQuery
+
+        try {
+          sq.processAllAvailable()
+
+          val explainWithoutExtended = sq.explainInternal(false)
+          // `extended = false` only displays the physical plan.
+          assert("FileScan".r
+            .findAllMatchIn(explainWithoutExtended).size === 1)
+          assert(tblSourceName.r
+            .findAllMatchIn(explainWithoutExtended).size === 1)
+
+          // in physical plan, there is no information for DSv1 sink
+
+          val explainWithExtended = sq.explainInternal(true)
+          // `extended = true` displays 3 logical plans (Parsed/Analyzed/Optimized) and 1 physical
+          // plan.
+          assert("Relation".r
+            .findAllMatchIn(explainWithExtended).size === 3)
+          assert("FileScan".r
+            .findAllMatchIn(explainWithExtended).size === 1)
+          // we don't compare with exact number since the number is also affected by SubqueryAlias
+          assert(tblSourceName.r
+            .findAllMatchIn(explainWithExtended).size >= 4)
+
+          // we have marker node for DSv1 sink only in logical node
+          assert("WriteToMicroBatchDataSourceV1".r
+            .findAllMatchIn(explainWithExtended).size === 3)
+          assert(tblTargetName.r
+            .findAllMatchIn(explainWithExtended).size === 3)
+        } finally {
+          sq.stop()
+        }
+      }
     }
   }
 

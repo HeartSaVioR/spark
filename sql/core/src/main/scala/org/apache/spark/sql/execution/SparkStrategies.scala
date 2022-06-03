@@ -37,7 +37,7 @@ import org.apache.spark.sql.execution.command._
 import org.apache.spark.sql.execution.exchange.{REBALANCE_PARTITIONS_BY_COL, REBALANCE_PARTITIONS_BY_NONE, REPARTITION_BY_COL, REPARTITION_BY_NUM, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.python._
 import org.apache.spark.sql.execution.streaming._
-import org.apache.spark.sql.execution.streaming.sources.MemoryPlan
+import org.apache.spark.sql.execution.streaming.sources.{MemoryPlan, WriteToMicroBatchDataSourceV1}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.OutputMode
 import org.apache.spark.sql.types.StructType
@@ -650,11 +650,24 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
   object StreamingRelationStrategy extends Strategy {
     def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
       case s: StreamingRelation =>
-        StreamingRelationExec(s.sourceName, s.output) :: Nil
+        val tableQualifier = s.catalogTable.map(_.identifier.unquotedString)
+        StreamingRelationExec(s.sourceName, s.output, tableQualifier) :: Nil
       case s: StreamingExecutionRelation =>
-        StreamingRelationExec(s.toString, s.output) :: Nil
+        val tableQualifier = s.catalogTable.map(_.identifier.unquotedString)
+        StreamingRelationExec(s.toString, s.output, tableQualifier) :: Nil
       case s: StreamingRelationV2 =>
-        StreamingRelationExec(s.sourceName, s.output) :: Nil
+        val tableQualifier = (s.catalog, s.identifier) match {
+          case (Some(catalog), Some(identifier)) => Some(s"${catalog.name}.${identifier}")
+          case _ => None
+        }
+        StreamingRelationExec(s.sourceName, s.output, tableQualifier) :: Nil
+      case _ => Nil
+    }
+  }
+
+  object EliminateWriteToMicroBatchDataSourceV1 extends Strategy {
+    def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
+      case s: WriteToMicroBatchDataSourceV1 => planLater(s.child) :: Nil
       case _ => Nil
     }
   }
