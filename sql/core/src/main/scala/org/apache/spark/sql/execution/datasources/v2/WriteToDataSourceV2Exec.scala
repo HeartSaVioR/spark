@@ -23,6 +23,7 @@ import scala.collection.JavaConverters._
 import scala.util.control.NonFatal
 
 import org.apache.spark.{SparkEnv, TaskContext}
+
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
@@ -37,6 +38,7 @@ import org.apache.spark.sql.connector.write.{BatchWrite, DataWriterFactory, Logi
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.execution.{SparkPlan, UnaryExecNode}
 import org.apache.spark.sql.execution.metric.{CustomMetrics, SQLMetric, SQLMetrics}
+import org.apache.spark.sql.execution.streaming.sources.MicroBatchWrite
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.util.{LongAccumulator, Utils}
 
@@ -54,6 +56,23 @@ case class WriteToDataSourceV2(
   override def output: Seq[Attribute] = Nil
   override protected def withNewChildInternal(newChild: LogicalPlan): WriteToDataSourceV2 =
     copy(query = newChild)
+
+  override def verboseString(maxFields: Int): String = {
+    val simpleName = getClass.getSimpleName
+    val batchWriteName = batchWrite match {
+      case m: MicroBatchWrite =>
+        s"${m.getClass.getSimpleName} [${m.writeSupport.getClass.getName}]"
+
+      case b => b.getClass.getName
+    }
+    val tableQualifier = relation.map { rel =>
+      (rel.catalog, rel.identifier) match {
+        case (Some(cat), Some(ident)) => s"${cat.name()}.${ident.toString}"
+        case _ => ""
+      }
+    }.getOrElse("")
+    s"$simpleName $tableQualifier $batchWriteName"
+  }
 }
 
 /**
@@ -317,6 +336,17 @@ case class WriteToDataSourceV2Exec(
 
   override protected def withNewChildInternal(newChild: SparkPlan): WriteToDataSourceV2Exec =
     copy(query = newChild)
+
+  override def verboseString(maxFields: Int): String = {
+    val simpleName = getClass.getSimpleName
+    val batchWriteName = batchWrite match {
+      case m: MicroBatchWrite =>
+        s"${m.getClass.getSimpleName} [${m.writeSupport.getClass.getName}]"
+
+      case b => b.getClass.getName
+    }
+    s"$simpleName $batchWriteName"
+  }
 }
 
 trait V2ExistingTableWriteExec extends V2TableWriteExec {

@@ -17,48 +17,42 @@
 
 package org.apache.spark.sql.execution.streaming.sources
 
+import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, UnaryNode}
-import org.apache.spark.sql.connector.catalog.SupportsWrite
-import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
+import org.apache.spark.sql.execution.streaming.Sink
 import org.apache.spark.sql.streaming.OutputMode
 
-/**
- * The logical plan for writing data to a micro-batch stream.
- *
- * Note that this logical plan does not have a corresponding physical plan, as it will be converted
- * to [[org.apache.spark.sql.execution.datasources.v2.WriteToDataSourceV2 WriteToDataSourceV2]]
- * with [[MicroBatchWrite]] before execution.
- */
-case class WriteToMicroBatchDataSource(
-    relation: Option[DataSourceV2Relation],
-    table: SupportsWrite,
+case class WriteToMicroBatchDataSourceV1(
+    catalogTable: Option[CatalogTable],
+    sink: Sink,
     query: LogicalPlan,
     queryId: String,
     writeOptions: Map[String, String],
     outputMode: OutputMode,
     batchId: Option[Long] = None)
   extends UnaryNode {
-  override def child: LogicalPlan = query
-  override def output: Seq[Attribute] = Nil
 
-  def withNewBatchId(batchId: Long): WriteToMicroBatchDataSource = {
+  override def child: LogicalPlan = query
+
+  // Despite this is logically the top node, this node should behave like "pass-through"
+  // since the DSv1 codepath on microbatch execution handles sink operation separately.
+  // We will eliminate this node in physical planning, which shouldn't make difference as
+  // this node is pass-through.
+  override def output: Seq[Attribute] = query.output
+
+  def withNewBatchId(batchId: Long): WriteToMicroBatchDataSourceV1 = {
     copy(batchId = Some(batchId))
   }
 
-  override protected def withNewChildInternal(newChild: LogicalPlan): WriteToMicroBatchDataSource =
-    copy(query = newChild)
+  override protected def withNewChildInternal(
+      newChild: LogicalPlan): WriteToMicroBatchDataSourceV1 = copy(query = newChild)
 
   override def verboseString(maxFields: Int): String = {
     val simpleName = getClass.getSimpleName
-    val tableSimpleName = table.getClass.getSimpleName
-    val tableQualifier = relation.map { rel =>
-      (rel.catalog, rel.identifier) match {
-        case (Some(cat), Some(ident)) => s"${cat.name()}.${ident.toString}"
-        case _ => ""
-      }
-    }.getOrElse("")
+    val sinkName = sink.getClass.getName
+    val tableQualifier = catalogTable.map(_.identifier.unquotedString).getOrElse("")
     val batchIdStr = batchId.map(_.toString).getOrElse("None")
-    s"$simpleName $tableQualifier $tableSimpleName [batchId: $batchIdStr]"
+    s"$simpleName $tableQualifier $sinkName [batchId: $batchIdStr]"
   }
 }

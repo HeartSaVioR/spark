@@ -150,6 +150,8 @@ case class StreamingDataSourceV2Relation(
     output: Seq[Attribute],
     scan: Scan,
     stream: SparkDataStream,
+    catalog: Option[CatalogPlugin],
+    identifier: Option[Identifier],
     startOffset: Option[Offset] = None,
     endOffset: Option[Offset] = None)
   extends LeafNode with MultiInstanceRelation {
@@ -164,6 +166,16 @@ case class StreamingDataSourceV2Relation(
       DataSourceV2Relation.transformV2Stats(statistics, None, conf.defaultSizeInBytes)
     case _ =>
       Statistics(sizeInBytes = conf.defaultSizeInBytes)
+  }
+
+  override def verboseString(maxFields: Int): String = {
+    val simpleName = getClass.getSimpleName
+    val streamSimpleName = stream.getClass.getName
+    val tableQualifier = (catalog, identifier) match {
+      case (Some(cat), Some(ident)) => s"${cat.name()}.${ident.toString}"
+      case _ => ""
+    }
+    s"$simpleName $tableQualifier $streamSimpleName"
   }
 }
 
