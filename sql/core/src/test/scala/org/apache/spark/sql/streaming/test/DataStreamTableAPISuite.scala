@@ -21,6 +21,7 @@ import java.io.File
 import java.util
 
 import org.scalatest.BeforeAndAfter
+
 import org.apache.spark.sql.{AnalysisException, Row}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException
@@ -31,6 +32,7 @@ import org.apache.spark.sql.connector.catalog.{Identifier, InMemoryTableCatalog,
 import org.apache.spark.sql.connector.expressions.Transform
 import org.apache.spark.sql.connector.read.ScanBuilder
 import org.apache.spark.sql.execution.streaming.{MemoryStream, MemoryStreamScanBuilder, StreamingQueryWrapper}
+import org.apache.spark.sql.functions.lit
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.StreamTest
 import org.apache.spark.sql.streaming.sources.FakeScanBuilder
@@ -322,11 +324,11 @@ class DataStreamTableAPISuite extends StreamTest with BeforeAndAfter {
     }
   }
 
-  test("explain with catalog table") {
+  test("explain with table on DSv1 data source") {
     val tblSourceName = "tbl_src"
     val tblTargetName = "tbl_target"
-    val tblSourceQualified = s"`default`.`$tblSourceName`"
-    val tblTargetQualified = s"`default`.`$tblTargetName`"
+    val tblSourceQualified = s"default.$tblSourceName"
+    val tblTargetQualified = s"default.$tblTargetName"
 
     withTable(tblSourceQualified, tblTargetQualified) {
       withTempDir { dir =>
@@ -358,7 +360,8 @@ class DataStreamTableAPISuite extends StreamTest with BeforeAndAfter {
           assert(tblSourceName.r
             .findAllMatchIn(explainWithoutExtended).size === 1)
 
-          // in physical plan, there is no information for DSv1 sink
+          // We have marker node for DSv1 sink only in logical node. In physical plan, there is no
+          // information for DSv1 sink.
 
           val explainWithExtended = sq.explainInternal(true)
           // `extended = true` displays 3 logical plans (Parsed/Analyzed/Optimized) and 1 physical
@@ -368,14 +371,77 @@ class DataStreamTableAPISuite extends StreamTest with BeforeAndAfter {
           assert("FileScan".r
             .findAllMatchIn(explainWithExtended).size === 1)
           // we don't compare with exact number since the number is also affected by SubqueryAlias
-          assert(tblSourceName.r
+          assert(tblSourceQualified.r
             .findAllMatchIn(explainWithExtended).size >= 4)
 
-          // we have marker node for DSv1 sink only in logical node
           assert("WriteToMicroBatchDataSourceV1".r
             .findAllMatchIn(explainWithExtended).size === 3)
-          assert(tblTargetName.r
+          assert(tblTargetQualified.r
+            .findAllMatchIn(explainWithExtended).size >= 3)
+        } finally {
+          sq.stop()
+        }
+      }
+    }
+  }
+
+  test("explain with table on DSv2 data source") {
+    val tblSourceName = "tbl_src"
+    val tblTargetName = "tbl_target"
+    val tblSourceQualified = s"teststream.ns.$tblSourceName"
+    val tblTargetQualified = s"testcat.ns.$tblTargetName"
+
+    spark.sql("CREATE NAMESPACE teststream.ns")
+    spark.sql("CREATE NAMESPACE testcat.ns")
+
+    withTable(tblSourceQualified, tblTargetQualified) {
+      withTempDir { dir =>
+        sql(s"CREATE TABLE $tblSourceQualified (value int) USING foo")
+        sql(s"CREATE TABLE $tblTargetQualified (col1 string, col2 integer) USING foo")
+
+        val stream = MemoryStream[Int]
+        val testCatalog = spark.sessionState.catalogManager.catalog("teststream").asTableCatalog
+        val table = testCatalog.loadTable(Identifier.of(Array("ns"), tblSourceName))
+        table.asInstanceOf[InMemoryStreamTable].setStream(stream)
+
+        val df = spark.readStream.table(tblSourceQualified)
+          .select(lit('a'), $"value")
+        val sq = df.writeStream
+          .option("checkpointLocation", dir.getCanonicalPath)
+          .toTable(tblTargetQualified)
+          .asInstanceOf[StreamingQueryWrapper].streamingQuery
+
+        try {
+          stream.addData(1, 2, 3)
+
+          sq.processAllAvailable()
+
+          val explainWithoutExtended = sq.explainInternal(false)
+          // `extended = false` only displays the physical plan.
+          // we don't guarantee the table information is available in physical plan.
+          assert("MicroBatchScan".r
+            .findAllMatchIn(explainWithoutExtended).size === 1)
+          assert("WriteToDataSourceV2".r
+            .findAllMatchIn(explainWithoutExtended).size === 1)
+
+          val explainWithExtended = sq.explainInternal(true)
+          // `extended = true` displays 3 logical plans (Parsed/Analyzed/Optimized) and 1 physical
+          // plan.
+          assert("StreamingDataSourceV2Relation".r
             .findAllMatchIn(explainWithExtended).size === 3)
+          // WriteToMicroBatchDataSource is used for both parsed and analyzed logical plan
+          assert("WriteToMicroBatchDataSource".r
+            .findAllMatchIn(explainWithExtended).size === 2)
+          // optimizer replaces WriteToMicroBatchDataSource to WriteToDataSourceV2
+          assert("WriteToDataSourceV2".r
+            .findAllMatchIn(explainWithExtended).size === 2)
+          assert("MicroBatchScan".r
+            .findAllMatchIn(explainWithExtended).size === 1)
+
+          assert(tblSourceQualified.r
+            .findAllMatchIn(explainWithExtended).size >= 3)
+          assert(tblTargetQualified.r
+            .findAllMatchIn(explainWithExtended).size >= 3)
         } finally {
           sq.stop()
         }

@@ -35,9 +35,10 @@ case class WriteToMicroBatchDataSourceV1(
 
   override def child: LogicalPlan = query
 
-  // Despite this is the top node, we still need to produce the same schema, since the DSv1
-  // codepath on microbatch execution handles sink operation separately. We will eliminate
-  // this node in physical plan via EliminateWriteToMicroBatchDataSourceV1.
+  // Despite this is logically the top node, this node should behave like "pass-through"
+  // since the DSv1 codepath on microbatch execution handles sink operation separately.
+  // We will eliminate this node in physical planning, which shouldn't make difference as
+  // this node is pass-through.
   override def output: Seq[Attribute] = query.output
 
   def withNewBatchId(batchId: Long): WriteToMicroBatchDataSourceV1 = {
@@ -49,7 +50,9 @@ case class WriteToMicroBatchDataSourceV1(
 
   override def verboseString(maxFields: Int): String = {
     val simpleName = getClass.getSimpleName
-    val detail = catalogTable.map(_.identifier.unquotedString).getOrElse(sink.toString)
-    s"$simpleName $detail"
+    val sinkSimpleName = sink.getClass.getSimpleName
+    val tableQualifier = catalogTable.map(_.identifier.unquotedString).getOrElse("")
+    val batchIdStr = batchId.map(_.toString).getOrElse("None")
+    s"$simpleName $tableQualifier $sinkSimpleName [batchId: $batchIdStr]"
   }
 }

@@ -48,4 +48,17 @@ case class WriteToMicroBatchDataSource(
 
   override protected def withNewChildInternal(newChild: LogicalPlan): WriteToMicroBatchDataSource =
     copy(query = newChild)
+
+  override def verboseString(maxFields: Int): String = {
+    val simpleName = getClass.getSimpleName
+    val tableSimpleName = table.getClass.getSimpleName
+    val tableQualifier = relation.map { rel =>
+      (rel.catalog, rel.identifier) match {
+        case (Some(cat), Some(ident)) => s"${cat.name()}.${ident.toString}"
+        case _ => ""
+      }
+    }.getOrElse("")
+    val batchIdStr = batchId.map(_.toString).getOrElse("None")
+    s"$simpleName $tableQualifier $tableSimpleName [batchId: $batchIdStr]"
+  }
 }
