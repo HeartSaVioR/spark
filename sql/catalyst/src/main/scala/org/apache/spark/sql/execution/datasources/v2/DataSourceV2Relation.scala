@@ -170,16 +170,12 @@ case class StreamingDataSourceV2Relation(
 
   override def verboseString(maxFields: Int): String = {
     val simpleName = getClass.getSimpleName
-    val streamSimpleName = stream.getClass.getSimpleName
+    val streamSimpleName = stream.getClass.getName
     val tableQualifier = (catalog, identifier) match {
       case (Some(cat), Some(ident)) => s"${cat.name()}.${ident.toString}"
       case _ => ""
     }
-    // FIXME: do start offset and end offset appear properly in UI?
-    val startOffsetStr = startOffset.map(_.json()).getOrElse("None")
-    val endOffsetStr = startOffset.map(_.json()).getOrElse("None")
-    s"$simpleName $tableQualifier $streamSimpleName " +
-      s"[startOffset: $startOffsetStr] [endOffset: $endOffsetStr]"
+    s"$simpleName $tableQualifier $streamSimpleName"
   }
 }
 

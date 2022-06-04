@@ -59,11 +59,11 @@ case class WriteToDataSourceV2(
 
   override def verboseString(maxFields: Int): String = {
     val simpleName = getClass.getSimpleName
-    val batchWriteSimpleName = batchWrite match {
+    val batchWriteName = batchWrite match {
       case m: MicroBatchWrite =>
-        s"MicroBatchWrite [${m.writeSupport.getClass.getSimpleName}]"
+        s"${m.getClass.getSimpleName} [${m.writeSupport.getClass.getName}]"
 
-      case b => b.getClass.getSimpleName
+      case b => b.getClass.getName
     }
     val tableQualifier = relation.map { rel =>
       (rel.catalog, rel.identifier) match {
@@ -71,7 +71,7 @@ case class WriteToDataSourceV2(
         case _ => ""
       }
     }.getOrElse("")
-    s"$simpleName $tableQualifier $batchWriteSimpleName"
+    s"$simpleName $tableQualifier $batchWriteName"
   }
 }
 
@@ -339,13 +339,13 @@ case class WriteToDataSourceV2Exec(
 
   override def verboseString(maxFields: Int): String = {
     val simpleName = getClass.getSimpleName
-    val batchWriteSimpleName = batchWrite match {
+    val batchWriteName = batchWrite match {
       case m: MicroBatchWrite =>
-        s"MicroBatchWrite [${m.writeSupport.getClass.getSimpleName}]"
+        s"${m.getClass.getSimpleName} [${m.writeSupport.getClass.getName}]"
 
-      case b => b.getClass.getSimpleName
+      case b => b.getClass.getName
     }
-    s"$simpleName $batchWriteSimpleName"
+    s"$simpleName $batchWriteName"
   }
 }
 

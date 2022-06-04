@@ -50,9 +50,9 @@ case class WriteToMicroBatchDataSourceV1(
 
   override def verboseString(maxFields: Int): String = {
     val simpleName = getClass.getSimpleName
-    val sinkSimpleName = sink.getClass.getSimpleName
+    val sinkName = sink.getClass.getName
     val tableQualifier = catalogTable.map(_.identifier.unquotedString).getOrElse("")
     val batchIdStr = batchId.map(_.toString).getOrElse("None")
-    s"$simpleName $tableQualifier $sinkSimpleName [batchId: $batchIdStr]"
+    s"$simpleName $tableQualifier $sinkName [batchId: $batchIdStr]"
   }
 }
