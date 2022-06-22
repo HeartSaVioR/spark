@@ -328,14 +328,12 @@ class DataStreamTableAPISuite extends StreamTest with BeforeAndAfter {
     val tblSourceName = "tbl_src"
     val tblTargetName = "tbl_target"
     val tblSourceQualified = s"default.$tblSourceName"
-    val tblTargetQualified = s"default.$tblTargetName"
+    // FIXME: default implementation of TreeNode stringArgs does not unquote from table identifier
+    //   check whether it is intended, and if it is intended, suggest to make it consistent
+    val tblTargetQualified = s"`default`.`$tblTargetName`"
 
     withTable(tblSourceQualified, tblTargetQualified) {
       withTempDir { dir =>
-        // To make sure we don't get affected by abnormally terminated test
-        sql(s"DROP TABLE IF EXISTS $tblSourceQualified")
-        sql(s"DROP TABLE IF EXISTS $tblTargetQualified")
-
         sql(s"CREATE TABLE $tblSourceQualified (col1 string, col2 integer) USING parquet")
         sql(s"CREATE TABLE $tblTargetQualified (col1 string, col2 integer) USING parquet")
 
@@ -375,9 +373,9 @@ class DataStreamTableAPISuite extends StreamTest with BeforeAndAfter {
             .findAllMatchIn(explainWithExtended).size >= 4)
 
           assert("WriteToMicroBatchDataSourceV1".r
-            .findAllMatchIn(explainWithExtended).size === 3)
+            .findAllMatchIn(explainWithExtended).size === 2)
           assert(tblTargetQualified.r
-            .findAllMatchIn(explainWithExtended).size >= 3)
+            .findAllMatchIn(explainWithExtended).size >= 2)
         } finally {
           sq.stop()
         }

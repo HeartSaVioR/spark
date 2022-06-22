@@ -47,12 +47,4 @@ case class WriteToMicroBatchDataSourceV1(
 
   override protected def withNewChildInternal(
       newChild: LogicalPlan): WriteToMicroBatchDataSourceV1 = copy(query = newChild)
-
-  override def verboseString(maxFields: Int): String = {
-    val simpleName = getClass.getSimpleName
-    val sinkName = sink.getClass.getName
-    val tableQualifier = catalogTable.map(_.identifier.unquotedString).getOrElse("")
-    val batchIdStr = batchId.map(_.toString).getOrElse("None")
-    s"$simpleName $tableQualifier $sinkName [batchId: $batchIdStr]"
-  }
 }
