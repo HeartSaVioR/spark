@@ -789,7 +789,8 @@ case class StreamingDeduplicateExec(
     child.execute().mapPartitionsWithStateStore(
       getStateInfo,
       keyExpressions.toStructType,
-      child.output.toStructType,
+      // In value side of state store, we store "dummy" empty row.
+      StructType(Array(StructField("dummy", NullType))),
       numColsPrefixKey = 0,
       session.sessionState,
       Some(session.streams.stateStoreCoordinator),
