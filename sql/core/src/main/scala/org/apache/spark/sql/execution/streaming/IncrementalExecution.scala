@@ -63,6 +63,7 @@ class IncrementalExecution(
       StatefulAggregationStrategy ::
       FlatMapGroupsWithStateStrategy ::
       UntypedFlatMapGroupsWithStateStrategy ::
+      PythonFlatMapGroupsWithStateStrategy ::
       StreamingRelationStrategy ::
       StreamingDeduplicationStrategy ::
       StreamingGlobalLimitStrategy(outputMode) :: Nil
@@ -212,6 +213,13 @@ class IncrementalExecution(
         )
 
       case m: UntypedFlatMapGroupsWithStateExec =>
+        m.copy(
+          stateInfo = Some(nextStatefulOperationStateInfo),
+          batchTimestampMs = Some(offsetSeqMetadata.batchTimestampMs),
+          eventTimeWatermark = Some(offsetSeqMetadata.batchWatermarkMs)
+        )
+
+      case m: PythonFlatMapGroupsWithStateExec =>
         m.copy(
           stateInfo = Some(nextStatefulOperationStateInfo),
           batchTimestampMs = Some(offsetSeqMetadata.batchTimestampMs),

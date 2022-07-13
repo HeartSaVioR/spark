@@ -679,6 +679,35 @@ class RelationalGroupedDataset protected[sql](
     Dataset.ofRows(df.sparkSession, plan)
   }
 
+  // FIXME: probably we have to change the type as String for outputMode and timeoutConf to provide
+  //  parameters from Python?
+  private[sql] def pythonFlatMapGroupsWithState(
+      func: PythonUDF,
+      outputStructType: StructType,
+      stateStructType: StructType,
+      outputMode: OutputMode,
+      timeoutConf: GroupStateTimeout): DataFrame = {
+    if (outputMode != OutputMode.Append && outputMode != OutputMode.Update) {
+      throw new IllegalArgumentException("The output mode of function should be append or update")
+    }
+    val groupingNamedExpressions = groupingExprs.map {
+      case ne: NamedExpression => ne
+      case other => Alias(other, other.toString)()
+    }
+    val groupingAttrs = groupingNamedExpressions.map(_.toAttribute)
+    val outputAttrs = outputStructType.toAttributes
+    val plan = PythonFlatMapGroupsWithState(
+      func,
+      groupingAttrs,
+      outputAttrs,
+      stateStructType,
+      outputMode,
+      isMapGroupsWithState = false,
+      timeoutConf,
+      child = df.logicalPlan)
+    Dataset.ofRows(df.sparkSession, plan)
+  }
+
   override def toString: String = {
     val builder = new StringBuilder
     builder.append("RelationalGroupedDataset: [grouping expressions: [")
