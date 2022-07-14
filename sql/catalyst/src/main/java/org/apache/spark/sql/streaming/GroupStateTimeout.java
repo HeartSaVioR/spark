@@ -63,4 +63,15 @@ public class GroupStateTimeout {
   /** No timeout. */
   public static GroupStateTimeout NoTimeout() { return NoTimeout$.MODULE$; }
 
+  public static GroupStateTimeout fromString(String str) {
+    switch (str) {
+      case "ProcessingTimeTimeout":
+        return ProcessingTimeTimeout();
+      case "EventTimeTimeout":
+        return EventTimeTimeout();
+      case "NoTimeout":
+        return NoTimeout();
+    }
+    return null;
+  }
 }

@@ -18,7 +18,7 @@ package org.apache.spark.sql.execution.streaming
 
 import java.util.concurrent.TimeUnit.NANOSECONDS
 
-import org.apache.spark.api.python.ChainedPythonFunctions
+import org.apache.spark.api.python.{ChainedPythonFunctions, PythonEvalType}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.InternalRow
@@ -27,6 +27,7 @@ import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, Expressi
 import org.apache.spark.sql.catalyst.plans.logical.{EventTimeTimeout, EventTimeWatermark, ProcessingTimeTimeout}
 import org.apache.spark.sql.catalyst.plans.physical.Distribution
 import org.apache.spark.sql.execution.{SparkPlan, UnaryExecNode}
+import org.apache.spark.sql.execution.python.ArrowPythonRunnerWithState
 import org.apache.spark.sql.execution.python.PandasGroupUtils._
 import org.apache.spark.sql.execution.streaming.GroupStateImpl.NO_TIMESTAMP
 import org.apache.spark.sql.execution.streaming.state.{StateStore, StateStoreOps}
@@ -206,12 +207,13 @@ case class PythonFlatMapGroupsWithStateExec(
     private val numOutputRows = longMetric("numOutputRows")
     private val numRemovedStateRows = longMetric("numRemovedStateRows")
 
+    private lazy val (dedupAttributes, argOffsets) = resolveArgOffsets(child, groupingAttributes)
+
     /**
      * For every group, get the key, values and corresponding state and call the function,
      * and return an iterator of rows
      */
     def processNewData(dataIter: Iterator[InternalRow]): Iterator[InternalRow] = {
-      val (dedupAttributes, argOffsets) = resolveArgOffsets(child, groupingAttributes)
 
       val data = groupAndProject(dataIter, groupingAttributes, child.output,
         dedupAttributes).map { case (keyRow, valueRowIter) =>
@@ -226,20 +228,31 @@ case class PythonFlatMapGroupsWithStateExec(
           hasTimedOut = false,
           watermarkPresent).asInstanceOf[GroupStateImpl[Row]]
 
-        // UnsafeRow, Iterator[UnsafeRow], GroupStateImpl[Row]
-        (keyRow, valueRowIter, groupedState)
+        // Iterator[UnsafeRow], GroupStateImpl[Row]
+        (valueRowIter, groupedState)
       }
 
-      // FIXME: need to construct the code to pass the iterator of (key, valueIter, GroupState)
-      //   and receive an iterator of (outputs, state update).
+      data.flatMap { case (valueRowIter, groupedState) =>
+        // This is fine. Monitor thread is reused, and Python worker process is reused by default.
+        val runner = new ArrowPythonRunnerWithState(
+          chainedFunc,
+          PythonEvalType.SQL_GROUPED_MAP_PANDAS_UDF,
+          Array(argOffsets),
+          StructType.fromAttributes(dedupAttributes),
+          sessionLocalTimeZone,
+          pythonRunnerConf,
+          groupedState,
+          keyDeserializer,
+          groupingAttributes.toStructType)
 
-      // FIXME: outputs should be produced to the downstream, with conversion from Row to
-      //  InternalRow.
-      // FIXME: state updates should be reflected to the state store.
-      // FIXME: refer UntypedFlatMapGroupsWithStateExec.callFunctionAndUpdateState for more details
+        // There is only one batch always. It's fine to eagerly load it.
+        val ret = executePython(valueRowIter, output, runner).toArray
 
-      // FIXME: pretty sure this is a dummy code
-      Iterator.empty
+        // FIXME: update something with this state
+        val state: GroupStateImpl[Row] = runner.newGroupState
+
+        ret
+      }
     }
 
     /** Find the groups that have timeout set and are timing out right now, and call the function */
@@ -264,19 +277,32 @@ case class PythonFlatMapGroupsWithStateExec(
             hasTimedOut = true,
             watermarkPresent).asInstanceOf[GroupStateImpl[Row]]
 
-          // UnsafeRow, Iterator[UnsafeRow], GroupStateImpl[Row]
-          (stateData.keyRow, Iterator.empty.asInstanceOf[Iterator[UnsafeRow]], groupedState)
+          // UnsafeRow, roupStateImpl[Row]
+          (stateData.keyRow, groupedState)
         }
 
-        // FIXME: need to construct the code to pass the iterator of (key, valueIter, GroupState)
-        //   and receive an iterator of (outputs, state update).
+        data.flatMap { case (keyRow, groupedState) =>
+          // This is fine. Monitor thread is reused, and Python worker process is reused by default.
+          val runner = new ArrowPythonRunnerWithState(
+            chainedFunc,
+            PythonEvalType.SQL_GROUPED_MAP_PANDAS_UDF,
+            Array(argOffsets),
+            StructType.fromAttributes(dedupAttributes),
+            sessionLocalTimeZone,
+            pythonRunnerConf,
+            groupedState,
+            keyDeserializer,
+            groupingAttributes.toStructType) {
+            override protected val isTimeoutProcessing: Boolean = true
+          }
 
-        // FIXME: outputs should be produced to the downstream, with conversion from Row to
-        //  InternalRow.
-        // FIXME: state updates should be reflected to the state store.
+          val ret = executePython(Iterator.single(keyRow), output, runner)
 
-        // FIXME: pretty sure this is a dummy code
-        Iterator.empty
+          // FIXME: update something with this state
+          val state: GroupStateImpl[Row] = runner.newGroupState
+
+          ret
+        }
       } else Iterator.empty
     }
   }

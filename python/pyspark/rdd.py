@@ -147,6 +147,7 @@ class PythonEvalType:
     SQL_MAP_PANDAS_ITER_UDF: "PandasMapIterUDFType" = 205
     SQL_COGROUPED_MAP_PANDAS_UDF: "PandasCogroupedMapUDFType" = 206
     SQL_MAP_ARROW_ITER_UDF: "ArrowMapIterUDFType" = 207
+    SQL_GROUPED_MAP_PANDAS_UDF_WITH_STATE: "ArrowMapIterUDFType" = 208
 
 
 def portable_hash(x: Hashable) -> int:

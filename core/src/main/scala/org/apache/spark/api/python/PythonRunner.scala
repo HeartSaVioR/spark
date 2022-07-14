@@ -559,6 +559,8 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
         writerThread.exception.orNull)
     }
 
+    protected def postHoc(stream: DataInputStream): Unit = { }
+
     protected def handleEndOfDataSection(): Unit = {
       // We've finished the data section of the output, but we can still
       // read some accumulator updates:
@@ -569,6 +571,9 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
         stream.readFully(update)
         maybeAccumulator.foreach(_.add(update))
       }
+
+      postHoc(stream)
+
       // Check whether the worker is ready to be re-used.
       if (stream.readInt() == SpecialLengths.END_OF_STREAM) {
         if (reuseWorker && releasedOrClosed.compareAndSet(false, true)) {

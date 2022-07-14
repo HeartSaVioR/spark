@@ -20,6 +20,8 @@ package org.apache.spark.sql.execution.streaming
 import java.sql.Date
 import java.util.concurrent.TimeUnit
 
+import com.fasterxml.jackson.annotation.JsonIgnore
+
 import org.apache.spark.api.java.Optional
 import org.apache.spark.sql.catalyst.plans.logical.{EventTimeTimeout, NoTimeout, ProcessingTimeTimeout}
 import org.apache.spark.sql.catalyst.util.IntervalUtils
@@ -39,11 +41,11 @@ import org.apache.spark.unsafe.types.UTF8String
  * @param hasTimedOut     Whether the key for which this state wrapped is being created is
  *                        getting timed out or not.
  */
-private[sql] class GroupStateImpl[S] private(
-    optionalValue: Option[S],
+private[sql] class GroupStateImpl[S] private[sql](
+    @JsonIgnore optionalValue: Option[S],  // will be manually serialized later.
     batchProcessingTimeMs: Long,
     eventTimeWatermarkMs: Long,
-    timeoutConf: GroupStateTimeout,
+    @JsonIgnore private[sql] val timeoutConf: GroupStateTimeout,
     override val hasTimedOut: Boolean,
     watermarkPresent: Boolean) extends TestGroupState[S] {
 
