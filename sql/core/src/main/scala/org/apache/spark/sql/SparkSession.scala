@@ -570,7 +570,6 @@ class SparkSession private(
     Dataset.ofRows(self, logicalPlan)
   }
 
-
   /* ------------------------- *
    |  Catalog-related methods  |
    * ------------------------- */
