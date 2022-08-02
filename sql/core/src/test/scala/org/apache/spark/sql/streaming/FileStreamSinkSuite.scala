@@ -26,12 +26,12 @@ import scala.collection.mutable.ArrayBuffer
 
 import org.apache.hadoop.fs.{FileStatus, Path, RawLocalFileSystem}
 import org.apache.hadoop.mapreduce.JobContext
-
 import org.apache.spark.SparkConf
+
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.io.FileCommitProtocol
 import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskEnd}
-import org.apache.spark.sql.{AnalysisException, DataFrame}
+import org.apache.spark.sql.{AnalysisException, DataFrame, Row}
 import org.apache.spark.sql.catalyst.util.stringToFile
 import org.apache.spark.sql.execution.DataSourceScanExec
 import org.apache.spark.sql.execution.datasources._
@@ -644,6 +644,55 @@ abstract class FileStreamSinkSuite extends StreamTest {
           }
         }
       }
+    }
+  }
+
+  test("...........") {
+    // import org.apache.spark.util.Utils
+    // import java.io.File
+
+    val seed = "105"
+    val baseBasePath = s"/tmp/july22/$seed/"
+    val baseTblPath = baseBasePath + "tblpath/"
+    val tb1Path = baseTblPath + "tab1"
+    val tb2Path = baseTblPath + "tab2"
+    val checkpointLocation = baseBasePath + "chkpoint/"
+
+    val format = "parquet"
+    try {
+      Seq((1, 2)).toDF("i", "d").write.format(format).option("path", tb1Path).saveAsTable("tab1")
+
+      val stream = spark.readStream.format(format).table("tab1").writeStream.format(format)
+        .option("checkpointLocation", checkpointLocation).option("path", tb2Path).toTable("tab2")
+
+      def checkAnswer(expected: Seq[Row]): Unit = {
+        val data = spark.table("tab2").sort($"i").collect()
+        assert(data sameElements expected,
+          s"data: ${data.toSeq.toString} expected: ${expected.toString}")
+      }
+
+      stream.processAllAvailable()
+      checkAnswer(Seq(Row(1, 2)))
+
+      // Test that credentials last for more than one microbatch
+      Seq((3, 4)).toDF("i", "d").write.mode("append")
+        .format(format).option("path", tb1Path).saveAsTable("tab1")
+      stream.processAllAvailable()
+
+      // Stream result should be updated
+      checkAnswer(Seq(Row(1, 2), Row(3, 4)))
+
+      stream.stop()
+
+      // there should be no exception in the stream
+      assert(stream.exception.isEmpty,
+        s"Stream failed with exception:\n${stream.exception}\n" +
+          s"${stream.exception.map(_.getCause)}\n" +
+          s"${stream.exception.map(_.getStackTrace.mkString("\n"))}")
+
+    } finally {
+      spark.sql("DROP TABLE IF EXISTS default.tab1")
+      spark.sql("DROP TABLE IF EXISTS default.tab2")
     }
   }
 }
