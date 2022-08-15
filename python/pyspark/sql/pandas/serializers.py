@@ -29,6 +29,7 @@ class SpecialLengths:
     END_OF_STREAM = -4
     NULL = -5
     START_ARROW_STREAM = -6
+    START_STATE_UPDATE = -7
 
 
 class ArrowCollectSerializer(Serializer):

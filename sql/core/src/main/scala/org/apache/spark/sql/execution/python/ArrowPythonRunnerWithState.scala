@@ -79,7 +79,9 @@ class ArrowPythonRunnerWithState(
 
   protected override def handleMetadataAfterExec(stream: DataInputStream): Unit = {
     super.handleMetadataAfterExec(stream)
+  }
 
+  protected override def handleStateUpdate(stream: DataInputStream): Unit = {
     implicit val formats = org.json4s.DefaultFormats
 
     // 1. Receive JSON-serialized GroupState

@@ -69,10 +69,11 @@ pickleSer = CPickleSerializer()
 utf8_deserializer = UTF8Deserializer()
 
 
-def report_times(outfile, boot, init, finish):
+def report_times(outfile, boot, init, func_init, finish):
     write_int(SpecialLengths.TIMING_DATA, outfile)
     write_long(int(1000 * boot), outfile)
     write_long(int(1000 * init), outfile)
+    write_long(int(1000 * func_init), outfile)
     write_long(int(1000 * finish), outfile)
 
 
@@ -385,6 +386,8 @@ def read_udfs(pickleSer, infile, eval_type):
             runner_conf[k] = v
 
         if eval_type == PythonEvalType.SQL_GROUPED_MAP_PANDAS_UDF_WITH_STATE:
+            state_start_time = time.time()
+
             # 1. State properties
             properties = json.loads(utf8_deserializer.loads(infile))
 
@@ -398,6 +401,10 @@ def read_udfs(pickleSer, infile, eval_type):
             properties["optionalValue"] = row
 
             state = GroupStateImpl(keySchema=key_schema, **properties)
+
+            state_end_time = time.time()
+
+            print("time for separate state read: %s ms" % ((state_end_time - state_start_time) * 1000,), file=sys.stderr)
 
         # NOTE: if timezone is set here, that implies respectSessionTimeZone is True
         timezone = runner_conf.get("spark.sql.session.timeZone", None)
@@ -724,6 +731,9 @@ def main(infile, outfile):
             broadcast_sock_file.close()
 
         _accumulatorRegistry.clear()
+
+        init_time = time.time()
+
         eval_type = read_int(infile)
         if eval_type == PythonEvalType.NON_UDF:
             func, profiler, deserializer, serializer = read_command(pickleSer, infile)
@@ -732,7 +742,7 @@ def main(infile, outfile):
                 pickleSer, infile, eval_type
             )
 
-        init_time = time.time()
+        func_init_time = time.time()
 
         def process():
             iterator = deserializer.load_stream(infile)
@@ -747,6 +757,19 @@ def main(infile, outfile):
             profiler.profile(process)
         else:
             process()
+
+        # Send GroupState back to JVM if exists.
+        if state is not None:
+            write_int(SpecialLengths.START_STATE_UPDATE, outfile)
+
+            # 1. Send JSON-serialized GroupState
+            write_with_length(state.json().encode("utf-8"), outfile)
+
+            # 2. Send pickled Row.
+            if state._value is None:
+                write_int(0, outfile)
+            else:
+                write_with_length(pickleSer.dumps(state._key_schema.toInternal(state._value)), outfile)
 
         # Reset task context to None. This is a guard code to avoid residual context when worker
         # reuse.
@@ -778,24 +801,14 @@ def main(infile, outfile):
             faulthandler.disable()
             faulthandler_log_file.close()
             os.remove(faulthandler_log_path)
+
     finish_time = time.time()
-    report_times(outfile, boot_time, init_time, finish_time)
+    report_times(outfile, boot_time, init_time, func_init_time, finish_time)
     write_long(shuffle.MemoryBytesSpilled, outfile)
     write_long(shuffle.DiskBytesSpilled, outfile)
 
     # Mark the beginning of the accumulators section of the output
     write_int(SpecialLengths.END_OF_DATA_SECTION, outfile)
-
-    # Send GroupState back to JVM if exists.
-    if state is not None:
-        # 1. Send JSON-serialized GroupState
-        write_with_length(state.json().encode("utf-8"), outfile)
-
-        # 2. Send pickled Row.
-        if state._value is None:
-            write_int(0, outfile)
-        else:
-            write_with_length(pickleSer.dumps(state._key_schema.toInternal(state._value)), outfile)
 
     write_int(len(_accumulatorRegistry), outfile)
     for (aid, accum) in _accumulatorRegistry.items():
