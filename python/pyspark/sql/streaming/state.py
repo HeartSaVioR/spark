@@ -167,7 +167,7 @@ class GroupStateImpl:
 
     def __str__(self) -> str:
         if self.exists:
-            return "GroupState(%s)" % self.get
+            return "GroupState(%s)" % (self.get, )
         else:
             return "GroupState(<undefined>)"
 

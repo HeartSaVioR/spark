@@ -41,6 +41,7 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.util.ArrowUtils
 import org.apache.spark.sql.vectorized.{ArrowColumnVector, ColumnarBatch, ColumnVector}
+import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.Utils
 
 
@@ -150,10 +151,10 @@ class ArrowPythonRunnerWithState(
         val keyRowAsPublicRow = keyRowDeserializer.apply(keyRow)
         val stateUnderlyingRow = new GenericInternalRow(
           Array[Any](
-            groupState.json(),
-            keySchema.json,
+            UTF8String.fromString(groupState.json()),
+            UTF8String.fromString(keySchema.json),
             PythonSQLUtils.toPyRow(keyRowAsPublicRow),
-            stateSchema.json,
+            UTF8String.fromString(stateSchema.json),
             groupState.getOption.map(PythonSQLUtils.toPyRow).orNull
           )
         )

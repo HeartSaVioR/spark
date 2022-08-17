@@ -116,7 +116,7 @@ case class FlatMapGroupsInPandasWithStateExec(
         (keyUnsafeRow, stateData, valueRowIter.map(unsafeProj))
       }
 
-      process(processIter)
+      process(processIter, hasTimedOut = false)
     }
 
     /** Find the groups that have timeout set and are timing out right now, and call the function */
@@ -142,13 +142,13 @@ case class FlatMapGroupsInPandasWithStateExec(
           (stateData.keyRow, stateData, Iterator.single(joinedKeyRow))
         }
 
-        process(processIter)
+        process(processIter, hasTimedOut = true)
       } else Iterator.empty
     }
 
     private def process(
-       iter: Iterator[(InternalRow, StateData, Iterator[InternalRow])])
-     : Iterator[InternalRow] = {
+       iter: Iterator[(InternalRow, StateData, Iterator[InternalRow])],
+       hasTimedOut: Boolean): Iterator[InternalRow] = {
       val keyUnsafeProj = UnsafeProjection.create(keySchema)
 
       val runner = new ArrowPythonRunnerWithState(
@@ -171,7 +171,7 @@ case class FlatMapGroupsInPandasWithStateExec(
           batchTimestampMs.getOrElse(NO_TIMESTAMP),
           eventTimeWatermark.getOrElse(NO_TIMESTAMP),
           timeoutConf,
-          hasTimedOut = true,
+          hasTimedOut = hasTimedOut,
           watermarkPresent).asInstanceOf[GroupStateImpl[Row]]
         (keyRow, groupedState, valueIter)
       }

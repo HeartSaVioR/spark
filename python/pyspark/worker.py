@@ -212,9 +212,13 @@ def wrap_grouped_map_pandas_udf(f, return_type, argspec):
 
 def wrap_grouped_map_pandas_udf_with_state(f, return_type):
     def wrapped(key_series, value_series, state):
+        print("==== <wrapped> key_series: %s, value_series: %s, state: %s" %
+              (key_series, value_series, state, ), file=sys.stderr)
+
         import pandas as pd
 
-        key = tuple(s[0] for s in key_series)
+        key = tuple(s.head(1) for s in key_series)
+        print("==== <wrapped> key: %s, state timeout: %s" % (key, state.hasTimedOut, ), file=sys.stderr)
         if state.hasTimedOut:
             # Timeout processing pass empty iterator. Here we return an empty DataFrame instead.
             result = f(key, pd.DataFrame(columns=pd.concat(value_series, axis=1).columns), state)
@@ -236,6 +240,8 @@ def wrap_grouped_map_pandas_udf_with_state(f, return_type):
                 "doesn't match specified schema. "
                 "Expected: {} Actual: {}".format(len(return_type), len(result.columns))
             )
+
+        print("==== <wrapped> result: %s, updated_state: %s" % (result, state, ), file=sys.stderr)
 
         return (result, state, )
 
@@ -402,7 +408,7 @@ def read_udfs(pickleSer, infile, eval_type):
         elif eval_type == PythonEvalType.SQL_MAP_ARROW_ITER_UDF:
             ser = ArrowStreamUDFSerializer()
         elif eval_type == PythonEvalType.SQL_GROUPED_MAP_PANDAS_UDF_WITH_STATE:
-            ser = ApplyInPandasWithStateSerializer()
+            ser = ApplyInPandasWithStateSerializer(timezone, safecheck, assign_cols_by_name)
         else:
             # Scalar Pandas UDF handles struct type arguments as pandas DataFrames instead of
             # pandas Series. See SPARK-27240.
@@ -511,7 +517,6 @@ def read_udfs(pickleSer, infile, eval_type):
 
     if eval_type in (
         PythonEvalType.SQL_GROUPED_MAP_PANDAS_UDF,
-        PythonEvalType.SQL_GROUPED_MAP_PANDAS_UDF_WITH_STATE,
     ):
         # We assume there is only one UDF here because grouped map doesn't
         # support combining multiple UDFs.
@@ -546,9 +551,13 @@ def read_udfs(pickleSer, infile, eval_type):
         # Create function like this:
         #   mapper a: f([a[0]], [a[0], a[1]])
         def mapper(a):
+            print("=== <mapper> a: %s, parsed_offsets: %s, len(a[0]): %s" %
+                  (a, parsed_offsets, len(a[0]), ), file=sys.stderr)
+            # [[[1, 2], [0, 1, 2, 3]]]
             keys = [a[0][o] for o in parsed_offsets[0][0]]
             vals = [a[0][o] for o in parsed_offsets[0][1]]
             state = a[1]
+            print("=== <mapper> keys: %s, vals: %s, state: %s" % (keys, vals, state, ), file=sys.stderr)
             return f(keys, vals, state)
 
     elif eval_type == PythonEvalType.SQL_COGROUPED_MAP_PANDAS_UDF:
