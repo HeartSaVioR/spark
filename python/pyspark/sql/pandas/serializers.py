@@ -248,6 +248,7 @@ class ArrowStreamPandasSerializer(ArrowStreamSerializer):
 
         arrs = []
         for s, t in series:
+            print("==== <__create_batch> s: %s, t: %s" % (s, t, ), file=sys.stderr)
             if t is not None and pa.types.is_struct(t):
                 if not isinstance(s, pd.DataFrame):
                     raise ValueError(
@@ -445,6 +446,7 @@ class ApplyInPandasWithStateSerializer(ArrowStreamPandasUDFSerializer):
 
         def init_stream_yield_batches():
             import pandas as pd
+            from pyspark.sql.pandas.types import to_arrow_type
 
             should_write_start_length = True
             for data in iterator:
@@ -454,15 +456,20 @@ class ApplyInPandasWithStateSerializer(ArrowStreamPandasUDFSerializer):
 
                 print("==== <dump_stream> packaged_result: %s, len(packaged_result): %s" % (packaged_result, len(packaged_result), ), file=sys.stderr)
 
-                series = packaged_result[0][0:-1]
+                pdf = packaged_result[0][0]
                 state = packaged_result[0][-1]
                 return_schema = packaged_result[1]
 
-                print("==== <dump_stream> series: %s / state: %s / return_schema: %s / type(return_schema): %s" % (series, state, return_schema, type(return_schema), ), file=sys.stderr)
+                print("==== <dump_stream> pdf: %s / pdf schema: %s / state: %s / return_schema: %s / type(return_schema): %s" % (pdf, pdf.info(verbose=True), state, return_schema, type(return_schema), ), file=sys.stderr)
 
-                series_with_empty_row = [pd.concat([pd.Series([None, ]), x], ignore_index=True) for x in series]
+                new_empty_row = pd.DataFrame(dict.fromkeys(pdf.columns), index=[0])
 
-                print("==== <dump_stream> series_with_empty_row: %s" % (series_with_empty_row, ), file=sys.stderr)
+                print("==== <dump_stream> new_empty_row: %s / schema: %s / type(new_empty_row): %s" % (new_empty_row, new_empty_row.info(verbose=True), type(new_empty_row), ), file=sys.stderr)
+
+                # Concatenate new_row with df
+                pdf_with_empty_row = pd.concat([new_empty_row, pdf[:]], axis=0).reset_index(drop=True)
+
+                print("==== <dump_stream> pdf_with_empty_row: %s / schema: %s / type(pdf_with_empty_row): %s" % (pdf_with_empty_row, pdf_with_empty_row.info(verbose=True), type(pdf_with_empty_row), ), file=sys.stderr)
 
                 state_properties = state.json().encode("utf-8")
                 state_key_schema = state._key_schema.json().encode("utf-8")
@@ -471,26 +478,100 @@ class ApplyInPandasWithStateSerializer(ArrowStreamPandasUDFSerializer):
                 state_object = self.pickleSer.dumps(state._value_schema.toInternal(state._value))
 
                 state_dict = {
-                    'properties': [state_properties, ],
-                    'keySchema': [state_key_schema, ],
-                    'keyRow': [state_key_row, ],
-                    'objectSchema': [state_object_schema, ],
-                    'object': [state_object, ],
+                    '__state__properties': [state_properties, ],
+                    '__state__keySchema': [state_key_schema, ],
+                    '__state__keyRow': [state_key_row, ],
+                    '__state__objectSchema': [state_object_schema, ],
+                    '__state__object': [state_object, ],
                 }
 
                 state_pdf = pd.DataFrame.from_dict(state_dict)
 
-                print("==== <dump_stream> state_pdf: %s" % (state_pdf, ), file=sys.stderr)
+                print("==== <dump_stream> state_pdf: %s / schema: %s" % (state_pdf, state_pdf.info(verbose=True), ), file=sys.stderr)
 
+                state_df_type = StructType([
+                    StructField('__state__properties', StringType()),
+                    StructField('__state__keySchema', StringType()),
+                    StructField('__state__keyRow', BinaryType()),
+                    StructField('__state__objectSchema', StringType()),
+                    StructField('__state__object', BinaryType()),
+                ])
+
+                state_pdf_arrow_type = to_arrow_type(state_df_type)
+
+                print("==== <dump_stream> state_pdf_arrow_type: %s" % (state_pdf_arrow_type, ), file=sys.stderr)
+
+                """
                 state_pdf_wrapped_to_series = pd.Series([state_pdf, ], name='!__state__!')
 
                 print("==== <dump_stream> state_pdf_wrapped_to_series: %s" % (state_pdf_wrapped_to_series, ), file=sys.stderr)
+                """
 
-                # FIXME: stuck here... probably return_schema is arrow type and we may need to adopt the state field?
-                # series is tuple here
+                """
+                <success case>
+                ==== <dump_stream> series: [(  key1  key2  maxTimestampSeenMs  average
+                0    a  15.0       1661732392000    275.0, StructType(struct<key1: string, key2: int64, maxTimestampSeenMs: int64, average: double>))] / type(series): <class 'list'> / series[0]: (  key1  key2  maxTimestampSeenMs  average
+                0    a  15.0       1661732392000    275.0, StructType(struct<key1: string, key2: int64, maxTimestampSeenMs: int64, average: double>)) / type(series[0]): <class 'tuple'>
+                ==== <dump_stream> series[0][0]:   key1  key2  maxTimestampSeenMs  average
+                0    a  15.0       1661732392000    275.0 / type(series[0][0]): <class 'pandas.core.frame.DataFrame'> / series[0][1]: struct<key1: string, key2: int64, maxTimestampSeenMs: int64, average: double> / type(series[0][1]): <class 'pyarrow.lib.StructType'>
+                """
+
+                """
+                <current case with new empty row>
+                ==== <dump_stream> series: [(                               key1  ...   average
+                0                              None  ...       NaN
+                1  0    a
+                Name: key1, dtype: object  ...  200000.0
+                
+                [2 rows x 4 columns], StructType(struct<key1: string, key2: int64, maxTimestampSeenMs: int64, average: double>))] / type(series): <class 'list'> / series[0]: (                               key1  ...   average
+                0                              None  ...       NaN
+                1  0    a
+                Name: key1, dtype: object  ...  200000.0
+                
+                [2 rows x 4 columns], StructType(struct<key1: string, key2: int64, maxTimestampSeenMs: int64, average: double>)) / type(series[0]): <class 'tuple'>
+                ==== <dump_stream> series[0][0]:                                key1  ...   average
+                0                              None  ...       NaN
+                1  0    a
+                Name: key1, dtype: object  ...  200000.0
+                
+                [2 rows x 4 columns] / type(series[0][0]): <class 'pandas.core.frame.DataFrame'> / series[0][1]: struct<key1: string, key2: int64, maxTimestampSeenMs: int64, average: double> / type(series[0][1]): <class 'pyarrow.lib.StructType'>
+                """
+
+                """
+                <current case without adding new empty row>
+                ==== <dump_stream> series: [(                               key1  ...   average
+                0  0    a
+                Name: key1, dtype: object  ...  200000.0
+                
+                [1 rows x 4 columns], StructType(struct<key1: string, key2: int64, maxTimestampSeenMs: int64, average: double>))] / type(series): <class 'list'> / series[0]: (                               key1  ...   average
+                0  0    a
+                Name: key1, dtype: object  ...  200000.0
+                
+                [1 rows x 4 columns], StructType(struct<key1: string, key2: int64, maxTimestampSeenMs: int64, average: double>)) / type(series[0]): <class 'tuple'>
+                ==== <dump_stream> series[0][0]:                                key1  ...   average
+                0  0    a
+                Name: key1, dtype: object  ...  200000.0
+                
+                [1 rows x 4 columns] / type(series[0][0]): <class 'pandas.core.frame.DataFrame'> / series[0][1]: struct<key1: string, key2: int64, maxTimestampSeenMs: int64, average: double> / type(series[0][1]): <class 'pyarrow.lib.StructType'>
+                """
+
+                series = [(pdf, return_schema)]
+                # series = [(pdf_with_empty_row, return_schema)]
+
+                print("==== <dump_stream> series: %s / type(series): %s / series[0]: %s / type(series[0]): %s" % (series, type(series), series[0], type(series[0]), ), file=sys.stderr)
+                print("==== <dump_stream> series[0][0]: %s / type(series[0][0]): %s / series[0][1]: %s / type(series[0][1]): %s" % (series[0][0], type(series[0][0]), series[0][1], type(series[0][1]), ), file=sys.stderr)
+
+                # FIXME: stuck here...
+                batch = self._create_batch(series)
+                """
                 batch = self._create_batch([
-                    (series_with_empty_row, return_schema),
-                    (state_pdf_wrapped_to_series, )])
+                    (pdf_with_empty_row, return_schema),
+                    (state_pdf, state_pdf_arrow_type)])
+                """
+                """
+                #batch = self._create_batch([(pdf_with_empty_row, return_schema), ])
+                batch = self._create_batch([(pdf, return_schema)])
+                """
 
                 print("=== <dump_stream> batch: %s" % (batch, ), file=sys.stderr)
 

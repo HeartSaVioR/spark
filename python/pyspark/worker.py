@@ -63,7 +63,6 @@ from pyspark.sql.pandas.types import to_arrow_type
 from pyspark.sql.types import StructType
 from pyspark.util import fail_on_stopiteration, try_simplify_traceback
 from pyspark import shuffle
-from pyspark.sql.streaming.state import GroupStateImpl
 
 pickleSer = CPickleSerializer()
 utf8_deserializer = UTF8Deserializer()
@@ -242,7 +241,6 @@ def wrap_grouped_map_pandas_udf_with_state(f, return_type):
             )
 
         print("==== <wrapped> result: %s, updated_state: %s" % (result, state, ), file=sys.stderr)
-
         return (result, state, )
 
     return lambda k, v, s: [(wrapped(k, v, s), to_arrow_type(return_type))]
