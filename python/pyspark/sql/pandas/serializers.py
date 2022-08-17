@@ -18,8 +18,9 @@
 """
 Serializers for PyArrow and pandas conversions. See `pyspark.serializers` for more details.
 """
+import sys
 
-from pyspark.serializers import Serializer, read_int, write_int, UTF8Deserializer
+from pyspark.serializers import Serializer, read_int, write_int, UTF8Deserializer, CPickleSerializer
 
 
 class SpecialLengths:
@@ -372,3 +373,84 @@ class CogroupUDFSerializer(ArrowStreamPandasUDFSerializer):
                 raise ValueError(
                     "Invalid number of pandas.DataFrames in group {0}".format(dataframes_in_group)
                 )
+
+
+class ApplyInPandasWithStateSerializer(ArrowStreamPandasUDFSerializer):
+
+    def __init__(self):
+        self.pickleSer = CPickleSerializer()
+        self.utf8_deserializer = UTF8Deserializer()
+
+    def load_stream(self, stream):
+        import pyarrow as pa
+        import json
+        from pyspark.sql.types import StructType
+        from pyspark.sql.streaming.state import GroupStateImpl
+
+        batches = ArrowStreamPandasUDFSerializer.load_stream(self, stream)
+        for batch in batches:
+            print("==== <load_stream> batch: %s" % (batch, ), file=sys.stderr)
+
+            # FIXME: can we leverage schema here?
+            state_info_col = batch[0][-1]
+
+            """
+            StructField("properties", StringType),
+            StructField("keySchema", StringType),
+            StructField("keyRow", BinaryType),
+            StructField("objectSchema", StringType),
+            StructField("object", BinaryType)
+            """
+
+            state_info_col_properties = state_info_col[0]
+            state_info_col_key_schema = state_info_col[1]
+            state_info_col_key_row = state_info_col[2]
+            state_info_col_object_schema = state_info_col[3]
+            state_info_col_object = state_info_col[4]
+
+            state_properties = json.loads(state_info_col_properties)
+            state_key_schema = StructType.fromJson(json.loads(state_info_col_key_schema))
+            state_key_row = self.pickleSer.loads(state_info_col_key_row)
+            state_object_schema = StructType.fromJson(json.loads(state_info_col_object_schema))
+            if state_info_col_object:
+                state_object = self.pickleSer.loads(state_info_col_object)
+            else:
+                state_object = None
+            state_properties["optionalValue"] = state_object
+
+            state = GroupStateImpl(key=state_key_row, keySchema=state_key_schema,
+                                   valueSchema=state_object_schema, **state_properties)
+
+            # state info
+            yield (batch[1:][0:-1], state, )
+
+    def dump_stream(self, iterator, stream):
+        """
+        Override because Pandas UDFs require a START_ARROW_STREAM before the Arrow stream is sent.
+        This should be sent after creating the first record batch so in case of an error, it can
+        be sent back to the JVM before the Arrow stream starts.
+        """
+
+        for data in iterator:
+            series = data[0]
+            state = data[1]
+
+            print("==== <dump_stream> series: %s / state: %s" % (series, state, ), file=sys.stderr)
+
+            # FIXME: debug purpose, do nothing
+
+        """
+        def init_stream_yield_batches():
+            should_write_start_length = True
+            for data in iterator:
+                series = data[0]
+                state = data[1]
+
+                batch = self._create_batch(series)
+                if should_write_start_length:
+                    write_int(SpecialLengths.START_ARROW_STREAM, stream)
+                    should_write_start_length = False
+                yield batch
+
+        return ArrowStreamSerializer.dump_stream(self, init_stream_yield_batches(), stream)
+        """
