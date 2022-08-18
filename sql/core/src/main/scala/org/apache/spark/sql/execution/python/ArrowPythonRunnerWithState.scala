@@ -258,7 +258,6 @@ class ArrowPythonRunnerWithState(
           batch: ColumnarBatch): (InternalRow, GroupStateImpl[Row], Iterator[InternalRow]) = {
         // this should at least have one row for state
         assert(batch.numRows() > 0)
-        logWarning(s"deserializeColumnarBatch - schema: $schema")
         assert(schema.length == 2)
 
         val dataAttributes = schema(0).dataType.asInstanceOf[StructType].toAttributes
@@ -276,8 +275,6 @@ class ArrowPythonRunnerWithState(
         flattenedBatchForState.setNumRows(1)
 
         val rowForStateInfo = unsafeProjForStateInfo(flattenedBatchForState.getRow(0))
-
-        logWarning(s"rowForStateInfo $rowForStateInfo")
 
         //  UDF returns a StructType column in ColumnarBatch, select the children here
         val structVector = batch.column(0).asInstanceOf[ArrowColumnVector]

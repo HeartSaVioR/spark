@@ -211,13 +211,9 @@ def wrap_grouped_map_pandas_udf(f, return_type, argspec):
 
 def wrap_grouped_map_pandas_udf_with_state(f, return_type):
     def wrapped(key_series, value_series, state):
-        print("==== <wrapped> key_series: %s, value_series: %s, state: %s" %
-              (key_series, value_series, state, ), file=sys.stderr)
-
         import pandas as pd
 
         key = tuple(s.head(1).at[0] for s in key_series)
-        print("==== <wrapped> key: %s, state timeout: %s" % (key, state.hasTimedOut, ), file=sys.stderr)
         if state.hasTimedOut:
             # Timeout processing pass empty iterator. Here we return an empty DataFrame instead.
             result = f(key, pd.DataFrame(columns=pd.concat(value_series, axis=1).columns), state)
@@ -240,7 +236,6 @@ def wrap_grouped_map_pandas_udf_with_state(f, return_type):
                 "Expected: {} Actual: {}".format(len(return_type), len(result.columns))
             )
 
-        print("==== <wrapped> result: %s, updated_state: %s" % (result, state, ), file=sys.stderr)
         return (result, state, )
 
     return lambda k, v, s: [(wrapped(k, v, s), to_arrow_type(return_type))]
@@ -546,16 +541,10 @@ def read_udfs(pickleSer, infile, eval_type):
         )
         parsed_offsets = extract_key_value_indexes(arg_offsets)
 
-        # Create function like this:
-        #   mapper a: f([a[0]], [a[0], a[1]])
         def mapper(a):
-            print("=== <mapper> a: %s, parsed_offsets: %s, len(a[0]): %s" %
-                  (a, parsed_offsets, len(a[0]), ), file=sys.stderr)
-            # [[[1, 2], [0, 1, 2, 3]]]
             keys = [a[0][o] for o in parsed_offsets[0][0]]
             vals = [a[0][o] for o in parsed_offsets[0][1]]
             state = a[1]
-            print("=== <mapper> keys: %s, vals: %s, state: %s" % (keys, vals, state, ), file=sys.stderr)
             return f(keys, vals, state)
 
     elif eval_type == PythonEvalType.SQL_COGROUPED_MAP_PANDAS_UDF:
