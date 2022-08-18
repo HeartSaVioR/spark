@@ -217,6 +217,8 @@ class ArrowStreamPandasSerializer(ArrowStreamSerializer):
             series = [series]
         series = ((s, None) if not isinstance(s, (list, tuple)) else s for s in series)
 
+        print("=== <__create_batch> series: %s" % (series, ), file=sys.stderr)
+
         def create_array(s, t):
             if hasattr(s.array, "__arrow_array__"):
                 mask = None
@@ -231,6 +233,7 @@ class ArrowStreamPandasSerializer(ArrowStreamSerializer):
                 # Note: This can be removed once minimum pyarrow version is >= 0.16.1
                 s = s.astype(s.dtypes.categories.dtype)
             try:
+                print("=== <__create_batch> from_pandas s: %s, t: %s, mask: %s" % (s, t, mask, ), file=sys.stderr)
                 array = pa.Array.from_pandas(s, mask=mask, type=t, safe=self._safecheck)
             except ValueError as e:
                 if self._safecheck:
@@ -456,7 +459,7 @@ class ApplyInPandasWithStateSerializer(ArrowStreamPandasUDFSerializer):
 
                 print("==== <dump_stream> packaged_result: %s, len(packaged_result): %s" % (packaged_result, len(packaged_result), ), file=sys.stderr)
 
-                pdf = packaged_result[0][0]
+                pdf = packaged_result[0][0].reset_index(drop=True)
                 state = packaged_result[0][-1]
                 return_schema = packaged_result[1]
 
@@ -478,11 +481,11 @@ class ApplyInPandasWithStateSerializer(ArrowStreamPandasUDFSerializer):
                 state_object = self.pickleSer.dumps(state._value_schema.toInternal(state._value))
 
                 state_dict = {
-                    '__state__properties': [state_properties, ],
-                    '__state__keySchema': [state_key_schema, ],
-                    '__state__keyRow': [state_key_row, ],
-                    '__state__objectSchema': [state_object_schema, ],
-                    '__state__object': [state_object, ],
+                    '__state__properties': [state_properties, ] + [None, ] * len(pdf),
+                    '__state__keySchema': [state_key_schema, ] + [None, ] * len(pdf),
+                    '__state__keyRow': [state_key_row, ] + [None, ] * len(pdf),
+                    '__state__objectSchema': [state_object_schema, ] + [None, ] * len(pdf),
+                    '__state__object': [state_object, ] + [None, ] * len(pdf),
                 }
 
                 state_pdf = pd.DataFrame.from_dict(state_dict)
@@ -555,19 +558,19 @@ class ApplyInPandasWithStateSerializer(ArrowStreamPandasUDFSerializer):
                 [1 rows x 4 columns] / type(series[0][0]): <class 'pandas.core.frame.DataFrame'> / series[0][1]: struct<key1: string, key2: int64, maxTimestampSeenMs: int64, average: double> / type(series[0][1]): <class 'pyarrow.lib.StructType'>
                 """
 
-                series = [(pdf, return_schema)]
+                #series = [(pdf, return_schema)]
                 # series = [(pdf_with_empty_row, return_schema)]
 
-                print("==== <dump_stream> series: %s / type(series): %s / series[0]: %s / type(series[0]): %s" % (series, type(series), series[0], type(series[0]), ), file=sys.stderr)
-                print("==== <dump_stream> series[0][0]: %s / type(series[0][0]): %s / series[0][1]: %s / type(series[0][1]): %s" % (series[0][0], type(series[0][0]), series[0][1], type(series[0][1]), ), file=sys.stderr)
+                # print("==== <dump_stream> series: %s / type(series): %s / series[0]: %s / type(series[0]): %s" % (series, type(series), series[0], type(series[0]), ), file=sys.stderr)
+                # print("==== <dump_stream> series[0][0]: %s / type(series[0][0]): %s / series[0][1]: %s / type(series[0][1]): %s" % (series[0][0], type(series[0][0]), series[0][1], type(series[0][1]), ), file=sys.stderr)
 
                 # FIXME: stuck here...
-                batch = self._create_batch(series)
-                """
+                #batch = self._create_batch(series)
+                # """
                 batch = self._create_batch([
                     (pdf_with_empty_row, return_schema),
                     (state_pdf, state_pdf_arrow_type)])
-                """
+                # """
                 """
                 #batch = self._create_batch([(pdf_with_empty_row, return_schema), ])
                 batch = self._create_batch([(pdf, return_schema)])

@@ -292,28 +292,43 @@ class ArrowPythonRunnerWithState(
           batch: ColumnarBatch): (InternalRow, GroupStateImpl[Row], Iterator[InternalRow]) = {
         // FIXME: this assumes we have consolidated schema of data and state info, and we want to
         //   split out when giving data to upstream
-        assert(schema.length == valueSchema.length + 1)
+        assert(batch.numRows() > 0)
+        logWarning(s"deserializeColumnarBatch - schema: $schema")
+        assert(schema.length == 2)
 
         val fullAttributes = schema.toAttributes
-        val stateInfoAttribute = fullAttributes(valueSchema.length)
-        val dataAttributes = fullAttributes.dropRight(1)
+        val dataAttributes = schema(0).dataType.asInstanceOf[StructType].toAttributes
+        val stateInfoAttribute = schema(1).dataType.asInstanceOf[StructType].toAttributes
 
         val unsafeProjForStateInfo = UnsafeProjection.create(
-          Seq(stateInfoAttribute), fullAttributes)
+          stateInfoAttribute, stateInfoAttribute)
         val unsafeProjForData = UnsafeProjection.create(
-          dataAttributes, fullAttributes)
+          dataAttributes, dataAttributes)
+
+        val structVectorForState = batch.column(1).asInstanceOf[ArrowColumnVector]
+        val outputVectorsForState = schema(1).dataType.asInstanceOf[StructType]
+          .indices.map(structVectorForState.getChild)
+        val flattenedBatchForState = new ColumnarBatch(outputVectorsForState.toArray)
+        flattenedBatchForState.setNumRows(1)
+
+        val rowForStateInfo = unsafeProjForStateInfo(flattenedBatchForState.getRow(0))
+
+        logWarning(s"rowForStateInfo $rowForStateInfo")
 
         //  UDF returns a StructType column in ColumnarBatch, select the children here
         val structVector = batch.column(0).asInstanceOf[ArrowColumnVector]
-        val outputVectors = schema.indices.map(structVector.getChild)
+        val outputVectors = schema(0).dataType.asInstanceOf[StructType]
+          .indices.map(structVector.getChild)
         val flattenedBatch = new ColumnarBatch(outputVectors.toArray)
         flattenedBatch.setNumRows(batch.numRows())
 
         val rowIterator = flattenedBatch.rowIterator.asScala
-        // FIXME: first row should be state info row
+        // drop first row as it's reserved for state
+        // FIXME: probably even not needed to have this once we put data and state separately
         assert(rowIterator.hasNext)
-        val joinedRowForStateInfo = rowIterator.next()
-        val wrappedRowForStateInfo = unsafeProjForStateInfo(joinedRowForStateInfo)
+        rowIterator.next()
+        // val joinedRowForStateInfo = rowIterator.next()
+        // val rowForStateInfo = unsafeProjForStateInfo(joinedRowForStateInfo)
 
         // FIXME: we rely on known schema for state info, but would we want to access this by
         //  column name?
@@ -326,8 +341,6 @@ class ArrowPythonRunnerWithState(
           StructField("object", BinaryType)
         )
         */
-        val rowForStateInfo = wrappedRowForStateInfo.getStruct(0, 5)
-
         implicit val formats = org.json4s.DefaultFormats
 
         val propertiesAsJson = parse(rowForStateInfo.getUTF8String(0).toString)

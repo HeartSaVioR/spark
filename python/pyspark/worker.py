@@ -216,7 +216,7 @@ def wrap_grouped_map_pandas_udf_with_state(f, return_type):
 
         import pandas as pd
 
-        key = tuple(s.head(1) for s in key_series)
+        key = tuple(s.head(1).at[0] for s in key_series)
         print("==== <wrapped> key: %s, state timeout: %s" % (key, state.hasTimedOut, ), file=sys.stderr)
         if state.hasTimedOut:
             # Timeout processing pass empty iterator. Here we return an empty DataFrame instead.
