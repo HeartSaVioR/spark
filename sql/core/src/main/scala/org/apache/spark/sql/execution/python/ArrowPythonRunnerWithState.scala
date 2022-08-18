@@ -44,48 +44,6 @@ import org.apache.spark.sql.vectorized.{ArrowColumnVector, ColumnarBatch, Column
 import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.Utils
 
-
-// FIXME: schema should account to the state data as well... Use apply?
-// FIXME: argOffsets should account to the state field as well... Use apply?
-/*
-  val schemaWithState: StructType = schema.add(
-    "!__state__!", StructType(
-      Array(
-        StructField("properties", StringType),
-        StructField("keySchema", StringType),
-        StructField("keyRow", BinaryType),
-        StructField("objectSchema", StringType),
-        StructField("object", BinaryType)
-      )
-    )
-  )
-  val argOffsetsWithState: Array[Array[Int]] = Array(argOffsets(0) :+ schemaWithState.length - 1)
- */
-
-object ArrowPythonRunnerWithState {
-  def schemaWithState(schema: StructType): StructType = {
-    schema.add("!__state__!",
-      StructType(
-        Array(
-          StructField("properties", StringType),
-          StructField("keySchema", StringType),
-          StructField("keyRow", BinaryType),
-          StructField("objectSchema", StringType),
-          StructField("object", BinaryType)
-        )
-      )
-    )
-  }
-
-  def argOffsetsWithState(
-      schema: StructType,
-      argOffsets: Array[Array[Int]]): Array[Array[Int]] = {
-    val argOffsetsForFn = argOffsets(0)
-    val newArgOffsetsForFn = argOffsetsForFn :+ schemaWithState(schema).length - 1
-    Array(newArgOffsetsForFn)
-  }
-}
-
 /**
  * [[ArrowPythonRunner]] with [[org.apache.spark.sql.streaming.GroupState]].
  */
@@ -104,8 +62,7 @@ class ArrowPythonRunnerWithState(
   extends BasePythonRunner[
     (InternalRow, GroupStateImpl[Row], Iterator[InternalRow]),
     (InternalRow, GroupStateImpl[Row], Iterator[InternalRow])](
-    // FIXME: move to apply?
-    funcs, evalType, ArrowPythonRunnerWithState.argOffsetsWithState(inputSchema, argOffsets)) {
+    funcs, evalType, argOffsets) {
 
   override val simplifiedTraceback: Boolean = SQLConf.get.pysparkSimplifiedTraceback
 
@@ -115,8 +72,17 @@ class ArrowPythonRunnerWithState(
     "Pandas execution requires more than 4 bytes. Please set higher buffer. " +
       s"Please change '${SQLConf.PANDAS_UDF_BUFFER_SIZE.key}'.")
 
-  // FIXME: move to apply?
-  val schemaWithState = ArrowPythonRunnerWithState.schemaWithState(inputSchema)
+  val schemaWithState = inputSchema.add("!__state__!",
+    StructType(
+      Array(
+        StructField("properties", StringType),
+        StructField("keySchema", StringType),
+        StructField("keyRow", BinaryType),
+        StructField("objectSchema", StringType),
+        StructField("object", BinaryType)
+      )
+    )
+  )
 
   val keyRowSerializer = keyEncoder.createSerializer()
   val keyRowDeserializer = keyEncoder.createDeserializer()
@@ -269,7 +235,7 @@ class ArrowPythonRunnerWithState(
               case SpecialLengths.START_ARROW_STREAM =>
                 reader = new ArrowStreamReader(stream, allocator)
                 root = reader.getVectorSchemaRoot()
-                // FIXME: should we validate schema here with value schema?
+                // FIXME: should we validate schema here with value schema and state schema?
                 schema = ArrowUtils.fromArrowSchema(root.getSchema())
                 vectors = root.getFieldVectors().asScala.map { vector =>
                   new ArrowColumnVector(vector)
@@ -290,13 +256,11 @@ class ArrowPythonRunnerWithState(
 
       private def deserializeColumnarBatch(
           batch: ColumnarBatch): (InternalRow, GroupStateImpl[Row], Iterator[InternalRow]) = {
-        // FIXME: this assumes we have consolidated schema of data and state info, and we want to
-        //   split out when giving data to upstream
+        // this should at least have one row for state
         assert(batch.numRows() > 0)
         logWarning(s"deserializeColumnarBatch - schema: $schema")
         assert(schema.length == 2)
 
-        val fullAttributes = schema.toAttributes
         val dataAttributes = schema(0).dataType.asInstanceOf[StructType].toAttributes
         val stateInfoAttribute = schema(1).dataType.asInstanceOf[StructType].toAttributes
 
@@ -324,11 +288,8 @@ class ArrowPythonRunnerWithState(
 
         val rowIterator = flattenedBatch.rowIterator.asScala
         // drop first row as it's reserved for state
-        // FIXME: probably even not needed to have this once we put data and state separately
         assert(rowIterator.hasNext)
         rowIterator.next()
-        // val joinedRowForStateInfo = rowIterator.next()
-        // val rowForStateInfo = unsafeProjForStateInfo(joinedRowForStateInfo)
 
         // FIXME: we rely on known schema for state info, but would we want to access this by
         //  column name?
@@ -345,7 +306,7 @@ class ArrowPythonRunnerWithState(
 
         val propertiesAsJson = parse(rowForStateInfo.getUTF8String(0).toString)
         // FIXME: keySchema is probably not needed as we already know it... let's check whether
-        //   it is needed for python worker, and if it does not, remove it.
+        //   it is needed for python worker, and if it does not, remove it. Or double check?
         val pickledKeyRow = rowForStateInfo.getBinary(2)
         val keyRowAsGenericRow = PythonSQLUtils.toJVMRow(pickledKeyRow, keySchema,
           keyRowDeserializer)
