@@ -317,6 +317,7 @@ class Analyzer(override val catalogManager: CatalogManager)
       ResolveRandomSeed ::
       ResolveBinaryArithmetic ::
       ResolveUnion ::
+      ResolveRowtime ::
       RewriteDeleteFromTable ::
       typeCoercionRules ++
       Seq(ResolveWithCTE) ++
@@ -4406,5 +4407,57 @@ object RemoveTempResolvedColumn extends Rule[LogicalPlan] {
 
   def restoreTempResolvedColumn(t: TempResolvedColumn): Expression = {
     CurrentOrigin.withOrigin(t.origin)(UnresolvedAttribute(t.nameParts))
+  }
+}
+
+object ResolveRowtime extends Rule[LogicalPlan] {
+  private final val ROWTIME_COL_NAME = "rowtime"
+
+  override def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsUpWithPruning(
+    _.containsPattern(ROWTIME), ruleId) {
+
+    case p: LogicalPlan if p.children.size == 1 =>
+      val child = p.children.head
+      val rowtimeExpressions =
+        p.expressions.flatMap(_.collect { case r: Rowtime => r}).toSet
+
+      if (rowtimeExpressions.nonEmpty && rowtimeExpressions.size == 1 &&
+          rowtimeExpressions.head.rowtimeExpr.resolved &&
+          rowtimeExpressions.head.checkInputDataTypes().isSuccess) {
+
+        val rowtime = rowtimeExpressions.head
+        val metadata = rowtime.rowtimeExpr match {
+          case a: Attribute => a.metadata
+          case _ => Metadata.empty
+        }
+
+        val rowtimeAttr = AttributeReference(ROWTIME_COL_NAME, rowtime.dataType,
+          metadata = metadata)()
+        val rowtimeCol = Alias(rowtime.rowtimeExpr, ROWTIME_COL_NAME)(
+          exprId = rowtimeAttr.exprId, explicitMetadata = Some(metadata))
+
+        // FIXME: Can we capture the topmost alias having nested aliases and finally Rowtime?
+        var aliasRowtime: Attribute = null
+        val replacedPlan = p transformExpressions {
+          case a @ Alias(_: Rowtime, _) =>
+            aliasRowtime = a.toAttribute
+            a.copy(child = rowtimeAttr)(exprId = a.exprId, qualifier = a.qualifier,
+              explicitMetadata = a.explicitMetadata,
+              nonInheritableMetadataKeys = a.nonInheritableMetadataKeys)
+          case UnresolvedAlias(_: Rowtime, _) => rowtimeAttr
+          case r: Rowtime => rowtimeAttr
+        }
+
+        EliminateEventTimeWatermark(
+          EventTimeWatermark(
+            Option(aliasRowtime).getOrElse(rowtimeAttr), rowtime.delay,
+            replacedPlan.withNewChildren(
+              Project(rowtimeCol +: child.output, child) :: Nil)))
+      } else if (rowtimeExpressions.size > 1) {
+        // FIXME: another error message
+        throw QueryCompilationErrors.multiTimeWindowExpressionsNotSupportedError(p)
+      } else {
+        p // Return unchanged. Analyzer will throw exception later
+      }
   }
 }

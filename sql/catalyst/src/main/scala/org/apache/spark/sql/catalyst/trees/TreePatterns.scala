@@ -75,6 +75,7 @@ object TreePattern extends Enumeration  {
   val PYTHON_UDF: Value = Value
   val REGEXP_EXTRACT_FAMILY: Value = Value
   val REGEXP_REPLACE: Value = Value
+  val ROWTIME: Value = Value
   val RUNTIME_REPLACEABLE: Value = Value
   val SCALAR_SUBQUERY: Value = Value
   val SCALAR_SUBQUERY_REFERENCE: Value = Value

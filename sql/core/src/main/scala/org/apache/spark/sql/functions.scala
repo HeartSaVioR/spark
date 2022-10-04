@@ -29,7 +29,7 @@ import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.plans.logical.{BROADCAST, HintInfo, ResolvedHint}
-import org.apache.spark.sql.catalyst.util.{CharVarcharUtils, TimestampFormatter}
+import org.apache.spark.sql.catalyst.util.{CharVarcharUtils, IntervalUtils, TimestampFormatter}
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.SparkSqlParser
 import org.apache.spark.sql.expressions.{Aggregator, SparkUserDefinedFunction, UserDefinedAggregator, UserDefinedFunction}
@@ -5552,4 +5552,10 @@ object functions {
   def unwrap_udt(column: Column): Column = withExpr {
     UnwrapUDT(column.expr)
   }
+
+  def rowtime(rowtimeExpr: Column, delay: String): Column = withExpr {
+    Rowtime(rowtimeExpr.expr, IntervalUtils.fromIntervalString(delay))
+  }
+  // FIXME: this wouldn't hurt anyway if we handle the multiple levels of aliases
+  // .as("rowtime")
 }
