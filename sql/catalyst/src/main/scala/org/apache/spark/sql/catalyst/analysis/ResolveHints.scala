@@ -21,13 +21,16 @@ import java.util.Locale
 
 import scala.collection.mutable
 
-import org.apache.spark.sql.catalyst.expressions.{Ascending, Expression, IntegerLiteral, SortOrder}
+import org.apache.spark.sql.catalyst.expressions.{Ascending, Expression, IntegerLiteral, Literal, SortOrder}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.CurrentOrigin
 import org.apache.spark.sql.catalyst.trees.TreePattern.UNRESOLVED_HINT
+import org.apache.spark.sql.catalyst.util.IntervalUtils
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types.StringType
+import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
 
 
 /**
@@ -286,6 +289,55 @@ object ResolveHints {
             createRebalance(hint)
           case _ => hint
         }
+    }
+  }
+
+  object ResolveWatermarkDefinitionHint extends Rule[LogicalPlan] {
+    private def applyWatermark(
+        tsCol: UnresolvedAttribute,
+        delayThreshold: CalendarInterval,
+        child: LogicalPlan): LogicalPlan = {
+      // FIXME: do we need to handle this here or up to EventTimeWatermark implementation?
+      require(tsCol.nameParts.length == 1,
+        "Spark only supports top-level column as event time column.")
+
+      EventTimeWatermark(
+        tsCol,
+        delayThreshold,
+        child)
+    }
+
+    private def applyWatermark(
+        tsCol: UnresolvedAttribute,
+        delayThreshold: String,
+        child: LogicalPlan): LogicalPlan = {
+      val parsedDelay = IntervalUtils.fromIntervalString(delayThreshold)
+      require(!IntervalUtils.isNegative(parsedDelay),
+        s"delay threshold ($delayThreshold) should not be negative.")
+      applyWatermark(tsCol, parsedDelay, child)
+    }
+
+    private def applyWatermark(hint: UnresolvedHint): LogicalPlan = {
+      hint.parameters match {
+        // FIXME: do we need to handle the case of Literal having
+        //  YearMonthIntervalType / DayTimeIntervalType / CalendarIntervalType?
+
+        case Seq(
+            timestampCol: UnresolvedAttribute,
+            Literal(delayThreshold: UTF8String, StringType)) =>
+          applyWatermark(timestampCol, delayThreshold.toString, hint.child)
+
+        case Seq(timestampCol: UnresolvedAttribute, delayThreshold: String) =>
+          applyWatermark(timestampCol, delayThreshold, hint.child)
+      }
+    }
+
+    def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsWithPruning(
+      _.containsPattern(UNRESOLVED_HINT), ruleId) {
+      case hint @ UnresolvedHint(hintName, _, _) => hintName.toUpperCase(Locale.ROOT) match {
+        case "WATERMARK" => applyWatermark(hint)
+        case _ => hint
+      }
     }
   }
 
