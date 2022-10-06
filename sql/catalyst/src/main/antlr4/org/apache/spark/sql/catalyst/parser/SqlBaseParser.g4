@@ -479,6 +479,7 @@ fromStatementBody
       queryOrganization
     | selectClause
       lateralView*
+      watermarkClause?
       whereClause?
       aggregationClause?
       havingClause?
@@ -490,6 +491,7 @@ querySpecification
     : transformClause
       fromClause?
       lateralView*
+      watermarkClause?
       whereClause?
       aggregationClause?
       havingClause?
@@ -497,6 +499,7 @@ querySpecification
     | selectClause
       fromClause?
       lateralView*
+      watermarkClause?
       whereClause?
       aggregationClause?
       havingClause?
@@ -620,6 +623,10 @@ pivotValue
 
 lateralView
     : LATERAL VIEW (OUTER)? qualifiedName LEFT_PAREN (expression (COMMA expression)*)? RIGHT_PAREN tblName=identifier (AS? colName+=identifier (COMMA colName+=identifier)*)?
+    ;
+
+watermarkClause
+    : WATERMARK colName=identifier OFFSET delay=interval
     ;
 
 setQuantifier

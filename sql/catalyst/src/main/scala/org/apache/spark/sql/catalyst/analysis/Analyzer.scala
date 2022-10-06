@@ -341,7 +341,9 @@ class Analyzer(override val catalogManager: CatalogManager)
     Batch("Cleanup", fixedPoint,
       CleanupAliases),
     Batch("HandleAnalysisOnlyCommand", Once,
-      HandleAnalysisOnlyCommand)
+      HandleAnalysisOnlyCommand),
+    Batch("Remove watermark for batch query", Once,
+      EliminateEventTimeWatermark)
   )
 
   /**
