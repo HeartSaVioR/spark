@@ -154,6 +154,7 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
         ctx,
         ctx.transformClause,
         ctx.lateralView,
+        ctx.watermarkClause,
         ctx.whereClause,
         ctx.aggregationClause,
         ctx.havingClause,
@@ -165,6 +166,7 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
         ctx,
         ctx.selectClause,
         ctx.lateralView,
+        ctx.watermarkClause,
         ctx.whereClause,
         ctx.aggregationClause,
         ctx.havingClause,
@@ -607,6 +609,7 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
       ctx,
       ctx.transformClause,
       ctx.lateralView,
+      ctx.watermarkClause,
       ctx.whereClause,
       ctx.aggregationClause,
       ctx.havingClause,
@@ -624,6 +627,7 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
       ctx,
       ctx.selectClause,
       ctx.lateralView,
+      ctx.watermarkClause,
       ctx.whereClause,
       ctx.aggregationClause,
       ctx.havingClause,
@@ -673,6 +677,7 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
       ctx: ParserRuleContext,
       transformClause: TransformClauseContext,
       lateralView: java.util.List[LateralViewContext],
+      watermarkClause: WatermarkClauseContext,
       whereClause: WhereClauseContext,
       aggregationClause: AggregationClauseContext,
       havingClause: HavingClauseContext,
@@ -700,6 +705,7 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
       relation,
       visitExpressionSeq(transformClause.expressionSeq),
       lateralView,
+      watermarkClause,
       whereClause,
       aggregationClause,
       havingClause,
@@ -732,6 +738,7 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
       ctx: ParserRuleContext,
       selectClause: SelectClauseContext,
       lateralView: java.util.List[LateralViewContext],
+      watermarkClause: WatermarkClauseContext,
       whereClause: WhereClauseContext,
       aggregationClause: AggregationClauseContext,
       havingClause: HavingClauseContext,
@@ -744,6 +751,7 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
       relation,
       visitNamedExpressionSeq(selectClause.namedExpressionSeq),
       lateralView,
+      watermarkClause,
       whereClause,
       aggregationClause,
       havingClause,
@@ -758,6 +766,7 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
       relation: LogicalPlan,
       expressions: Seq[Expression],
       lateralView: java.util.List[LateralViewContext],
+      watermarkClause: WatermarkClauseContext,
       whereClause: WhereClauseContext,
       aggregationClause: AggregationClauseContext,
       havingClause: HavingClauseContext,
@@ -766,8 +775,11 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
     // Add lateral views.
     val withLateralView = lateralView.asScala.foldLeft(relation)(withGenerate)
 
+    // FIXME: Add watermark node based on relation + lateral views.
+    val withWatermarkDef = withLateralView.optionalMap(watermarkClause)(withWatermark)
+
     // Add where.
-    val withFilter = withLateralView.optionalMap(whereClause)(withWhereClause)
+    val withFilter = withWatermarkDef.optionalMap(whereClause)(withWhereClause)
 
     // Add aggregation or a project.
     val namedExpressions = expressions.map {
@@ -1114,6 +1126,20 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
       // scalastyle:on caselocale
       ctx.colName.asScala.map(_.getText).map(UnresolvedAttribute.quoted).toSeq,
       query)
+  }
+
+  /**
+   * Add an [[EventTimeWatermark]] to a logical plan.
+   */
+  private def withWatermark(
+      ctx: WatermarkClauseContext,
+      query: LogicalPlan): LogicalPlan = withOrigin(ctx) {
+    val attrRef = UnresolvedAttribute.quoted(ctx.colName.getText)
+    val delayInterval = visitInterval(ctx.delay)
+    val delay = IntervalUtils.fromIntervalString(delayInterval.toString)
+    require(!IntervalUtils.isNegative(delay),
+      s"delay threshold (${delayInterval.toString}) should not be negative.")
+    EventTimeWatermark(attrRef, delay, query)
   }
 
   /**
