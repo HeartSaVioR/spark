@@ -154,7 +154,6 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
         ctx,
         ctx.transformClause,
         ctx.lateralView,
-        ctx.watermarkClause,
         ctx.whereClause,
         ctx.aggregationClause,
         ctx.havingClause,
@@ -166,7 +165,6 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
         ctx,
         ctx.selectClause,
         ctx.lateralView,
-        ctx.watermarkClause,
         ctx.whereClause,
         ctx.aggregationClause,
         ctx.havingClause,
@@ -609,7 +607,6 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
       ctx,
       ctx.transformClause,
       ctx.lateralView,
-      ctx.watermarkClause,
       ctx.whereClause,
       ctx.aggregationClause,
       ctx.havingClause,
@@ -627,7 +624,6 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
       ctx,
       ctx.selectClause,
       ctx.lateralView,
-      ctx.watermarkClause,
       ctx.whereClause,
       ctx.aggregationClause,
       ctx.havingClause,
@@ -677,7 +673,6 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
       ctx: ParserRuleContext,
       transformClause: TransformClauseContext,
       lateralView: java.util.List[LateralViewContext],
-      watermarkClause: WatermarkClauseContext,
       whereClause: WhereClauseContext,
       aggregationClause: AggregationClauseContext,
       havingClause: HavingClauseContext,
@@ -705,7 +700,6 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
       relation,
       visitExpressionSeq(transformClause.expressionSeq),
       lateralView,
-      watermarkClause,
       whereClause,
       aggregationClause,
       havingClause,
@@ -738,7 +732,6 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
       ctx: ParserRuleContext,
       selectClause: SelectClauseContext,
       lateralView: java.util.List[LateralViewContext],
-      watermarkClause: WatermarkClauseContext,
       whereClause: WhereClauseContext,
       aggregationClause: AggregationClauseContext,
       havingClause: HavingClauseContext,
@@ -751,7 +744,6 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
       relation,
       visitNamedExpressionSeq(selectClause.namedExpressionSeq),
       lateralView,
-      watermarkClause,
       whereClause,
       aggregationClause,
       havingClause,
@@ -766,7 +758,6 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
       relation: LogicalPlan,
       expressions: Seq[Expression],
       lateralView: java.util.List[LateralViewContext],
-      watermarkClause: WatermarkClauseContext,
       whereClause: WhereClauseContext,
       aggregationClause: AggregationClauseContext,
       havingClause: HavingClauseContext,
@@ -775,11 +766,8 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
     // Add lateral views.
     val withLateralView = lateralView.asScala.foldLeft(relation)(withGenerate)
 
-    // FIXME: Add watermark node based on relation + lateral views.
-    val withWatermarkDef = withLateralView.optionalMap(watermarkClause)(withWatermark)
-
     // Add where.
-    val withFilter = withWatermarkDef.optionalMap(whereClause)(withWhereClause)
+    val withFilter = withLateralView.optionalMap(whereClause)(withWhereClause)
 
     // Add aggregation or a project.
     val namedExpressions = expressions.map {
@@ -893,11 +881,12 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
    */
   override def visitFromClause(ctx: FromClauseContext): LogicalPlan = withOrigin(ctx) {
     val from = ctx.relation.asScala.foldLeft(null: LogicalPlan) { (left, relation) =>
-      val right = plan(relation.relationPrimary)
-      val join = right.optionalMap(left) { (left, right) =>
+      val relationPrimary = relation.relationPrimaryWithWatermark().relationPrimary()
+      val rightWithWatermark = plan(relation.relationPrimaryWithWatermark())
+      val join = rightWithWatermark.optionalMap(left) { (left, right) =>
         if (relation.LATERAL != null) {
-          if (!relation.relationPrimary.isInstanceOf[AliasedQueryContext]) {
-            throw QueryParsingErrors.invalidLateralJoinRelationError(relation.relationPrimary)
+          if (!relationPrimary.isInstanceOf[AliasedQueryContext]) {
+            throw QueryParsingErrors.invalidLateralJoinRelationError(relationPrimary)
           }
           LateralJoin(left, LateralSubquery(right), Inner, None)
         } else {
@@ -1150,7 +1139,15 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
    * }}}
    */
   override def visitRelation(ctx: RelationContext): LogicalPlan = withOrigin(ctx) {
-    withJoinRelations(plan(ctx.relationPrimary), ctx)
+    withJoinRelations(plan(ctx.relationPrimaryWithWatermark()), ctx)
+  }
+
+  override def visitRelationPrimaryWithWatermark(
+      ctx: RelationPrimaryWithWatermarkContext): LogicalPlan = withOrigin(ctx) {
+    val relationPrimary = ctx.relationPrimary()
+    val watermarkClause = ctx.watermarkClause()
+    val relation = plan(relationPrimary)
+    relation.optionalMap(watermarkClause)(withWatermark)
   }
 
   /**
@@ -1170,8 +1167,9 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
           case _ => Inner
         }
 
-        if (join.LATERAL != null && !join.right.isInstanceOf[AliasedQueryContext]) {
-          throw QueryParsingErrors.invalidLateralJoinRelationError(join.right)
+        if (join.LATERAL != null &&
+            !join.right.relationPrimary().isInstanceOf[AliasedQueryContext]) {
+          throw QueryParsingErrors.invalidLateralJoinRelationError(join.right.relationPrimary())
         }
 
         // Resolve the join type and join condition

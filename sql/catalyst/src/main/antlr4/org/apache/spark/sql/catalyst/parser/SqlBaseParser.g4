@@ -479,7 +479,6 @@ fromStatementBody
       queryOrganization
     | selectClause
       lateralView*
-      watermarkClause?
       whereClause?
       aggregationClause?
       havingClause?
@@ -491,7 +490,6 @@ querySpecification
     : transformClause
       fromClause?
       lateralView*
-      watermarkClause?
       whereClause?
       aggregationClause?
       havingClause?
@@ -499,7 +497,6 @@ querySpecification
     | selectClause
       fromClause?
       lateralView*
-      watermarkClause?
       whereClause?
       aggregationClause?
       havingClause?
@@ -635,12 +632,12 @@ setQuantifier
     ;
 
 relation
-    : LATERAL? relationPrimary joinRelation*
+    : LATERAL? relationPrimaryWithWatermark joinRelation*
     ;
 
 joinRelation
-    : (joinType) JOIN LATERAL? right=relationPrimary joinCriteria?
-    | NATURAL joinType JOIN LATERAL? right=relationPrimary
+    : (joinType) JOIN LATERAL? right=relationPrimaryWithWatermark joinCriteria?
+    | NATURAL joinType JOIN LATERAL? right=relationPrimaryWithWatermark
     ;
 
 joinType
@@ -692,6 +689,10 @@ identifierCommentList
 
 identifierComment
     : identifier commentSpec?
+    ;
+
+relationPrimaryWithWatermark
+    : relationPrimary watermarkClause?
     ;
 
 relationPrimary
