@@ -623,7 +623,7 @@ lateralView
     ;
 
 watermarkClause
-    : WATERMARK colName=identifier OFFSET delay=interval
+    : WATERMARK colName=namedExpression OFFSET delay=interval
     ;
 
 setQuantifier
@@ -632,12 +632,12 @@ setQuantifier
     ;
 
 relation
-    : LATERAL? relationPrimaryWithWatermark joinRelation*
+    : LATERAL? relationPrimary joinRelation*
     ;
 
 joinRelation
-    : (joinType) JOIN LATERAL? right=relationPrimaryWithWatermark joinCriteria?
-    | NATURAL joinType JOIN LATERAL? right=relationPrimaryWithWatermark
+    : (joinType) JOIN LATERAL? right=relationPrimary joinCriteria?
+    | NATURAL joinType JOIN LATERAL? right=relationPrimary
     ;
 
 joinType
@@ -691,25 +691,29 @@ identifierComment
     : identifier commentSpec?
     ;
 
-relationPrimaryWithWatermark
-    : relationPrimary watermarkClause?
-    ;
-
 relationPrimary
     : multipartIdentifier temporalClause?
-      sample? tableAlias                                    #tableName
-    | LEFT_PAREN query RIGHT_PAREN sample? tableAlias       #aliasedQuery
-    | LEFT_PAREN relation RIGHT_PAREN sample? tableAlias    #aliasedRelation
+      sample? watermarkClause? tableAlias                   #tableName
+    | LEFT_PAREN query RIGHT_PAREN sample?
+      watermarkClause? tableAlias                           #aliasedQuery
+    | LEFT_PAREN relation RIGHT_PAREN sample?
+      watermarkClause? tableAlias                           #aliasedRelation
     | inlineTable                                           #inlineTableDefault2
     | functionTable                                         #tableValuedFunction
     ;
 
+// Unlike all other types of expression for relation, we do not support watermarkClause for
+// inlineTable.
 inlineTable
     : VALUES expression (COMMA expression)* tableAlias
     ;
 
+// This is only used in relationPrimary where having watermarkClause makes sense. If this becomes
+// referred by other clause, please check wheter watermarkClause makes sense to the clause.
+// If not, consider separate this rule.
 functionTable
-    : funcName=functionName LEFT_PAREN (expression (COMMA expression)*)? RIGHT_PAREN tableAlias
+    : funcName=functionName LEFT_PAREN (expression (COMMA expression)*)? RIGHT_PAREN
+      watermarkClause? tableAlias
     ;
 
 tableAlias

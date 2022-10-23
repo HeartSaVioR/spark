@@ -881,9 +881,9 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
    */
   override def visitFromClause(ctx: FromClauseContext): LogicalPlan = withOrigin(ctx) {
     val from = ctx.relation.asScala.foldLeft(null: LogicalPlan) { (left, relation) =>
-      val relationPrimary = relation.relationPrimaryWithWatermark().relationPrimary()
-      val rightWithWatermark = plan(relation.relationPrimaryWithWatermark())
-      val join = rightWithWatermark.optionalMap(left) { (left, right) =>
+      val relationPrimary = relation.relationPrimary()
+      val right = plan(relationPrimary)
+      val join = right.optionalMap(left) { (left, right) =>
         if (relation.LATERAL != null) {
           if (!relationPrimary.isInstanceOf[AliasedQueryContext]) {
             throw QueryParsingErrors.invalidLateralJoinRelationError(relationPrimary)
@@ -1123,12 +1123,27 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
   private def withWatermark(
       ctx: WatermarkClauseContext,
       query: LogicalPlan): LogicalPlan = withOrigin(ctx) {
-    val attrRef = UnresolvedAttribute.quoted(ctx.colName.getText)
+    val expression = visitNamedExpression(ctx.namedExpression())
+
+    if (expression.isInstanceOf[MultiAlias]) {
+      throw new AnalysisException("Multiple aliases are not supported in watermark clause")
+    }
+
+    val namedExpression = expression match {
+      case e: NamedExpression => e
+      case e: Expression => UnresolvedAlias(e)
+    }
+
+    // FIXME: This seems to need to find the new expression by index. We can't rely on exprId
+    //  due to UnresolvedAlias. Are there better ways to do?
+    val proj = Project(Seq(namedExpression, UnresolvedStar(None)), query)
+    val attrRef = proj.projectList.head.toAttribute
+
     val delayInterval = visitInterval(ctx.delay)
     val delay = IntervalUtils.fromIntervalString(delayInterval.toString)
     require(!IntervalUtils.isNegative(delay),
       s"delay threshold (${delayInterval.toString}) should not be negative.")
-    EventTimeWatermark(attrRef, delay, query)
+    EventTimeWatermark(attrRef, delay, proj)
   }
 
   /**
@@ -1139,15 +1154,7 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
    * }}}
    */
   override def visitRelation(ctx: RelationContext): LogicalPlan = withOrigin(ctx) {
-    withJoinRelations(plan(ctx.relationPrimaryWithWatermark()), ctx)
-  }
-
-  override def visitRelationPrimaryWithWatermark(
-      ctx: RelationPrimaryWithWatermarkContext): LogicalPlan = withOrigin(ctx) {
-    val relationPrimary = ctx.relationPrimary()
-    val watermarkClause = ctx.watermarkClause()
-    val relation = plan(relationPrimary)
-    relation.optionalMap(watermarkClause)(withWatermark)
+    withJoinRelations(plan(ctx.relationPrimary()), ctx)
   }
 
   /**
@@ -1168,8 +1175,8 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
         }
 
         if (join.LATERAL != null &&
-            !join.right.relationPrimary().isInstanceOf[AliasedQueryContext]) {
-          throw QueryParsingErrors.invalidLateralJoinRelationError(join.right.relationPrimary())
+            !join.right.isInstanceOf[AliasedQueryContext]) {
+          throw QueryParsingErrors.invalidLateralJoinRelationError(join.right)
         }
 
         // Resolve the join type and join condition
@@ -1295,9 +1302,10 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
   override def visitTableName(ctx: TableNameContext): LogicalPlan = withOrigin(ctx) {
     val tableId = visitMultipartIdentifier(ctx.multipartIdentifier)
     val relation = UnresolvedRelation(tableId)
-    val table = mayApplyAliasPlan(
-      ctx.tableAlias, relation.optionalMap(ctx.temporalClause)(withTimeTravel))
-    table.optionalMap(ctx.sample)(withSample)
+    val temporal = relation.optionalMap(ctx.temporalClause)(withTimeTravel)
+    val sample = temporal.optionalMap(ctx.sample)(withSample)
+    val watermark = sample.optionalMap(ctx.watermarkClause)(withWatermark)
+    mayApplyAliasPlan(ctx.tableAlias, watermark)
   }
 
   private def withTimeTravel(
@@ -1334,7 +1342,9 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
 
     val tvf = UnresolvedTableValuedFunction(
       name, func.expression.asScala.map(expression).toSeq, aliases)
-    tvf.optionalMap(func.tableAlias.strictIdentifier)(aliasPlan)
+    val watermarkClause = func.watermarkClause()
+    val tvfWithWatermark = tvf.optionalMap(watermarkClause)(withWatermark)
+    tvfWithWatermark.optionalMap(func.tableAlias.strictIdentifier)(aliasPlan)
   }
 
   /**
@@ -1372,7 +1382,8 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
    */
   override def visitAliasedRelation(ctx: AliasedRelationContext): LogicalPlan = withOrigin(ctx) {
     val relation = plan(ctx.relation).optionalMap(ctx.sample)(withSample)
-    mayApplyAliasPlan(ctx.tableAlias, relation)
+    val watermark = relation.optionalMap(ctx.watermarkClause)(withWatermark)
+    mayApplyAliasPlan(ctx.tableAlias, watermark)
   }
 
   /**
@@ -1385,14 +1396,15 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
    */
   override def visitAliasedQuery(ctx: AliasedQueryContext): LogicalPlan = withOrigin(ctx) {
     val relation = plan(ctx.query).optionalMap(ctx.sample)(withSample)
+    val watermark = relation.optionalMap(ctx.watermarkClause)(withWatermark)
     if (ctx.tableAlias.strictIdentifier == null) {
       // For un-aliased subqueries, use a default alias name that is not likely to conflict with
       // normal subquery names, so that parent operators can only access the columns in subquery by
       // unqualified names. Users can still use this special qualifier to access columns if they
       // know it, but that's not recommended.
-      SubqueryAlias("__auto_generated_subquery_name", relation)
+      SubqueryAlias("__auto_generated_subquery_name", watermark)
     } else {
-      mayApplyAliasPlan(ctx.tableAlias, relation)
+      mayApplyAliasPlan(ctx.tableAlias, watermark)
     }
   }
 
