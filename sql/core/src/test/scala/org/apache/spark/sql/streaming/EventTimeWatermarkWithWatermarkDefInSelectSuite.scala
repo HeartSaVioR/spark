@@ -69,12 +69,8 @@ class EventTimeWatermarkWithWatermarkDefInSelectSuite
         |SELECT
         |    CAST(window.start AS LONG), CAST(count(*) AS LONG) AS count
         |FROM
-        |(
-        |    SELECT
-        |        *, timestamp_seconds(value) AS eventTime
-        |    FROM stream_src
-        |)
-        |WATERMARK eventTime OFFSET INTERVAL 10 seconds
+        |stream_src
+        |WATERMARK timestamp_seconds(value) AS eventTime OFFSET INTERVAL 10 seconds
         |GROUP BY window(eventTime, '5 seconds')
         |""".stripMargin)
 
@@ -154,24 +150,16 @@ class EventTimeWatermarkWithWatermarkDefInSelectSuite
         |FROM
         |(
         |    SELECT
-        |        *
-        |    FROM
-        |    (
-        |        SELECT
-        |            leftKey, timestamp_seconds(time) AS leftTime, leftKey * 2 AS leftValue
-        |        FROM stream_left
-        |    ) WATERMARK leftTime OFFSET INTERVAL 0 second
+        |        leftKey, leftTime, leftKey * 2 AS leftValue
+        |    FROM stream_left
+        |    WATERMARK timestamp_seconds(time) AS leftTime OFFSET INTERVAL 0 second
         |)
         |FULL OUTER JOIN
         |(
         |    SELECT
-        |        *
-        |    FROM
-        |    (
-        |        SELECT
-        |            rightKey, timestamp_seconds(time) AS rightTime, rightKey * 3 AS rightValue
-        |        FROM stream_right
-        |    ) WATERMARK rightTime OFFSET INTERVAL 0 second
+        |        rightKey, rightTime, rightKey * 3 AS rightValue
+        |    FROM stream_right
+        |    WATERMARK timestamp_seconds(time) AS rightTime OFFSET INTERVAL 0 second
         |)
         |ON
         |    leftKey = rightKey AND leftTime BETWEEN rightTime - INTERVAL 5 SECONDS

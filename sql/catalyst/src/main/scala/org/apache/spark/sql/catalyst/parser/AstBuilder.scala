@@ -1134,12 +1134,27 @@ class AstBuilder extends SqlBaseParserBaseVisitor[AnyRef] with SQLConfHelper wit
   private def withWatermark(
       ctx: WatermarkClauseContext,
       query: LogicalPlan): LogicalPlan = withOrigin(ctx) {
-    val attrRef = UnresolvedAttribute.quoted(ctx.colName.getText)
+    val expression = visitNamedExpression(ctx.namedExpression())
+
+    if (expression.isInstanceOf[MultiAlias]) {
+      throw new AnalysisException("Multiple aliases are not supported in watermark clause")
+    }
+
+    val namedExpression = expression match {
+      case e: NamedExpression => e
+      case e: Expression => UnresolvedAlias(e)
+    }
+
+    // FIXME: This seems to need to find the new expression by index. We can't rely on exprId
+    //  due to UnresolvedAlias. Are there better ways to do?
+    val proj = Project(Seq(namedExpression, UnresolvedStar(None)), query)
+    val attrRef = proj.projectList.head.toAttribute
+
     val delayInterval = visitInterval(ctx.delay)
     val delay = IntervalUtils.fromIntervalString(delayInterval.toString)
     require(!IntervalUtils.isNegative(delay),
       s"delay threshold (${delayInterval.toString}) should not be negative.")
-    EventTimeWatermark(attrRef, delay, query)
+    EventTimeWatermark(attrRef, delay, proj)
   }
 
   /**

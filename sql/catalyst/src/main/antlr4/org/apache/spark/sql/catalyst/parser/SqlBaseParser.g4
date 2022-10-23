@@ -626,7 +626,7 @@ lateralView
     ;
 
 watermarkClause
-    : WATERMARK colName=identifier OFFSET delay=interval
+    : WATERMARK colName=namedExpression OFFSET delay=interval
     ;
 
 setQuantifier
