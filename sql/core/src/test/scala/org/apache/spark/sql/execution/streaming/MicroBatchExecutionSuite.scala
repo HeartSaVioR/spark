@@ -259,6 +259,8 @@ class MicroBatchExecutionSuite extends StreamTest with BeforeAndAfter with Match
     )
   }
 
+  // FIXME: mock class to produce any result over comparison, and run microbatch
+
   case class ReExecutedBatchTestSource(spark: SparkSession) extends Source {
     @volatile var currentOffset = 0L
     @volatile var getBatchCallCount = 0

@@ -28,7 +28,8 @@ import org.apache.spark.sql.catalyst.streaming.{StreamingRelationV2, WriteToStre
 import org.apache.spark.sql.catalyst.trees.TreePattern.CURRENT_LIKE
 import org.apache.spark.sql.catalyst.util.truncatedString
 import org.apache.spark.sql.connector.catalog.{SupportsRead, SupportsWrite, TableCapability}
-import org.apache.spark.sql.connector.read.streaming.{MicroBatchStream, Offset => OffsetV2, ReadLimit, SparkDataStream, SupportsAdmissionControl, SupportsTriggerAvailableNow}
+import org.apache.spark.sql.connector.read.streaming.{ComparableOffset, MicroBatchStream, ReadLimit, SparkDataStream, SupportsAdmissionControl, SupportsTriggerAvailableNow, Offset => OffsetV2}
+import org.apache.spark.sql.connector.read.streaming.ComparableOffset.CompareResult
 import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.datasources.LogicalRelation
@@ -578,6 +579,7 @@ class MicroBatchExecution(
         case (source: Source, available: Offset)
           if committedOffsets.get(source).map(_ != available).getOrElse(true) =>
           val current = committedOffsets.get(source).map(_.asInstanceOf[Offset])
+          assertOffsetRange(current, available)
           val batch = source.getBatch(current, available)
           assert(batch.isStreaming,
             s"DataFrame returned by getBatch from $source did not have isStreaming=true\n" +
@@ -595,6 +597,8 @@ class MicroBatchExecution(
             case v2: OffsetV2 => v2
           }
           val startOffset = current.getOrElse(stream.initialOffset)
+          assertOffsetRange(current, available)
+
           logDebug(s"Retrieving data from $stream: $current -> $endOffset")
 
           // To be compatible with the v1 source, the `newData` is represented as a logical plan,
@@ -736,6 +740,17 @@ class MicroBatchExecution(
       committedOffsets ++= availableOffsets
     }
     logDebug(s"Completed batch ${currentBatchId}")
+  }
+
+  private def assertOffsetRange(start: Option[OffsetV2], end: OffsetV2): Unit = {
+    (start, end) match {
+      case (Some(c: ComparableOffset), a: ComparableOffset) =>
+        val res = c.compareTo(a)
+        assert(res == CompareResult.EQUAL || res == CompareResult.LESS,
+          s"Invalid Offset range! start: $c, end: $a, comparison result: $res")
+
+      case _ => // we can't compare both offsets, skip assertion
+    }
   }
 
   /** Execute a function while locking the stream from making an progress */
