@@ -2872,7 +2872,7 @@ object SQLConf {
       "sources will fallback to Data Source V1 code path.")
     .version("3.0.0")
     .stringConf
-    .createWithDefault("avro,csv,json,kafka,orc,parquet,text")
+    .createWithDefault("avro,csv,json,orc,parquet,text")
 
   val DISABLED_V2_STREAMING_WRITERS = buildConf("spark.sql.streaming.disabledV2Writers")
     .doc("A comma-separated list of fully qualified data source register class names for which" +

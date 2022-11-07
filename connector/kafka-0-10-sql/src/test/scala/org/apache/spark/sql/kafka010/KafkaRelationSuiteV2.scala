@@ -26,7 +26,6 @@ import org.apache.kafka.common.TopicPartition
 
 import org.apache.spark.{SparkConf, TestUtils}
 import org.apache.spark.sql.{DataFrameReader, QueryTest}
-import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
@@ -39,11 +38,6 @@ abstract class KafkaRelationSuiteBase extends QueryTest with SharedSparkSession 
   private val topicId = new AtomicInteger(0)
 
   protected var testUtils: KafkaTestUtils = _
-
-  override protected def sparkConf: SparkConf =
-    super
-      .sparkConf
-      .set(SQLConf.USE_V1_SOURCE_LIST, "kafka")
 
   protected def newTopic(): String = s"topic-${topicId.getAndIncrement()}"
 
@@ -618,37 +612,12 @@ abstract class KafkaRelationSuiteBase extends QueryTest with SharedSparkSession 
   }
 }
 
-class KafkaRelationSuiteWithAdminV1 extends KafkaRelationSuiteV1 {
+class KafkaRelationSuiteV2WithAdminV2 extends KafkaRelationSuiteV2 {
   override protected def sparkConf: SparkConf =
     super.sparkConf.set(SQLConf.USE_DEPRECATED_KAFKA_OFFSET_FETCHING.key, "false")
-}
-
-class KafkaRelationSuiteWithAdminV2 extends KafkaRelationSuiteV2 {
-  override protected def sparkConf: SparkConf =
-    super.sparkConf.set(SQLConf.USE_DEPRECATED_KAFKA_OFFSET_FETCHING.key, "false")
-}
-
-class KafkaRelationSuiteV1 extends KafkaRelationSuiteBase {
-  override protected def sparkConf: SparkConf =
-    super
-      .sparkConf
-      .set(SQLConf.USE_V1_SOURCE_LIST, "kafka")
-
-  test("V1 Source is used when set through SQLConf") {
-    val topic = newTopic()
-    val df = createDF(topic)
-    assert(df.logicalPlan.collect {
-      case LogicalRelation(_, _, _, _) => true
-    }.nonEmpty)
-  }
 }
 
 class KafkaRelationSuiteV2 extends KafkaRelationSuiteBase {
-  override protected def sparkConf: SparkConf =
-    super
-      .sparkConf
-      .set(SQLConf.USE_V1_SOURCE_LIST, "")
-
   test("V2 Source is used when set through SQLConf") {
     val topic = newTopic()
     val df = createDF(topic)

@@ -120,7 +120,6 @@ abstract class KafkaSourceTest extends StreamTest with SharedSparkSession with K
 
       val sources: Seq[SparkDataStream] = {
         query.get.logicalPlan.collect {
-          case StreamingExecutionRelation(source: KafkaSource, _, _) => source
           case r: StreamingDataSourceV2Relation if r.stream.isInstanceOf[KafkaMicroBatchStream] ||
               r.stream.isInstanceOf[KafkaContinuousStream] =>
             r.stream
@@ -1356,49 +1355,10 @@ abstract class KafkaMicroBatchSourceSuiteBase extends KafkaSourceSuiteBase {
   }
 }
 
-
-class KafkaMicroBatchV1SourceWithAdminSuite extends KafkaMicroBatchV1SourceSuite {
-  override def beforeAll(): Unit = {
-    super.beforeAll()
-    spark.conf.set(SQLConf.USE_DEPRECATED_KAFKA_OFFSET_FETCHING.key, "false")
-  }
-}
-
 class KafkaMicroBatchV2SourceWithAdminSuite extends KafkaMicroBatchV2SourceSuite {
   override def beforeAll(): Unit = {
     super.beforeAll()
     spark.conf.set(SQLConf.USE_DEPRECATED_KAFKA_OFFSET_FETCHING.key, "false")
-  }
-}
-
-class KafkaMicroBatchV1SourceSuite extends KafkaMicroBatchSourceSuiteBase {
-  override def beforeAll(): Unit = {
-    super.beforeAll()
-    spark.conf.set(
-      SQLConf.DISABLED_V2_STREAMING_MICROBATCH_READERS.key,
-      classOf[KafkaSourceProvider].getCanonicalName)
-  }
-
-  test("V1 Source is used when disabled through SQLConf") {
-    val topic = newTopic()
-    testUtils.createTopic(topic, partitions = 5)
-
-    val kafka = spark
-      .readStream
-      .format("kafka")
-      .option("kafka.bootstrap.servers", testUtils.brokerAddress)
-      .option("kafka.metadata.max.age.ms", "1")
-      .option("subscribePattern", s"$topic.*")
-      .load()
-
-    testStream(kafka)(
-      makeSureGetOffsetCalled,
-      AssertOnQuery { query =>
-        query.logicalPlan.collect {
-          case StreamingExecutionRelation(_: KafkaSource, _, _) => true
-        }.nonEmpty
-      }
-    )
   }
 }
 

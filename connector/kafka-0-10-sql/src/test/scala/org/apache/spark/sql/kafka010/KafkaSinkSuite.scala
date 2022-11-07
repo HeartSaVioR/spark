@@ -30,13 +30,12 @@ import org.apache.kafka.common.serialization.ByteArraySerializer
 import org.scalatest.concurrent.TimeLimits.failAfter
 import org.scalatest.time.SpanSugar._
 
-import org.apache.spark.{SparkConf, SparkContext, SparkException, TestUtils}
+import org.apache.spark.{SparkContext, SparkException, TestUtils}
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, SpecificInternalRow, UnsafeProjection}
 import org.apache.spark.sql.execution.streaming.{MemoryStream, MemoryStreamBase}
 import org.apache.spark.sql.execution.streaming.sources.ContinuousMemoryStream
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming._
 import org.apache.spark.sql.test.{SharedSparkSession, TestSparkSession}
 import org.apache.spark.sql.types.{BinaryType, DataType, IntegerType, StringType, StructField, StructType}
@@ -538,23 +537,7 @@ abstract class KafkaSinkBatchSuiteBase extends KafkaSinkSuiteBase {
   }
 }
 
-class KafkaSinkBatchSuiteV1 extends KafkaSinkBatchSuiteBase {
-  override protected def sparkConf: SparkConf =
-    super
-      .sparkConf
-      .set(SQLConf.USE_V1_SOURCE_LIST, "kafka")
-
-  test("batch - unsupported save modes") {
-    testUnsupportedSaveModes((mode) => s"Save mode ${mode.name} not allowed for Kafka" :: Nil)
-  }
-}
-
 class KafkaSinkBatchSuiteV2 extends KafkaSinkBatchSuiteBase {
-  override protected def sparkConf: SparkConf =
-    super
-      .sparkConf
-      .set(SQLConf.USE_V1_SOURCE_LIST, "")
-
   test("batch - unsupported save modes") {
     testUnsupportedSaveModes((mode) =>
       Seq(s"cannot be written with ${mode.name} mode", "does not support truncate"))

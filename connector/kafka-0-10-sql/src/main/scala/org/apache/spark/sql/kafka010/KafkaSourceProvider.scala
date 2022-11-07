@@ -28,17 +28,14 @@ import org.apache.kafka.common.serialization.{ByteArrayDeserializer, ByteArraySe
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.kafka010.KafkaConfigUpdater
-import org.apache.spark.sql.{AnalysisException, DataFrame, SaveMode, SQLContext}
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.connector.catalog.{SupportsRead, SupportsWrite, Table, TableCapability}
 import org.apache.spark.sql.connector.metric.{CustomMetric, CustomSumMetric}
 import org.apache.spark.sql.connector.read.{Batch, Scan, ScanBuilder}
 import org.apache.spark.sql.connector.read.streaming.{ContinuousStream, MicroBatchStream}
 import org.apache.spark.sql.connector.write.{LogicalWriteInfo, SupportsTruncate, Write, WriteBuilder}
-import org.apache.spark.sql.execution.streaming.{Sink, Source}
 import org.apache.spark.sql.internal.connector.{SimpleTableProvider, SupportsStreamingUpdateAsAppend}
 import org.apache.spark.sql.sources._
-import org.apache.spark.sql.streaming.OutputMode
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
@@ -48,154 +45,16 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap
  * missing options even before the query is started.
  */
 private[kafka010] class KafkaSourceProvider extends DataSourceRegister
-    with StreamSourceProvider
-    with StreamSinkProvider
-    with RelationProvider
-    with CreatableRelationProvider
-    with SimpleTableProvider
-    with Logging {
+  with SimpleTableProvider
+  with Logging {
+
   import KafkaSourceProvider._
 
   override def shortName(): String = "kafka"
 
-  /**
-   * Returns the name and schema of the source. In addition, it also verifies whether the options
-   * are correct and sufficient to create the [[KafkaSource]] when the query is started.
-   */
-  override def sourceSchema(
-      sqlContext: SQLContext,
-      schema: Option[StructType],
-      providerName: String,
-      parameters: Map[String, String]): (String, StructType) = {
-    val caseInsensitiveParameters = CaseInsensitiveMap(parameters)
-    validateStreamOptions(caseInsensitiveParameters)
-    require(schema.isEmpty, "Kafka source has a fixed schema and cannot be set with a custom one")
-    val includeHeaders = caseInsensitiveParameters.getOrElse(INCLUDE_HEADERS, "false").toBoolean
-    (shortName(), KafkaRecordToRowConverter.kafkaSchema(includeHeaders))
-  }
-
-  override def createSource(
-      sqlContext: SQLContext,
-      metadataPath: String,
-      schema: Option[StructType],
-      providerName: String,
-      parameters: Map[String, String]): Source = {
-    val caseInsensitiveParameters = CaseInsensitiveMap(parameters)
-    validateStreamOptions(caseInsensitiveParameters)
-    // Each running query should use its own group id. Otherwise, the query may be only assigned
-    // partial data since Kafka will assign partitions to multiple consumers having the same group
-    // id. Hence, we should generate a unique id for each query.
-    val uniqueGroupId = streamingUniqueGroupId(caseInsensitiveParameters, metadataPath)
-
-    val specifiedKafkaParams = convertToSpecifiedParams(caseInsensitiveParameters)
-
-    val startingStreamOffsets = KafkaSourceProvider.getKafkaOffsetRangeLimit(
-      caseInsensitiveParameters, STARTING_TIMESTAMP_OPTION_KEY,
-      STARTING_OFFSETS_BY_TIMESTAMP_OPTION_KEY, STARTING_OFFSETS_OPTION_KEY,
-      LatestOffsetRangeLimit)
-
-    val kafkaOffsetReader = KafkaOffsetReader.build(
-      strategy(caseInsensitiveParameters),
-      kafkaParamsForDriver(specifiedKafkaParams),
-      caseInsensitiveParameters,
-      driverGroupIdPrefix = s"$uniqueGroupId-driver")
-
-    new KafkaSource(
-      sqlContext,
-      kafkaOffsetReader,
-      kafkaParamsForExecutors(specifiedKafkaParams, uniqueGroupId),
-      caseInsensitiveParameters,
-      metadataPath,
-      startingStreamOffsets,
-      failOnDataLoss(caseInsensitiveParameters))
-  }
-
   override def getTable(options: CaseInsensitiveStringMap): KafkaTable = {
     val includeHeaders = options.getBoolean(INCLUDE_HEADERS, false)
     new KafkaTable(includeHeaders)
-  }
-
-  /**
-   * Returns a new base relation with the given parameters.
-   *
-   * @note The parameters' keywords are case insensitive and this insensitivity is enforced
-   *       by the Map that is passed to the function.
-   */
-  override def createRelation(
-      sqlContext: SQLContext,
-      parameters: Map[String, String]): BaseRelation = {
-    val caseInsensitiveParameters = CaseInsensitiveMap(parameters)
-    validateBatchOptions(caseInsensitiveParameters)
-    val specifiedKafkaParams = convertToSpecifiedParams(caseInsensitiveParameters)
-
-    val startingRelationOffsets = KafkaSourceProvider.getKafkaOffsetRangeLimit(
-      caseInsensitiveParameters, STARTING_TIMESTAMP_OPTION_KEY,
-      STARTING_OFFSETS_BY_TIMESTAMP_OPTION_KEY, STARTING_OFFSETS_OPTION_KEY,
-      EarliestOffsetRangeLimit)
-    assert(startingRelationOffsets != LatestOffsetRangeLimit)
-
-    val endingRelationOffsets = KafkaSourceProvider.getKafkaOffsetRangeLimit(
-      caseInsensitiveParameters, ENDING_TIMESTAMP_OPTION_KEY,
-      ENDING_OFFSETS_BY_TIMESTAMP_OPTION_KEY, ENDING_OFFSETS_OPTION_KEY,
-      LatestOffsetRangeLimit)
-    assert(endingRelationOffsets != EarliestOffsetRangeLimit)
-
-    val includeHeaders = caseInsensitiveParameters.getOrElse(INCLUDE_HEADERS, "false").toBoolean
-
-    new KafkaRelation(
-      sqlContext,
-      strategy(caseInsensitiveParameters),
-      sourceOptions = caseInsensitiveParameters,
-      specifiedKafkaParams = specifiedKafkaParams,
-      failOnDataLoss = failOnDataLoss(caseInsensitiveParameters),
-      includeHeaders = includeHeaders,
-      startingOffsets = startingRelationOffsets,
-      endingOffsets = endingRelationOffsets)
-  }
-
-  override def createSink(
-      sqlContext: SQLContext,
-      parameters: Map[String, String],
-      partitionColumns: Seq[String],
-      outputMode: OutputMode): Sink = {
-    val caseInsensitiveParameters = CaseInsensitiveMap(parameters)
-    val defaultTopic = caseInsensitiveParameters.get(TOPIC_OPTION_KEY).map(_.trim)
-    val specifiedKafkaParams = kafkaParamsForProducer(caseInsensitiveParameters)
-    new KafkaSink(sqlContext, specifiedKafkaParams, defaultTopic)
-  }
-
-  override def createRelation(
-      outerSQLContext: SQLContext,
-      mode: SaveMode,
-      parameters: Map[String, String],
-      data: DataFrame): BaseRelation = {
-    mode match {
-      case SaveMode.Overwrite | SaveMode.Ignore =>
-        throw new AnalysisException(s"Save mode $mode not allowed for Kafka. " +
-          s"Allowed save modes are ${SaveMode.Append} and " +
-          s"${SaveMode.ErrorIfExists} (default).")
-      case _ => // good
-    }
-    val caseInsensitiveParameters = CaseInsensitiveMap(parameters)
-    val topic = caseInsensitiveParameters.get(TOPIC_OPTION_KEY).map(_.trim)
-    val specifiedKafkaParams = kafkaParamsForProducer(caseInsensitiveParameters)
-    KafkaWriter.write(outerSQLContext.sparkSession, data.queryExecution, specifiedKafkaParams,
-      topic)
-
-    /* This method is suppose to return a relation that reads the data that was written.
-     * We cannot support this for Kafka. Therefore, in order to make things consistent,
-     * we return an empty base relation.
-     */
-    new BaseRelation {
-      override def sqlContext: SQLContext = unsupportedException
-      override def schema: StructType = unsupportedException
-      override def needConversion: Boolean = unsupportedException
-      override def sizeInBytes: Long = unsupportedException
-      override def unhandledFilters(filters: Array[Filter]): Array[Filter] = unsupportedException
-      private def unsupportedException =
-        throw new UnsupportedOperationException("BaseRelation from Kafka write " +
-          "operation is not usable.")
-    }
   }
 
   private def strategy(params: CaseInsensitiveMap[String]) = {
