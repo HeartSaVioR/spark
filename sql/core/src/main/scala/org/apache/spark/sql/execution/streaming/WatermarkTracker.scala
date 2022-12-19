@@ -113,10 +113,10 @@ case class WatermarkTracker(policy: MultipleWatermarkPolicy) extends Logging {
     // `org.apache.spark.sql.execution.streaming.MultipleWatermarkPolicy` implementations.
     val chosenGlobalWatermark = policy.chooseGlobalWatermark(operatorToWatermarkMap.values.toSeq)
     if (chosenGlobalWatermark > globalWatermarkMs) {
-      logInfo(s"Updating event-time watermark from $globalWatermarkMs to $chosenGlobalWatermark ms")
+      logWarning(s"Updating event-time watermark from $globalWatermarkMs to $chosenGlobalWatermark ms")
       globalWatermarkMs = chosenGlobalWatermark
     } else {
-      logDebug(s"Event time watermark didn't move: $chosenGlobalWatermark < $globalWatermarkMs")
+      logWarning(s"Event time watermark didn't move: $chosenGlobalWatermark < $globalWatermarkMs")
     }
   }
 

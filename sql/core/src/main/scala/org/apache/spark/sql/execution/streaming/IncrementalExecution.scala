@@ -260,7 +260,7 @@ class IncrementalExecution(
       }
 
       val watermarkCalc = new WatermarkPropagationCalculator(planWithStateInfo)
-      watermarkCalc.calculate(eventTimeWatermarkForEviction, eventTimeWatermarkForLateEvents)
+      watermarkCalc.calculate(eventTimeWatermarkForLateEvents, eventTimeWatermarkForEviction)
 
       val planWithWatermark = planWithStateInfo transform {
         case StateStoreSaveExec(keys, Some(stateInfo), _, None, None, stateFormatVersion,

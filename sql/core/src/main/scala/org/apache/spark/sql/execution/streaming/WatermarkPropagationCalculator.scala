@@ -77,10 +77,11 @@ class WatermarkPropagationCalculator(plan: SparkPlan) extends Logging {
         node
     }
 
-    logDebug("watermark update ----------------------------------")
-    logDebug("BEFORE ===================================================")
-    logDebug(s"late events: $statefulOperatorToWatermarkForLateEvents")
-    logDebug(s"eviction: $statefulOperatorToWatermarkForEviction")
+    logWarning("watermark update ----------------------------------")
+    logWarning(s"late events: $watermarkForLateEvents eviction: $watermarkForEviction")
+    logWarning("BEFORE ===================================================")
+    logWarning(s"late events: $statefulOperatorToWatermarkForLateEvents")
+    logWarning(s"eviction: $statefulOperatorToWatermarkForEviction")
 
     statefulOperatorToWatermarkForLateEvents.clear()
     statefulOperatorToWatermarkForLateEvents ++= statefulOperatorToInputWatermark.mapValues(_._1)
@@ -88,9 +89,9 @@ class WatermarkPropagationCalculator(plan: SparkPlan) extends Logging {
     statefulOperatorToWatermarkForEviction.clear()
     statefulOperatorToWatermarkForEviction ++= statefulOperatorToInputWatermark.mapValues(_._2)
 
-    logDebug("AFTER ===================================================")
-    logDebug(s"late events: $statefulOperatorToWatermarkForLateEvents")
-    logDebug(s"eviction: $statefulOperatorToWatermarkForEviction")
+    logWarning("AFTER ===================================================")
+    logWarning(s"late events: $statefulOperatorToWatermarkForLateEvents")
+    logWarning(s"eviction: $statefulOperatorToWatermarkForEviction")
   }
 
   private def inputWatermark(
