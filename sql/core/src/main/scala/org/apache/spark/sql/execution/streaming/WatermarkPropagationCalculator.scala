@@ -23,9 +23,15 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.execution.{LeafExecNode, SparkPlan}
 import org.apache.spark.sql.execution.streaming.WatermarkTracker.DEFAULT_WATERMARK_MS
 
-class WatermarkPropagationCalculator(plan: SparkPlan) extends Logging {
+class WatermarkPropagationCalculator(plan: SparkPlan, debugLog: Boolean) extends Logging {
   private val statefulOperatorToWatermarkForLateEvents = mutable.HashMap[Long, Long]()
   private val statefulOperatorToWatermarkForEviction = mutable.HashMap[Long, Long]()
+
+  private def debugLog(str: => String): Unit = {
+    if (debugLog) {
+      logWarning(str)
+    }
+  }
 
   def getWatermarkForLateEvents(stateOpId: Long): Long = {
     statefulOperatorToWatermarkForLateEvents.getOrElse(stateOpId,
@@ -77,11 +83,11 @@ class WatermarkPropagationCalculator(plan: SparkPlan) extends Logging {
         node
     }
 
-    logWarning("watermark update ----------------------------------")
-    logWarning(s"late events: $watermarkForLateEvents eviction: $watermarkForEviction")
-    logWarning("BEFORE ===================================================")
-    logWarning(s"late events: $statefulOperatorToWatermarkForLateEvents")
-    logWarning(s"eviction: $statefulOperatorToWatermarkForEviction")
+    debugLog("watermark update ----------------------------------")
+    debugLog(s"late events: $watermarkForLateEvents eviction: $watermarkForEviction")
+    debugLog("BEFORE ===================================================")
+    debugLog(s"late events: $statefulOperatorToWatermarkForLateEvents")
+    debugLog(s"eviction: $statefulOperatorToWatermarkForEviction")
 
     statefulOperatorToWatermarkForLateEvents.clear()
     statefulOperatorToWatermarkForLateEvents ++= statefulOperatorToInputWatermark.mapValues(_._1)
@@ -89,9 +95,9 @@ class WatermarkPropagationCalculator(plan: SparkPlan) extends Logging {
     statefulOperatorToWatermarkForEviction.clear()
     statefulOperatorToWatermarkForEviction ++= statefulOperatorToInputWatermark.mapValues(_._2)
 
-    logWarning("AFTER ===================================================")
-    logWarning(s"late events: $statefulOperatorToWatermarkForLateEvents")
-    logWarning(s"eviction: $statefulOperatorToWatermarkForEviction")
+    debugLog("AFTER ===================================================")
+    debugLog(s"late events: $statefulOperatorToWatermarkForLateEvents")
+    debugLog(s"eviction: $statefulOperatorToWatermarkForEviction")
   }
 
   private def inputWatermark(

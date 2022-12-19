@@ -52,6 +52,15 @@ class IncrementalExecution(
     val offsetSeqMetadata: OffsetSeqMetadata)
   extends QueryExecution(sparkSession, logicalPlan) with Logging {
 
+  private val isDebugLog: Boolean = checkpointLocation != "<unknown>"
+  private def debugLog(str: => String): Unit = {
+    if (isDebugLog) {
+      logWarning(str)
+    }
+  }
+
+  debugLog(s"====== Initialing IncrementalExecution: id $id with batch ID $currentBatchId ======")
+
   // Modified planner with stateful operations.
   override val planner: SparkPlanner = new SparkPlanner(
       sparkSession,
@@ -123,6 +132,7 @@ class IncrementalExecution(
   private val eventTimeWatermarkForEviction = offsetSeqMetadata.batchWatermarkMs
   private val eventTimeWatermarkForLateEvents =
     if (sparkSession.conf.get(SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE)) {
+      debugLog(s"====== prevOffsetSeqMetadata: $prevOffsetSeqMetadata ======")
       prevOffsetSeqMetadata.getOrElse(offsetSeqMetadata).batchWatermarkMs
     } else {
       eventTimeWatermarkForEviction
@@ -157,22 +167,28 @@ class IncrementalExecution(
       !statefulOpFound
     }
 
+    private var numApplyCalled: Int = 0
+
     override def apply(plan: SparkPlan): SparkPlan = {
+      numApplyCalled += 1
+      debugLog(s"======== state rule: called ${numApplyCalled} times =======")
+      debugLog("======== state rule: issuing state info ========")
+
       val planWithStateInfo = plan transformDown {
         // NOTE: we should include all aggregate execs here which are used in streaming aggregations
-        case a: SortAggregateExec if a.isStreaming =>
+        case a: SortAggregateExec if a.isStreaming && a.numShufflePartitions.isEmpty =>
           a.copy(numShufflePartitions = Some(numStateStores))
 
-        case a: HashAggregateExec if a.isStreaming =>
+        case a: HashAggregateExec if a.isStreaming && a.numShufflePartitions.isEmpty =>
           a.copy(numShufflePartitions = Some(numStateStores))
 
-        case a: ObjectHashAggregateExec if a.isStreaming =>
+        case a: ObjectHashAggregateExec if a.isStreaming && a.numShufflePartitions.isEmpty =>
           a.copy(numShufflePartitions = Some(numStateStores))
 
-        case a: MergingSessionsExec if a.isStreaming =>
+        case a: MergingSessionsExec if a.isStreaming && a.numShufflePartitions.isEmpty =>
           a.copy(numShufflePartitions = Some(numStateStores))
 
-        case a: UpdatingSessionsExec if a.isStreaming =>
+        case a: UpdatingSessionsExec if a.isStreaming && a.numShufflePartitions.isEmpty =>
           a.copy(numShufflePartitions = Some(numStateStores))
 
         case StateStoreSaveExec(keys, None, None, None, None, stateFormatVersion,
@@ -225,7 +241,7 @@ class IncrementalExecution(
             None,
             None)
 
-        case m: FlatMapGroupsWithStateExec =>
+        case m: FlatMapGroupsWithStateExec if m.stateInfo.isEmpty =>
           // We set this to true only for the first batch of the streaming query.
           val hasInitialState = (currentBatchId == 0L && m.hasInitialState)
           val stateInfo = nextStatefulOperationStateInfo
@@ -237,17 +253,17 @@ class IncrementalExecution(
             hasInitialState = hasInitialState
           )
 
-        case m: FlatMapGroupsInPandasWithStateExec =>
+        case m: FlatMapGroupsInPandasWithStateExec if m.stateInfo.isEmpty =>
           val stateInfo = nextStatefulOperationStateInfo
           m.copy(
             stateInfo = Some(stateInfo),
             batchTimestampMs = Some(offsetSeqMetadata.batchTimestampMs))
 
-        case j: StreamingSymmetricHashJoinExec =>
+        case j: StreamingSymmetricHashJoinExec if j.stateInfo.isEmpty =>
           val stateInfo = nextStatefulOperationStateInfo
           j.copy(stateInfo = Some(stateInfo))
 
-        case l: StreamingGlobalLimitExec =>
+        case l: StreamingGlobalLimitExec if l.stateInfo.isEmpty =>
           l.copy(
             stateInfo = Some(nextStatefulOperationStateInfo),
             outputMode = Some(outputMode))
@@ -259,8 +275,18 @@ class IncrementalExecution(
           LocalLimitExec(limit, child)
       }
 
-      val watermarkCalc = new WatermarkPropagationCalculator(planWithStateInfo)
+      if (plan.fastEquals(planWithStateInfo)) {
+        return plan
+      }
+
+      debugLog("======== state rule: calculating watermark propagation ========")
+      debugLog(s"======== state rule: late events: $eventTimeWatermarkForLateEvents, " +
+        s"eviction: $eventTimeWatermarkForEviction ========")
+
+      val watermarkCalc = new WatermarkPropagationCalculator(planWithStateInfo, isDebugLog)
       watermarkCalc.calculate(eventTimeWatermarkForLateEvents, eventTimeWatermarkForEviction)
+
+      debugLog("======== state rule: applying watermark to state ops ========")
 
       val planWithWatermark = planWithStateInfo transform {
         case StateStoreSaveExec(keys, Some(stateInfo), _, None, None, stateFormatVersion,
@@ -280,7 +306,7 @@ class IncrementalExecution(
                 stateFormatVersion,
                 child) :: Nil))
 
-        case SessionWindowStateStoreSaveExec(keys, session, Some(stateInfo), None, None, None,
+        case SessionWindowStateStoreSaveExec(keys, session, Some(stateInfo), _, None, None,
         stateFormatVersion,
         UnaryExecNode(agg,
         SessionWindowStateStoreRestoreExec(_, _, _, None, None, _, child))) =>
@@ -310,7 +336,8 @@ class IncrementalExecution(
             Some(watermarkCalc.getWatermarkForLateEvents(stateInfo.operatorId)),
             Some(watermarkCalc.getWatermarkForEviction(stateInfo.operatorId)))
 
-        case m: FlatMapGroupsWithStateExec if m.stateInfo.isDefined =>
+        case m: FlatMapGroupsWithStateExec
+          if m.stateInfo.isDefined && m.eventTimeWatermarkForLateEvents.isEmpty =>
           val stateInfo = m.stateInfo.get
           m.copy(
             eventTimeWatermarkForLateEvents =
@@ -318,7 +345,8 @@ class IncrementalExecution(
             eventTimeWatermarkForEviction =
               Some(watermarkCalc.getWatermarkForEviction(stateInfo.operatorId)))
 
-        case m: FlatMapGroupsInPandasWithStateExec if m.stateInfo.isDefined =>
+        case m: FlatMapGroupsInPandasWithStateExec
+          if m.stateInfo.isDefined && m.eventTimeWatermarkForLateEvents.isEmpty =>
           val stateInfo = m.stateInfo.get
           m.copy(
             eventTimeWatermarkForLateEvents =
@@ -326,7 +354,8 @@ class IncrementalExecution(
             eventTimeWatermarkForEviction =
               Some(watermarkCalc.getWatermarkForEviction(stateInfo.operatorId)))
 
-        case j: StreamingSymmetricHashJoinExec if j.stateInfo.isDefined =>
+        case j: StreamingSymmetricHashJoinExec
+          if j.stateInfo.isDefined && j.eventTimeWatermarkForLateEvents.isEmpty =>
           val stateInfo = j.stateInfo.get
           j.copy(
             eventTimeWatermarkForLateEvents =
@@ -343,7 +372,12 @@ class IncrementalExecution(
     }
   }
 
-  override def preparations: Seq[Rule[SparkPlan]] = state +: super.preparations
+  override def preparations: Seq[Rule[SparkPlan]] = {
+    debugLog(s"====== preparations called from execution id ${this.id} ======")
+    debugLog(s"======== preparations: late events: $eventTimeWatermarkForLateEvents, " +
+      s"eviction: $eventTimeWatermarkForEviction ========")
+    state +: super.preparations
+  }
 
   /** No need assert supported, as this check has already been done */
   override def assertSupported(): Unit = { }
@@ -353,7 +387,8 @@ class IncrementalExecution(
    * updated metadata.
    */
   def shouldRunAnotherBatch(newMetadata: OffsetSeqMetadata): Boolean = {
-    val watermarkCalc = new WatermarkPropagationCalculator(executedPlan)
+    debugLog("======== shouldRunAnotherBatch ========")
+    val watermarkCalc = new WatermarkPropagationCalculator(executedPlan, isDebugLog)
     watermarkCalc.calculate(0, newMetadata.batchWatermarkMs)
     executedPlan.collect {
       case p: StateStoreWriter => p.shouldRunAnotherBatch(

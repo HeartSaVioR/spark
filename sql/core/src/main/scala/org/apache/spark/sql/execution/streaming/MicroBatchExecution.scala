@@ -501,6 +501,7 @@ class MicroBatchExecution(
       .map(p => p._1 -> p._2.get).toMap
 
     // Update the query metadata
+    logWarning(s"=== updating offsetSeqMetadata: new watermark ${watermarkTracker.currentWatermark} ======")
     offsetSeqMetadata = offsetSeqMetadata.copy(
       batchWatermarkMs = watermarkTracker.currentWatermark,
       batchTimestampMs = triggerClock.getTimeMillis())
@@ -509,7 +510,7 @@ class MicroBatchExecution(
     val lastExecutionRequiresAnotherBatch = noDataBatchesEnabled &&
       Option(lastExecution).exists(_.shouldRunAnotherBatch(offsetSeqMetadata))
     val shouldConstructNextBatch = isNewDataAvailable || lastExecutionRequiresAnotherBatch
-    logTrace(
+    logWarning(
       s"noDataBatchesEnabled = $noDataBatchesEnabled, " +
       s"lastExecutionRequiresAnotherBatch = $lastExecutionRequiresAnotherBatch, " +
       s"isNewDataAvailable = $isNewDataAvailable, " +
@@ -699,6 +700,7 @@ class MicroBatchExecution(
       StreamExecution.IS_CONTINUOUS_PROCESSING, false.toString)
 
     reportTimeTaken("queryPlanning") {
+      logWarning("===== queryPlanning - creating IncrementalExecution =====")
       lastExecution = new IncrementalExecution(
         sparkSessionToRunBatch,
         triggerLogicalPlan,
@@ -709,6 +711,7 @@ class MicroBatchExecution(
         currentBatchId,
         offsetLog.offsetSeqMetadataForBatchId(currentBatchId - 1),
         offsetSeqMetadata)
+      logWarning("===== queryPlanning - forcing executedPlan =====")
       lastExecution.executedPlan // Force the lazy generation of execution plan
     }
 

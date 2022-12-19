@@ -94,7 +94,7 @@ case class WatermarkTracker(policy: MultipleWatermarkPolicy) extends Logging {
 
     watermarkOperators.zipWithIndex.foreach {
       case (e, index) if e.eventTimeStats.value.count > 0 =>
-        logDebug(s"Observed event time stats $index: ${e.eventTimeStats.value}")
+        logWarning(s"Observed event time stats $index: ${e.eventTimeStats.value}")
         val newWatermarkMs = e.eventTimeStats.value.max - e.delayMs
         val prevWatermarkMs = operatorToWatermarkMap.get(index)
         if (prevWatermarkMs.isEmpty || newWatermarkMs > prevWatermarkMs.get) {
