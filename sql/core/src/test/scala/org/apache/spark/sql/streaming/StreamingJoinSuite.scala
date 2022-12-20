@@ -336,8 +336,8 @@ class StreamingInnerJoinSuite extends StreamingJoinSuite {
       StartStream(),
 
       AddData(input2, 1),
-      CheckNewAnswer(),                             // Should not join as < 15 removed
-      assertNumStateRows(total = 2, updated = 0),   // row not add as 1 < state key watermark = 15
+      CheckNewAnswer(),                             // rows < 15 won't be joined
+      assertNumStateRows(total = 2, updated = 1),
 
       AddData(input1, 5),
       CheckNewAnswer(),                             // Same reason as above
@@ -391,12 +391,11 @@ class StreamingInnerJoinSuite extends StreamingJoinSuite {
       // not be cleared. But rows rightTime <= 20 should be filtered due to event time watermark and
       // state rows with rightTime <= 25 should be removed from state.
       // (1, 20) ==> filtered by event time watermark = 20
-      // (1, 21) ==> passed filter, matched with left (1, 3) and (1, 5), not added to state
-      //             as 21 < state watermark = 25
+      // (1, 21) ==> passed filter, matched with left (1, 3) and (1, 5), added to state
       // (1, 28) ==> passed filter, matched with left (1, 3) and (1, 5), added to state
       AddData(rightInput, (1, 20), (1, 21), (1, 28)),
       CheckNewAnswer((1, 3, 21), (1, 5, 21), (1, 3, 28), (1, 5, 28)),
-      assertNumStateRows(total = 5, updated = 1, droppedByWatermark = 1),
+      assertNumStateRows(total = 5, updated = 2, droppedByWatermark = 1),
 
       // New data to left input with leftTime <= 20 should be filtered due to event time watermark
       AddData(leftInput, (1, 20), (1, 21)),
