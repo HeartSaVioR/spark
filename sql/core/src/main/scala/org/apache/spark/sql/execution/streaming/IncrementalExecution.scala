@@ -138,9 +138,31 @@ class IncrementalExecution(
       eventTimeWatermarkForEviction
     }
 
-  /** Locates save/restore pairs surrounding aggregation. */
-  val state = new Rule[SparkPlan] {
+  val enforceShufflePartitions = new Rule[SparkPlan] {
+    override def apply(plan: SparkPlan): SparkPlan = {
+      debugLog("======== state rule: enforcing shuffle partitions ========")
 
+      plan transform {
+        // NOTE: we should include all aggregate execs here which are used in streaming aggregations
+        case a: SortAggregateExec if a.isStreaming =>
+          a.copy(numShufflePartitions = Some(numStateStores))
+
+        case a: HashAggregateExec if a.isStreaming =>
+          a.copy(numShufflePartitions = Some(numStateStores))
+
+        case a: ObjectHashAggregateExec if a.isStreaming =>
+          a.copy(numShufflePartitions = Some(numStateStores))
+
+        case a: MergingSessionsExec if a.isStreaming =>
+          a.copy(numShufflePartitions = Some(numStateStores))
+
+        case a: UpdatingSessionsExec if a.isStreaming =>
+          a.copy(numShufflePartitions = Some(numStateStores))
+      }
+    }
+  }
+
+  val issueStateIds = new Rule[SparkPlan] {
     /**
      * Ensures that this plan DOES NOT have any stateful operation in it whose pipelined execution
      * depends on this plan. In other words, this function returns true if this plan does
@@ -155,8 +177,8 @@ class IncrementalExecution(
             statefulOpFound = true
 
           case e: ShuffleExchangeLike =>
-            // Don't search recursively any further as any child stateful operator as we
-            // are only looking for stateful subplans that this plan has narrow dependencies on.
+          // Don't search recursively any further as any child stateful operator as we
+          // are only looking for stateful subplans that this plan has narrow dependencies on.
 
           case p: SparkPlan =>
             p.children.foreach(findStatefulOp)
@@ -167,30 +189,10 @@ class IncrementalExecution(
       !statefulOpFound
     }
 
-    private var numApplyCalled: Int = 0
-
     override def apply(plan: SparkPlan): SparkPlan = {
-      numApplyCalled += 1
-      debugLog(s"======== state rule: called ${numApplyCalled} times =======")
       debugLog("======== state rule: issuing state info ========")
 
-      val planWithStateInfo = plan transformDown {
-        // NOTE: we should include all aggregate execs here which are used in streaming aggregations
-        case a: SortAggregateExec if a.isStreaming && a.numShufflePartitions.isEmpty =>
-          a.copy(numShufflePartitions = Some(numStateStores))
-
-        case a: HashAggregateExec if a.isStreaming && a.numShufflePartitions.isEmpty =>
-          a.copy(numShufflePartitions = Some(numStateStores))
-
-        case a: ObjectHashAggregateExec if a.isStreaming && a.numShufflePartitions.isEmpty =>
-          a.copy(numShufflePartitions = Some(numStateStores))
-
-        case a: MergingSessionsExec if a.isStreaming && a.numShufflePartitions.isEmpty =>
-          a.copy(numShufflePartitions = Some(numStateStores))
-
-        case a: UpdatingSessionsExec if a.isStreaming && a.numShufflePartitions.isEmpty =>
-          a.copy(numShufflePartitions = Some(numStateStores))
-
+      plan transform {
         case StateStoreSaveExec(keys, None, None, None, None, stateFormatVersion,
         UnaryExecNode(agg,
         StateStoreRestoreExec(_, None, _, child))) =>
@@ -274,101 +276,103 @@ class IncrementalExecution(
           // no stateful operator (i.e., consuming the iterator is not needed).
           LocalLimitExec(limit, child)
       }
+    }
+  }
 
-      if (plan.fastEquals(planWithStateInfo)) {
-        return plan
-      }
+  val propagateWatermark = new Rule[SparkPlan] {
+    override def apply(plan: SparkPlan): SparkPlan = {
+      if (statefulOperatorId.get() > 0) {
+        debugLog("======== state rule: calculating watermark propagation ========")
+        debugLog(s"======== state rule: late events: $eventTimeWatermarkForLateEvents, " +
+          s"eviction: $eventTimeWatermarkForEviction ========")
 
-      debugLog("======== state rule: calculating watermark propagation ========")
-      debugLog(s"======== state rule: late events: $eventTimeWatermarkForLateEvents, " +
-        s"eviction: $eventTimeWatermarkForEviction ========")
+        val watermarkCalc = new WatermarkPropagationCalculator(plan, isDebugLog)
+        watermarkCalc.calculate(eventTimeWatermarkForLateEvents, eventTimeWatermarkForEviction)
 
-      val watermarkCalc = new WatermarkPropagationCalculator(planWithStateInfo, isDebugLog)
-      watermarkCalc.calculate(eventTimeWatermarkForLateEvents, eventTimeWatermarkForEviction)
+        debugLog("======== state rule: applying watermark to state ops ========")
 
-      debugLog("======== state rule: applying watermark to state ops ========")
-
-      val planWithWatermark = planWithStateInfo transform {
-        case StateStoreSaveExec(keys, Some(stateInfo), _, None, None, stateFormatVersion,
-        UnaryExecNode(agg,
-        StateStoreRestoreExec(_, _, _, child))) =>
-          StateStoreSaveExec(
-            keys,
-            Some(stateInfo),
-            Some(outputMode),
-            Some(watermarkCalc.getWatermarkForLateEvents(stateInfo.operatorId)),
-            Some(watermarkCalc.getWatermarkForEviction(stateInfo.operatorId)),
-            stateFormatVersion,
-            agg.withNewChildren(
-              StateStoreRestoreExec(
-                keys,
-                Some(stateInfo),
-                stateFormatVersion,
-                child) :: Nil))
-
-        case SessionWindowStateStoreSaveExec(keys, session, Some(stateInfo), _, None, None,
-        stateFormatVersion,
-        UnaryExecNode(agg,
-        SessionWindowStateStoreRestoreExec(_, _, _, None, None, _, child))) =>
-          SessionWindowStateStoreSaveExec(
-            keys,
-            session,
-            Some(stateInfo),
-            Some(outputMode),
-            Some(watermarkCalc.getWatermarkForLateEvents(stateInfo.operatorId)),
-            Some(watermarkCalc.getWatermarkForEviction(stateInfo.operatorId)),
-            stateFormatVersion,
-            agg.withNewChildren(
-              SessionWindowStateStoreRestoreExec(
-                keys,
-                session,
-                Some(stateInfo),
-                Some(watermarkCalc.getWatermarkForLateEvents(stateInfo.operatorId)),
-                Some(watermarkCalc.getWatermarkForEviction(stateInfo.operatorId)),
-                stateFormatVersion,
-                child) :: Nil))
-
-        case StreamingDeduplicateExec(keys, child, Some(stateInfo), None, None) =>
-          StreamingDeduplicateExec(
-            keys,
-            child,
-            Some(stateInfo),
-            Some(watermarkCalc.getWatermarkForLateEvents(stateInfo.operatorId)),
-            Some(watermarkCalc.getWatermarkForEviction(stateInfo.operatorId)))
-
-        case m: FlatMapGroupsWithStateExec
-          if m.stateInfo.isDefined && m.eventTimeWatermarkForLateEvents.isEmpty =>
-          val stateInfo = m.stateInfo.get
-          m.copy(
-            eventTimeWatermarkForLateEvents =
+        plan transform {
+          case StateStoreSaveExec(keys, Some(stateInfo), _, None, None, stateFormatVersion,
+          UnaryExecNode(agg,
+          StateStoreRestoreExec(_, _, _, child))) =>
+            StateStoreSaveExec(
+              keys,
+              Some(stateInfo),
+              Some(outputMode),
               Some(watermarkCalc.getWatermarkForLateEvents(stateInfo.operatorId)),
-            eventTimeWatermarkForEviction =
-              Some(watermarkCalc.getWatermarkForEviction(stateInfo.operatorId)))
-
-        case m: FlatMapGroupsInPandasWithStateExec
-          if m.stateInfo.isDefined && m.eventTimeWatermarkForLateEvents.isEmpty =>
-          val stateInfo = m.stateInfo.get
-          m.copy(
-            eventTimeWatermarkForLateEvents =
-              Some(watermarkCalc.getWatermarkForLateEvents(stateInfo.operatorId)),
-            eventTimeWatermarkForEviction =
-              Some(watermarkCalc.getWatermarkForEviction(stateInfo.operatorId)))
-
-        case j: StreamingSymmetricHashJoinExec
-          if j.stateInfo.isDefined && j.eventTimeWatermarkForLateEvents.isEmpty =>
-          val stateInfo = j.stateInfo.get
-          j.copy(
-            eventTimeWatermarkForLateEvents =
-              Some(watermarkCalc.getWatermarkForLateEvents(stateInfo.operatorId)),
-            eventTimeWatermarkForEviction =
               Some(watermarkCalc.getWatermarkForEviction(stateInfo.operatorId)),
-            stateWatermarkPredicates =
-              StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
-                j.left.output, j.right.output, j.leftKeys, j.rightKeys, j.condition.full,
-                Some(watermarkCalc.getWatermarkForEviction(stateInfo.operatorId))))
-      }
+              stateFormatVersion,
+              agg.withNewChildren(
+                StateStoreRestoreExec(
+                  keys,
+                  Some(stateInfo),
+                  stateFormatVersion,
+                  child) :: Nil))
 
-      planWithWatermark
+          case SessionWindowStateStoreSaveExec(keys, session, Some(stateInfo), _, None, None,
+          stateFormatVersion,
+          UnaryExecNode(agg,
+          SessionWindowStateStoreRestoreExec(_, _, _, None, None, _, child))) =>
+            SessionWindowStateStoreSaveExec(
+              keys,
+              session,
+              Some(stateInfo),
+              Some(outputMode),
+              Some(watermarkCalc.getWatermarkForLateEvents(stateInfo.operatorId)),
+              Some(watermarkCalc.getWatermarkForEviction(stateInfo.operatorId)),
+              stateFormatVersion,
+              agg.withNewChildren(
+                SessionWindowStateStoreRestoreExec(
+                  keys,
+                  session,
+                  Some(stateInfo),
+                  Some(watermarkCalc.getWatermarkForLateEvents(stateInfo.operatorId)),
+                  Some(watermarkCalc.getWatermarkForEviction(stateInfo.operatorId)),
+                  stateFormatVersion,
+                  child) :: Nil))
+
+          case StreamingDeduplicateExec(keys, child, Some(stateInfo), None, None) =>
+            StreamingDeduplicateExec(
+              keys,
+              child,
+              Some(stateInfo),
+              Some(watermarkCalc.getWatermarkForLateEvents(stateInfo.operatorId)),
+              Some(watermarkCalc.getWatermarkForEviction(stateInfo.operatorId)))
+
+          case m: FlatMapGroupsWithStateExec
+            if m.stateInfo.isDefined && m.eventTimeWatermarkForLateEvents.isEmpty =>
+            val stateInfo = m.stateInfo.get
+            m.copy(
+              eventTimeWatermarkForLateEvents =
+                Some(watermarkCalc.getWatermarkForLateEvents(stateInfo.operatorId)),
+              eventTimeWatermarkForEviction =
+                Some(watermarkCalc.getWatermarkForEviction(stateInfo.operatorId)))
+
+          case m: FlatMapGroupsInPandasWithStateExec
+            if m.stateInfo.isDefined && m.eventTimeWatermarkForLateEvents.isEmpty =>
+            val stateInfo = m.stateInfo.get
+            m.copy(
+              eventTimeWatermarkForLateEvents =
+                Some(watermarkCalc.getWatermarkForLateEvents(stateInfo.operatorId)),
+              eventTimeWatermarkForEviction =
+                Some(watermarkCalc.getWatermarkForEviction(stateInfo.operatorId)))
+
+          case j: StreamingSymmetricHashJoinExec
+            if j.stateInfo.isDefined && j.eventTimeWatermarkForLateEvents.isEmpty =>
+            val stateInfo = j.stateInfo.get
+            j.copy(
+              eventTimeWatermarkForLateEvents =
+                Some(watermarkCalc.getWatermarkForLateEvents(stateInfo.operatorId)),
+              eventTimeWatermarkForEviction =
+                Some(watermarkCalc.getWatermarkForEviction(stateInfo.operatorId)),
+              stateWatermarkPredicates =
+                StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
+                  j.left.output, j.right.output, j.leftKeys, j.rightKeys, j.condition.full,
+                  Some(watermarkCalc.getWatermarkForEviction(stateInfo.operatorId))))
+        }
+      } else {
+        plan
+      }
     }
   }
 
@@ -376,7 +380,7 @@ class IncrementalExecution(
     debugLog(s"====== preparations called from execution id ${this.id} ======")
     debugLog(s"======== preparations: late events: $eventTimeWatermarkForLateEvents, " +
       s"eviction: $eventTimeWatermarkForEviction ========")
-    state +: super.preparations
+    enforceShufflePartitions +: issueStateIds +: propagateWatermark +: super.preparations
   }
 
   /** No need assert supported, as this check has already been done */
