@@ -1105,7 +1105,6 @@ class StreamingOuterJoinSuite extends StreamingJoinSuite {
     }
   }
 
-  // FIXME: only failing!
   test("chained stream-stream outer joins with append mode") {
     // This test verifies the bugfix of watermark between stateful operators, mentioned in
     // Spark dev@ mailing list: https://lists.apache.org/thread/r0v8qcxlcxz0tgq0fjbzzj0bowyrnsnb

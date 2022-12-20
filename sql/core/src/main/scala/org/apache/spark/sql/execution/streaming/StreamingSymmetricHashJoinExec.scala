@@ -628,12 +628,9 @@ case class StreamingSymmetricHashJoinExec(
       override def completion(): Unit = {
         val isLeftSemiWithMatch =
           joinType == LeftSemi && joinSide == LeftSide && iteratorNotEmpty
-        // Add to state store only if both removal predicates do not match,
-        // and the row is not matched for left side of left semi join.
-        val shouldAddToState =
-          !stateKeyWatermarkPredicateFunc(key) && !stateValueWatermarkPredicateFunc(thisRow) &&
-          !isLeftSemiWithMatch
-        if (shouldAddToState) {
+        // FIXME: now we cannot simply filter out input rows... is there any possibility on further
+        //   optimization?
+        if (!isLeftSemiWithMatch) {
           joinStateManager.append(key, thisRow, matched = iteratorNotEmpty)
           updatedStateRowsCount += 1
         }
