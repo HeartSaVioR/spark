@@ -501,7 +501,8 @@ class MicroBatchExecution(
       .map(p => p._1 -> p._2.get).toMap
 
     // Update the query metadata
-    logWarning(s"=== updating offsetSeqMetadata: new watermark ${watermarkTracker.currentWatermark} ======")
+    logWarning(s"=== updating offsetSeqMetadata: new watermark " +
+      s"${watermarkTracker.currentWatermark} ======")
     offsetSeqMetadata = offsetSeqMetadata.copy(
       batchWatermarkMs = watermarkTracker.currentWatermark,
       batchTimestampMs = triggerClock.getTimeMillis())
