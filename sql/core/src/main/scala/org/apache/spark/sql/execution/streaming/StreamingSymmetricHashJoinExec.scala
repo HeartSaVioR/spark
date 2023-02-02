@@ -557,7 +557,7 @@ case class StreamingSymmetricHashJoinExec(
         generateJoinedRow: (InternalRow, InternalRow) => JoinedRow)
       : Iterator[InternalRow] = {
 
-      val watermarkAttribute = inputAttributes.find(_.metadata.contains(delayKey))
+      val watermarkAttribute = WatermarkSupport.findEventTimeColumn(inputAttributes)
       val nonLateRows =
         WatermarkSupport.watermarkExpression(
           watermarkAttribute, eventTimeWatermarkForLateEvents) match {

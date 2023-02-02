@@ -25,6 +25,7 @@ import scala.collection.mutable
 
 import org.apache.spark.SparkContext
 import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
@@ -239,7 +240,7 @@ trait WatermarkSupport extends SparkPlan {
   /** Generate an expression that matches data older than the watermark */
   private def watermarkExpression(watermark: Option[Long]): Option[Expression] = {
     WatermarkSupport.watermarkExpression(
-      child.output.find(_.metadata.contains(EventTimeWatermark.delayKey)), watermark)
+      WatermarkSupport.findEventTimeColumn(child.output), watermark)
   }
 
   /** Predicate based on keys that matches data older than the late event filtering watermark */
@@ -325,6 +326,16 @@ object WatermarkSupport {
           Literal(optionalWatermarkMs.get * 1000))
       }
     Some(evictionExpression)
+  }
+
+  def findEventTimeColumn(attrs: Seq[Attribute]): Option[Attribute] = {
+    val eventTimeCols = attrs.filter(_.metadata.contains(EventTimeWatermark.delayKey))
+    if (eventTimeCols.size > 1) {
+      throw new AnalysisException("More than one event time columns are available. Please " +
+        "ensure there is at most one event time column per stream. event time columns: " +
+        eventTimeCols.mkString("(", ",", ")"))
+    }
+    eventTimeCols.headOption
   }
 }
 
