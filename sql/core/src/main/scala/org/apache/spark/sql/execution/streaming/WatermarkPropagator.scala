@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.execution.streaming
 
+import java.{util => jutil}
+
 import scala.collection.mutable
 
 import org.apache.spark.internal.Logging
@@ -27,27 +29,25 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.Utils
 
 trait WatermarkPropagator {
-  def isInitialized(batchId: Long): Boolean
   def propagate(batchId: Long, plan: SparkPlan, originWatermark: Long): Unit
   def getInputWatermark(batchId: Long, stateOpId: Long): Long
-  def evictBatch(batchId: Long): Unit
+  def purge(batchId: Long): Unit
 }
 
 class NoOpWatermarkPropagator extends WatermarkPropagator {
-  def isInitialized(batchId: Long): Boolean = false
   def propagate(batchId: Long, plan: SparkPlan, originWatermark: Long): Unit = {}
   def getInputWatermark(batchId: Long, stateOpId: Long): Long = Long.MinValue
-  def evictBatch(batchId: Long): Unit = {}
+  def purge(batchId: Long): Unit = {}
 }
 
 class UseSingleWatermarkPropagator extends WatermarkPropagator {
-  private val batchIdToWatermark: mutable.Map[Long, Long] = mutable.Map[Long, Long]()
+  private val batchIdToWatermark: jutil.TreeMap[Long, Long] = new jutil.TreeMap[Long, Long]()
 
-  override def isInitialized(batchId: Long): Boolean = batchIdToWatermark.contains(batchId)
+  private def isInitialized(batchId: Long): Boolean = batchIdToWatermark.containsKey(batchId)
 
   override def propagate(batchId: Long, plan: SparkPlan, originWatermark: Long): Unit = {
     if (isInitialized(batchId)) {
-      val cached = batchIdToWatermark(batchId)
+      val cached = batchIdToWatermark.get(batchId)
       assert(cached == originWatermark,
         s"Watermark has been changed for the same batch ID! Batch ID: $batchId, " +
           s"Value in cache: $cached, value given: $originWatermark")
@@ -58,19 +58,29 @@ class UseSingleWatermarkPropagator extends WatermarkPropagator {
 
   override def getInputWatermark(batchId: Long, stateOpId: Long): Long = {
     assert(isInitialized(batchId), s"Watermark for batch ID $batchId is not yet set!")
-    batchIdToWatermark(batchId)
+    batchIdToWatermark.get(batchId)
   }
 
-  // FIXME: evict up to the batch ID?
-  override def evictBatch(batchId: Long): Unit = batchIdToWatermark.remove(batchId)
+  override def purge(batchId: Long): Unit = {
+    val keyIter = batchIdToWatermark.keySet().iterator()
+    var stopIter = false
+    while (keyIter.hasNext && !stopIter) {
+      val currKey = keyIter.next()
+      if (currKey <= batchId) {
+        keyIter.remove()
+      } else {
+        stopIter = true
+      }
+    }
+  }
 }
 
 class PropagateWatermarkSimulator extends WatermarkPropagator with Logging {
-  private val batchIdToWatermark: mutable.Map[Long, Long] = mutable.Map[Long, Long]()
+  private val batchIdToWatermark: jutil.TreeMap[Long, Long] = new jutil.TreeMap[Long, Long]()
   private val inputWatermarks: mutable.Map[Long, Map[Long, Long]] =
     mutable.Map[Long, Map[Long, Long]]()
 
-  override def isInitialized(batchId: Long): Boolean = batchIdToWatermark.contains(batchId)
+  private def isInitialized(batchId: Long): Boolean = batchIdToWatermark.containsKey(batchId)
 
   private def getInputWatermarks(
       node: SparkPlan,
@@ -144,7 +154,7 @@ class PropagateWatermarkSimulator extends WatermarkPropagator with Logging {
 
   override def propagate(batchId: Long, plan: SparkPlan, originWatermark: Long): Unit = {
     if (isInitialized(batchId)) {
-      val cached = batchIdToWatermark(batchId)
+      val cached = batchIdToWatermark.get(batchId)
       assert(cached == originWatermark,
         s"Watermark has been changed for the same batch ID! Batch ID: $batchId, " +
           s"Value in cache: $cached, value given: $originWatermark")
@@ -159,19 +169,25 @@ class PropagateWatermarkSimulator extends WatermarkPropagator with Logging {
     assert(isInitialized(batchId), s"Watermark for batch ID $batchId is not yet set!")
     // In current Spark's logic, event time watermark cannot go down to negative. So even there is
     // no input watermark for operator, the final input watermark for operator should be 0L.
-    Math.max(batchIdToWatermark(batchId), 0L)
+    Math.max(batchIdToWatermark.get(batchId), 0L)
   }
 
-  // FIXME: evict up to the batch ID?
-  override def evictBatch(batchId: Long): Unit = {
-    batchIdToWatermark.remove(batchId)
-    inputWatermarks.remove(batchId)
+  override def purge(batchId: Long): Unit = {
+    val keyIter = batchIdToWatermark.keySet().iterator()
+    var stopIter = false
+    while (keyIter.hasNext && !stopIter) {
+      val currKey = keyIter.next()
+      if (currKey <= batchId) {
+        keyIter.remove()
+        inputWatermarks.remove(currKey)
+      } else {
+        stopIter = true
+      }
+    }
   }
 }
 
 object WatermarkPropagator {
-  // FIXME: Can we change this to -1L?
-  // this has to be equal or higher than 0 due to check condition of FlatMapGroupsWithState.
   val DEFAULT_WATERMARK_MS = -1L
 
   def apply(conf: SQLConf): WatermarkPropagator = {

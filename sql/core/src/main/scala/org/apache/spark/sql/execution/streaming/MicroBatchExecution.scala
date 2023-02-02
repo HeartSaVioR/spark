@@ -792,7 +792,9 @@ class MicroBatchExecution(
       val prevBatchOff = offsetLog.get(currentBatchId - 1)
       if (prevBatchOff.isDefined) {
         commitSources(prevBatchOff.get)
-        // FIXME: probably need to clean up input watermarks as well
+        // The watermark for each batch is given as (prev. watermark, curr. watermark), hence
+        // we can't purge the previous version of watermark.
+        watermarkPropagator.purge(currentBatchId - 2)
       } else {
         throw new IllegalStateException(s"batch ${currentBatchId - 1} doesn't exist")
       }

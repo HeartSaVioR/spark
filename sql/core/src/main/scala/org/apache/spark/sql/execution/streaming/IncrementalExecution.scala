@@ -163,8 +163,8 @@ class IncrementalExecution(
             statefulOpFound = true
 
           case e: ShuffleExchangeLike =>
-          // Don't search recursively any further as any child stateful operator as we
-          // are only looking for stateful subplans that this plan has narrow dependencies on.
+            // Don't search recursively any further as any child stateful operator as we
+            // are only looking for stateful subplans that this plan has narrow dependencies on.
 
           case p: SparkPlan =>
             p.children.foreach(findStatefulOp)
@@ -187,8 +187,8 @@ class IncrementalExecution(
   val stateOpIdRule = new Rule[SparkPlan] {
     override def apply(plan: SparkPlan): SparkPlan = plan transform {
       case StateStoreSaveExec(keys, None, None, None, None, stateFormatVersion,
-      UnaryExecNode(agg,
-      StateStoreRestoreExec(_, None, _, child))) =>
+             UnaryExecNode(agg,
+               StateStoreRestoreExec(_, None, _, child))) =>
         val aggStateInfo = nextStatefulOperationStateInfo
         StateStoreSaveExec(
           keys,
@@ -205,27 +205,27 @@ class IncrementalExecution(
               child) :: Nil))
 
       case SessionWindowStateStoreSaveExec(keys, session, None, None, None, None,
-      stateFormatVersion,
-      UnaryExecNode(agg,
-      SessionWindowStateStoreRestoreExec(_, _, None, None, None, _, child))) =>
-        val aggStateInfo = nextStatefulOperationStateInfo
-        SessionWindowStateStoreSaveExec(
-          keys,
-          session,
-          Some(aggStateInfo),
-          Some(outputMode),
-          eventTimeWatermarkForLateEvents = None,
-          eventTimeWatermarkForEviction = None,
-          stateFormatVersion,
-          agg.withNewChildren(
-            SessionWindowStateStoreRestoreExec(
-              keys,
-              session,
-              Some(aggStateInfo),
-              eventTimeWatermarkForLateEvents = None,
-              eventTimeWatermarkForEviction = None,
-              stateFormatVersion,
-              child) :: Nil))
+        stateFormatVersion,
+        UnaryExecNode(agg,
+        SessionWindowStateStoreRestoreExec(_, _, None, None, None, _, child))) =>
+          val aggStateInfo = nextStatefulOperationStateInfo
+          SessionWindowStateStoreSaveExec(
+            keys,
+            session,
+            Some(aggStateInfo),
+            Some(outputMode),
+            eventTimeWatermarkForLateEvents = None,
+            eventTimeWatermarkForEviction = None,
+            stateFormatVersion,
+            agg.withNewChildren(
+              SessionWindowStateStoreRestoreExec(
+                keys,
+                session,
+                Some(aggStateInfo),
+                eventTimeWatermarkForLateEvents = None,
+                eventTimeWatermarkForEviction = None,
+                stateFormatVersion,
+                child) :: Nil))
 
       case StreamingDeduplicateExec(keys, child, None, None, None) =>
         StreamingDeduplicateExec(
@@ -270,12 +270,8 @@ class IncrementalExecution(
 
   val watermarkPropagationRule = new Rule[SparkPlan] {
     private def simulateWatermarkPropagation(plan: SparkPlan): Unit = {
-      if (!watermarkPropagator.isInitialized(currentBatchId - 1)) {
-        watermarkPropagator.propagate(currentBatchId - 1, plan, eventTimeWatermarkForLateEvents)
-      }
-      if (!watermarkPropagator.isInitialized(currentBatchId)) {
-        watermarkPropagator.propagate(currentBatchId, plan, eventTimeWatermarkForEviction)
-      }
+      watermarkPropagator.propagate(currentBatchId - 1, plan, eventTimeWatermarkForLateEvents)
+      watermarkPropagator.propagate(currentBatchId, plan, eventTimeWatermarkForEviction)
     }
 
     private def inputWatermark(
@@ -351,9 +347,7 @@ class IncrementalExecution(
    */
   def shouldRunAnotherBatch(newMetadata: OffsetSeqMetadata): Boolean = {
     val tentativeBatchId = currentBatchId + 1
-    if (!watermarkPropagator.isInitialized(tentativeBatchId)) {
-      watermarkPropagator.propagate(tentativeBatchId, executedPlan, newMetadata.batchWatermarkMs)
-    }
+    watermarkPropagator.propagate(tentativeBatchId, executedPlan, newMetadata.batchWatermarkMs)
     executedPlan.collect {
       case p: StateStoreWriter => p.shouldRunAnotherBatch(
         watermarkPropagator.getInputWatermark(tentativeBatchId, p.stateInfo.get.operatorId))
