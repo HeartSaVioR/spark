@@ -699,6 +699,11 @@ case class StreamingSymmetricHashJoinExec(
       Nil
     }
 
+  // This operator will evict based on the state watermark on both side of inputs; we would like
+  // to let users leverage both sides of event time column for output of join, so the watermark
+  // must be lower bound of both sides of event time column. The lower bound of event time column
+  // for each side is determined by state watermark, hence we take a minimum of (left state
+  // watermark, right state watermark, input watermark) to decide the output watermark.
   override def produceWatermark(minInputWatermarkMs: Long): Long = {
     val (leftStateWatermark, rightStateWatermark) =
       StreamingSymmetricHashJoinHelper.getStateWatermark(

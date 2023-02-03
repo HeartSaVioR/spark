@@ -126,9 +126,9 @@ class PropagateWatermarkSimulator extends WatermarkPropagator with Logging {
           DEFAULT_WATERMARK_MS
         }
 
-        val newWatermarkMs = node.produceWatermark(finalInputWatermarkMs)
-        nodeToOutputWatermark.put(node.id, newWatermarkMs)
-        nextStatefulOperatorToWatermark.put(stOpId, newWatermarkMs)
+        val outputWatermarkMs = node.produceWatermark(finalInputWatermarkMs)
+        nodeToOutputWatermark.put(node.id, outputWatermarkMs)
+        nextStatefulOperatorToWatermark.put(stOpId, finalInputWatermarkMs)
         node
 
       case node =>
@@ -169,7 +169,10 @@ class PropagateWatermarkSimulator extends WatermarkPropagator with Logging {
     assert(isInitialized(batchId), s"Watermark for batch ID $batchId is not yet set!")
     // In current Spark's logic, event time watermark cannot go down to negative. So even there is
     // no input watermark for operator, the final input watermark for operator should be 0L.
-    Math.max(batchIdToWatermark.get(batchId), 0L)
+    val opWatermark = inputWatermarks(batchId).get(stateOpId)
+    assert(opWatermark.isDefined, s"Watermark for batch ID $batchId and stateOpId $stateOpId is " +
+      "not yet set!")
+    Math.max(opWatermark.get, 0L)
   }
 
   override def purge(batchId: Long): Unit = {

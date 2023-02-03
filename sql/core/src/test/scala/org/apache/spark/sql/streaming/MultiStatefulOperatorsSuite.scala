@@ -21,10 +21,11 @@ import java.sql.Timestamp
 
 import org.scalatest.BeforeAndAfter
 
-import org.apache.spark.sql.{AnalysisException, SparkSession}
-import org.apache.spark.sql.execution.streaming.MemoryStream
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.execution.streaming.{MemoryStream, StateStoreSaveExec, StreamingSymmetricHashJoinExec}
 import org.apache.spark.sql.execution.streaming.state.StateStore
 import org.apache.spark.sql.functions._
+import org.apache.spark.sql.internal.SQLConf
 
 // Tests for the multiple stateful operators support.
 class MultiStatefulOperatorsSuite
@@ -405,35 +406,6 @@ class MultiStatefulOperatorsSuite
     )
   }
 
-  test("join on time interval -> window agg, append mode, should fail") {
-    val input1 = MemoryStream[Int]
-    val inputDF1 = input1.toDF()
-      .withColumnRenamed("value", "value1")
-      .withColumn("eventTime1", timestamp_seconds($"value1"))
-      .withWatermark("eventTime1", "0 seconds")
-
-    val input2 = MemoryStream[(Int, Int)]
-    val inputDF2 = input2.toDS().toDF("start", "end")
-      .withColumn("eventTime2Start", timestamp_seconds($"start"))
-      .withColumn("eventTime2End", timestamp_seconds($"end"))
-      .withColumn("start2", timestamp_seconds($"start"))
-      .withWatermark("eventTime2Start", "0 seconds")
-
-    val stream = inputDF1.join(inputDF2,
-      expr("eventTime1 >= eventTime2Start AND eventTime1 < eventTime2End " +
-        "AND eventTime1 = start2"), "inner")
-      .groupBy(window($"eventTime1", "5 seconds") as 'window)
-      .agg(count("*") as 'count)
-      .select($"window".getField("start").cast("long").as[Long], $"count".as[Long])
-
-    val e = intercept[AnalysisException] {
-      testStream(stream)(
-        StartStream()
-      )
-    }
-    assert(e.getMessage.contains("Detected pattern of possible 'correctness' issue"))
-  }
-
   test("join with range join on non-time intervals -> window agg, append mode, shouldn't fail") {
     val input1 = MemoryStream[Int]
     val inputDF1 = input1.toDF()
@@ -466,169 +438,426 @@ class MultiStatefulOperatorsSuite
   }
 
   test("stream-stream time interval left outer join -> aggregation, append mode") {
-    withSQLConf("spark.sql.streaming.unsupportedOperationCheck" -> "false") {
-      val input1 = MemoryStream[(Timestamp, String, String)]
-      val df1 = input1.toDF
-        .selectExpr("_1 as eventTime", "_2 as id", "_3 as comment")
-        .withWatermark(s"eventTime", "2 minutes")
+    val input1 = MemoryStream[(String, Timestamp)]
+    val input2 = MemoryStream[(String, Timestamp)]
 
-      val input2 = MemoryStream[(Timestamp, String, String)]
-      val df2 = input2.toDF
-        .selectExpr("_1 as eventTime", "_2 as id", "_3 as name")
-        .withWatermark(s"eventTime", "4 minutes")
+    val s1 = input1.toDF()
+      .selectExpr("_1 AS id1", "_2 AS timestamp1")
+      .withWatermark("timestamp1", "0 seconds")
+      .as("s1")
 
-      val joined = df1.as("left")
-        .join(df2.as("right"),
-          expr("""
-                 |left.id = right.id AND left.eventTime BETWEEN
-                 |  right.eventTime - INTERVAL 40 seconds AND
-                 |  right.eventTime + INTERVAL 30 seconds
-             """.stripMargin),
-          joinType = "leftOuter")
+    val s2 = input2.toDF()
+      .selectExpr("_1 AS id2", "_2 AS timestamp2")
+      .withWatermark("timestamp2", "0 seconds")
+      .as("s2")
 
-      val windowAggregation = joined
-        .groupBy(window($"left.eventTime", "30 seconds"))
-        .agg(count("*").as("cnt"))
-        .selectExpr("window.start AS window_start", "window.end AS window_end", "cnt")
+    val s3 = s1.join(s2, expr("s1.id1 = s2.id2 AND (s1.timestamp1 BETWEEN " +
+      "s2.timestamp2 - INTERVAL 1 hour AND s2.timestamp2 + INTERVAL 1 hour)"), "leftOuter")
 
-      testStream(windowAggregation)(
+    val agg = s3.groupBy(window($"timestamp1", "10 minutes"))
+      .agg(count("*").as("cnt"))
+      .selectExpr("CAST(window.start AS STRING) AS window_start",
+        "CAST(window.end AS STRING) AS window_end", "cnt")
+
+    // for ease of verification, we change the session timezone to UTC
+    withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+      testStream(agg)(
         MultiAddData(
           (input1, Seq(
-            (Timestamp.valueOf("2020-01-01 00:00:00"), "abc", "has no join partner"),
-            (Timestamp.valueOf("2020-01-02 00:00:00"), "abc", "joined with A"),
-            (Timestamp.valueOf("2020-01-02 01:00:00"), "abc", "joined with B"))),
+            ("1", Timestamp.valueOf("2023-01-01 01:00:10")),
+            ("2", Timestamp.valueOf("2023-01-01 01:00:30")))
+          ),
           (input2, Seq(
-            (Timestamp.valueOf("2020-01-02 00:00:10"), "abc", "A"),
-            (Timestamp.valueOf("2020-01-02 00:59:59"), "abc", "B"),
-            (Timestamp.valueOf("2020-01-02 02:00:00"), "abc", "C")))
+            ("1", Timestamp.valueOf("2023-01-01 01:00:20"))))
         ),
 
         // < data batch >
         // global watermark (0, 0)
-        // op1 (join) IW (0, 0) OW 0
-        // - result
-        // (Timestamp.valueOf("2020-01-02 00:00:00"), "abc", "joined with A",
-        //  Timestamp.valueOf("2020-01-02 00:00:10"), "abc", "A")
-        // (Timestamp.valueOf("2020-01-02 01:00:00"), "abc", "joined with B",
-        //  Timestamp.valueOf("2020-01-02 00:59:59"), "abc", "B")
-        // op2 (aggregation) IW (0, 0) OW 0
+        // op1 (join)
+        // -- IW (0, 0)
+        // -- OW 0
+        // -- left state
+        // ("1", "2023-01-01 01:00:10", matched=true)
+        // ("1", "2023-01-01 01:00:30", matched=false)
+        // -- right state
+        // ("1", "2023-01-01 01:00:20")
+        // -- result
+        // ("1", "2023-01-01 01:00:10", "1", "2023-01-01 01:00:20")
+        // op2 (aggregation)
+        // -- IW (0, 0)
+        // -- OW 0
         // -- state row
-        // (Timestamp.valueOf("2020-01-02 00:00:00"), Timestamp.valueOf("2020-01-02 00:00:30"), 1)
-        // (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
+        // ("2023-01-01 01:00:00", "2023-01-01 01:10:00", 1)
+        // -- result
+        // None
 
-        // - watermark calculation
-        // watermark in left input: 2020-01-02 00:58:00
-        // watermark in right input: 2020-01-02 01:56:00
-        // origin watermark: 2020-01-02 00:58:00
+        // -- watermark calculation
+        // watermark in left input: 2023-01-01 01:00:30
+        // watermark in right input: 2023-01-01 01:00:20
+        // origin watermark: 2023-01-01 01:00:20
 
         // < no-data batch >
-        // global watermark (0, 2020-01-02 00:58:00)
-        // op1 (join) IW (0, 2020-01-02 00:58:00) OW 2020-01-02 00:57:20
-        // -- state watermark on eviction: 2020-01-02 00:57:20
-        // -- result (eviction)
-        // (Timestamp.valueOf("2020-01-01 00:00:00"), "abc", "has no join partner",
-        //  null, null, null)
-        // op2 (aggregation) IW (0, 2020-01-02 00:57:20) OW 2020-01-02 00:57:20
-        // -- state row
-        // (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
+        // global watermark (0, 2023-01-01 01:00:20)
+        // op1 (join)
+        // -- IW (0, 2023-01-01 01:00:20)
+        // -- OW 2023-01-01 00:00:19.999999
+        // -- left state
+        // ("1", "2023-01-01 01:00:10", matched=true)
+        // ("1", "2023-01-01 01:00:30", matched=false)
+        // -- right state
+        // ("1", "2023-01-01 01:00:20")
         // -- result
-        // (Timestamp.valueOf("2020-01-01 00:00:00"), Timestamp.valueOf("2020-01-01 00:00:30"), 1)
-        // (Timestamp.valueOf("2020-01-02 00:00:00"), Timestamp.valueOf("2020-01-02 00:00:30"), 1)
+        // None
+        // op2 (aggregation)
+        // -- IW (0, 2023-01-01 00:00:19.999999)
+        // -- OW 2023-01-01 00:00:19.999999
+        // -- state row
+        // ("2023-01-01 01:00:00", "2023-01-01 01:10:00", 1)
+        // -- result
+        // None
+        CheckAnswer(),
 
-        CheckNewAnswer(
-          (Timestamp.valueOf("2020-01-01 00:00:00"), Timestamp.valueOf("2020-01-01 00:00:30"), 1),
-          (Timestamp.valueOf("2020-01-02 00:00:00"), Timestamp.valueOf("2020-01-02 00:00:30"), 1)
-        ),
+        Execute { query =>
+          val lastExecution = query.lastExecution
+          val joinOperator = lastExecution.executedPlan.collect {
+            case j: StreamingSymmetricHashJoinExec => j
+          }.head
+          val aggSaveOperator = lastExecution.executedPlan.collect {
+            case j: StateStoreSaveExec => j
+          }.head
 
-        // FIXME: check the join & aggregation nodes and see the watermark
-        //  for filtering vs eviction
+          assert(joinOperator.eventTimeWatermarkForLateEvents === Some(0))
+          assert(joinOperator.eventTimeWatermarkForEviction ===
+            Some(Timestamp.valueOf("2023-01-01 01:00:20").getTime))
+
+          assert(aggSaveOperator.eventTimeWatermarkForLateEvents === Some(0))
+          assert(aggSaveOperator.eventTimeWatermarkForEviction ===
+            Some(Timestamp.valueOf("2023-01-01 00:00:20").getTime - 1))
+        },
 
         MultiAddData(
-          (input1, Seq((Timestamp.valueOf("2020-01-05 00:00:00"), "abc", "joined with D"))),
-          (input2, Seq((Timestamp.valueOf("2020-01-05 00:00:10"), "abc", "D")))
+          (input1, Seq(("5", Timestamp.valueOf("2023-01-01 01:15:00")))),
+          (input2, Seq(("6", Timestamp.valueOf("2023-01-01 01:15:00"))))
         ),
 
         // < data batch >
-        // global watermark (2020-01-02 00:58:00, 2020-01-02 00:58:00)
-        // op1 (join) IW (2020-01-02 00:58:00, 2020-01-02 00:58:00) OW 2020-01-02 00:57:20
-        // -- result
-        // (Timestamp.valueOf("2020-01-05 00:00:00"), "abc", "joined with D",
-        //  Timestamp.valueOf("2020-01-05 00:00:10"), "abc", "D")
-        // op2 (aggregation) IW (2020-01-02 00:57:20, 2020-01-02 00:57:20) OW 2020-01-02 00:57:20
-        // -- state row
-        // (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
-        // (Timestamp.valueOf("2020-01-05 00:00:00"), Timestamp.valueOf("2020-01-05 01:00:30"), 1)
-
-        // - watermark calculation
-        // watermark in left input: 2020-01-04 23:58:00
-        // watermark in right input: 2020-01-04 23:56:10
-        // origin watermark: 2020-01-04 23:56:10
-
-        // < no-data batch >
-        // global watermark (2020-01-02 00:58:00, 2020-01-04 23:56:10)
-        // op1 (join) IW (2020-01-02 00:58:00, 2020-01-04 23:56:10) OW 2020-01-04 23:55:30
+        // global watermark (2023-01-01 01:00:20, 2023-01-01 01:00:20)
+        // op1 (join)
+        // -- IW (2023-01-01 01:00:20, 2023-01-01 01:00:20)
+        // -- OW 2023-01-01 00:00:19.999999
+        // -- left state
+        // ("1", "2023-01-01 01:00:10", matched=true)
+        // ("1", "2023-01-01 01:00:30", matched=false)
+        // ("5", "2023-01-01 01:15:00", matched=false)
+        // -- right state
+        // ("1", "2023-01-01 01:00:20")
+        // ("6", "2023-01-01 01:15:00")
         // -- result
         // None
-        // op2 (aggregation) IW (2020-01-02 00:57:20, 2020-01-04 23:55:30) OW 2020-01-04 23:55:30
-        // -- result
-        // (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
+        // op2 (aggregation)
+        // -- IW (2023-01-01 00:00:19.999999, 2023-01-01 00:00:19.999999)
+        // -- OW 2023-01-01 00:00:19.999999
         // -- state row
-        // (Timestamp.valueOf("2020-01-05 00:00:00"), Timestamp.valueOf("2020-01-05 01:00:30"), 1)
+        // ("2023-01-01 01:00:00", "2023-01-01 01:10:00", 1)
+        // -- result
+        // None
 
-        CheckNewAnswer(
-          (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
-        )
+        // -- watermark calculation
+        // watermark in left input: 2023-01-01 01:15:00
+        // watermark in right input: 2023-01-01 01:15:00
+        // origin watermark: 2023-01-01 01:15:00
 
-        // FIXME: check the join & aggregation nodes and see the watermark for
-        //  filtering vs eviction
+        // < no-data batch >
+        // global watermark (2023-01-01 01:00:20, 2023-01-01 01:15:00)
+        // op1 (join)
+        // -- IW (2023-01-01 01:00:20, 2023-01-01 01:15:00)
+        // -- OW 2023-01-01 00:14:59.999999
+        // -- left state
+        // ("1", "2023-01-01 01:00:10", matched=true)
+        // ("1", "2023-01-01 01:00:30", matched=false)
+        // ("5", "2023-01-01 01:15:00", matched=false)
+        // -- right state
+        // ("1", "2023-01-01 01:00:20")
+        // ("6", "2023-01-01 01:15:00")
+        // -- result
+        // None
+        // op2 (aggregation)
+        // -- IW (2023-01-01 00:00:19.999999, 2023-01-01 00:14:59.999999)
+        // -- OW 2023-01-01 00:14:59.999999
+        // -- state row
+        // ("2023-01-01 01:00:00", "2023-01-01 01:10:00", 1)
+        // -- result
+        // None
+        CheckAnswer(),
+
+        Execute { query =>
+          val lastExecution = query.lastExecution
+          val joinOperator = lastExecution.executedPlan.collect {
+            case j: StreamingSymmetricHashJoinExec => j
+          }.head
+          val aggSaveOperator = lastExecution.executedPlan.collect {
+            case j: StateStoreSaveExec => j
+          }.head
+
+          assert(joinOperator.eventTimeWatermarkForLateEvents ===
+            Some(Timestamp.valueOf("2023-01-01 01:00:20").getTime))
+          assert(joinOperator.eventTimeWatermarkForEviction ===
+            Some(Timestamp.valueOf("2023-01-01 01:15:00").getTime))
+
+          assert(aggSaveOperator.eventTimeWatermarkForLateEvents ===
+            Some(Timestamp.valueOf("2023-01-01 00:00:20").getTime - 1))
+          assert(aggSaveOperator.eventTimeWatermarkForEviction ===
+            Some(Timestamp.valueOf("2023-01-01 00:15:00").getTime - 1))
+        },
+
+        MultiAddData(
+          (input1, Seq(
+            ("5", Timestamp.valueOf("2023-01-01 02:16:00")))),
+          (input2, Seq(
+            ("6", Timestamp.valueOf("2023-01-01 02:16:00"))))
+        ),
+
+        // < data batch >
+        // global watermark (2023-01-01 01:15:00, 2023-01-01 01:15:00)
+        // op1 (join)
+        // -- IW (2023-01-01 01:15:00, 2023-01-01 01:15:00)
+        // -- OW 2023-01-01 00:14:59.999999
+        // -- left state
+        // ("1", "2023-01-01 01:00:10", matched=true)
+        // ("1", "2023-01-01 01:00:30", matched=false)
+        // ("5", "2023-01-01 01:15:00", matched=false)
+        // ("5", "2023-01-01 02:16:00", matched=false)
+        // -- right state
+        // ("1", "2023-01-01 01:00:20")
+        // ("6", "2023-01-01 01:15:00")
+        // ("6", "2023-01-01 02:16:00")
+        // -- result
+        // None
+        // op2 (aggregation)
+        // -- IW (2023-01-01 00:14:59.999999, 2023-01-01 00:14:59.999999)
+        // -- OW 2023-01-01 00:14:59.999999
+        // -- state row
+        // ("2023-01-01 01:00:00", "2023-01-01 01:10:00", 1)
+        // -- result
+        // None
+
+        // -- watermark calculation
+        // watermark in left input: 2023-01-01 02:16:00
+        // watermark in right input: 2023-01-01 02:16:00
+        // origin watermark: 2023-01-01 02:16:00
+
+        // < no-data batch >
+        // global watermark (2023-01-01 01:15:00, 2023-01-01 02:16:00)
+        // op1 (join)
+        // -- IW (2023-01-01 01:15:00, 2023-01-01 02:16:00)
+        // -- OW 2023-01-01 01:15:59.999999
+        // -- left state
+        // ("5", "2023-01-01 02:16:00", matched=false)
+        // -- right state
+        // ("6", "2023-01-01 02:16:00")
+        // -- result
+        // ("1", "2023-01-01 01:00:30", null, null)
+        // ("5", "2023-01-01 01:15:00", null, null)
+        // op2 (aggregation)
+        // -- IW (2023-01-01 00:14:59.999999, 2023-01-01 01:15:59.999999)
+        // -- OW 2023-01-01 01:15:59.999999
+        // -- state row
+        // ("2023-01-01 01:10:00", "2023-01-01 01:20:00", 1)
+        // -- result
+        // ("2023-01-01 01:00:00", "2023-01-01 01:10:00", 2)
+        CheckAnswer(
+          ("2023-01-01 01:00:00", "2023-01-01 01:10:00", 2)
+        ),
+
+        Execute { query =>
+          val lastExecution = query.lastExecution
+          val joinOperator = lastExecution.executedPlan.collect {
+            case j: StreamingSymmetricHashJoinExec => j
+          }.head
+          val aggSaveOperator = lastExecution.executedPlan.collect {
+            case j: StateStoreSaveExec => j
+          }.head
+
+          assert(joinOperator.eventTimeWatermarkForLateEvents ===
+            Some(Timestamp.valueOf("2023-01-01 01:15:00").getTime))
+          assert(joinOperator.eventTimeWatermarkForEviction ===
+            Some(Timestamp.valueOf("2023-01-01 02:16:00").getTime))
+
+          assert(aggSaveOperator.eventTimeWatermarkForLateEvents ===
+            Some(Timestamp.valueOf("2023-01-01 00:15:00").getTime - 1))
+          assert(aggSaveOperator.eventTimeWatermarkForEviction ===
+            Some(Timestamp.valueOf("2023-01-01 01:16:00").getTime - 1))
+        }
       )
     }
   }
 
-  test("stream-stream time interval left outer join (left side condition) ->" +
-    " time window aggregation") {
-    import java.sql.Timestamp
-    import MultiStatefulOperatorsSuite.RecordClass
+  // FIXME: construct a simpler test which may pass without phase 2, but strictly check for the
+  //  value of watermark per operator. set watermark delay threshold differently.
 
-    withSQLConf("spark.sql.streaming.unsupportedOperationCheck" -> "false") {
-      val adImprStream = MemoryStream[RecordClass]
-      val adClickStream = MemoryStream[RecordClass]
+  test("FIXME: stream-stream time interval left outer join -> aggregation, append mode") {
+    val input1 = MemoryStream[(Timestamp, String, String)]
+    val df1 = input1.toDF
+      .selectExpr("_1 as eventTime", "_2 as id", "_3 as comment")
+      .withWatermark(s"eventTime", "2 minutes")
 
-      val adImpr = adImprStream.toDS().withWatermark("ts", "1 hour")
-      val adClick = adClickStream.toDS().withWatermark("ts", "1 hour")
+    val input2 = MemoryStream[(Timestamp, String, String)]
+    val df2 = input2.toDF
+      .selectExpr("_1 as eventTime", "_2 as id", "_3 as name")
+      .withWatermark(s"eventTime", "4 minutes")
 
-      val stream = adImpr.as("tb1")
-        .join(adClick.as("tb2"),
-          expr("tb1.id == tb2.id AND tb1.ts + interval 5 minutes > tb2.ts"), "leftOuter")
-        .groupBy(window($"tb1.ts", "5 minutes"))
-        .count()
-        .select("window.start", "window.end", "count")
+    val joined = df1.as("left")
+      .join(df2.as("right"),
+        expr("""
+               |left.id = right.id AND left.eventTime BETWEEN
+               |  right.eventTime - INTERVAL 40 seconds AND
+               |  right.eventTime + INTERVAL 30 seconds
+           """.stripMargin),
+        joinType = "leftOuter")
 
-      testStream(stream)(
-        MultiAddData(
-          (adImprStream, Seq(
-            RecordClass(1, Timestamp.valueOf("2022-01-01 01:30:55.888")),
-            RecordClass(2, Timestamp.valueOf("2022-01-01 03:30:55.888")),
-            RecordClass(4, Timestamp.valueOf("2022-01-01 05:30:55.888")))
-          ),
-          (adClickStream, Seq(
-            RecordClass(1, Timestamp.valueOf("2022-01-01 01:31:55.888")),
-            RecordClass(3, Timestamp.valueOf("2022-01-01 02:40:55.888")),
-            RecordClass(6, Timestamp.valueOf("2022-01-01 05:30:55.888")))
-          )
-        ),
+    val windowAggregation = joined
+      .groupBy(window($"left.eventTime", "30 seconds"))
+      .agg(count("*").as("cnt"))
+      .selectExpr("window.start AS window_start", "window.end AS window_end", "cnt")
 
-        // FIXME: explain...
+    testStream(windowAggregation)(
+      MultiAddData(
+        (input1, Seq(
+          (Timestamp.valueOf("2020-01-01 00:00:00"), "abc", "has no join partner"),
+          (Timestamp.valueOf("2020-01-02 00:00:00"), "abc", "joined with A"),
+          (Timestamp.valueOf("2020-01-02 01:00:00"), "abc", "joined with B"))),
+        (input2, Seq(
+          (Timestamp.valueOf("2020-01-02 00:00:10"), "abc", "A"),
+          (Timestamp.valueOf("2020-01-02 00:59:59"), "abc", "B"),
+          (Timestamp.valueOf("2020-01-02 02:00:00"), "abc", "C")))
+      ),
 
-        CheckNewAnswer(
-          (Timestamp.valueOf("2022-01-01 01:30:00"), Timestamp.valueOf("2022-01-01 01:35:00"), 1),
-          (Timestamp.valueOf("2022-01-01 03:30:00"), Timestamp.valueOf("2022-01-01 03:35:00"), 1)
-        )
+      // < data batch >
+      // global watermark (0, 0)
+      // op1 (join)
+      // -- IW (0, 0)
+      // -- OW 0
+      // -- result
+      // (Timestamp.valueOf("2020-01-02 00:00:00"), "abc", "joined with A",
+      //  Timestamp.valueOf("2020-01-02 00:00:10"), "abc", "A")
+      // (Timestamp.valueOf("2020-01-02 01:00:00"), "abc", "joined with B",
+      //  Timestamp.valueOf("2020-01-02 00:59:59"), "abc", "B")
+      // op2 (aggregation)
+      // -- IW (0, 0)
+      // -- OW 0
+      // -- state row
+      // (Timestamp.valueOf("2020-01-02 00:00:00"), Timestamp.valueOf("2020-01-02 00:00:30"), 1)
+      // (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
 
-        // FIXME: check the join & aggregation nodes and see the watermark for
-        //  filtering vs eviction
-      )
-    }
+      // -- watermark calculation
+      // watermark in left input: 2020-01-02 00:58:00
+      // watermark in right input: 2020-01-02 01:56:00
+      // origin watermark: 2020-01-02 00:58:00
+
+      // < no-data batch >
+      // global watermark (0, 2020-01-02 00:58:00)
+      // op1 (join)
+      // -- IW (0, 2020-01-02 00:58:00)
+      // -- OW 2020-01-02 00:57:19.999999
+      // -- result (eviction)
+      // (Timestamp.valueOf("2020-01-01 00:00:00"), "abc", "has no join partner",
+      //  null, null, null)
+      // op2 (aggregation)
+      // -- IW (0, 2020-01-02 00:57:19.999999)
+      // -- OW 2020-01-02 00:57:19.999999
+      // -- state row
+      // (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
+      // -- result
+      // (Timestamp.valueOf("2020-01-01 00:00:00"), Timestamp.valueOf("2020-01-01 00:00:30"), 1)
+      // (Timestamp.valueOf("2020-01-02 00:00:00"), Timestamp.valueOf("2020-01-02 00:00:30"), 1)
+
+      CheckNewAnswer(
+        (Timestamp.valueOf("2020-01-01 00:00:00"), Timestamp.valueOf("2020-01-01 00:00:30"), 1),
+        (Timestamp.valueOf("2020-01-02 00:00:00"), Timestamp.valueOf("2020-01-02 00:00:30"), 1)
+      ),
+
+      Execute { query =>
+        val lastExecution = query.lastExecution
+        val joinOperator = lastExecution.executedPlan.collect {
+          case j: StreamingSymmetricHashJoinExec => j
+        }.head
+        val aggSaveOperator = lastExecution.executedPlan.collect {
+          case j: StateStoreSaveExec => j
+        }.head
+
+        assert(joinOperator.eventTimeWatermarkForLateEvents === Some(0))
+        assert(joinOperator.eventTimeWatermarkForEviction ===
+          Some(Timestamp.valueOf("2020-01-02 00:58:00").getTime))
+
+        assert(aggSaveOperator.eventTimeWatermarkForLateEvents === Some(0))
+        assert(aggSaveOperator.eventTimeWatermarkForEviction ===
+          Some(Timestamp.valueOf("2020-01-02 00:57:20").getTime - 1))
+      },
+
+      MultiAddData(
+        (input1, Seq((Timestamp.valueOf("2020-01-05 00:00:00"), "abc", "joined with D"))),
+        (input2, Seq((Timestamp.valueOf("2020-01-05 00:00:10"), "abc", "D")))
+      ),
+
+      // < data batch >
+      // global watermark (2020-01-02 00:58:00, 2020-01-02 00:58:00)
+      // op1 (join)
+      // -- IW (2020-01-02 00:58:00, 2020-01-02 00:58:00)
+      // -- OW 2020-01-02 00:57:19.999999
+      // -- result
+      // (Timestamp.valueOf("2020-01-05 00:00:00"), "abc", "joined with D",
+      //  Timestamp.valueOf("2020-01-05 00:00:10"), "abc", "D")
+      // op2 (aggregation)
+      // -- IW (2020-01-02 00:57:19.999999, 2020-01-02 00:57:19.999999)
+      // -- OW 2020-01-02 00:57:19.999999
+      // -- state row
+      // (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
+      // (Timestamp.valueOf("2020-01-05 00:00:00"), Timestamp.valueOf("2020-01-05 01:00:30"), 1)
+
+      // - watermark calculation
+      // watermark in left input: 2020-01-04 23:58:00
+      // watermark in right input: 2020-01-04 23:56:10
+      // origin watermark: 2020-01-04 23:56:10
+
+      // < no-data batch >
+      // global watermark (2020-01-02 00:58:00, 2020-01-04 23:56:10)
+      // op1 (join)
+      // -- IW (2020-01-02 00:58:00, 2020-01-04 23:56:10)
+      // -- OW 2020-01-04 23:55:29.999999
+      // -- result
+      // None
+      // op2 (aggregation)
+      // -- IW (2020-01-02 00:57:19.999999, 2020-01-04 23:55:29.999999)
+      // -- OW 2020-01-04 23:55:29.999999
+      // -- result
+      // (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
+      // -- state row
+      // (Timestamp.valueOf("2020-01-05 00:00:00"), Timestamp.valueOf("2020-01-05 01:00:30"), 1)
+
+      CheckNewAnswer(
+        (Timestamp.valueOf("2020-01-02 01:00:00"), Timestamp.valueOf("2020-01-02 01:00:30"), 1)
+      ),
+
+      Execute { query =>
+        val lastExecution = query.lastExecution
+        val joinOperator = lastExecution.executedPlan.collect {
+          case j: StreamingSymmetricHashJoinExec => j
+        }.head
+        val aggSaveOperator = lastExecution.executedPlan.collect {
+          case j: StateStoreSaveExec => j
+        }.head
+
+        assert(joinOperator.eventTimeWatermarkForLateEvents ===
+          Some(Timestamp.valueOf("2020-01-02 00:58:00").getTime))
+        assert(joinOperator.eventTimeWatermarkForEviction ===
+          Some(Timestamp.valueOf("2020-01-04 23:56:10").getTime))
+
+        assert(aggSaveOperator.eventTimeWatermarkForLateEvents ===
+          Some(Timestamp.valueOf("2020-01-02 00:57:20").getTime - 1))
+        assert(aggSaveOperator.eventTimeWatermarkForEviction ===
+          Some(Timestamp.valueOf("2020-01-04 23:55:30").getTime - 1))
+      }
+    )
   }
 
   private def assertNumStateRows(numTotalRows: Seq[Long]): AssertOnQuery = AssertOnQuery { q =>
