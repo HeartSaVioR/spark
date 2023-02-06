@@ -897,7 +897,3 @@ class MultiStatefulOperatorsSuite
     true
   }
 }
-
-object MultiStatefulOperatorsSuite {
-  final case class RecordClass(id: Integer, ts: Timestamp)
-}
