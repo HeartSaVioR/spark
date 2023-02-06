@@ -30,13 +30,15 @@ import org.apache.spark.util.Utils
 
 trait WatermarkPropagator {
   def propagate(batchId: Long, plan: SparkPlan, originWatermark: Long): Unit
-  def getInputWatermark(batchId: Long, stateOpId: Long): Long
+  def getInputWatermarkForLateEvents(batchId: Long, stateOpId: Long): Long
+  def getInputWatermarkForEviction(batchId: Long, stateOpId: Long): Long
   def purge(batchId: Long): Unit
 }
 
 class NoOpWatermarkPropagator extends WatermarkPropagator {
   def propagate(batchId: Long, plan: SparkPlan, originWatermark: Long): Unit = {}
-  def getInputWatermark(batchId: Long, stateOpId: Long): Long = Long.MinValue
+  def getInputWatermarkForLateEvents(batchId: Long, stateOpId: Long): Long = Long.MinValue
+  def getInputWatermarkForEviction(batchId: Long, stateOpId: Long): Long = Long.MinValue
   def purge(batchId: Long): Unit = {}
 }
 
@@ -56,10 +58,16 @@ class UseSingleWatermarkPropagator extends WatermarkPropagator {
     }
   }
 
-  override def getInputWatermark(batchId: Long, stateOpId: Long): Long = {
+  private def getInputWatermark(batchId: Long, stateOpId: Long): Long = {
     assert(isInitialized(batchId), s"Watermark for batch ID $batchId is not yet set!")
     batchIdToWatermark.get(batchId)
   }
+
+  def getInputWatermarkForLateEvents(batchId: Long, stateOpId: Long): Long =
+    getInputWatermark(batchId, stateOpId)
+
+  def getInputWatermarkForEviction(batchId: Long, stateOpId: Long): Long =
+    getInputWatermark(batchId, stateOpId)
 
   override def purge(batchId: Long): Unit = {
     val keyIter = batchIdToWatermark.keySet().iterator()
@@ -108,8 +116,8 @@ class PropagateWatermarkSimulator extends WatermarkPropagator with Logging {
         val inputWatermarks = getInputWatermarks(node, nodeToOutputWatermark)
         if (inputWatermarks.nonEmpty) {
           throw new AnalysisException("Redefining watermark is disallowed. You can set the " +
-            s"config '${SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE}' to 'false' to restore the " +
-            "previous behavior. Note that multiple stateful operators will be disallowed.")
+            s"config '${SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE.key}' to 'false' to restore " +
+            "the previous behavior. Note that multiple stateful operators will be disallowed.")
         }
 
         nodeToOutputWatermark.put(node.id, originWatermark)
@@ -167,7 +175,7 @@ class PropagateWatermarkSimulator extends WatermarkPropagator with Logging {
     }
   }
 
-  override def getInputWatermark(batchId: Long, stateOpId: Long): Long = {
+  private def getInputWatermark(batchId: Long, stateOpId: Long): Long = {
     assert(isInitialized(batchId), s"Watermark for batch ID $batchId is not yet set!")
     // In current Spark's logic, event time watermark cannot go down to negative. So even there is
     // no input watermark for operator, the final input watermark for operator should be 0L.
@@ -176,6 +184,12 @@ class PropagateWatermarkSimulator extends WatermarkPropagator with Logging {
       "not yet set!")
     Math.max(opWatermark.get, 0L)
   }
+
+  override def getInputWatermarkForLateEvents(batchId: Long, stateOpId: Long): Long =
+    getInputWatermark(batchId - 1, stateOpId)
+
+  override def getInputWatermarkForEviction(batchId: Long, stateOpId: Long): Long =
+    getInputWatermark(batchId, stateOpId)
 
   override def purge(batchId: Long): Unit = {
     val keyIter = batchIdToWatermark.keySet().iterator()

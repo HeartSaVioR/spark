@@ -114,19 +114,6 @@ class IncrementalExecution(
       numStateStores)
   }
 
-  // Watermarks to use for late record filtering and state eviction in stateful operators.
-  // Using the previous watermark for late record filtering is a Spark behavior change so we allow
-  // this to be disabled. Note that this also disables propagation of watermark as well - all
-  // stateful operators will use the same watermark.
-  val eventTimeWatermarkForEviction = offsetSeqMetadata.batchWatermarkMs
-  val eventTimeWatermarkForLateEvents =
-    if (sparkSession.conf.get(SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE)) {
-      prevOffsetSeqMetadata.getOrElse(offsetSeqMetadata).batchWatermarkMs
-    } else {
-      assert(watermarkPropagator.isInstanceOf[UseSingleWatermarkPropagator])
-      eventTimeWatermarkForEviction
-    }
-
   /** Locates save/restore pairs surrounding aggregation. */
   val shufflePartitionsRule = new Rule[SparkPlan] {
     override def apply(plan: SparkPlan): SparkPlan = plan transform {
@@ -270,14 +257,20 @@ class IncrementalExecution(
 
   val watermarkPropagationRule = new Rule[SparkPlan] {
     private def simulateWatermarkPropagation(plan: SparkPlan): Unit = {
-      watermarkPropagator.propagate(currentBatchId - 1, plan, eventTimeWatermarkForLateEvents)
-      watermarkPropagator.propagate(currentBatchId, plan, eventTimeWatermarkForEviction)
+      val watermarkForPrevBatch = prevOffsetSeqMetadata.map(_.batchWatermarkMs).getOrElse(0L)
+      val watermarkForCurrBatch = offsetSeqMetadata.batchWatermarkMs
+
+      watermarkPropagator.propagate(currentBatchId - 1, plan, watermarkForPrevBatch)
+      watermarkPropagator.propagate(currentBatchId, plan, watermarkForCurrBatch)
     }
 
-    private def inputWatermark(
-        batchId: Long,
-        stateInfo: StatefulOperatorStateInfo): Option[Long] = {
-      Some(watermarkPropagator.getInputWatermark(batchId, stateInfo.operatorId))
+    private def inputWatermarkForLateEvents(stateInfo: StatefulOperatorStateInfo): Option[Long] = {
+      Some(watermarkPropagator.getInputWatermarkForLateEvents(currentBatchId,
+        stateInfo.operatorId))
+    }
+
+    private def inputWatermarkForEviction(stateInfo: StatefulOperatorStateInfo): Option[Long] = {
+      Some(watermarkPropagator.getInputWatermarkForEviction(currentBatchId, stateInfo.operatorId))
     }
 
     override def apply(plan: SparkPlan): SparkPlan = {
@@ -285,50 +278,50 @@ class IncrementalExecution(
       plan transform {
         case s: StateStoreSaveExec if s.stateInfo.isDefined =>
           s.copy(
-            eventTimeWatermarkForLateEvents = inputWatermark(currentBatchId - 1, s.stateInfo.get),
-            eventTimeWatermarkForEviction = inputWatermark(currentBatchId, s.stateInfo.get)
+            eventTimeWatermarkForLateEvents = inputWatermarkForLateEvents(s.stateInfo.get),
+            eventTimeWatermarkForEviction = inputWatermarkForEviction(s.stateInfo.get)
           )
 
         case s: SessionWindowStateStoreSaveExec if s.stateInfo.isDefined =>
           s.copy(
-            eventTimeWatermarkForLateEvents = inputWatermark(currentBatchId - 1, s.stateInfo.get),
-            eventTimeWatermarkForEviction = inputWatermark(currentBatchId, s.stateInfo.get)
+            eventTimeWatermarkForLateEvents = inputWatermarkForLateEvents(s.stateInfo.get),
+            eventTimeWatermarkForEviction = inputWatermarkForEviction(s.stateInfo.get)
           )
 
         case s: SessionWindowStateStoreRestoreExec if s.stateInfo.isDefined =>
           s.copy(
-            eventTimeWatermarkForLateEvents = inputWatermark(currentBatchId - 1, s.stateInfo.get),
-            eventTimeWatermarkForEviction = inputWatermark(currentBatchId, s.stateInfo.get)
+            eventTimeWatermarkForLateEvents = inputWatermarkForLateEvents(s.stateInfo.get),
+            eventTimeWatermarkForEviction = inputWatermarkForEviction(s.stateInfo.get)
           )
 
         case s: StreamingDeduplicateExec if s.stateInfo.isDefined =>
           s.copy(
-            eventTimeWatermarkForLateEvents = inputWatermark(currentBatchId - 1, s.stateInfo.get),
-            eventTimeWatermarkForEviction = inputWatermark(currentBatchId, s.stateInfo.get)
+            eventTimeWatermarkForLateEvents = inputWatermarkForLateEvents(s.stateInfo.get),
+            eventTimeWatermarkForEviction = inputWatermarkForEviction(s.stateInfo.get)
           )
 
         case m: FlatMapGroupsWithStateExec if m.stateInfo.isDefined =>
           m.copy(
-            eventTimeWatermarkForLateEvents = inputWatermark(currentBatchId - 1, m.stateInfo.get),
-            eventTimeWatermarkForEviction = inputWatermark(currentBatchId, m.stateInfo.get)
+            eventTimeWatermarkForLateEvents = inputWatermarkForLateEvents(m.stateInfo.get),
+            eventTimeWatermarkForEviction = inputWatermarkForEviction(m.stateInfo.get)
           )
 
         case m: FlatMapGroupsInPandasWithStateExec if m.stateInfo.isDefined =>
           m.copy(
-            eventTimeWatermarkForLateEvents = inputWatermark(currentBatchId - 1, m.stateInfo.get),
-            eventTimeWatermarkForEviction = inputWatermark(currentBatchId, m.stateInfo.get)
+            eventTimeWatermarkForLateEvents = inputWatermarkForLateEvents(m.stateInfo.get),
+            eventTimeWatermarkForEviction = inputWatermarkForEviction(m.stateInfo.get)
           )
 
         case j: StreamingSymmetricHashJoinExec =>
-          val inputWatermarkForLateEvents = inputWatermark(currentBatchId - 1, j.stateInfo.get)
-          val inputWatermarkForEviction = inputWatermark(currentBatchId, j.stateInfo.get)
+          val iwLateEvents = inputWatermarkForLateEvents(j.stateInfo.get)
+          val iwEviction = inputWatermarkForEviction(j.stateInfo.get)
           j.copy(
-            eventTimeWatermarkForLateEvents = inputWatermarkForLateEvents,
-            eventTimeWatermarkForEviction = inputWatermarkForEviction,
+            eventTimeWatermarkForLateEvents = iwLateEvents,
+            eventTimeWatermarkForEviction = iwEviction,
             stateWatermarkPredicates =
               StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
                 j.left.output, j.right.output, j.leftKeys, j.rightKeys, j.condition.full,
-                inputWatermarkForEviction)
+                iwEviction)
           )
       }
     }
@@ -350,7 +343,8 @@ class IncrementalExecution(
     watermarkPropagator.propagate(tentativeBatchId, executedPlan, newMetadata.batchWatermarkMs)
     executedPlan.collect {
       case p: StateStoreWriter => p.shouldRunAnotherBatch(
-        watermarkPropagator.getInputWatermark(tentativeBatchId, p.stateInfo.get.operatorId))
+        watermarkPropagator.getInputWatermarkForEviction(tentativeBatchId,
+          p.stateInfo.get.operatorId))
     }.exists(_ == true)
   }
 }
