@@ -123,6 +123,8 @@ class PropagateWatermarkSimulator extends WatermarkPropagator with Logging {
         val finalInputWatermarkMs = if (inputWatermarks.nonEmpty) {
           inputWatermarks.min
         } else {
+          // We can't throw exception here, as we allow stateful operator to process without
+          // watermark. E.g. streaming aggregation with update/complete mode.
           DEFAULT_WATERMARK_MS
         }
 

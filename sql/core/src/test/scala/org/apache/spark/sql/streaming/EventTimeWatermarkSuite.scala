@@ -548,17 +548,26 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
     assert(e.getMessage contains "should not be negative.")
   }
 
+  // This is not allowed in full streaming query by default - WatermarkPropagator will throw an
+  // exception. We keep the logic here because we also maintain the compatibility flag. (See
+  // SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE for details.)
+  // TODO: Remove this test once we remove the compatibility flag.
   test("the new watermark should override the old one") {
-    val df = MemoryStream[(Long, Long)].toDF()
-      .withColumn("first", timestamp_seconds($"_1"))
-      .withColumn("second", timestamp_seconds($"_2"))
-      .withWatermark("first", "1 minute")
-      .withWatermark("second", "2 minutes")
+    // This test does not throw an exception even if we don't set the compatibility flag, as Spark
+    // throws an exception from WatermarkPropagator and this test does not run the query. Setting
+    // the compatibility flag here to make the test more natural.
+    withSQLConf(SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE.key -> "false") {
+      val df = MemoryStream[(Long, Long)].toDF()
+        .withColumn("first", timestamp_seconds($"_1"))
+        .withColumn("second", timestamp_seconds($"_2"))
+        .withWatermark("first", "1 minute")
+        .withWatermark("second", "2 minutes")
 
-    val eventTimeColumns = df.logicalPlan.output
-      .filter(_.metadata.contains(EventTimeWatermark.delayKey))
-    assert(eventTimeColumns.size === 1)
-    assert(eventTimeColumns(0).name === "second")
+      val eventTimeColumns = df.logicalPlan.output
+        .filter(_.metadata.contains(EventTimeWatermark.delayKey))
+      assert(eventTimeColumns.size === 1)
+      assert(eventTimeColumns(0).name === "second")
+    }
   }
 
   test("EventTime watermark should be ignored in batch query.") {
