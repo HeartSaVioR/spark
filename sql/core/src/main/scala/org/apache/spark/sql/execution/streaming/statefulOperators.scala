@@ -330,11 +330,16 @@ object WatermarkSupport {
 
   def findEventTimeColumn(attrs: Seq[Attribute]): Option[Attribute] = {
     val eventTimeCols = attrs.filter(_.metadata.contains(EventTimeWatermark.delayKey))
-    if (eventTimeCols.size > 1) {
+    // There is a case projection leads the same column (same exprId) to appear more than one time.
+    // Allowing them does not hurt the correctness of state row eviction, hence let's start with
+    // allowing them.
+    val eventTimeColsSet = eventTimeCols.map(_.exprId).toSet
+    if (eventTimeColsSet.size > 1) {
       throw new AnalysisException("More than one event time columns are available. Please " +
         "ensure there is at most one event time column per stream. event time columns: " +
         eventTimeCols.mkString("(", ",", ")"))
     }
+    // With above check, even there are multiple columns here, all columns must be same.
     eventTimeCols.headOption
   }
 }

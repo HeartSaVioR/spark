@@ -48,7 +48,9 @@ class UseSingleWatermarkPropagator extends WatermarkPropagator {
   private def isInitialized(batchId: Long): Boolean = batchIdToWatermark.containsKey(batchId)
 
   override def propagate(batchId: Long, plan: SparkPlan, originWatermark: Long): Unit = {
-    if (isInitialized(batchId)) {
+    if (batchId < 0) {
+      // no-op
+    } else if (isInitialized(batchId)) {
       val cached = batchIdToWatermark.get(batchId)
       assert(cached == originWatermark,
         s"Watermark has been changed for the same batch ID! Batch ID: $batchId, " +
@@ -59,8 +61,12 @@ class UseSingleWatermarkPropagator extends WatermarkPropagator {
   }
 
   private def getInputWatermark(batchId: Long, stateOpId: Long): Long = {
-    assert(isInitialized(batchId), s"Watermark for batch ID $batchId is not yet set!")
-    batchIdToWatermark.get(batchId)
+    if (batchId < 0) {
+      0
+    } else {
+      assert(isInitialized(batchId), s"Watermark for batch ID $batchId is not yet set!")
+      batchIdToWatermark.get(batchId)
+    }
   }
 
   def getInputWatermarkForLateEvents(batchId: Long, stateOpId: Long): Long =
@@ -163,7 +169,9 @@ class PropagateWatermarkSimulator extends WatermarkPropagator with Logging {
   }
 
   override def propagate(batchId: Long, plan: SparkPlan, originWatermark: Long): Unit = {
-    if (isInitialized(batchId)) {
+    if (batchId < 0) {
+      // no-op
+    } else if (isInitialized(batchId)) {
       val cached = batchIdToWatermark.get(batchId)
       assert(cached == originWatermark,
         s"Watermark has been changed for the same batch ID! Batch ID: $batchId, " +
@@ -176,13 +184,17 @@ class PropagateWatermarkSimulator extends WatermarkPropagator with Logging {
   }
 
   private def getInputWatermark(batchId: Long, stateOpId: Long): Long = {
-    assert(isInitialized(batchId), s"Watermark for batch ID $batchId is not yet set!")
-    // In current Spark's logic, event time watermark cannot go down to negative. So even there is
-    // no input watermark for operator, the final input watermark for operator should be 0L.
-    val opWatermark = inputWatermarks(batchId).get(stateOpId)
-    assert(opWatermark.isDefined, s"Watermark for batch ID $batchId and stateOpId $stateOpId is " +
-      "not yet set!")
-    Math.max(opWatermark.get, 0L)
+    if (batchId < 0) {
+      0
+    } else {
+      assert(isInitialized(batchId), s"Watermark for batch ID $batchId is not yet set!")
+      // In current Spark's logic, event time watermark cannot go down to negative. So even there is
+      // no input watermark for operator, the final input watermark for operator should be 0L.
+      val opWatermark = inputWatermarks(batchId).get(stateOpId)
+      assert(opWatermark.isDefined, s"Watermark for batch ID $batchId and stateOpId $stateOpId " +
+        "is not yet set!")
+      Math.max(opWatermark.get, 0L)
+    }
   }
 
   override def getInputWatermarkForLateEvents(batchId: Long, stateOpId: Long): Long =
