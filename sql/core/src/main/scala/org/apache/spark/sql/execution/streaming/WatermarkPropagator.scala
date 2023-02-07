@@ -134,6 +134,9 @@ class UseSingleWatermarkPropagator extends WatermarkPropagator {
  *   -- stateless nodes: same as input watermark
  *   -- stateful nodes: the return value of `op.produceWatermark(input watermark)`
  *
+ * NOTE: this implementation will throw an exception if watermark node sees a valid input watermark
+ * from children, meaning that we do not support re-definition of watermark.
+ *
  * Once the algorithm traverses the physical plan tree, the association between stateful operator
  * and input watermark will be constructed. Spark will request the input watermark for specific
  * stateful operator, which this implementation will give the value from the association.
