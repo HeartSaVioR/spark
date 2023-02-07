@@ -28,13 +28,34 @@ import org.apache.spark.sql.execution.streaming.WatermarkPropagator.DEFAULT_WATE
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.Utils
 
+/** Interface for propagating watermark. */
 trait WatermarkPropagator {
+  /**
+   * Request to propagate watermark among operators based on origin watermark value. The result
+   * should be input watermark per stateful operator, which Spark will request the value by calling
+   * getInputWatermarkXXX with operator ID.
+   *
+   * It is recommended for implementation to cache the result, as Spark can request the propagation
+   * multiple times with the same batch ID and origin watermark value.
+   */
   def propagate(batchId: Long, plan: SparkPlan, originWatermark: Long): Unit
+
+  /** Provide the calculated input watermark for late events for given stateful operator. */
   def getInputWatermarkForLateEvents(batchId: Long, stateOpId: Long): Long
+
+  /** Provide the calculated input watermark for eviction for given stateful operator. */
   def getInputWatermarkForEviction(batchId: Long, stateOpId: Long): Long
+
+  /**
+   * Request to clean up cached result on propagation. Spark will call this method when the given
+   * batch ID will be likely to be not re-executed.
+   */
   def purge(batchId: Long): Unit
 }
 
+/**
+ * Do nothing. This is dummy implementation to help creating a dummy IncrementalExecution instance.
+ */
 class NoOpWatermarkPropagator extends WatermarkPropagator {
   def propagate(batchId: Long, plan: SparkPlan, originWatermark: Long): Unit = {}
   def getInputWatermarkForLateEvents(batchId: Long, stateOpId: Long): Long = Long.MinValue
@@ -42,6 +63,12 @@ class NoOpWatermarkPropagator extends WatermarkPropagator {
   def purge(batchId: Long): Unit = {}
 }
 
+/**
+ * This implementation uses a single global watermark for late events and eviction.
+ *
+ * This implementation provides the behavior before Structured Streaming supports multiple stateful
+ * operators. (prior to SPARK-40925) This is only used for compatibility mode.
+ */
 class UseSingleWatermarkPropagator extends WatermarkPropagator {
   private val batchIdToWatermark: jutil.TreeMap[Long, Long] = new jutil.TreeMap[Long, Long]()
 
@@ -89,6 +116,28 @@ class UseSingleWatermarkPropagator extends WatermarkPropagator {
   }
 }
 
+/**
+ * This implementation simulates propagation of watermark among operators.
+ *
+ * The high-level explanation of propagating watermark is following:
+ *
+ * The algorithm traverses the physical plan tree via post-order (children first). For each node,
+ * below logic is applied:
+ *
+ * - Input watermark is decided by `min(input watermarks from all children)`.
+ *   -- Children providing no input watermark (DEFAULT_WATERMARK_MS) are excluded.
+ *   -- If there is no valid input watermark from children, input watermark = DEFAULT_WATERMARK_MS.
+ * - Output watermark is decided as following:
+ *   -- watermark nodes: origin watermark value
+ *      This could be individual origin watermark value, but we decide to retain global watermark
+ *      to keep the watermark model be simple.
+ *   -- stateless nodes: same as input watermark
+ *   -- stateful nodes: the return value of `op.produceWatermark(input watermark)`
+ *
+ * Once the algorithm traverses the physical plan tree, the association between stateful operator
+ * and input watermark will be constructed. Spark will request the input watermark for specific
+ * stateful operator, which this implementation will give the value from the association.
+ */
 class PropagateWatermarkSimulator extends WatermarkPropagator with Logging {
   private val batchIdToWatermark: jutil.TreeMap[Long, Long] = new jutil.TreeMap[Long, Long]()
   private val inputWatermarks: mutable.Map[Long, Map[Long, Long]] =

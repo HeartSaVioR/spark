@@ -260,7 +260,9 @@ class IncrementalExecution(
       val watermarkForPrevBatch = prevOffsetSeqMetadata.map(_.batchWatermarkMs).getOrElse(0L)
       val watermarkForCurrBatch = offsetSeqMetadata.batchWatermarkMs
 
+      // This is to simulate watermark propagation for late events.
       watermarkPropagator.propagate(currentBatchId - 1, plan, watermarkForPrevBatch)
+      // This is to simulate watermark propagation for eviction.
       watermarkPropagator.propagate(currentBatchId, plan, watermarkForCurrBatch)
     }
 

@@ -97,7 +97,19 @@ trait StateStoreReader extends StatefulOperator {
 /** An operator that writes to a StateStore. */
 trait StateStoreWriter extends StatefulOperator with PythonSQLMetrics { self: SparkPlan =>
 
-  def produceWatermark(minInputWatermarkMs: Long): Long
+  /**
+   * Produce the output watermark for given input watermark (ms).
+   *
+   * In most cases, this is same as the criteria of state eviction, as most stateful operators
+   * produce the output from two different kinds:
+   *
+   * 1. without buffering
+   * 2. with buffering (state)
+   *
+   * The state eviction happens when event time exceeds a "certain threshold of timestamp", which
+   * denotes a lower bound of event time values for output (output watermark).
+   */
+  def produceWatermark(inputWatermarkMs: Long): Long
 
   override lazy val metrics = statefulOperatorCustomMetrics ++ Map(
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
@@ -574,7 +586,7 @@ case class StateStoreSaveExec(
 
   // This operator will evict based on min input watermark and ensure it will be minimum of
   // the event time value for the output so far (including output from eviction).
-  override def produceWatermark(minInputWatermarkMs: Long): Long = minInputWatermarkMs
+  override def produceWatermark(inputWatermarkMs: Long): Long = inputWatermarkMs
 }
 
 /**
@@ -834,7 +846,7 @@ case class SessionWindowStateStoreSaveExec(
 
   // This operator will evict based on min input watermark and ensure it will be minimum of
   // the event time value for the output so far (including output from eviction).
-  override def produceWatermark(minInputWatermarkMs: Long): Long = minInputWatermarkMs
+  override def produceWatermark(inputWatermarkMs: Long): Long = inputWatermarkMs
 }
 
 
@@ -929,7 +941,7 @@ case class StreamingDeduplicateExec(
 
   // This operator will evict based on min input watermark and ensure it will be minimum of
   // the event time value for the output so far (including output from eviction).
-  override def produceWatermark(minInputWatermarkMs: Long): Long = minInputWatermarkMs
+  override def produceWatermark(inputWatermarkMs: Long): Long = inputWatermarkMs
 }
 
 object StreamingDeduplicateExec {
