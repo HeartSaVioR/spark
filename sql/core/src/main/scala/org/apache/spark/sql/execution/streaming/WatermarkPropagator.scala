@@ -119,23 +119,24 @@ class UseSingleWatermarkPropagator extends WatermarkPropagator {
 /**
  * This implementation simulates propagation of watermark among operators.
  *
- * The high-level explanation of propagating watermark is following:
+ * The simulation algorithm traverses the physical plan tree via post-order (children first) to
+ * calculate (input watermark, output watermark) for all nodes.
  *
- * The algorithm traverses the physical plan tree via post-order (children first). For each node,
- * below logic is applied:
+ * For each node, below logic is applied:
  *
- * - Input watermark is decided by `min(input watermarks from all children)`.
+ * - Input watermark for specific node is decided by `min(input watermarks from all children)`.
  *   -- Children providing no input watermark (DEFAULT_WATERMARK_MS) are excluded.
  *   -- If there is no valid input watermark from children, input watermark = DEFAULT_WATERMARK_MS.
- * - Output watermark is decided as following:
+ * - Output watermark for specific node is decided as following:
  *   -- watermark nodes: origin watermark value
  *      This could be individual origin watermark value, but we decide to retain global watermark
  *      to keep the watermark model be simple.
  *   -- stateless nodes: same as input watermark
- *   -- stateful nodes: the return value of `op.produceWatermark(input watermark)`
+ *   -- stateful nodes: the return value of `op.produceWatermark(input watermark)`.
+ *      @see [[StateStoreWriter.produceWatermark]]
  *
- * NOTE: this implementation will throw an exception if watermark node sees a valid input watermark
- * from children, meaning that we do not support re-definition of watermark.
+ * Note that this implementation will throw an exception if watermark node sees a valid input
+ * watermark from children, meaning that we do not support re-definition of watermark.
  *
  * Once the algorithm traverses the physical plan tree, the association between stateful operator
  * and input watermark will be constructed. Spark will request the input watermark for specific
