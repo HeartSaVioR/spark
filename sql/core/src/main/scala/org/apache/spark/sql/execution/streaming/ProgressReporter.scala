@@ -210,14 +210,17 @@ class ProgressReporter(private val queryProperties: StreamingQueryProperties)
     currentStatus = currentStatus.copy(message = message)
   }
 
+  /** Updates the activity of trigger in `status`. */
   def updateTriggerActive(activated: Boolean): Unit = statusLock.synchronized {
     currentStatus = currentStatus.copy(isTriggerActive = activated)
   }
 
+  /** Updates the availability of the new data in `status`. */
   def updateNewDataAvailability(newDataAvailable: Boolean): Unit = statusLock.synchronized {
     currentStatus = currentStatus.copy(isDataAvailable = newDataAvailable)
   }
 
+  /** Posts the query started event to the listeners. */
   def postQueryStarted(): Unit = {
     val startTimestamp = queryProperties.triggerClock.getTimeMillis()
     postEvent(new QueryStartedEvent(
@@ -225,6 +228,7 @@ class ProgressReporter(private val queryProperties: StreamingQueryProperties)
       formatTimestamp(startTimestamp)))
   }
 
+  /** Posts the query terminated event to the listeners. */
   def postQueryTerminated(exception: Option[StreamingQueryException]): Unit = {
     statusLock.synchronized {
       currentStatus = currentStatus.copy(isTriggerActive = false,
@@ -352,6 +356,7 @@ class EpochProgressReportContext(
 
   def processingTimeMillis: Long = currentTriggerEndTimestamp - currentTriggerStartTimestamp
 
+  /** Builds a query progress instance based on tracking. */
   def buildQueryProgress(
       hasNewData: Boolean,
       hasExecuted: Boolean,
@@ -362,6 +367,7 @@ class EpochProgressReportContext(
     buildQueryProgress(hasNewData, hasExecuted, map, lastEpochId)
   }
 
+  /** Builds a query progress instance based on tracking. */
   def buildQueryProgress(
       hasNewData: Boolean,
       hasExecuted: Boolean,
