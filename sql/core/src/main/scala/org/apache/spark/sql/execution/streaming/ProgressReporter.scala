@@ -142,11 +142,11 @@ class ProgressReporter(
   // I doubt it has been working for continuous mode though.
 
   def finishTrigger(
-      triggerContext: EpochProgressReportContext,
+      progressCtx: EpochProgressReportContext,
       hasNewData: Boolean,
       hasExecuted: Boolean,
       lastEpochId: Long): Unit = {
-    finishTrigger(triggerContext, hasNewData, hasExecuted, null, lastEpochId)
+    finishTrigger(progressCtx, hasNewData, hasExecuted, null, lastEpochId)
   }
 
   /**
@@ -158,7 +158,7 @@ class ProgressReporter(
    *                    though the sources don't have any new data.
    */
   def finishTrigger(
-      triggerContext: EpochProgressReportContext,
+      progressCtx: EpochProgressReportContext,
       hasNewData: Boolean,
       hasExecuted: Boolean,
       sourceToNumInputRowsMap: Map[SparkDataStream, Long],
@@ -166,10 +166,10 @@ class ProgressReporter(
     val startProcessingFinishTriggerMillis = queryProperties.triggerClock.getTimeMillis()
 
     val newProgress = if (sourceToNumInputRowsMap != null) {
-      triggerContext.buildQueryProgress(hasNewData, hasExecuted, sourceToNumInputRowsMap,
+      progressCtx.buildQueryProgress(hasNewData, hasExecuted, sourceToNumInputRowsMap,
         lastEpochId)
     } else {
-      triggerContext.buildQueryProgress(hasNewData, hasExecuted, lastEpochId)
+      progressCtx.buildQueryProgress(hasNewData, hasExecuted, lastEpochId)
     }
 
     if (hasExecuted) {
@@ -186,7 +186,7 @@ class ProgressReporter(
 
     // Log a warning message if finishTrigger step takes more time than processing the batch and
     // also longer than min threshold (1 minute).
-    val processingTimeMills = triggerContext.processingTimeMillis
+    val processingTimeMills = progressCtx.processingTimeMillis
     val finishTriggerDurationMillis = queryProperties.triggerClock.getTimeMillis() -
       startProcessingFinishTriggerMillis
     val thresholdForLoggingMillis = 60 * 1000

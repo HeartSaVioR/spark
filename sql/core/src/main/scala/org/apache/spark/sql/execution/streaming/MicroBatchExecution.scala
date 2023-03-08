@@ -767,7 +767,7 @@ class MicroBatchExecution(
    * Called at the start of the micro batch with given offsets. It takes care of offset
    * checkpointing to offset log and any microbatch startup tasks.
    */
-  protected def markMicroBatchStart(triggerContext: EpochProgressReportContext): Unit = {
+  protected def markMicroBatchStart(progressCtx: EpochProgressReportContext): Unit = {
     assert(offsetLog.add(currentBatchId,
       availableOffsets.toOffsetSeq(sources, offsetSeqMetadata)),
       s"Concurrent update to the log. Multiple streaming jobs detected for $currentBatchId")
@@ -779,26 +779,25 @@ class MicroBatchExecution(
    * Method called once after the planning is done and before the start of the microbatch execution.
    * It can be used to perform any pre-execution tasks.
    */
-  protected def markMicroBatchExecutionStart(
-      triggerContext: EpochProgressReportContext): Unit = {}
+  protected def markMicroBatchExecutionStart(progressCtx: EpochProgressReportContext): Unit = {}
 
   /**
    * Method called after the microbatch execution completion. It can be used to perform
    * post-execution tasks.
    */
   protected def markMicroBatchExecutionEnd(
-      triggerContext: EpochProgressReportContext,
+      progressCtx: EpochProgressReportContext,
       batchSinkProgress: Option[StreamWriterCommitProgress]): Unit = {
-    triggerContext.updateSinkCommitProgress(batchSinkProgress)
+    progressCtx.updateSinkCommitProgress(batchSinkProgress)
   }
 
   /**
    * Called after the microbatch has completed execution. It takes care of committing the offset
    * to commit log and other bookkeeping.
    */
-  protected def markMicroBatchEnd(triggerContext: EpochProgressReportContext): Unit = {
+  protected def markMicroBatchEnd(progressCtx: EpochProgressReportContext): Unit = {
     watermarkTracker.updateWatermark(lastExecution.executedPlan)
-    triggerContext.reportTimeTaken("commitOffsets") {
+    progressCtx.reportTimeTaken("commitOffsets") {
       assert(commitLog.add(currentBatchId, CommitMetadata(watermarkTracker.currentWatermark)),
         "Concurrent update to the commit log. Multiple streaming jobs detected for " +
           s"$currentBatchId")
