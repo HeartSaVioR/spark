@@ -18,7 +18,7 @@
 package org.apache.spark.sql.execution.streaming
 
 import java.text.SimpleDateFormat
-import java.util.{Date, Optional, UUID}
+import java.util.{Date, Optional}
 import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.collection.JavaConverters._
@@ -35,7 +35,7 @@ import org.apache.spark.sql.execution.QueryExecution
 import org.apache.spark.sql.execution.datasources.v2.{MicroBatchScanExec, StreamingDataSourceV2Relation, StreamWriterCommitProgress}
 import org.apache.spark.sql.streaming.{SinkProgress, SourceProgress, StateOperatorProgress, StreamingQueryException, StreamingQueryListener, StreamingQueryProgress, StreamingQueryStatus}
 import org.apache.spark.sql.streaming.StreamingQueryListener.{QueryProgressEvent, QueryStartedEvent, QueryTerminatedEvent}
-import org.apache.spark.util.{Clock, Utils}
+import org.apache.spark.util.Utils
 
 /**
  * Responsible for continually reporting statistics about the amount of data processed as well
@@ -120,7 +120,9 @@ class ProgressReporter(
   }
 
   /** Begins recording statistics about query progress for a given trigger. */
-  def startTrigger(initialOffsetSeqMetadata: OffsetSeqMetadata): EpochProgressReportContext = {
+  def startTrigger(
+      initialOffsetSeqMetadata: OffsetSeqMetadata,
+      initialLastExecution: IncrementalExecution): EpochProgressReportContext = {
     logDebug("Starting Trigger Calculation")
 
     assert(queryProperties != null)
@@ -131,6 +133,7 @@ class ProgressReporter(
       lastTriggerStartTimestamp, currentTriggerStartTimestamp, metricWarningLogged)
     lastTriggerStartTimestamp = currentTriggerStartTimestamp
     context.updateOffsetSeqMetadata(initialOffsetSeqMetadata)
+    context.updateLastExecution(initialLastExecution)
     context
   }
 

@@ -191,7 +191,7 @@ class ContinuousExecution(
    * @param sparkSessionForQuery Isolated [[SparkSession]] to run the continuous query with.
    */
   private def runContinuous(sparkSessionForQuery: SparkSession): Unit = {
-    progressCtx = progressReporter.startTrigger(offsetSeqMetadata)
+    progressCtx = progressReporter.startTrigger(offsetSeqMetadata, lastExecution)
 
     val offsets = getStartOffsets()
 
@@ -258,7 +258,7 @@ class ContinuousExecution(
       override def run: Unit = {
         try {
           triggerExecutor.execute(() => {
-            progressCtx = progressReporter.startTrigger(offsetSeqMetadata)
+            progressCtx = progressReporter.startTrigger(offsetSeqMetadata, lastExecution)
 
             if (stream.needsReconfiguration && state.compareAndSet(ACTIVE, RECONFIGURING)) {
               if (queryExecutionThread.isAlive) {

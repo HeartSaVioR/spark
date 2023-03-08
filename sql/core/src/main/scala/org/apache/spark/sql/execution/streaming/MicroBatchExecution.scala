@@ -238,7 +238,7 @@ class MicroBatchExecution(
 
         var currentBatchHasNewData = false // Whether the current batch had new data
 
-        val progressCtx = progressReporter.startTrigger(offsetSeqMetadata)
+        val progressCtx = progressReporter.startTrigger(offsetSeqMetadata, lastExecution)
         progressReporter.updateTriggerActive(activated = true)
 
         progressCtx.reportTimeTaken("triggerExecution") {
@@ -519,6 +519,7 @@ class MicroBatchExecution(
     offsetSeqMetadata = offsetSeqMetadata.copy(
       batchWatermarkMs = watermarkTracker.currentWatermark,
       batchTimestampMs = triggerClock.getTimeMillis())
+    progressCtx.updateOffsetSeqMetadata(offsetSeqMetadata)
 
     // Check whether next batch should be constructed
     val lastExecutionRequiresAnotherBatch = noDataBatchesEnabled &&

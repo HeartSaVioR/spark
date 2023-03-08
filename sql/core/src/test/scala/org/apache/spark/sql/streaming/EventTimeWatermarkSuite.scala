@@ -169,9 +169,6 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
     )
   }
 
-  // FIXME: test is failing... fix it!
-  //   Assert on query failed: AssertEventStats: "1970-01-01T00:00:0[0].000Z"
-  //   did not equal "1970-01-01T00:00:0[5].000Z" watermark value mismatch
   test("event time and watermark metrics with Trigger.Once (SPARK-24699)") {
     // All event time metrics where watermarking is set
     val inputData = MemoryStream[Int]
