@@ -43,6 +43,8 @@ import org.apache.spark.util.Utils
  * and `finishTrigger` at the appropriate times, to track and report statistics for each epoch run.
  * Additionally, the status can updated with `updateStatusMessage` to allow reporting on the
  * streams current state (i.e. "Fetching more data").
+ *
+ * The class is designed as thread-safe, meaning all public methods are thread-safe.
  */
 class ProgressReporter(private val queryProperties: StreamingQueryProperties)
   extends Logging {
@@ -50,9 +52,14 @@ class ProgressReporter(private val queryProperties: StreamingQueryProperties)
   private val sparkSession: SparkSession = queryProperties.sparkSession
 
   // Static properties that do not change once streaming query has been planned
-  private var queryPlanningProperties: StreamingQueryPlanProperties = _
+  @volatile private var queryPlanningProperties: StreamingQueryPlanProperties = _
 
-  // This is guaranteed to be set before calling startTrigger().
+  /**
+   * Sets properties which are available after the initialization of the query. This method is
+   * expected to be called only once. (There would be no concurrent writer.)
+   *
+   * This method should be called before the first call of startTrigger().
+   */
   def setPlanningProperties(planningProperties: StreamingQueryPlanProperties): Unit = {
     queryPlanningProperties = planningProperties
   }
@@ -104,9 +111,10 @@ class ProgressReporter(private val queryProperties: StreamingQueryProperties)
   /**
    * Begins recording statistics about query progress for a given trigger.
    *
-   * This method also gets initial values of some parameters because currently Spark also reports
+   * This method also gets initial values as parameters because currently Spark also reports
    * progress for the trigger which does not actually run the batch, and for the case it looks
    * back for most recent values rather than emptying out all the info.
+   *
    * TODO: How much it has been useful for reporting progress on the trigger which corresponding
    *   batch does not exist (no executed)? Wouldn't it be much clearer if we only report progress
    *   on "executed" batch? Who cares about trigger with no batch execution?
@@ -128,6 +136,14 @@ class ProgressReporter(private val queryProperties: StreamingQueryProperties)
     context
   }
 
+  /**
+   * Finalizes the query progress and adds it to list of recent status updates.
+   *
+   * @param hasNewData Whether the sources of this stream had new data for this trigger.
+   * @param hasExecuted Whether any batch was executed during this trigger. Streaming queries that
+   *                    perform stateful aggregations with timeouts can still run batches even
+   *                    though the sources don't have any new data.
+   */
   def finishTrigger(
       progressCtx: EpochProgressReportContext,
       hasNewData: Boolean,
