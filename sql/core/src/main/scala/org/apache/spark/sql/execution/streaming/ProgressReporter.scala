@@ -116,8 +116,9 @@ class ProgressReporter(private val queryProperties: StreamingQueryProperties)
    * back for most recent values rather than emptying out all the info.
    *
    * TODO: How much it has been useful for reporting progress on the trigger which corresponding
-   *   batch does not exist (no executed)? Wouldn't it be much clearer if we only report progress
-   *   on "executed" batch? Who cares about trigger with no batch execution?
+   *   batch does not exist (no executed) for a while, based on noDataProgressEventInterval?
+   *   Are we leveraging this functionality? Wouldn't it be much clearer if we only report
+   *   progress on "executed" batch?
    */
   def startTrigger(
       initialOffsetSeqMetadata: OffsetSeqMetadata,
