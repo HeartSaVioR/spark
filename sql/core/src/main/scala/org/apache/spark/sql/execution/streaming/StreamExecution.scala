@@ -97,13 +97,13 @@ abstract class StreamExecution(
    * The base logical plan which will be used across batch runs. Once the value is set, it should
    * not be modified.
    */
-  protected def logicalPlan: LogicalPlan
+  protected[sql] def logicalPlan: LogicalPlan
 
   /**
    * The list of stream instances which will be used across batch runs. Once the value is set,
    * it should not be modified.
    */
-  protected def sources: Seq[SparkDataStream]
+  protected[sql] def sources: Seq[SparkDataStream]
 
   /**
    * Tracks how much data we have processed and committed to the sink or state store from each
