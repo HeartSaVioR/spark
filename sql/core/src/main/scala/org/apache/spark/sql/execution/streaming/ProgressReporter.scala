@@ -118,7 +118,8 @@ class ProgressReporter(private val queryProperties: StreamingQueryProperties)
    * TODO: How much it has been useful for reporting progress on the trigger which corresponding
    *   batch does not exist (no executed) for a while, based on noDataProgressEventInterval?
    *   Are we leveraging this functionality? Wouldn't it be much clearer if we only report
-   *   progress on "executed" batch?
+   *   progress on "executed" batch? What about separating out the streaming query listener event
+   *   for "no data progress for a while" and do not produce the information about recent one?
    */
   def startTrigger(
       initialOffsetSeqMetadata: OffsetSeqMetadata,
