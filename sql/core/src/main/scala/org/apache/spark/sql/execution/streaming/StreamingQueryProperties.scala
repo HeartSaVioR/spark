@@ -25,6 +25,7 @@ import org.apache.spark.sql.connector.catalog.Table
 import org.apache.spark.sql.connector.read.streaming.SparkDataStream
 import org.apache.spark.util.Clock
 
+// FIXME: ...TBD...
 case class StreamingQueryProperties(
     id: UUID,
     runId: UUID,
@@ -33,4 +34,5 @@ case class StreamingQueryProperties(
     sparkSession: SparkSession,
     sink: Table)
 
+// FIXME: ...TBD...
 case class StreamingQueryPlanProperties(logicalPlan: LogicalPlan, sources: Seq[SparkDataStream])

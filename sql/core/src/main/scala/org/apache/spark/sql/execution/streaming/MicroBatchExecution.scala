@@ -61,7 +61,7 @@ class MicroBatchExecution(
 
   protected var watermarkTracker: WatermarkTracker = _
 
-  override lazy val logicalPlan: LogicalPlan = {
+  override protected lazy val logicalPlan: LogicalPlan = {
     assert(queryExecutionThread eq Thread.currentThread,
       "logicalPlan must be initialized in QueryExecutionThread " +
         s"but the current thread was ${Thread.currentThread}")

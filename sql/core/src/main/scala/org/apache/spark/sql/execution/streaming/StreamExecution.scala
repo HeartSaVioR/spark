@@ -90,7 +90,10 @@ abstract class StreamExecution(
   private val startLatch = new CountDownLatch(1)
   private val terminationLatch = new CountDownLatch(1)
 
-  def logicalPlan: LogicalPlan
+  // `logicalPlan` and `sources` are being set only once at the initialization and never be
+  // changed. Hence thread-safe.
+  protected def logicalPlan: LogicalPlan
+  protected def sources: Seq[SparkDataStream]
 
   /**
    * Tracks how much data we have processed and committed to the sink or state store from each
@@ -148,9 +151,6 @@ abstract class StreamExecution(
    * The fault-tolerant watermark state is in offsetSeqMetadata.
    */
   protected val watermarkMsMap: MutableMap[Int, Long] = MutableMap()
-
-  // This is being set only once and never be changed, hence thread-safe.
-  protected def sources: Seq[SparkDataStream]
 
   override val id: UUID = UUID.fromString(streamMetadata.id)
 

@@ -49,9 +49,6 @@ class ProgressReporter(
     postEventFn: StreamingQueryListener.Event => Unit)
   extends Logging {
 
-  // Internal state of the stream, required for computing metrics.
-
-  // extracting out fields being used for multiple times
   private val sparkSession: SparkSession = queryProperties.sparkSession
 
   // Static properties that do not change once streaming query has been planned
@@ -61,8 +58,6 @@ class ProgressReporter(
   def setPlanningProperties(planningProperties: StreamingQueryPlanProperties): Unit = {
     queryPlanningProperties = planningProperties
   }
-
-  // Dynamic properties that can change during the execution
 
   // TODO: Restore this from the checkpoint when possible.
   private var lastTriggerStartTimestamp = -1L
@@ -82,38 +77,23 @@ class ProgressReporter(
   private val timestampFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'") // ISO8601
   timestampFormat.setTimeZone(DateTimeUtils.getTimeZone("UTC"))
 
-  // This is being read and written from multiple places:
-  // Read: MicroBatchExecution, ProgressReporter (mostly to copy, but it's also read via `status`)
-  // Write: MicroBatchExecution, ProgressReporter, StreamExecution
-  @volatile
-  private var currentStatus: StreamingQueryStatus = {
+  // FIXME: it's not crystally clear where is the best place for status. Leave this as it is
+  //  till we find a better place.
+  @volatile private var currentStatus: StreamingQueryStatus = {
     new StreamingQueryStatus(
       message = "Initializing StreamExecution",
       isDataAvailable = false,
       isTriggerActive = false)
   }
 
-  // Methods
-
-  // This is exposed in StreamingQuery. Since the path for reading is only for copying, maybe it's
-  // just be better to "update" to the centralized and synchronized field. Maybe, defined in
-  // StreamExecution?
-  // It's still arguable, as finishTrigger also updates the currentStatus. One thins we need to
-  // make clear is, if multiple batches run concurrently which can update the statue individually,
-  // it's not clear "what" is the "current" status. Should we follow the latest batch? What if
-  // there's a failure in batch N while batch N+1 is running?
   /** Returns the current status of the query. */
   def status: StreamingQueryStatus = currentStatus
 
-  // This is exposed in StreamingQuery. Looks valid to handle here, as this class manages report
-  // of StreamingQueryProgress?
   /** Returns an array containing the most recent query progress updates. */
   def recentProgress: Array[StreamingQueryProgress] = progressBuffer.synchronized {
     progressBuffer.toArray
   }
 
-  // This is exposed in StreamingQuery. Looks valid to handle here, as this class manages report
-  // of StreamingQueryProgress?
   /** Returns the most recent query progress update or null if there were no progress updates. */
   def lastProgress: StreamingQueryProgress = progressBuffer.synchronized {
     progressBuffer.lastOption.orNull
@@ -200,8 +180,6 @@ class ProgressReporter(
     updateTriggerActive(activated = false)
   }
 
-  // This is used for StreamExecution/MicroBatchExecution/ContinuousExecution. But the read path
-  // is not here, so maybe wrong fit to be here?
   /** Updates the message returned in `status`. */
   def updateStatusMessage(message: String): Unit = {
     currentStatus = currentStatus.copy(message = message)
@@ -246,8 +224,7 @@ class ProgressReporter(
   }
 }
 
-// FIXME: should this need to have the context for previous epoch, in case of no data &
-//  no execution?
+// FIXME: ...TBD...
 class EpochProgressReportContext(
     queryProperties: StreamingQueryProperties,
     planningProperties: StreamingQueryPlanProperties,
@@ -432,7 +409,6 @@ class EpochProgressReportContext(
     if (lastExecution == null) return Nil
     // lastExecution could belong to one of the previous triggers if `!hasExecuted`.
     // Walking the plan again should be inexpensive.
-    // FIXME: so we still need to pick up "old" context...
     lastExecution.executedPlan.collect {
       case p if p.isInstanceOf[StateStoreWriter] =>
         val progress = p.asInstanceOf[StateStoreWriter].getProgress()
