@@ -92,7 +92,17 @@ abstract class StreamExecution(
 
   // `logicalPlan` and `sources` are being set only once at the initialization and never be
   // changed. Hence thread-safe.
+
+  /**
+   * The base logical plan which will be used across batch runs. Once the value is set, it should
+   * not be modified.
+   */
   protected def logicalPlan: LogicalPlan
+
+  /**
+   * The list of stream instances which will be used across batch runs. Once the value is set,
+   * it should not be modified.
+   */
   protected def sources: Seq[SparkDataStream]
 
   /**
