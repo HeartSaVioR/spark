@@ -485,7 +485,7 @@ class EpochProgressReportContext(
       }
     }
 
-    val onlyV2MicroBatchSources = {
+    val onlyDataSourceV2Sources = {
       // Check whether the streaming query's logical plan has only V2 micro-batch data sources
       val allStreamingLeaves = planningProperties.logicalPlan.collect {
         case s: StreamingDataSourceV2Relation => s.stream.isInstanceOf[MicroBatchStream]
@@ -494,7 +494,7 @@ class EpochProgressReportContext(
       allStreamingLeaves.forall(_ == true)
     }
 
-    if (onlyV2MicroBatchSources) {
+    if (onlyDataSourceV2Sources) {
       // It's possible that multiple DataSourceV2ScanExec instances may refer to the same source
       // (can happen with self-unions or self-joins). This means the source is scanned multiple
       // times in the query, we should count the numRows for each scan.
