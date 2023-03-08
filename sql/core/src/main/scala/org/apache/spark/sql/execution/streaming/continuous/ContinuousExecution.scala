@@ -59,6 +59,8 @@ class ContinuousExecution(
   // Throwable that caused the execution to fail
   private val failure: AtomicReference[Throwable] = new AtomicReference[Throwable](null)
 
+  private var progressCtx: EpochProgressReportContext = _
+
   override val logicalPlan: WriteToContinuousDataSource = {
     val v2ToRelationMap = MutableMap[StreamingRelationV2, StreamingDataSourceV2Relation]()
     var nextSourceId = 0
@@ -189,6 +191,8 @@ class ContinuousExecution(
    * @param sparkSessionForQuery Isolated [[SparkSession]] to run the continuous query with.
    */
   private def runContinuous(sparkSessionForQuery: SparkSession): Unit = {
+    progressCtx = progressReporter.startTrigger(offsetSeqMetadata)
+
     val offsets = getStartOffsets()
 
     if (currentBatchId > 0) {
@@ -209,7 +213,7 @@ class ContinuousExecution(
           " not yet supported for continuous processing")
     }
 
-    reportTimeTaken("queryPlanning") {
+    progressCtx.reportTimeTaken("queryPlanning") {
       lastExecution = new IncrementalExecution(
         sparkSessionForQuery,
         withNewSources,
@@ -223,6 +227,7 @@ class ContinuousExecution(
         WatermarkPropagator.noop())
       lastExecution.executedPlan // Force the lazy generation of execution plan
     }
+    progressCtx.updateLastExecution(lastExecution)
 
     val stream = withNewSources.collect {
       case relation: StreamingDataSourceV2Relation =>
@@ -253,7 +258,7 @@ class ContinuousExecution(
       override def run: Unit = {
         try {
           triggerExecutor.execute(() => {
-            startTrigger()
+            progressCtx = progressReporter.startTrigger(offsetSeqMetadata)
 
             if (stream.needsReconfiguration && state.compareAndSet(ACTIVE, RECONFIGURING)) {
               if (queryExecutionThread.isAlive) {
@@ -280,7 +285,7 @@ class ContinuousExecution(
       epochUpdateThread.start()
 
       updateStatusMessage("Running")
-      reportTimeTaken("runContinuous") {
+      progressCtx.reportTimeTaken("runContinuous") {
         SQLExecution.withNewExecutionId(lastExecution) {
           lastExecution.executedPlan.execute()
         }
@@ -362,7 +367,8 @@ class ContinuousExecution(
 
     synchronized {
       // Record offsets before updating `committedOffsets`
-      recordTriggerOffsets(from = committedOffsets, to = availableOffsets, latest = latestOffsets)
+      progressCtx.recordTriggerOffsets(from = committedOffsets, to = availableOffsets,
+        latest = latestOffsets)
       if (queryExecutionThread.isAlive) {
         commitLog.add(epoch, CommitMetadata())
         val offset =

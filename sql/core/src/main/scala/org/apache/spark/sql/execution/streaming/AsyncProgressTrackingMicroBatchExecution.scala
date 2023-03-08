@@ -108,7 +108,7 @@ class AsyncProgressTrackingMicroBatchExecution(
     }
   }
 
-  override def markMicroBatchExecutionStart(): Unit = {
+  override def markMicroBatchExecutionStart(progressCtx: EpochProgressReportContext): Unit = {
     // check if streaming query is stateful
     checkNotStatefulStreamingQuery
   }
@@ -122,7 +122,7 @@ class AsyncProgressTrackingMicroBatchExecution(
    * Should not call super method as we need to do something completely different
    * in this method for async progress tracking
    */
-  override def markMicroBatchStart(): Unit = {
+  override def markMicroBatchStart(progressCtx: EpochProgressReportContext): Unit = {
     // Because we are using a thread pool with only one thread, async writes to the offset log
     // are still written in a serial / in order fashion
     offsetLog
@@ -168,9 +168,9 @@ class AsyncProgressTrackingMicroBatchExecution(
     }
   }
 
-  override def markMicroBatchEnd(): Unit = {
+  override def markMicroBatchEnd(progressCtx: EpochProgressReportContext): Unit = {
     watermarkTracker.updateWatermark(lastExecution.executedPlan)
-    reportTimeTaken("commitOffsets") {
+    progressCtx.reportTimeTaken("commitOffsets") {
       // check if current batch there is a async write for the offset log is issued for this batch
       // if so, we should do the same for commit log.  However, if this is the first batch executed
       // in this run we should always persist to the commit log.  There can be situations in which

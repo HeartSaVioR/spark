@@ -40,7 +40,6 @@ import org.apache.spark.sql.connector.catalog.{SupportsWrite, Table}
 import org.apache.spark.sql.connector.read.streaming.{Offset => OffsetV2, ReadLimit, SparkDataStream}
 import org.apache.spark.sql.connector.write.{LogicalWriteInfoImpl, SupportsTruncate, Write}
 import org.apache.spark.sql.execution.command.StreamingExplainCommand
-import org.apache.spark.sql.execution.datasources.v2.StreamWriterCommitProgress
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.connector.SupportsStreamingUpdateAsAppend
 import org.apache.spark.sql.streaming._
@@ -74,9 +73,7 @@ abstract class StreamExecution(
     val triggerClock: Clock,
     val outputMode: OutputMode,
     deleteCheckpointOnStop: Boolean)
-  extends StreamingQuery with ProgressReporter with Logging {
-
-  import org.apache.spark.sql.streaming.StreamingQueryListener._
+  extends StreamingQuery with Logging {
 
   protected val pollingDelayMs: Long = sparkSession.sessionState.conf.streamingPollingDelay
 
@@ -124,9 +121,6 @@ abstract class StreamExecution(
   @volatile
   var latestOffsets = new StreamProgress
 
-  @volatile
-  var sinkCommitProgress: Option[StreamWriterCommitProgress] = None
-
   /** The current batchId or -1 if execution has not yet been initialized. */
   protected var currentBatchId: Long = -1
 
@@ -155,9 +149,16 @@ abstract class StreamExecution(
    */
   protected val watermarkMsMap: MutableMap[Int, Long] = MutableMap()
 
+  // This is being set only once and never be changed, hence thread-safe.
+  protected def sources: Seq[SparkDataStream]
+
   override val id: UUID = UUID.fromString(streamMetadata.id)
 
   override val runId: UUID = UUID.randomUUID
+
+  protected val progressReporter = new ProgressReporter(
+    StreamingQueryProperties(id, runId, name, triggerClock, sparkSession, sink),
+    postEvent)
 
   /**
    * Pretty identified string of printing in logs. Format is
@@ -176,9 +177,6 @@ abstract class StreamExecution(
 
   @volatile
   var lastExecution: IncrementalExecution = _
-
-  /** Holds the most recent input data for each source. */
-  protected var newData: Map[SparkDataStream, LogicalPlan] = _
 
   @volatile
   protected var streamDeathCause: StreamingQueryException = null
@@ -223,6 +221,12 @@ abstract class StreamExecution(
    */
   val commitLog = new CommitLog(sparkSession, checkpointFile("commits"))
 
+  override def status: StreamingQueryStatus = progressReporter.status
+
+  override def recentProgress: Array[StreamingQueryProgress] = progressReporter.recentProgress
+
+  override def lastProgress: StreamingQueryProgress = progressReporter.lastProgress
+
   /** Whether all fields of the query have been initialized */
   private def isInitialized: Boolean = state.get != INITIALIZING
 
@@ -256,6 +260,10 @@ abstract class StreamExecution(
    */
   protected def runActivatedStream(sparkSessionForStream: SparkSession): Unit
 
+  protected def updateStatusMessage(message: String): Unit = {
+    progressReporter.updateStatusMessage(message)
+  }
+
   /**
    * Activate the stream and then wrap a callout to runActivatedStream, handling start and stop.
    *
@@ -274,8 +282,7 @@ abstract class StreamExecution(
       }
 
       // `postEvent` does not throw non fatal exception.
-      val startTimestamp = triggerClock.getTimeMillis()
-      postEvent(new QueryStartedEvent(id, runId, name, formatTimestamp(startTimestamp)))
+      progressReporter.postQueryStarted()
 
       // Unblock starting thread
       startLatch.countDown()
@@ -296,6 +303,13 @@ abstract class StreamExecution(
         updateStatusMessage("Initializing sources")
         // force initialization of the logical plan so that the sources can be created
         logicalPlan
+
+        // We should have initialized logical plan as well as sources which will never change
+        // afterwards.
+        // FIXME: would we be better to deduce a new method with proper contract rather than just
+        //   leaving code comment?
+        progressReporter.setPlanningProperties(
+          StreamingQueryPlanProperties(logicalPlan, sources))
 
         offsetSeqMetadata = OffsetSeqMetadata(
           batchWatermarkMs = 0, batchTimestampMs = 0, sparkSessionForStream.conf)
@@ -352,15 +366,13 @@ abstract class StreamExecution(
         stopSources()
         cleanup()
         state.set(TERMINATED)
-        currentStatus = status.copy(isTriggerActive = false, isDataAvailable = false)
 
         // Update metrics and status
         sparkSession.sparkContext.env.metricsSystem.removeSource(streamMetrics)
 
         // Notify others
         sparkSession.streams.notifyQueryTermination(StreamExecution.this)
-        postEvent(
-          new QueryTerminatedEvent(id, runId, exception.map(_.cause).map(Utils.exceptionString)))
+        progressReporter.postQueryTerminated(exception)
 
         // Delete the temp checkpoint when either force delete enabled or the query didn't fail
         if (deleteCheckpointOnStop &&
@@ -398,7 +410,7 @@ abstract class StreamExecution(
     }
   }
 
-  override protected def postEvent(event: StreamingQueryListener.Event): Unit = {
+  protected def postEvent(event: StreamingQueryListener.Event): Unit = {
     sparkSession.streams.postListenerEvent(event)
   }
 

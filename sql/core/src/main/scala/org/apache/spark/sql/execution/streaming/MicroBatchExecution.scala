@@ -222,12 +222,6 @@ class MicroBatchExecution(
     logInfo(s"Async log purge executor pool for query ${prettyIdString} has been shutdown")
   }
 
-  /** Begins recording statistics about query progress for a given trigger. */
-  override protected def startTrigger(): Unit = {
-    super.startTrigger()
-    currentStatus = currentStatus.copy(isTriggerActive = true)
-  }
-
   /**
    * Repeatedly attempts to run batches as data arrives.
    */
@@ -244,14 +238,15 @@ class MicroBatchExecution(
 
         var currentBatchHasNewData = false // Whether the current batch had new data
 
-        startTrigger()
+        val progressCtx = progressReporter.startTrigger(offsetSeqMetadata)
+        progressReporter.updateTriggerActive(activated = true)
 
-        reportTimeTaken("triggerExecution") {
+        progressCtx.reportTimeTaken("triggerExecution") {
           // We'll do this initialization only once every start / restart
           if (currentBatchId < 0) {
             AcceptsLatestSeenOffsetHandler.setLatestSeenOffsetOnSources(
               offsetLog.getLatest().map(_._2), sources)
-            populateStartOffsets(sparkSessionForStream)
+            populateStartOffsets(sparkSessionForStream, progressCtx)
             logInfo(s"Stream started from $committedOffsets")
           }
 
@@ -265,11 +260,11 @@ class MicroBatchExecution(
           // state cleanup, etc. `isNewDataAvailable` will be updated to reflect whether new data
           // is available or not.
           if (!isCurrentBatchConstructed) {
-            isCurrentBatchConstructed = constructNextBatch(noDataBatchesEnabled)
+            isCurrentBatchConstructed = constructNextBatch(progressCtx, noDataBatchesEnabled)
           }
 
           // Record the trigger offset range for progress reporting *before* processing the batch
-          recordTriggerOffsets(
+          progressCtx.recordTriggerOffsets(
             from = committedOffsets,
             to = availableOffsets,
             latest = latestOffsets)
@@ -279,18 +274,20 @@ class MicroBatchExecution(
           // to false as the batch would have already processed the available data.
           currentBatchHasNewData = isNewDataAvailable
 
-          currentStatus = currentStatus.copy(isDataAvailable = isNewDataAvailable)
+          progressReporter.updateNewDataAvailability(isNewDataAvailable)
+
           if (isCurrentBatchConstructed) {
             if (currentBatchHasNewData) updateStatusMessage("Processing new data")
             else updateStatusMessage("No new data but cleaning up state")
-            runBatch(sparkSessionForStream)
+            runBatch(sparkSessionForStream, progressCtx)
           } else {
             updateStatusMessage("Waiting for data to arrive")
           }
         }
 
         // Must be outside reportTimeTaken so it is recorded
-        finishTrigger(currentBatchHasNewData, isCurrentBatchConstructed)
+        progressReporter.finishTrigger(progressCtx, currentBatchHasNewData,
+          isCurrentBatchConstructed, currentBatchId)
 
         // Signal waiting threads. Note this must be after finishTrigger() to ensure all
         // activities (progress generation, etc.) have completed before signaling.
@@ -356,8 +353,9 @@ class MicroBatchExecution(
    *    Identify a brand new batch
    *  DONE
    */
-  private def populateStartOffsets(sparkSessionToRunBatches: SparkSession): Unit = {
-    sinkCommitProgress = None
+  private def populateStartOffsets(
+      sparkSessionToRunBatches: SparkSession,
+      progressCtx: EpochProgressReportContext): Unit = {
     offsetLog.getLatest() match {
       case Some((latestBatchId, nextOffsets)) =>
         /* First assume that we are re-executing the latest known batch
@@ -375,6 +373,7 @@ class MicroBatchExecution(
           OffsetSeqMetadata.setSessionConf(metadata, sparkSessionToRunBatches.conf)
           offsetSeqMetadata = OffsetSeqMetadata(
             metadata.batchWatermarkMs, metadata.batchTimestampMs, sparkSessionToRunBatches.conf)
+          progressCtx.updateOffsetSeqMetadata(offsetSeqMetadata)
           watermarkTracker = WatermarkTracker(sparkSessionToRunBatches.conf)
           watermarkTracker.setWatermark(metadata.batchWatermarkMs)
         }
@@ -472,7 +471,9 @@ class MicroBatchExecution(
    * - If either of the above is true, then construct the next batch by committing to the offset
    *   log that range of offsets that the next batch will process.
    */
-  private def constructNextBatch(noDataBatchesEnabled: Boolean): Boolean = withProgressLocked {
+  private def constructNextBatch(
+      progressCtx: EpochProgressReportContext,
+      noDataBatchesEnabled: Boolean): Boolean = withProgressLocked {
     if (isCurrentBatchConstructed) return true
 
     // Generate a map from each unique source to the next available offset.
@@ -480,27 +481,27 @@ class MicroBatchExecution(
       case (s: AvailableNowDataStreamWrapper, limit) =>
         updateStatusMessage(s"Getting offsets from $s")
         val originalSource = s.delegate
-        reportTimeTaken("latestOffset") {
+        progressCtx.reportTimeTaken("latestOffset") {
           val next = s.latestOffset(getStartOffset(originalSource), limit)
           val latest = s.reportLatestOffset()
           ((originalSource, Option(next)), (originalSource, Option(latest)))
         }
       case (s: SupportsAdmissionControl, limit) =>
         updateStatusMessage(s"Getting offsets from $s")
-        reportTimeTaken("latestOffset") {
+        progressCtx.reportTimeTaken("latestOffset") {
           val next = s.latestOffset(getStartOffset(s), limit)
           val latest = s.reportLatestOffset()
           ((s, Option(next)), (s, Option(latest)))
         }
       case (s: Source, _) =>
         updateStatusMessage(s"Getting offsets from $s")
-        reportTimeTaken("getOffset") {
+        progressCtx.reportTimeTaken("getOffset") {
           val offset = s.getOffset
           ((s, offset), (s, offset))
         }
       case (s: MicroBatchStream, _) =>
         updateStatusMessage(s"Getting offsets from $s")
-        reportTimeTaken("latestOffset") {
+        progressCtx.reportTimeTaken("latestOffset") {
           val latest = s.latestOffset()
           ((s, Option(latest)), (s, Option(latest)))
         }
@@ -532,8 +533,8 @@ class MicroBatchExecution(
     if (shouldConstructNextBatch) {
       // Commit the next batch offset range to the offset log
       updateStatusMessage("Writing offsets to log")
-      reportTimeTaken("walCommit") {
-        markMicroBatchStart()
+      progressCtx.reportTimeTaken("walCommit") {
+        markMicroBatchStart(progressCtx)
 
         // NOTE: The following code is correct because runStream() processes exactly one
         // batch at a time. If we add pipeline parallelism (multiple batches in flight at
@@ -576,11 +577,13 @@ class MicroBatchExecution(
    * Processes any data available between `availableOffsets` and `committedOffsets`.
    * @param sparkSessionToRunBatch Isolated [[SparkSession]] to run this batch with.
    */
-  private def runBatch(sparkSessionToRunBatch: SparkSession): Unit = {
+  private def runBatch(
+      sparkSessionToRunBatch: SparkSession,
+      progressCtx: EpochProgressReportContext): Unit = {
     logDebug(s"Running batch $currentBatchId")
 
     // Request unprocessed data from all sources.
-    val mutableNewData = mutable.Map.empty ++ reportTimeTaken("getBatch") {
+    val mutableNewData = mutable.Map.empty ++ progressCtx.reportTimeTaken("getBatch") {
       availableOffsets.flatMap {
         case (source: Source, available: Offset)
           if committedOffsets.get(source).map(_ != available).getOrElse(true) =>
@@ -674,7 +677,7 @@ class MicroBatchExecution(
           LocalRelation(r.output, isStreaming = true)
         }
     }
-    newData = mutableNewData.toMap
+    progressCtx.updateNewData(mutableNewData.toMap)
     // Rewire the plan to use the new attributes that were returned by the source.
     val newAttributePlan = newBatchesPlan.transformAllExpressionsWithPruning(
       _.containsPattern(CURRENT_LIKE)) {
@@ -705,7 +708,7 @@ class MicroBatchExecution(
     sparkSessionToRunBatch.sparkContext.setLocalProperty(
       StreamExecution.IS_CONTINUOUS_PROCESSING, false.toString)
 
-    reportTimeTaken("queryPlanning") {
+    progressCtx.reportTimeTaken("queryPlanning") {
       lastExecution = new IncrementalExecution(
         sparkSessionToRunBatch,
         triggerLogicalPlan,
@@ -719,37 +722,41 @@ class MicroBatchExecution(
         watermarkPropagator)
       lastExecution.executedPlan // Force the lazy generation of execution plan
     }
+    progressCtx.updateLastExecution(lastExecution)
 
-    markMicroBatchExecutionStart()
+    markMicroBatchExecutionStart(progressCtx)
 
     val nextBatch =
       new Dataset(lastExecution, RowEncoder(lastExecution.analyzed.schema))
 
-    val batchSinkProgress: Option[StreamWriterCommitProgress] = reportTimeTaken("addBatch") {
-      SQLExecution.withNewExecutionId(lastExecution) {
-        sink match {
-          case s: Sink =>
-            s.addBatch(currentBatchId, nextBatch)
-            // DSv2 write node has a mechanism to invalidate DSv2 relation, but there is no
-            // corresponding one for DSv1. Given we have an information of catalog table for sink,
-            // we can refresh the catalog table once the write has succeeded.
-            plan.catalogTable.foreach { tbl =>
-              sparkSession.catalog.refreshTable(tbl.identifier.quotedString)
-            }
-          case _: SupportsWrite =>
-            // This doesn't accumulate any data - it just forces execution of the microbatch writer.
-            nextBatch.collect()
-        }
-        lastExecution.executedPlan match {
-          case w: WriteToDataSourceV2Exec => w.commitProgress
-          case _ => None
+    val batchSinkProgress: Option[StreamWriterCommitProgress] = {
+      progressCtx.reportTimeTaken("addBatch") {
+        SQLExecution.withNewExecutionId(lastExecution) {
+          sink match {
+            case s: Sink =>
+              s.addBatch(currentBatchId, nextBatch)
+              // DSv2 write node has a mechanism to invalidate DSv2 relation, but there is no
+              // corresponding one for DSv1. Given we have an information of catalog table for sink,
+              // we can refresh the catalog table once the write has succeeded.
+              plan.catalogTable.foreach { tbl =>
+                sparkSession.catalog.refreshTable(tbl.identifier.quotedString)
+              }
+            case _: SupportsWrite =>
+              // This doesn't accumulate any data - it just forces execution of the microbatch
+              // writer.
+              nextBatch.collect()
+          }
+          lastExecution.executedPlan match {
+            case w: WriteToDataSourceV2Exec => w.commitProgress
+            case _ => None
+          }
         }
       }
     }
 
     withProgressLocked {
-      sinkCommitProgress = batchSinkProgress
-      markMicroBatchEnd()
+      progressCtx.updateSinkCommitProgress(batchSinkProgress)
+      markMicroBatchEnd(progressCtx)
     }
     logDebug(s"Completed batch ${currentBatchId}")
   }
@@ -759,7 +766,7 @@ class MicroBatchExecution(
    * Called at the start of the micro batch with given offsets. It takes care of offset
    * checkpointing to offset log and any microbatch startup tasks.
    */
-  protected def markMicroBatchStart(): Unit = {
+  protected def markMicroBatchStart(triggerContext: EpochProgressReportContext): Unit = {
     assert(offsetLog.add(currentBatchId,
       availableOffsets.toOffsetSeq(sources, offsetSeqMetadata)),
       s"Concurrent update to the log. Multiple streaming jobs detected for $currentBatchId")
@@ -771,15 +778,26 @@ class MicroBatchExecution(
    * Method called once after the planning is done and before the start of the microbatch execution.
    * It can be used to perform any pre-execution tasks.
    */
-  protected def markMicroBatchExecutionStart(): Unit = {}
+  protected def markMicroBatchExecutionStart(
+      triggerContext: EpochProgressReportContext): Unit = {}
+
+  /**
+   * Method called after the microbatch execution completion. It can be used to perform
+   * post-execution tasks.
+   */
+  protected def markMicroBatchExecutionEnd(
+      triggerContext: EpochProgressReportContext,
+      batchSinkProgress: Option[StreamWriterCommitProgress]): Unit = {
+    triggerContext.updateSinkCommitProgress(batchSinkProgress)
+  }
 
   /**
    * Called after the microbatch has completed execution. It takes care of committing the offset
    * to commit log and other bookkeeping.
    */
-  protected def markMicroBatchEnd(): Unit = {
+  protected def markMicroBatchEnd(triggerContext: EpochProgressReportContext): Unit = {
     watermarkTracker.updateWatermark(lastExecution.executedPlan)
-    reportTimeTaken("commitOffsets") {
+    triggerContext.reportTimeTaken("commitOffsets") {
       assert(commitLog.add(currentBatchId, CommitMetadata(watermarkTracker.currentWatermark)),
         "Concurrent update to the commit log. Multiple streaming jobs detected for " +
           s"$currentBatchId")
