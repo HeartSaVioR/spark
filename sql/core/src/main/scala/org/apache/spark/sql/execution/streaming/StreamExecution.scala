@@ -95,7 +95,9 @@ abstract class StreamExecution(
 
   /**
    * The base logical plan which will be used across batch runs. Once the value is set, it should
-   * not be modified.
+   * not be modified. Note that the scope is protected[sql] (not protected) because tests are
+   * accessing this.
+   * TODO: check whether tests should need to access this or there's alternative.
    */
   protected[sql] def logicalPlan: LogicalPlan
 
@@ -103,7 +105,7 @@ abstract class StreamExecution(
    * The list of stream instances which will be used across batch runs. Once the value is set,
    * it should not be modified.
    */
-  protected[sql] def sources: Seq[SparkDataStream]
+  protected def sources: Seq[SparkDataStream]
 
   /**
    * Tracks how much data we have processed and committed to the sink or state store from each

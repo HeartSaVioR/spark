@@ -61,7 +61,7 @@ class ContinuousExecution(
 
   private var progressCtx: EpochProgressReportContext = _
 
-  override protected val logicalPlan: WriteToContinuousDataSource = {
+  override protected[sql] val logicalPlan: WriteToContinuousDataSource = {
     val v2ToRelationMap = MutableMap[StreamingRelationV2, StreamingDataSourceV2Relation]()
     var nextSourceId = 0
     import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Implicits._
