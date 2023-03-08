@@ -25,7 +25,10 @@ import org.apache.spark.sql.connector.catalog.Table
 import org.apache.spark.sql.connector.read.streaming.SparkDataStream
 import org.apache.spark.util.Clock
 
-// FIXME: ...TBD...
+/**
+ * Class containing properties which are available at the start of streaming query run, and does
+ * not change during query run.
+ */
 case class StreamingQueryProperties(
     id: UUID,
     runId: UUID,
@@ -34,5 +37,8 @@ case class StreamingQueryProperties(
     sparkSession: SparkSession,
     sink: Table)
 
-// FIXME: ...TBD...
+/**
+ * Class containing properties which are available after initialization of the streaming query,
+ * and does not change during query run.
+ */
 case class StreamingQueryPlanProperties(logicalPlan: LogicalPlan, sources: Seq[SparkDataStream])

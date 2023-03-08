@@ -90,13 +90,10 @@ abstract class StreamExecution(
   private val startLatch = new CountDownLatch(1)
   private val terminationLatch = new CountDownLatch(1)
 
-  // `logicalPlan` and `sources` are being set only once at the initialization and never be
-  // changed. Hence thread-safe.
-
   /**
    * The base logical plan which will be used across batch runs. Once the value is set, it should
    * not be modified. Note that the scope is protected[sql] (not protected) because tests are
-   * accessing this.
+   * also accessing this.
    * TODO: check whether tests should need to access this or there's alternative.
    */
   protected[sql] def logicalPlan: LogicalPlan
@@ -169,8 +166,7 @@ abstract class StreamExecution(
   override val runId: UUID = UUID.randomUUID
 
   protected val progressReporter = new ProgressReporter(
-    StreamingQueryProperties(id, runId, name, triggerClock, sparkSession, sink),
-    postEvent)
+    StreamingQueryProperties(id, runId, name, triggerClock, sparkSession, sink))
 
   /**
    * Pretty identified string of printing in logs. Format is
@@ -314,12 +310,10 @@ abstract class StreamExecution(
 
         updateStatusMessage("Initializing sources")
         // force initialization of the logical plan so that the sources can be created
+        // TODO: would we be better to deduce a new method with proper contract rather than just
+        //   leaving contract as code comment?
         logicalPlan
 
-        // We should have initialized logical plan as well as sources which will never change
-        // afterwards.
-        // FIXME: would we be better to deduce a new method with proper contract rather than just
-        //   leaving code comment?
         progressReporter.setPlanningProperties(
           StreamingQueryPlanProperties(logicalPlan, sources))
 

@@ -44,9 +44,7 @@ import org.apache.spark.util.Utils
  * Additionally, the status can updated with `updateStatusMessage` to allow reporting on the
  * streams current state (i.e. "Fetching more data").
  */
-class ProgressReporter(
-    private val queryProperties: StreamingQueryProperties,
-    postEventFn: StreamingQueryListener.Event => Unit)
+class ProgressReporter(private val queryProperties: StreamingQueryProperties)
   extends Logging {
 
   private val sparkSession: SparkSession = queryProperties.sparkSession
@@ -77,7 +75,7 @@ class ProgressReporter(
   private val timestampFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'") // ISO8601
   timestampFormat.setTimeZone(DateTimeUtils.getTimeZone("UTC"))
 
-  // FIXME: it's not crystally clear where is the best place for status. Leave this as it is
+  // TODO: it's not crystally clear where is the best place for status. Leave this as it is
   //  till we find a better place.
   @volatile private var currentStatus: StreamingQueryStatus = {
     new StreamingQueryStatus(
@@ -99,7 +97,16 @@ class ProgressReporter(
     progressBuffer.lastOption.orNull
   }
 
-  /** Begins recording statistics about query progress for a given trigger. */
+  /**
+   * Begins recording statistics about query progress for a given trigger.
+   *
+   * This method also gets initial values of some parameters because currently Spark also reports
+   * progress for the trigger which does not actually run the batch, and for the case it looks
+   * back for most recent values rather than emptying out all the info.
+   * TODO: How much it has been useful for reporting progress on the trigger which corresponding
+   *   batch does not exist (no executed)? Wouldn't it be much clearer if we only report progress
+   *   on "executed" batch? Who cares about trigger with no batch execution?
+   */
   def startTrigger(
       initialOffsetSeqMetadata: OffsetSeqMetadata,
       initialLastExecution: IncrementalExecution): EpochProgressReportContext = {
@@ -116,10 +123,6 @@ class ProgressReporter(
     context.updateLastExecution(initialLastExecution)
     context
   }
-
-  // This is used in ProgressReporter for the case of microbatch execution (not
-  // in MicroBatchExecution), but used in ContinuousExecution for the case of continuous mode.
-  // I doubt it has been working for continuous mode though.
 
   def finishTrigger(
       progressCtx: EpochProgressReportContext,
@@ -195,7 +198,7 @@ class ProgressReporter(
 
   def postQueryStarted(): Unit = {
     val startTimestamp = queryProperties.triggerClock.getTimeMillis()
-    postEventFn(new QueryStartedEvent(
+    postEvent(new QueryStartedEvent(
       queryProperties.id, queryProperties.runId, queryProperties.name,
       formatTimestamp(startTimestamp)))
   }
@@ -203,7 +206,7 @@ class ProgressReporter(
   def postQueryTerminated(exception: Option[StreamingQueryException]): Unit = {
     currentStatus = currentStatus.copy(isTriggerActive = false, isDataAvailable = false)
 
-    postEventFn(new QueryTerminatedEvent(
+    postEvent(new QueryTerminatedEvent(
       queryProperties.id, queryProperties.runId,
       exception.map(_.cause).map(Utils.exceptionString)))
   }
@@ -219,12 +222,19 @@ class ProgressReporter(
         progressBuffer.dequeue()
       }
     }
-    postEventFn(new QueryProgressEvent(newProgress))
+    postEvent(new QueryProgressEvent(newProgress))
     logInfo(s"Streaming query made progress: $newProgress")
+  }
+
+  private def postEvent(event: StreamingQueryListener.Event): Unit = {
+    sparkSession.streams.postListenerEvent(event)
   }
 }
 
-// FIXME: ...TBD...
+/**
+ * The context class for tracking and reporting progress for specific epoch (batch for microbatch
+ * execution, epoch for continuous execution).
+ */
 class EpochProgressReportContext(
     queryProperties: StreamingQueryProperties,
     planningProperties: StreamingQueryPlanProperties,
