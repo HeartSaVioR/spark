@@ -75,17 +75,21 @@ class ProgressReporter(private val queryProperties: StreamingQueryProperties)
   private val timestampFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'") // ISO8601
   timestampFormat.setTimeZone(DateTimeUtils.getTimeZone("UTC"))
 
+  /** Holds the most recent status for the query. Access must lock on the `statusLock` field. */
   // TODO: it's not crystally clear where is the best place for status. Leave this as it is
   //  till we find a better place.
-  @volatile private var currentStatus: StreamingQueryStatus = {
+  private var currentStatus: StreamingQueryStatus = {
     new StreamingQueryStatus(
       message = "Initializing StreamExecution",
       isDataAvailable = false,
       isTriggerActive = false)
   }
+  private val statusLock: Object = new Object
 
   /** Returns the current status of the query. */
-  def status: StreamingQueryStatus = currentStatus
+  def status: StreamingQueryStatus = statusLock.synchronized {
+    currentStatus
+  }
 
   /** Returns an array containing the most recent query progress updates. */
   def recentProgress: Array[StreamingQueryProgress] = progressBuffer.synchronized {
@@ -184,15 +188,15 @@ class ProgressReporter(private val queryProperties: StreamingQueryProperties)
   }
 
   /** Updates the message returned in `status`. */
-  def updateStatusMessage(message: String): Unit = {
+  def updateStatusMessage(message: String): Unit = statusLock.synchronized {
     currentStatus = currentStatus.copy(message = message)
   }
 
-  def updateTriggerActive(activated: Boolean): Unit = {
+  def updateTriggerActive(activated: Boolean): Unit = statusLock.synchronized {
     currentStatus = currentStatus.copy(isTriggerActive = activated)
   }
 
-  def updateNewDataAvailability(newDataAvailable: Boolean): Unit = {
+  def updateNewDataAvailability(newDataAvailable: Boolean): Unit = statusLock.synchronized {
     currentStatus = currentStatus.copy(isDataAvailable = newDataAvailable)
   }
 
@@ -204,7 +208,10 @@ class ProgressReporter(private val queryProperties: StreamingQueryProperties)
   }
 
   def postQueryTerminated(exception: Option[StreamingQueryException]): Unit = {
-    currentStatus = currentStatus.copy(isTriggerActive = false, isDataAvailable = false)
+    statusLock.synchronized {
+      currentStatus = currentStatus.copy(isTriggerActive = false,
+        isDataAvailable = false)
+    }
 
     postEvent(new QueryTerminatedEvent(
       queryProperties.id, queryProperties.runId,
