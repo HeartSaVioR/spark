@@ -413,6 +413,10 @@ class EpochProgressReportContext(
     } else {
       // The batch hasn't been executed anyway, so it doesn't sound meaningful for the
       // number of output rows for sink to be 0 vs -1.
+      // TODO: should we follow the old behavior? It's just to show the number as 0 rather than
+      //   -1 for non-executed trigger. Is it really a big deal for sink output row to be
+      //   consistently shown as >= 0 vs -1? If the latter doesn't need to be consistent as -1,
+      //   just set 0L here.
       None
     }
 
