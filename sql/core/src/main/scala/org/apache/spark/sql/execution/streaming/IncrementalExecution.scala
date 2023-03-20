@@ -228,6 +228,15 @@ class IncrementalExecution(
           eventTimeWatermarkForLateEvents = None,
           eventTimeWatermarkForEviction = None)
 
+      case StreamingDeduplicateWithTTLExec(keys, timeToLiveMicros, child, None, None, None) =>
+        StreamingDeduplicateWithTTLExec(
+          keys,
+          timeToLiveMicros,
+          child,
+          Some(nextStatefulOperationStateInfo),
+          eventTimeWatermarkForLateEvents = None,
+          eventTimeWatermarkForEviction = None)
+
       case m: FlatMapGroupsWithStateExec =>
         // We set this to true only for the first batch of the streaming query.
         val hasInitialState = (currentBatchId == 0L && m.hasInitialState)
@@ -291,6 +300,12 @@ class IncrementalExecution(
         )
 
       case s: StreamingDeduplicateExec if s.stateInfo.isDefined =>
+        s.copy(
+          eventTimeWatermarkForLateEvents = inputWatermarkForLateEvents(s.stateInfo.get),
+          eventTimeWatermarkForEviction = inputWatermarkForEviction(s.stateInfo.get)
+        )
+
+      case s: StreamingDeduplicateWithTTLExec if s.stateInfo.isDefined =>
         s.copy(
           eventTimeWatermarkForLateEvents = inputWatermarkForLateEvents(s.stateInfo.get),
           eventTimeWatermarkForEviction = inputWatermarkForEviction(s.stateInfo.get)
