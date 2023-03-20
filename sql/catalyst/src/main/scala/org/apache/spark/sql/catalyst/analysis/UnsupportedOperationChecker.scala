@@ -465,6 +465,19 @@ object UnsupportedOperationChecker extends Logging {
               throwError(s"Join type $joinType is not supported with streaming DataFrame/Dataset")
           }
 
+        case d: DeduplicateWithTTL if d.isStreaming =>
+          // Find any attributes that are associated with an eventTime watermark.
+          val watermarkAttributes = d.child.output.collect {
+            case a: Attribute if a.metadata.contains(EventTimeWatermark.delayKey) => a
+          }
+
+          // dropDuplicatesWithTTL requires event time column being set in the input DataFrame
+          if (watermarkAttributes.isEmpty) {
+            throwError(
+              "dropDuplicatesWithTTL is not supported on streaming DataFrames/DataSets without " +
+                "watermark")(plan)
+          }
+
         case c: CoGroup if c.children.exists(_.isStreaming) =>
           throwError("CoGrouping with a streaming DataFrame/Dataset is not supported")
 
