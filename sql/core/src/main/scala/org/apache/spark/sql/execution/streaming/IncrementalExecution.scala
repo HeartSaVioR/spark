@@ -228,10 +228,9 @@ class IncrementalExecution(
           eventTimeWatermarkForLateEvents = None,
           eventTimeWatermarkForEviction = None)
 
-      case StreamingDeduplicateWithTTLExec(keys, timeToLiveMicros, child, None, None, None) =>
-        StreamingDeduplicateWithTTLExec(
+      case StreamingDeduplicateWithinWatermarkExec(keys, child, None, None, None) =>
+        StreamingDeduplicateWithinWatermarkExec(
           keys,
-          timeToLiveMicros,
           child,
           Some(nextStatefulOperationStateInfo),
           eventTimeWatermarkForLateEvents = None,
@@ -305,7 +304,7 @@ class IncrementalExecution(
           eventTimeWatermarkForEviction = inputWatermarkForEviction(s.stateInfo.get)
         )
 
-      case s: StreamingDeduplicateWithTTLExec if s.stateInfo.isDefined =>
+      case s: StreamingDeduplicateWithinWatermarkExec if s.stateInfo.isDefined =>
         s.copy(
           eventTimeWatermarkForLateEvents = inputWatermarkForLateEvents(s.stateInfo.get),
           eventTimeWatermarkForEviction = inputWatermarkForEviction(s.stateInfo.get)

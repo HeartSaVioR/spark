@@ -454,8 +454,8 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
       case Deduplicate(keys, child) if child.isStreaming =>
         StreamingDeduplicateExec(keys, planLater(child)) :: Nil
 
-      case DeduplicateWithTTL(keys, timeToLiveMicros, child) if child.isStreaming =>
-        StreamingDeduplicateWithTTLExec(keys, timeToLiveMicros, planLater(child)) :: Nil
+      case DeduplicateWithinWatermark(keys, child) if child.isStreaming =>
+        StreamingDeduplicateWithinWatermarkExec(keys, planLater(child)) :: Nil
 
       case _ => Nil
     }

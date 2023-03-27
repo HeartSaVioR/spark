@@ -981,9 +981,8 @@ object StreamingDeduplicateExec {
     UnsafeProjection.create(Array[DataType](NullType)).apply(InternalRow.apply(null))
 }
 
-case class StreamingDeduplicateWithTTLExec(
+case class StreamingDeduplicateWithinWatermarkExec(
     keyExpressions: Seq[Attribute],
-    timeToLiveMicros: Long,
     child: SparkPlan,
     stateInfo: Option[StatefulOperatorStateInfo] = None,
     eventTimeWatermarkForLateEvents: Option[Long] = None,
@@ -997,12 +996,11 @@ case class StreamingDeduplicateWithTTLExec(
   }
 
   private val schemaForTimeoutRow: StructType = StructType(
-    Array(StructField("timeoutTimestamp", LongType, nullable = false)))
-  private val eventTimeColOrdinal: Int = {
-    val colOpt = WatermarkSupport.findEventTimeColumn(child.output,
-      allowMultipleEventTimeColumns = false)
-    child.output.indexOf(colOpt.get)
-  }
+    Array(StructField("expiresAt", LongType, nullable = false)))
+  private val eventTimeCol: Attribute = WatermarkSupport.findEventTimeColumn(child.output,
+    allowMultipleEventTimeColumns = false).get
+  private val delayThreshold = eventTimeCol.metadata.getLong(EventTimeWatermark.delayKey)
+  private val eventTimeColOrdinal: Int = child.output.indexOf(eventTimeCol)
 
   override protected def doExecute(): RDD[InternalRow] = {
     metrics // force lazy init at driver
@@ -1040,7 +1038,7 @@ case class StreamingDeduplicateWithTTLExec(
         val value = store.get(key)
         if (value == null) {
           val timestamp = row.getLong(eventTimeColOrdinal)
-          val timeoutTimestamp = timestamp + timeToLiveMicros
+          val timeoutTimestamp = timestamp + delayThreshold
 
           timeoutRow.setLong(0, timeoutTimestamp)
           store.put(key, timeoutRow)
@@ -1051,18 +1049,6 @@ case class StreamingDeduplicateWithTTLExec(
         } else {
           // Drop duplicated rows
           numDroppedDuplicateRows += 1
-
-          val timestamp = row.getLong(eventTimeColOrdinal)
-          val newTimeoutTimestamp = timestamp + timeToLiveMicros
-
-          val currTimeoutTimestamp = value.getLong(0)
-          if (currTimeoutTimestamp < newTimeoutTimestamp) {
-            timeoutRow.setLong(0, newTimeoutTimestamp)
-            store.put(key, timeoutRow)
-
-            numUpdatedStateRows += 1
-          }
-
           false
         }
       }
@@ -1097,7 +1083,7 @@ case class StreamingDeduplicateWithTTLExec(
     Seq(StatefulOperatorCustomSumMetric("numDroppedDuplicateRows", "number of duplicates dropped"))
   }
 
-  override def shortName: String = "dedupeWithTTL"
+  override def shortName: String = "dedupeWithinWatermark"
 
   override def shouldRunAnotherBatch(newInputWatermark: Long): Boolean = {
     eventTimeWatermarkForEviction.isDefined &&
@@ -1105,5 +1091,5 @@ case class StreamingDeduplicateWithTTLExec(
   }
 
   override protected def withNewChildInternal(
-      newChild: SparkPlan): StreamingDeduplicateWithTTLExec = copy(child = newChild)
+      newChild: SparkPlan): StreamingDeduplicateWithinWatermarkExec = copy(child = newChild)
 }

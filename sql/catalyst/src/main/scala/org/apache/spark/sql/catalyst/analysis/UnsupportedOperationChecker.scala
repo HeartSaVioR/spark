@@ -37,6 +37,10 @@ object UnsupportedOperationChecker extends Logging {
       case p if p.isStreaming =>
         throwError("Queries with streaming sources must be executed with writeStream.start()")(p)
 
+      case d: DeduplicateWithinWatermark =>
+        throwError("dropDuplicatesWithinWatermark is not supported with batch " +
+          "DataFrames/DataSets")(d)
+
       case _ =>
     }
   }
@@ -114,7 +118,7 @@ object UnsupportedOperationChecker extends Logging {
     case f: FlatMapGroupsWithState if f.isStreaming => true
     case f: FlatMapGroupsInPandasWithState if f.isStreaming => true
     case d: Deduplicate if d.isStreaming && d.keys.exists(hasEventTimeCol) => true
-    case d: DeduplicateWithTTL if d.isStreaming => true
+    case d: DeduplicateWithinWatermark if d.isStreaming => true
     case _ => false
   }
 
@@ -465,17 +469,17 @@ object UnsupportedOperationChecker extends Logging {
               throwError(s"Join type $joinType is not supported with streaming DataFrame/Dataset")
           }
 
-        case d: DeduplicateWithTTL if d.isStreaming =>
+        case d: DeduplicateWithinWatermark if d.isStreaming =>
           // Find any attributes that are associated with an eventTime watermark.
           val watermarkAttributes = d.child.output.collect {
             case a: Attribute if a.metadata.contains(EventTimeWatermark.delayKey) => a
           }
 
-          // dropDuplicatesWithTTL requires event time column being set in the input DataFrame
+          // DeduplicateWithinWatermark requires event time column being set in the input DataFrame
           if (watermarkAttributes.isEmpty) {
             throwError(
-              "dropDuplicatesWithTTL is not supported on streaming DataFrames/DataSets without " +
-                "watermark")(plan)
+              "dropDuplicatesWithinWatermark is not supported on streaming DataFrames/DataSets " +
+                "without watermark")(plan)
           }
 
         case c: CoGroup if c.children.exists(_.isStreaming) =>

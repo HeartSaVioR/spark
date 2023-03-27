@@ -46,7 +46,6 @@ import org.apache.spark.sql.catalyst.parser.{ParseException, ParserUtils}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
-import org.apache.spark.sql.catalyst.util.DateTimeConstants.MICROS_PER_DAY
 import org.apache.spark.sql.catalyst.util.IntervalUtils
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.errors.QueryCompilationErrors.toSQLId
@@ -3040,14 +3039,12 @@ class Dataset[T] private[sql](
   }
 
   // Scala/Java, all columns
-  def dropDuplicatesWithTTL(timeToLive: String): Dataset[T] = {
-    dropDuplicatesWithTTL(this.columns, timeToLive)
+  def dropDuplicatesWithinWatermark(): Dataset[T] = {
+    dropDuplicatesWithinWatermark(this.columns)
   }
 
   // Scala friendly, specifying subset
-  def dropDuplicatesWithTTL(
-      colNames: Seq[String],
-      timeToLive: String): Dataset[T] = withTypedPlan {
+  def dropDuplicatesWithinWatermark(colNames: Seq[String]): Dataset[T] = withTypedPlan {
     val resolver = sparkSession.sessionState.analyzer.resolver
     val allColumns = queryExecution.analyzed.output
     // SPARK-31990: We must keep `toSet.toSeq` here because of the backward compatibility issue
@@ -3062,21 +3059,18 @@ class Dataset[T] private[sql](
       }
       cols
     }
-    if (isStreaming) {
-      val parsedTTL = IntervalUtils.fromIntervalString(timeToLive)
-      require(!IntervalUtils.isNegative(parsedTTL),
-        s"time to live ($timeToLive) should not be negative.")
-      val ttlMicroSecs = Math.addExact(Math.multiplyExact(parsedTTL.days, MICROS_PER_DAY),
-        parsedTTL.microseconds)
-      DeduplicateWithTTL(groupCols, ttlMicroSecs, logicalPlan)
-    } else {
-      Deduplicate(groupCols, logicalPlan)
-    }
+    DeduplicateWithinWatermark(groupCols, logicalPlan)
   }
 
   // Java friendly, specifying subset
-  def dropDuplicatesWithTTL(colNames: Array[String], timeToLive: String): Dataset[T] = {
-    dropDuplicatesWithTTL(colNames.toSeq, timeToLive)
+  def dropDuplicatesWithinWatermark(colNames: Array[String]): Dataset[T] = {
+    dropDuplicatesWithinWatermark(colNames.toSeq)
+  }
+
+  @scala.annotation.varargs
+  def dropDuplicatesWithinWatermark(col1: String, cols: String*): Dataset[T] = {
+    val colNames: Seq[String] = col1 +: cols
+    dropDuplicatesWithinWatermark(colNames)
   }
 
   /**

@@ -1905,15 +1905,12 @@ case class Deduplicate(
     copy(child = newChild)
 }
 
-case class DeduplicateWithTTL(
-    keys: Seq[Attribute],
-    timeToLiveMicros: Long,
-    child: LogicalPlan) extends UnaryNode {
+case class DeduplicateWithinWatermark(keys: Seq[Attribute], child: LogicalPlan) extends UnaryNode {
   override def maxRows: Option[Long] = child.maxRows
   override def output: Seq[Attribute] = child.output
   // FIXME: DISTINCT_LIKE?
   // final override val nodePatterns: Seq[TreePattern] = Seq(DISTINCT_LIKE)
-  override protected def withNewChildInternal(newChild: LogicalPlan): DeduplicateWithTTL =
+  override protected def withNewChildInternal(newChild: LogicalPlan): DeduplicateWithinWatermark =
     copy(child = newChild)
 }
 
