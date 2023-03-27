@@ -43,6 +43,20 @@ class StreamingDeduplicationWithinWatermarkSuite extends StateStoreMetricsTest {
     val result2 = inputData.toDS().withColumn("newcol", $"value")
       .dropDuplicatesWithinWatermark("newcol")
     testAndVerify(result2)
+
+    val inputData2 = MemoryStream[(String, Int)]
+    val otherSideForJoin = inputData2.toDF()
+      .select($"_1" as "key", timestamp_seconds($"_2") as "time")
+      .withWatermark("Time", "10 seconds")
+
+    val result3 = inputData.toDS()
+      .select($"value".as("key"))
+      // there are two streams which one stream only defines the watermark. the stream which
+      // contains dropDuplicatesWithinWatermark does not define the watermark, which is not
+      // supported.
+      .dropDuplicatesWithinWatermark()
+      .join(otherSideForJoin, "key")
+    testAndVerify(result3)
   }
 
   test("deduplicate in batch DataFrame") {
@@ -108,18 +122,19 @@ class StreamingDeduplicationWithinWatermarkSuite extends StateStoreMetricsTest {
       .select($"_1", $"eventTime".cast("long").as[Long])
 
     testStream(result, Append)(
-      // Advances watermark to 15.
+      // Advances watermark to 15
       AddData(inputData, "a" -> 17),
       CheckNewAnswer("a" -> 17),
       // expired time is set to 19
       assertNumStateRows(total = 1, updated = 1),
 
-      // Watermark does not advance.
+      // Watermark does not advance
       AddData(inputData, "a" -> 16),
       CheckNewAnswer(),
       assertNumStateRows(total = 1, updated = 0),
 
-      // Watermark does not advance. Should not emit anything as data less than watermark.
+      // Watermark does not advance
+      // Should not emit anything as data less than watermark
       AddData(inputData, "a" -> 13),
       CheckNewAnswer(),
       assertNumStateRows(total = 1, updated = 0, droppedByWatermark = 1),
@@ -130,9 +145,9 @@ class StreamingDeduplicationWithinWatermarkSuite extends StateStoreMetricsTest {
       // expired time is set to 24
       assertNumStateRows(total = 1, updated = 1),
 
-      // Watermark does not advance.
+      // Watermark does not advance
       AddData(inputData, "a" -> 21),
-      // "a" is identified as new event
+      // "a" is identified as new event since previous batch dropped state row ("a" -> 19)
       CheckNewAnswer("a" -> 21),
       // expired time is set to 23
       assertNumStateRows(total = 2, updated = 1)

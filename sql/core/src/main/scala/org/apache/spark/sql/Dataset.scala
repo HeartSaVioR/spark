@@ -3038,12 +3038,58 @@ class Dataset[T] private[sql](
     dropDuplicates(colNames)
   }
 
-  // Scala/Java, all columns
+  /**
+   * Returns a new Dataset with duplicates rows removed, as long as event times of duplicated rows
+   * are within delay threshold of watermark.
+   *
+   * This only works with streaming [[Dataset]], and watermark for the input [[Dataset]] must be
+   * set via [[withWatermark]].
+   *
+   * This will keep all data across triggers as intermediate state to drop duplicated rows. The
+   * state will be kept for delay threshold of watermark from the first arrived event of
+   * duplicated rows.
+   *
+   * In other words, if event time of the first arrived event is 'ts', this guarantees all
+   * duplicated rows will be dropped where these rows are within the time range of
+   * (ts - delay threshold, ts + delay threshold).
+   *
+   * In practice, users are encouraged to set the delay threshold of watermark longer than max
+   * timestamp differences among duplicated events.
+   *
+   * In addition, too late data older than watermark will be dropped to avoid any possibility
+   * of duplicates.
+   *
+   * @group typedrel
+   * @since 3.5.0
+   */
   def dropDuplicatesWithinWatermark(): Dataset[T] = {
     dropDuplicatesWithinWatermark(this.columns)
   }
 
-  // Scala friendly, specifying subset
+  /**
+   * Returns a new Dataset with duplicates rows removed, considering only the subset of columns,
+   * as long as event times of duplicated rows are within delay threshold of watermark.
+   *
+   * This only works with streaming [[Dataset]], and watermark for the input [[Dataset]] must be
+   * set via [[withWatermark]].
+   *
+   * This will keep all data across triggers as intermediate state to drop duplicated rows. The
+   * state will be kept for delay threshold of watermark from the first arrived event of
+   * duplicated rows.
+   *
+   * In other words, if event time of the first arrived event is 'ts', this guarantees all
+   * duplicated rows will be dropped where these rows are within the time range of
+   * (ts - delay threshold, ts + delay threshold).
+   *
+   * In practice, users are encouraged to set the delay threshold of watermark longer than max
+   * timestamp differences among duplicated events.
+   *
+   * In addition, too late data older than watermark will be dropped to avoid any possibility
+   * of duplicates.
+   *
+   * @group typedrel
+   * @since 3.5.0
+   */
   def dropDuplicatesWithinWatermark(colNames: Seq[String]): Dataset[T] = withTypedPlan {
     val resolver = sparkSession.sessionState.analyzer.resolver
     val allColumns = queryExecution.analyzed.output
@@ -3062,11 +3108,58 @@ class Dataset[T] private[sql](
     DeduplicateWithinWatermark(groupCols, logicalPlan)
   }
 
-  // Java friendly, specifying subset
+  /**
+   * Returns a new Dataset with duplicates rows removed, considering only the subset of columns,
+   * as long as event times of duplicated rows are within delay threshold of watermark.
+   *
+   * This only works with streaming [[Dataset]], and watermark for the input [[Dataset]] must be
+   * set via [[withWatermark]].
+   *
+   * This will keep all data across triggers as intermediate state to drop duplicated rows. The
+   * state will be kept for delay threshold of watermark from the first arrived event of
+   * duplicated rows.
+   *
+   * In other words, if event time of the first arrived event is 'ts', this guarantees all
+   * duplicated rows will be dropped where these rows are within the time range of
+   * (ts - delay threshold, ts + delay threshold).
+   *
+   * In practice, users are encouraged to set the delay threshold of watermark longer than max
+   * timestamp differences among duplicated events.
+   *
+   * In addition, too late data older than watermark will be dropped to avoid any possibility
+   * of duplicates.
+   *
+   * @group typedrel
+   * @since 3.5.0
+   */
   def dropDuplicatesWithinWatermark(colNames: Array[String]): Dataset[T] = {
     dropDuplicatesWithinWatermark(colNames.toSeq)
   }
 
+  /**
+   * Returns a new Dataset with duplicates rows removed, considering only the subset of columns,
+   * as long as event times of duplicated rows are within delay threshold of watermark.
+   *
+   * This only works with streaming [[Dataset]], and watermark for the input [[Dataset]] must be
+   * set via [[withWatermark]].
+   *
+   * This will keep all data across triggers as intermediate state to drop duplicated rows. The
+   * state will be kept for delay threshold of watermark from the first arrived event of
+   * duplicated rows.
+   *
+   * In other words, if event time of the first arrived event is 'ts', this guarantees all
+   * duplicated rows will be dropped where these rows are within the time range of
+   * (ts - delay threshold, ts + delay threshold).
+   *
+   * In practice, users are encouraged to set the delay threshold of watermark longer than max
+   * timestamp differences among duplicated events.
+   *
+   * In addition, too late data older than watermark will be dropped to avoid any possibility
+   * of duplicates.
+   *
+   * @group typedrel
+   * @since 3.5.0
+   */
   @scala.annotation.varargs
   def dropDuplicatesWithinWatermark(col1: String, cols: String*): Dataset[T] = {
     val colNames: Seq[String] = col1 +: cols
