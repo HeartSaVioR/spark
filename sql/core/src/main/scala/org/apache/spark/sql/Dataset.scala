@@ -3047,14 +3047,11 @@ class Dataset[T] private[sql](
    *
    * This will keep all data across triggers as intermediate state to drop duplicated rows. The
    * state will be kept for delay threshold of watermark from the first arrived event of
-   * duplicated rows.
-   *
-   * In other words, if event time of the first arrived event is 'ts', this guarantees all
-   * duplicated rows will be dropped where these rows are within the time range of
-   * (ts - delay threshold, ts + delay threshold).
-   *
-   * In practice, users are encouraged to set the delay threshold of watermark longer than max
-   * timestamp differences among duplicated events.
+   * duplicated rows. In other words, if event time of the first arrived event is 'ts',
+   * this guarantees all duplicated rows will be dropped where these rows are within the time
+   * range of (ts - delay threshold, ts + delay threshold). In practice, users are encouraged to
+   * set the delay threshold of watermark longer than max timestamp differences among duplicated
+   * events.
    *
    * In addition, too late data older than watermark will be dropped to avoid any possibility
    * of duplicates.
@@ -3075,14 +3072,11 @@ class Dataset[T] private[sql](
    *
    * This will keep all data across triggers as intermediate state to drop duplicated rows. The
    * state will be kept for delay threshold of watermark from the first arrived event of
-   * duplicated rows.
-   *
-   * In other words, if event time of the first arrived event is 'ts', this guarantees all
-   * duplicated rows will be dropped where these rows are within the time range of
-   * (ts - delay threshold, ts + delay threshold).
-   *
-   * In practice, users are encouraged to set the delay threshold of watermark longer than max
-   * timestamp differences among duplicated events.
+   * duplicated rows. In other words, if event time of the first arrived event is 'ts',
+   * this guarantees all duplicated rows will be dropped where these rows are within the time
+   * range of (ts - delay threshold, ts + delay threshold). In practice, users are encouraged to
+   * set the delay threshold of watermark longer than max timestamp differences among duplicated
+   * events.
    *
    * In addition, too late data older than watermark will be dropped to avoid any possibility
    * of duplicates.
@@ -3117,14 +3111,11 @@ class Dataset[T] private[sql](
    *
    * This will keep all data across triggers as intermediate state to drop duplicated rows. The
    * state will be kept for delay threshold of watermark from the first arrived event of
-   * duplicated rows.
-   *
-   * In other words, if event time of the first arrived event is 'ts', this guarantees all
-   * duplicated rows will be dropped where these rows are within the time range of
-   * (ts - delay threshold, ts + delay threshold).
-   *
-   * In practice, users are encouraged to set the delay threshold of watermark longer than max
-   * timestamp differences among duplicated events.
+   * duplicated rows. In other words, if event time of the first arrived event is 'ts',
+   * this guarantees all duplicated rows will be dropped where these rows are within the time
+   * range of (ts - delay threshold, ts + delay threshold). In practice, users are encouraged to
+   * set the delay threshold of watermark longer than max timestamp differences among duplicated
+   * events.
    *
    * In addition, too late data older than watermark will be dropped to avoid any possibility
    * of duplicates.
@@ -3145,14 +3136,11 @@ class Dataset[T] private[sql](
    *
    * This will keep all data across triggers as intermediate state to drop duplicated rows. The
    * state will be kept for delay threshold of watermark from the first arrived event of
-   * duplicated rows.
-   *
-   * In other words, if event time of the first arrived event is 'ts', this guarantees all
-   * duplicated rows will be dropped where these rows are within the time range of
-   * (ts - delay threshold, ts + delay threshold).
-   *
-   * In practice, users are encouraged to set the delay threshold of watermark longer than max
-   * timestamp differences among duplicated events.
+   * duplicated rows. In other words, if event time of the first arrived event is 'ts',
+   * this guarantees all duplicated rows will be dropped where these rows are within the time
+   * range of (ts - delay threshold, ts + delay threshold). In practice, users are encouraged to
+   * set the delay threshold of watermark longer than max timestamp differences among duplicated
+   * events.
    *
    * In addition, too late data older than watermark will be dropped to avoid any possibility
    * of duplicates.
