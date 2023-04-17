@@ -50,9 +50,9 @@ class StreamingQueryListener(ABC):
     ...        # Do something with event.
     ...        pass
     ...
-    ...   def onQueryIdle(self, event: QueryIdleEvent) -> None:
-    ...       # Do something with event.
-    ...       pass
+    ...    def onQueryIdle(self, event: QueryIdleEvent) -> None:
+    ...        # Do something with event.
+    ...        pass
     ...
     ...    def onQueryTerminated(self, event: QueryTerminatedEvent) -> None:
     ...        # Do something with event.
