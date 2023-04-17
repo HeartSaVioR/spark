@@ -59,7 +59,7 @@ abstract class StreamingQueryListener {
    * Called when the query is idle for a certain time period and waiting for new data to process.
    * @since 3.5.0
    */
-  def onQueryIdle(event: QueryIdleEvent): Unit
+  def onQueryIdle(event: QueryIdleEvent): Unit = {}
 
   /**
    * Called when a query is stopped, with or without error.
@@ -91,7 +91,7 @@ private[spark] class PythonStreamingQueryListenerWrapper(
 
   def onQueryProgress(event: QueryProgressEvent): Unit = listener.onQueryProgress(event)
 
-  def onQueryIdle(event: QueryIdleEvent): Unit = listener.onQueryIdle(event)
+  override def onQueryIdle(event: QueryIdleEvent): Unit = listener.onQueryIdle(event)
 
   def onQueryTerminated(event: QueryTerminatedEvent): Unit = listener.onQueryTerminated(event)
 }
