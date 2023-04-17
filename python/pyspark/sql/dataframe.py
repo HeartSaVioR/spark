@@ -3600,6 +3600,9 @@ class DataFrame(PandasMapOpsMixin, PandasConversionMixin):
         ...            # Trigger alert
         ...            pass
         ...
+        ...    def onQueryIdle(self, event):
+        ...        pass
+        ...
         ...    def onQueryTerminated(self, event):
         ...        pass
         ...
