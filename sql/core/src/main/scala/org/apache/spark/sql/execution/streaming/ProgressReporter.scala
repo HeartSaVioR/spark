@@ -34,7 +34,7 @@ import org.apache.spark.sql.connector.read.streaming.{MicroBatchStream, ReportsS
 import org.apache.spark.sql.execution.QueryExecution
 import org.apache.spark.sql.execution.datasources.v2.{MicroBatchScanExec, StreamingDataSourceV2Relation, StreamWriterCommitProgress}
 import org.apache.spark.sql.streaming._
-import org.apache.spark.sql.streaming.StreamingQueryListener.QueryProgressEvent
+import org.apache.spark.sql.streaming.StreamingQueryListener.{QueryIdleEvent, QueryProgressEvent}
 import org.apache.spark.util.Clock
 
 /**
@@ -89,7 +89,7 @@ trait ProgressReporter extends Logging {
     sparkSession.sessionState.conf.streamingNoDataProgressEventInterval
 
   // The timestamp we report an event that has not executed anything
-  private var lastNoExecutionProgressEventTime = Long.MinValue
+  private var lastNoExecutionProgressEventTime = triggerClock.getTimeMillis()
 
   private val timestampFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'") // ISO8601
   timestampFormat.setTimeZone(DateTimeUtils.getTimeZone("UTC"))
@@ -151,6 +151,11 @@ trait ProgressReporter extends Logging {
     }
     postEvent(new QueryProgressEvent(newProgress))
     logInfo(s"Streaming query made progress: $newProgress")
+  }
+
+  private def postIdleness(): Unit = {
+    postEvent(new QueryIdleEvent(id, runId))
+    logInfo("Streaming query has been idle and waiting for new data.")
   }
 
   /**
@@ -236,7 +241,7 @@ trait ProgressReporter extends Logging {
       val now = triggerClock.getTimeMillis()
       if (now - noDataProgressEventInterval >= lastNoExecutionProgressEventTime) {
         lastNoExecutionProgressEventTime = now
-        updateProgress(newProgress)
+        postIdleness()
       }
     }
 
