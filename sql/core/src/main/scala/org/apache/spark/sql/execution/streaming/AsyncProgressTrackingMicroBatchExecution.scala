@@ -50,8 +50,6 @@ class AsyncProgressTrackingMicroBatchExecution(
   // to cache the batch id of the last batch written to storage
   private val lastBatchPersistedToDurableStorage = new AtomicLong(-1)
 
-  override val triggerExecutor: TriggerExecutor = validateAndGetTrigger()
-
   // used to check during the first batch if the pipeline is stateful
   private var isFirstBatch: Boolean = true
 
@@ -228,7 +226,7 @@ class AsyncProgressTrackingMicroBatchExecution(
     asyncWritesExecutorService.getQueue.size() > 0 || asyncWritesExecutorService.getActiveCount > 0
   }
 
-  private def validateAndGetTrigger(): TriggerExecutor = {
+  override protected def validateAndGetTrigger(): TriggerExecutor = {
     // validate that the pipeline is using a supported sink
     if (!extraOptions
       .getOrElse(

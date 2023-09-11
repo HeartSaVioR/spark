@@ -24,7 +24,7 @@ import org.apache.spark.sql.catalyst.plans.logical.Range
 import org.apache.spark.sql.catalyst.util.stringToFile
 import org.apache.spark.sql.connector.read.streaming
 import org.apache.spark.sql.connector.read.streaming.{ReadLimit, SupportsAdmissionControl}
-import org.apache.spark.sql.execution.streaming.{LongOffset, MemoryStream, Offset, SerializedOffset, Source, StreamingExecutionRelation}
+import org.apache.spark.sql.execution.streaming.{LongOffset, MemoryStream, MicroBatchExecution, Offset, SerializedOffset, SingleBatchExecutor, Source, StreamingExecutionRelation, StreamingQueryWrapper}
 import org.apache.spark.sql.types.{LongType, StructType}
 import org.apache.spark.tags.SlowSQLTest
 
@@ -154,6 +154,9 @@ class TriggerAvailableNowSuite extends FileStreamSourceTest {
           q.recentProgress.foreach { p =>
             assert(p.sources.exists(_.description.startsWith(testSource.sourceName)))
           }
+          // We fall back to single batch executor because there is a source which doesn't support
+          // Trigger.AvailableNow.
+          assertQueryUsingSingleBatchExecutor(q)
           checkAnswer(sql(s"SELECT * from parquet.`$targetDir`"),
             Seq(1, 2, 3, 7, 8, 9).map(_.toString).toDF())
         } finally {
@@ -174,6 +177,9 @@ class TriggerAvailableNowSuite extends FileStreamSourceTest {
           q2.recentProgress.foreach { p =>
             assert(p.sources.exists(_.description.startsWith(testSource.sourceName)))
           }
+          // We fall back to single batch executor because there is a source which doesn't support
+          // Trigger.AvailableNow.
+          assertQueryUsingSingleBatchExecutor(q)
           checkAnswer(sql(s"SELECT * from parquet.`$targetDir`"), (1 to 12).map(_.toString).toDF())
         } finally {
           q2.stop()
@@ -210,6 +216,7 @@ class TriggerAvailableNowSuite extends FileStreamSourceTest {
           q.recentProgress.foreach { p =>
             assert(p.sources.exists(_.description.startsWith(testSource.sourceName)))
           }
+          assertQueryUsingSingleBatchExecutor(q)
           checkAnswer(spark.table(tableName), (1 to 3).toDF())
         } finally {
           q.stop()
@@ -225,11 +232,24 @@ class TriggerAvailableNowSuite extends FileStreamSourceTest {
           q2.recentProgress.foreach { p =>
             assert(p.sources.exists(_.description.startsWith(testSource.sourceName)))
           }
+          assertQueryUsingSingleBatchExecutor(q)
           checkAnswer(spark.table(tableName), (1 to 6).toDF())
         } finally {
           q2.stop()
         }
       }
+    }
+  }
+
+  private def assertQueryUsingSingleBatchExecutor(query: StreamingQuery): Unit = {
+    assert(getMicroBatchExecution(query).triggerExecutor.isInstanceOf[SingleBatchExecutor])
+  }
+
+  private def getMicroBatchExecution(query: StreamingQuery): MicroBatchExecution = {
+    if (query.isInstanceOf[StreamingQueryWrapper]) {
+      query.asInstanceOf[StreamingQueryWrapper].streamingQuery.asInstanceOf[MicroBatchExecution]
+    } else {
+      query.asInstanceOf[MicroBatchExecution]
     }
   }
 }

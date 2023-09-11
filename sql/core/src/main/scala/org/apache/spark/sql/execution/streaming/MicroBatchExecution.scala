@@ -52,11 +52,33 @@ class MicroBatchExecution(
 
   @volatile protected var sources: Seq[SparkDataStream] = Seq.empty
 
-  protected val triggerExecutor: TriggerExecutor = trigger match {
-    case t: ProcessingTimeTrigger => ProcessingTimeExecutor(t, triggerClock)
-    case OneTimeTrigger => SingleBatchExecutor()
-    case AvailableNowTrigger => MultiBatchExecutor()
-    case _ => throw new IllegalStateException(s"Unknown type of trigger: $trigger")
+  @volatile protected[sql] var triggerExecutor: TriggerExecutor = _
+
+  protected def validateAndGetTrigger(): TriggerExecutor = {
+    assert(sources.nonEmpty, "sources should have been retrieved from the plan!")
+    trigger match {
+      case t: ProcessingTimeTrigger => ProcessingTimeExecutor(t, triggerClock)
+      case OneTimeTrigger => SingleBatchExecutor()
+      case AvailableNowTrigger =>
+        val supportsTriggerAvailableNow = sources.distinct.forall { src =>
+          val supportsTriggerAvailableNow = src.isInstanceOf[SupportsTriggerAvailableNow]
+          if (!supportsTriggerAvailableNow) {
+            logWarning(s"source [$src] does not support Trigger.AvailableNow. Failing back to " +
+              "single batch execution. Note that this may not guarantee processing new data if " +
+              "there is an uncommitted batch. Please consult with data source developer to " +
+              "support Trigger.AvailableNow.")
+          }
+
+          supportsTriggerAvailableNow
+        }
+
+        if (supportsTriggerAvailableNow) {
+          MultiBatchExecutor()
+        } else {
+          SingleBatchExecutor()
+        }
+      case _ => throw new IllegalStateException(s"Unknown type of trigger: $trigger")
+    }
   }
 
   protected var watermarkTracker: WatermarkTracker = _
@@ -130,6 +152,11 @@ class MicroBatchExecution(
       // v2 source
       case r: StreamingDataSourceV2Relation => r.stream
     }
+
+    // Initializing TriggerExecutor relies on `sources`, hence calling this after initializing
+    // sources.
+    triggerExecutor = validateAndGetTrigger()
+
     uniqueSources = triggerExecutor match {
       case _: SingleBatchExecutor =>
         sources.distinct.map {
@@ -147,8 +174,8 @@ class MicroBatchExecution(
       case _: MultiBatchExecutor =>
         sources.distinct.map {
           case s: SupportsTriggerAvailableNow => s
-          case s: Source => new AvailableNowSourceWrapper(s)
-          case s: MicroBatchStream => new AvailableNowMicroBatchStreamWrapper(s)
+          case _ =>
+            throw new IllegalStateException("Should not reach here! Check validateAndGetTrigger().")
         }.map { s =>
           s.prepareForTriggerAvailableNow()
           s -> s.getDefaultReadLimit
@@ -477,14 +504,6 @@ class MicroBatchExecution(
 
     // Generate a map from each unique source to the next available offset.
     val (nextOffsets, recentOffsets) = uniqueSources.toSeq.map {
-      case (s: AvailableNowDataStreamWrapper, limit) =>
-        updateStatusMessage(s"Getting offsets from $s")
-        val originalSource = s.delegate
-        reportTimeTaken("latestOffset") {
-          val next = s.latestOffset(getStartOffset(originalSource), limit)
-          val latest = s.reportLatestOffset()
-          ((originalSource, Option(next)), (originalSource, Option(latest)))
-        }
       case (s: SupportsAdmissionControl, limit) =>
         updateStatusMessage(s"Getting offsets from $s")
         reportTimeTaken("latestOffset") {
