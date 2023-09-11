@@ -54,7 +54,7 @@ class MicroBatchExecution(
 
   @volatile protected[sql] var triggerExecutor: TriggerExecutor = _
 
-  protected def validateAndGetTrigger(): TriggerExecutor = {
+  protected def getTrigger(): TriggerExecutor = {
     assert(sources.nonEmpty, "sources should have been retrieved from the plan!")
     trigger match {
       case t: ProcessingTimeTrigger => ProcessingTimeExecutor(t, triggerClock)
@@ -155,7 +155,7 @@ class MicroBatchExecution(
 
     // Initializing TriggerExecutor relies on `sources`, hence calling this after initializing
     // sources.
-    triggerExecutor = validateAndGetTrigger()
+    triggerExecutor = getTrigger()
 
     uniqueSources = triggerExecutor match {
       case _: SingleBatchExecutor =>
@@ -175,7 +175,7 @@ class MicroBatchExecution(
         sources.distinct.map {
           case s: SupportsTriggerAvailableNow => s
           case _ =>
-            throw new IllegalStateException("Should not reach here! Check validateAndGetTrigger().")
+            throw new IllegalStateException("Should not reach here!")
         }.map { s =>
           s.prepareForTriggerAvailableNow()
           s -> s.getDefaultReadLimit

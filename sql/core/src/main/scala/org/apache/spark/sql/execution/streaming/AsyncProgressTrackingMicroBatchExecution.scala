@@ -226,7 +226,9 @@ class AsyncProgressTrackingMicroBatchExecution(
     asyncWritesExecutorService.getQueue.size() > 0 || asyncWritesExecutorService.getActiveCount > 0
   }
 
-  override protected def validateAndGetTrigger(): TriggerExecutor = {
+  override protected def getTrigger(): TriggerExecutor = validateAndGetTrigger()
+
+  private def validateAndGetTrigger(): TriggerExecutor = {
     // validate that the pipeline is using a supported sink
     if (!extraOptions
       .getOrElse(
