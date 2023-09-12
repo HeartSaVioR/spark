@@ -238,6 +238,18 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
         .agg(count("*") as Symbol("count"))
         .select($"window".getField("start").cast("long").as[Long], $"count".as[Long])
 
+    // Unlike the ProcessingTime trigger, Trigger.Once only runs one trigger every time
+    // the query is started and it does not run no-data batches. Hence the answer generated
+    // by the updated watermark is only generated the next time the query is started.
+    // Also, the data to process in the next trigger is added *before* starting the stream in
+    // Trigger.Once to ensure that first and only trigger picks up the new data.
+
+    // NOTE: MemoryStream does not implement Trigger.AvailableNow, hence works same as
+    // Trigger.Once. For better clarification, we could use Trigger.Once explicitly till we
+    // implement Trigger.AvailableNow in MemoryStream. That said, the test uses the deprecated
+    // Trigger.Once() by intention, do not change.
+
+    // TODO: Support Trigger.AvailableNow in MemoryStream and reflect this test.
 
     val resourceUri = this.getClass.getResource(
       "/structured-streaming/checkpoint-version-2.3.1-without-commit-log-metadata/").toURI
@@ -266,23 +278,28 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
       // Offset log should have watermark recorded as 5.
       */
 
-      StartStream(Trigger.AvailableNow),
+      StartStream(Trigger.Once),
       awaitTermination(),
 
       AddData(inputData, 25),
-      StartStream(Trigger.AvailableNow, checkpointLocation = checkpointDir.getAbsolutePath),
+      StartStream(Trigger.Once, checkpointLocation = checkpointDir.getAbsolutePath),
       awaitTermination(),
-      CheckNewAnswer((10, 3)), // watermark should be updated to 25 - 10 = 15
+      CheckNewAnswer(),
+      assertEventStats(min = 25, max = 25, avg = 25, wtrmark = 5),
+      // watermark should be updated to 25 - 10 = 15
 
       AddData(inputData, 50),
-      StartStream(Trigger.AvailableNow, checkpointLocation = checkpointDir.getAbsolutePath),
+      StartStream(Trigger.Once, checkpointLocation = checkpointDir.getAbsolutePath),
       awaitTermination(),
-      CheckNewAnswer((15, 1), (25, 1)), // watermark should be updated to 50 - 10 = 40
+      CheckNewAnswer((10, 3)), // watermark = 15 is used to generate this
+      assertEventStats(min = 50, max = 50, avg = 50, wtrmark = 15),
+      // watermark should be updated to 50 - 10 = 40
 
       AddData(inputData, 50),
-      StartStream(Trigger.AvailableNow, checkpointLocation = checkpointDir.getAbsolutePath),
+      StartStream(Trigger.Once, checkpointLocation = checkpointDir.getAbsolutePath),
       awaitTermination(),
-      CheckNewAnswer()
+      CheckNewAnswer((15, 1), (25, 1)), // watermark = 40 is used to generate this
+      assertEventStats(min = 50, max = 50, avg = 50, wtrmark = 40)
     )
   }
 

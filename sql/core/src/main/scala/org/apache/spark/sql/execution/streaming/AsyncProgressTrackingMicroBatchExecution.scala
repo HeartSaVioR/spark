@@ -92,6 +92,9 @@ class AsyncProgressTrackingMicroBatchExecution(
   override val commitLog =
     new AsyncCommitLog(sparkSession, checkpointFile("commits"), asyncWritesExecutorService)
 
+  // perform quick validation to fail faster
+  validateAndGetTrigger()
+
   override def validateOffsetLogAndGetPrevOffset(latestBatchId: Long): Option[OffsetSeq] = {
     /* Initialize committed offsets to a committed batch, which at this
      * is the second latest batch id in the offset log.
