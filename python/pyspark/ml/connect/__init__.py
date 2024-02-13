@@ -31,7 +31,6 @@ from pyspark.ml.connect import (
     classification,
     io_utils
 )
-from pyspark.ml.connect.evaluation import Evaluator
 
 from pyspark.ml.connect.pipeline import Pipeline, PipelineModel
 
@@ -39,7 +38,7 @@ from pyspark.ml.connect.pipeline import Pipeline, PipelineModel
 __all__ = [
     "Estimator",
     "Transformer",
-    "Evaluator",
+    "Estimator",
     "Model",
     "feature",
     "classification",
