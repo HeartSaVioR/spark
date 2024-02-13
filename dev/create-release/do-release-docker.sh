@@ -93,6 +93,8 @@ cd "$WORKDIR"
 rm -rf "$WORKDIR/output"
 mkdir "$WORKDIR/output"
 
+chmod 777 $WORKDIR/output
+
 get_release_info
 
 # Place all RM scripts and necessary data in a local directory that must be defined in the command
@@ -109,7 +111,8 @@ cp "$SELF/../../docs/Gemfile.lock" "$WORKDIR"
 cp -r "$SELF/../../docs/.bundle" "$WORKDIR"
 
 GPG_KEY_FILE="$WORKDIR/gpg.key"
-fcreate_secure "$GPG_KEY_FILE"
+#fcreate_secure "$GPG_KEY_FILE"
+touch $GPG_KEY_FILE
 $GPG --export-secret-key --armor --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" "$GPG_KEY" > "$GPG_KEY_FILE"
 
 run_silent "Building spark-rm image with tag $IMGTAG..." "docker-build.log" \
@@ -118,7 +121,8 @@ run_silent "Building spark-rm image with tag $IMGTAG..." "docker-build.log" \
 # Write the release information to a file with environment variables to be used when running the
 # image.
 ENVFILE="$WORKDIR/env.list"
-fcreate_secure "$ENVFILE"
+#fcreate_secure "$ENVFILE"
+touch $ENVFILE
 
 function cleanup {
   rm -f "$ENVFILE"
