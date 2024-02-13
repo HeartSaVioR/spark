@@ -27,10 +27,14 @@ from pyspark.ml.connect import (
     feature,
     evaluation,
     tuning,
+    functions,
+    classification,
+    io_utils
 )
 from pyspark.ml.connect.evaluation import Evaluator
 
 from pyspark.ml.connect.pipeline import Pipeline, PipelineModel
+
 
 __all__ = [
     "Estimator",
@@ -38,6 +42,8 @@ __all__ = [
     "Evaluator",
     "Model",
     "feature",
+    "classification",
+    "functions",
     "evaluation",
     "Pipeline",
     "PipelineModel",
