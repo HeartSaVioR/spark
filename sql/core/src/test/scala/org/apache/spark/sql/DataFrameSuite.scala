@@ -2578,8 +2578,7 @@ class DataFrameSuite extends QueryTest
 
   test("DEBUG: nth_match") {
     val expression = expr("nth_match(employee_name, 3) = 'Joe' AND" +
-      " nth_match(organization, 2) = 'streaming'")
-    logWarning(s"DEBUG: expression = $expression")
+      " nth_match(organization, 2) = 'streaming' AND employee_name = 'Neil'")
 
     val cepOperatorInputType: StructType = StructType(
       Array(
@@ -2588,16 +2587,15 @@ class DataFrameSuite extends QueryTest
       )
     )
     val rows = new java.util.ArrayList[Row]()
+    // This does not match.
     rows.add(Row.fromSeq(Seq("Joe", "streaming")))
-    val df: DataFrame = spark.createDataFrame(
-      rows, cepOperatorInputType)
+    // This matches.
+    rows.add(Row.fromSeq(Seq("Neil", "streaming")))
+
+    val df: DataFrame = spark.createDataFrame(rows, cepOperatorInputType)
 
     val evaluatedDf = df.evalNthMatchPoc(expression)
-    logWarning(s"DEBUG: evaluatedDf = ${evaluatedDf}")
-
-    logWarning(s"DEBUG: collect DF = ${evaluatedDf.collect().mkString("Array(", ", ", ")")}")
-
-    assert(!evaluatedDf.isEmpty, "Predicate has to be matched!")
+    checkAnswer(evaluatedDf, rows.get(1))
   }
 }
 

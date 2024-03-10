@@ -20,7 +20,7 @@ import scala.collection.mutable
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, Literal, NthMatch, SafeProjection}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, JoinedRow, NthMatch, Predicate, Projection, SafeProjection}
 import org.apache.spark.sql.catalyst.trees.TreePattern.NTH_MATCH
 import org.apache.spark.unsafe.types.UTF8String
 
@@ -29,9 +29,12 @@ case class EvalNthMatchPocExec(
     child: SparkPlan)
   extends UnaryExecNode {
 
+  import EvalNthMatchPocExec._
+
+  // In actual implementation, this should be state store.
   private val matchedRows: mutable.ArrayBuffer[InternalRow] = mutable.ArrayBuffer[InternalRow]()
 
-  // FIXME: added testing data
+  // FIXME: added testing data for now
   private def addTestData(employeeName: String, organization: String): Unit = {
     matchedRows.append(
       InternalRow(
@@ -46,36 +49,78 @@ case class EvalNthMatchPocExec(
   addTestData("Joe", "pyspark")
   addTestData("Hello", "sql")
 
+  private val referenceToMatchedRows = mutable.HashMap[MatchedRowsReference, ReferenceResolution]()
+
+  private val predicateResolved = predicate.transformUpWithPruning(
+    _.containsAnyPattern(NTH_MATCH)) {
+
+    case NthMatch(input: AttributeReference, offset) =>
+      val resolution = referenceToMatchedRows.getOrElseUpdate(
+        MatchedRowsReference(input, offset), {
+
+          val attr = AttributeReference(s"__${offset}_th_${input.name}", input.dataType,
+            input.nullable)()
+          ReferenceResolution(None, attr)
+      })
+
+      resolution.attribute
+    }
+
   override protected def doExecute(): RDD[InternalRow] = {
     child.execute().mapPartitions { iter =>
-      logWarning(s"DEBUG: predicate: $predicate")
-
-      val predicateResolved = predicate
-        .transformUpWithPruning(_.containsAnyPattern(NTH_MATCH)) {
-
-        case NthMatch(input, offset) =>
-          val proj = SafeProjection.create(Seq(input), child.output)
-          // TODO: this should refer to the N-th matched row, probably reading from state store.
-          // TODO: Need to decide if there is less matched rows than the offset. null?
-          // offset - 1, as index in SQL function mostly starts from 1
-          val matchedRow = matchedRows(offset - 1)
-
-          val colVal = proj.apply(matchedRow).get(0, input.dataType)
-
-          // replace the function call with column value as literal
-          Literal(colVal)
+      // Have to create projection inside each partition as it's not serializable, but should not
+      // create the projection per row as it could be heavyweight (may incur codegen)
+      referenceToMatchedRows.foreach { case (reference, resolution) =>
+        val proj = SafeProjection.create(Seq(reference.input), child.output)
+        referenceToMatchedRows.put(reference, resolution.copy(projection = Some(proj)))
       }
 
       logWarning(s"DEBUG: predicateResolved = $predicateResolved")
+      logWarning(s"DEBUG: referenceToMatchedRows = $referenceToMatchedRows")
+
+      def constructAttrToValue(references: Seq[MatchedRowsReference]): Seq[(Attribute, AnyRef)] = {
+        references.map { reference =>
+          val resolution = referenceToMatchedRows(reference)
+          // index in SQL starts from 1
+          val matchedRow = matchedRows(reference.offset - 1)
+          val colValue = resolution.projection.get.apply(matchedRow)
+            .get(0, reference.input.dataType)
+
+          resolution.attribute -> colValue
+        }
+      }
+
+      // Need to build a consistent order of elements, so that we can just update the lookup row
+      // without changing predicate, which could be also heavyweight on initializing.
+      val references = referenceToMatchedRows.keys.toList
+
+      // NOTE: attributes does not change, only values could change, depending on updates of
+      // matchedRows
+      val attrToValue = constructAttrToValue(references)
+      val lookupAttrs = attrToValue.map(_._1)
+      val fullSchema = child.output ++ lookupAttrs
+      val finalPredicate = Predicate.create(predicateResolved, fullSchema)
+
+      logWarning(s"DEBUG: final predicate: $finalPredicate")
+
+      // purposed to reuse per partition
+      val joinRow = new JoinedRow()
+
+      var lookupRow = InternalRow(attrToValue.map(_._2): _*)
 
       iter.filter { row =>
-        // FIXME: This is just a simplified example - in practice, predicateResolved has to be
-        //  actually changed whenever we add the match here...
-        //  Could we make the predicate as parameterized? Then we could build an association
-        //  between param name and the offset and column name we need to retrieve, and do the
-        //  thing for every input without having to replace the function call with literal
-        //  in the predicate.
-        predicateResolved.eval(row).asInstanceOf[Boolean]
+        joinRow.withLeft(row)
+
+        logWarning(s"DEBUG: attrToValue = $attrToValue")
+        logWarning(s"DEBUG: fullSchema = $fullSchema")
+
+        // TODO: We should update lookupRow if matchedRows has changed in the loop. Either simply
+        //  invalidate whenever matchedRows has changed, or smart enough to detect whether the
+        //  matched rows in offsets are changed and invalidate if any of them is changed.
+
+        joinRow.withRight(lookupRow)
+
+        finalPredicate.eval(joinRow)
       }
     }
   }
@@ -84,4 +129,10 @@ case class EvalNthMatchPocExec(
 
   override protected def withNewChildInternal(newChild: SparkPlan): SparkPlan =
     copy(child = newChild)
+}
+
+object EvalNthMatchPocExec {
+  private case class MatchedRowsReference(input: Expression, offset: Int)
+
+  private case class ReferenceResolution(projection: Option[Projection], attribute: Attribute)
 }
