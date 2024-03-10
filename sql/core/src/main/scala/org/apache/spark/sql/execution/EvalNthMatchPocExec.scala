@@ -20,7 +20,7 @@ import scala.collection.mutable
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, JoinedRow, NthMatch, Predicate, Projection, SafeProjection}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, JoinedRow, NthMatch, Predicate, Projection, UnsafeProjection}
 import org.apache.spark.sql.catalyst.trees.TreePattern.NTH_MATCH
 import org.apache.spark.unsafe.types.UTF8String
 
@@ -71,7 +71,7 @@ case class EvalNthMatchPocExec(
       // Have to create projection inside each partition as it's not serializable, but should not
       // create the projection per row as it could be heavyweight (may incur codegen)
       referenceToMatchedRows.foreach { case (reference, resolution) =>
-        val proj = SafeProjection.create(Seq(reference.input), child.output)
+        val proj = UnsafeProjection.create(Seq(reference.input), child.output)
         referenceToMatchedRows.put(reference, resolution.copy(projection = Some(proj)))
       }
 
