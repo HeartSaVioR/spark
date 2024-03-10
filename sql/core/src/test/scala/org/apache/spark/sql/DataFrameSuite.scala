@@ -2597,6 +2597,28 @@ class DataFrameSuite extends QueryTest
     val evaluatedDf = df.evalNthMatchPoc(expression)
     checkAnswer(evaluatedDf, rows.get(1))
   }
+
+  test("DEBUG: nth_match 2") {
+    val expression = expr("nth_match(CONCAT(employee_name, organization), 3) = 'Joepyspark' AND" +
+      " employee_name = 'Neil'")
+
+    val cepOperatorInputType: StructType = StructType(
+      Array(
+        StructField("employee_name", StringType),
+        StructField("organization", StringType)
+      )
+    )
+    val rows = new java.util.ArrayList[Row]()
+    // This does not match.
+    rows.add(Row.fromSeq(Seq("Joe", "streaming")))
+    // This matches.
+    rows.add(Row.fromSeq(Seq("Neil", "streaming")))
+
+    val df: DataFrame = spark.createDataFrame(rows, cepOperatorInputType)
+
+    val evaluatedDf = df.evalNthMatchPoc(expression)
+    checkAnswer(evaluatedDf, rows.get(1))
+  }
 }
 
 case class GroupByKey(a: Int, b: Int)

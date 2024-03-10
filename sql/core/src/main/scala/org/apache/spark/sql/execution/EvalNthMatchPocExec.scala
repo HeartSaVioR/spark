@@ -51,20 +51,38 @@ case class EvalNthMatchPocExec(
 
   private val referenceToMatchedRows = mutable.HashMap[MatchedRowsReference, ReferenceResolution]()
 
-  private val predicateResolved = predicate.transformUpWithPruning(
-    _.containsAnyPattern(NTH_MATCH)) {
+  private val predicateResolved = {
+    var genColumnIdx = 0
+    predicate.transformUpWithPruning(_.containsAnyPattern(NTH_MATCH)) {
 
-    case NthMatch(input: AttributeReference, offset) =>
-      val resolution = referenceToMatchedRows.getOrElseUpdate(
-        MatchedRowsReference(input, offset), {
+      case NthMatch(input: AttributeReference, offset) =>
+        val resolution = referenceToMatchedRows.getOrElseUpdate(
+          MatchedRowsReference(input, offset), {
 
-          val attr = AttributeReference(s"__${offset}_th_${input.name}", input.dataType,
-            input.nullable)()
-          ReferenceResolution(None, attr)
-      })
+            val attr = AttributeReference(s"__${offset}_th_${input.name}", input.dataType,
+              input.nullable)()
+            ReferenceResolution(None, attr)
+          })
 
-      resolution.attribute
+        resolution.attribute
+
+      // NOTE: while we give a flexibility of expression here, it does not work if there is a
+      // nested use of nth_match(). It's probably feasible to handle the nested case with
+      // complex logic, but let's not worry about this for now.
+      case NthMatch(input: Expression, offset) =>
+        val resolution = referenceToMatchedRows.getOrElseUpdate(
+          MatchedRowsReference(input, offset), {
+
+            val attr = AttributeReference(s"__${offset}_th_gen_$genColumnIdx", input.dataType,
+              input.nullable)()
+            genColumnIdx += 1
+
+            ReferenceResolution(None, attr)
+          })
+
+        resolution.attribute
     }
+  }
 
   override protected def doExecute(): RDD[InternalRow] = {
     child.execute().mapPartitions { iter =>
