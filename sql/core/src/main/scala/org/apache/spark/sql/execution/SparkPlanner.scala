@@ -42,6 +42,7 @@ class SparkPlanner(val session: SparkSession, val experimentalMethods: Experimen
       DataSourceStrategy ::
       SpecialLimits ::
       Aggregation ::
+      EvalNthMatchPocStrategy ::
       Window ::
       WindowGroupLimit ::
       JoinSelection ::

@@ -563,6 +563,15 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
     }
   }
 
+  object EvalNthMatchPocStrategy extends Strategy {
+    def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
+      case EvalNthMatchPoc(predicate, child) =>
+        Seq(EvalNthMatchPocExec(predicate, planLater(child)))
+
+      case _ => Seq()
+    }
+  }
+
   /**
    * Used to plan the aggregate operator for expressions based on the AggregateFunction2 interface.
    */

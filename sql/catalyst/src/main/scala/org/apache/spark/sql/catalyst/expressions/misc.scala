@@ -18,13 +18,14 @@
 package org.apache.spark.sql.catalyst.expressions
 
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.analysis.{ExpressionBuilder, FunctionRegistry, UnresolvedSeed}
+import org.apache.spark.sql.catalyst.analysis.{ExpressionBuilder, FunctionRegistry, TypeCheckResult, UnresolvedSeed}
+import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.DataTypeMismatch
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.expressions.objects.StaticInvoke
-import org.apache.spark.sql.catalyst.trees.TreePattern.{CURRENT_LIKE, TreePattern}
+import org.apache.spark.sql.catalyst.trees.TreePattern.{CURRENT_LIKE, NTH_MATCH, TreePattern}
 import org.apache.spark.sql.catalyst.util.{MapData, RandomUUIDGenerator}
-import org.apache.spark.sql.errors.QueryCompilationErrors
+import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryErrorsBase}
 import org.apache.spark.sql.errors.QueryExecutionErrors.raiseError
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
@@ -538,4 +539,52 @@ case class TryAesDecrypt(
   override protected def withNewChildInternal(newChild: Expression): Expression =
     this.copy(replacement = newChild)
 }
+
+// FIXME: should move to CEP expressions eventually
+case class NthMatch(input: Expression, offset: Int)
+  extends UnaryExpression
+  with ExpectsInputTypes
+  with Unevaluable
+  // with NonSQLExpression
+  with QueryErrorsBase {
+
+  def this(
+      input: Expression,
+      offset: Expression) = {
+    // FIXME: Just a hack right now. maybe should guard against the type.
+    this(input, offset.asInstanceOf[Literal].value.asInstanceOf[Int])
+  }
+
+  override def child: Expression = input
+
+  override def inputTypes: Seq[AbstractDataType] = Seq(input.dataType)
+
+  override def dataType: DataType = input.dataType
+
+  override def prettyName: String = "nth_match"
+
+  override protected val nodePatterns: Seq[TreePattern] = Seq(NTH_MATCH)
+
+  override def checkInputDataTypes(): TypeCheckResult = {
+    val dataTypeCheck = super.checkInputDataTypes()
+    if (dataTypeCheck.isSuccess) {
+      if (offset <= 0) {
+        return DataTypeMismatch(
+          errorSubClass = "VALUE_OUT_OF_RANGE",
+          messageParameters = Map(
+            "exprName" -> toSQLId("offset"),
+            "valueRange" -> s"(0, ${Int.MaxValue}]",
+            "currentValue" -> toSQLValue(offset, IntegerType)
+          )
+        )
+      }
+    }
+    dataTypeCheck
+  }
+
+  override protected def withNewChildInternal(newChild: Expression): Expression = {
+    copy(input = newChild)
+  }
+}
+
 // scalastyle:on line.size.limit

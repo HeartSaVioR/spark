@@ -2575,6 +2575,30 @@ class DataFrameSuite extends QueryTest
     val expected = getQueryResult(false).map(_.getTimestamp(0).toString).sorted
     assert(actual == expected)
   }
+
+  test("DEBUG: nth_match") {
+    val expression = expr("nth_match(employee_name, 3) = 'Joe' AND" +
+      " nth_match(organization, 2) = 'streaming'")
+    logWarning(s"DEBUG: expression = $expression")
+
+    val cepOperatorInputType: StructType = StructType(
+      Array(
+        StructField("employee_name", StringType),
+        StructField("organization", StringType)
+      )
+    )
+    val rows = new java.util.ArrayList[Row]()
+    rows.add(Row.fromSeq(Seq("Joe", "streaming")))
+    val df: DataFrame = spark.createDataFrame(
+      rows, cepOperatorInputType)
+
+    val evaluatedDf = df.evalNthMatchPoc(expression)
+    logWarning(s"DEBUG: evaluatedDf = ${evaluatedDf}")
+
+    logWarning(s"DEBUG: collect DF = ${evaluatedDf.collect().mkString("Array(", ", ", ")")}")
+
+    assert(!evaluatedDf.isEmpty, "Predicate has to be matched!")
+  }
 }
 
 case class GroupByKey(a: Int, b: Int)

@@ -799,6 +799,10 @@ class Dataset[T] private[sql](
       EventTimeWatermark(UnresolvedAttribute(eventTime), parsedDelay, logicalPlan))
   }
 
+  def evalNthMatchPoc(predicate: Column): Dataset[T] = withTypedPlan {
+    EvalNthMatchPoc(predicate.expr, logicalPlan)
+  }
+
   /**
    * Displays the Dataset in a tabular form. Strings more than 20 characters will be truncated,
    * and all cells will be aligned right. For example:
