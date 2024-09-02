@@ -24,11 +24,11 @@ import scala.collection.mutable
 import org.apache.spark.internal.{Logging, MDC}
 import org.apache.spark.internal.LogKeys.{NUM_PRUNED, POST_SCAN_FILTERS, PUSHED_FILTERS, TOTAL}
 import org.apache.spark.sql._
-import org.apache.spark.sql.catalyst.catalog.BucketSpec
+import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogTable}
 import org.apache.spark.sql.catalyst.expressions
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.planning.ScanOperation
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.catalyst.plans.logical.{CollectMetrics, LogicalPlan}
 import org.apache.spark.sql.catalyst.trees.TreePattern.{PLAN_EXPRESSION, SCALAR_SUBQUERY}
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.execution.{FileSourceScanExec, SparkPlan}
@@ -60,6 +60,25 @@ import org.apache.spark.util.collection.BitSet
  *     and add it.  Proceed to the next file.
  */
 object FileSourceStrategy extends Strategy with PredicateHelper with Logging {
+
+  private type HadoopFsRelationHolderRetType =
+    (LogicalRelation, HadoopFsRelation, Option[CatalogTable], Option[CollectMetrics])
+
+  private object HadoopFsRelationHolder {
+    def unapply(plan: LogicalPlan): Option[HadoopFsRelationHolderRetType] = {
+      plan match {
+        case c @ CollectMetrics(name, _,
+          l @ LogicalRelation(fsRelation: HadoopFsRelation, _, table, _), _)
+          if CollectMetrics.isForStreamSource(name) =>
+            Some(l, fsRelation, table, Some(c))
+
+        case l @ LogicalRelation(fsRelation: HadoopFsRelation, _, table, _) =>
+          Some(l, fsRelation, table, None)
+
+        case _ => None
+      }
+    }
+  }
 
   // should prune buckets iff num buckets is greater than 1 and there is only one bucket column
   private def shouldPruneBuckets(bucketSpec: Option[BucketSpec]): Boolean = {
@@ -151,7 +170,7 @@ object FileSourceStrategy extends Strategy with PredicateHelper with Logging {
 
   def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
     case ScanOperation(projects, stayUpFilters, filters,
-      l @ LogicalRelation(fsRelation: HadoopFsRelation, _, table, _)) =>
+      HadoopFsRelationHolder(l, fsRelation, table, collectMetricsOpt)) =>
       // Filters on this relation fall into four categories based on where we can use them to avoid
       // reading unneeded data:
       //  - partition keys only - used to prune directories to read
@@ -342,9 +361,25 @@ object FileSourceStrategy extends Strategy with PredicateHelper with Logging {
         val metadataAlias =
           Alias(KnownNotNull(CreateStruct(structColumns.toImmutableArraySeq)),
             FileFormat.METADATA_NAME)(exprId = metadataStruct.exprId)
+
+        val nodeExec = if (collectMetricsOpt.isDefined) {
+          val collectMetricsLogical = collectMetricsOpt.get
+          execution.CollectMetricsExec(
+            collectMetricsLogical.name, collectMetricsLogical.metrics, scan)
+        } else {
+          scan
+        }
         execution.ProjectExec(
-          readDataColumns ++ partitionColumns :+ metadataAlias, scan)
-      }.getOrElse(scan)
+          readDataColumns ++ partitionColumns :+ metadataAlias, nodeExec)
+      }.getOrElse {
+        if (collectMetricsOpt.isDefined) {
+          val collectMetricsLogical = collectMetricsOpt.get
+          execution.CollectMetricsExec(
+            collectMetricsLogical.name, collectMetricsLogical.metrics, scan)
+        } else {
+          scan
+        }
+      }
 
       // bottom-most filters are put in the left of the list.
       val finalFilters = afterScanFilters.toSeq.reduceOption(expressions.And).toSeq ++ stayUpFilters

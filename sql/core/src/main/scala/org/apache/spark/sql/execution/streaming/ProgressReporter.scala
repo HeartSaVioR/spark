@@ -27,14 +27,13 @@ import scala.jdk.CollectionConverters._
 
 import org.apache.spark.internal.{Logging, LogKeys, MDC}
 import org.apache.spark.sql.{Row, SparkSession}
-import org.apache.spark.sql.catalyst.optimizer.InlineCTE
-import org.apache.spark.sql.catalyst.plans.logical.{EventTimeWatermark, LogicalPlan, WithCTE}
+import org.apache.spark.sql.catalyst.plans.logical.{EventTimeWatermark, LogicalPlan}
 import org.apache.spark.sql.catalyst.util.DateTimeConstants.MILLIS_PER_SECOND
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.connector.catalog.Table
-import org.apache.spark.sql.connector.read.streaming.{MicroBatchStream, ReportsSinkMetrics, ReportsSourceMetrics, SparkDataStream}
+import org.apache.spark.sql.connector.read.streaming.{ReportsSinkMetrics, ReportsSourceMetrics, SparkDataStream}
 import org.apache.spark.sql.execution.QueryExecution
-import org.apache.spark.sql.execution.datasources.v2.{MicroBatchScanExec, StreamingDataSourceV2ScanRelation, StreamWriterCommitProgress}
+import org.apache.spark.sql.execution.datasources.v2.{StreamWriterCommitProgress}
 import org.apache.spark.sql.streaming._
 import org.apache.spark.sql.streaming.StreamingQueryListener.{QueryIdleEvent, QueryProgressEvent}
 import org.apache.spark.util.{Clock, Utils}
@@ -143,6 +142,8 @@ abstract class ProgressContext(
 
   // the most recent input data for each source.
   protected def newData: Map[SparkDataStream, LogicalPlan]
+
+  protected def uuidToStream: Map[String, SparkDataStream]
 
   /** Flag that signals whether any error with input metrics have already been logged */
   protected var metricWarningLogged: Boolean = false
@@ -409,103 +410,21 @@ abstract class ProgressContext(
       tuples.groupBy(_._1).transform((_, v) => v.map(_._2).sum) // sum up rows for each source
     }
 
-    def unrollCTE(plan: LogicalPlan): LogicalPlan = {
-      val containsCTE = plan.exists {
-        case _: WithCTE => true
-        case _ => false
-      }
+    import org.apache.spark.sql.execution.CollectMetricsExec
 
-      if (containsCTE) {
-        InlineCTE(alwaysInline = true).apply(plan)
-      } else {
-        plan
-      }
-    }
-
-    val onlyDataSourceV2Sources = {
-      // Check whether the streaming query's logical plan has only V2 micro-batch data sources
-      val allStreamingLeaves = progressReporter.logicalPlan().collect {
-        case s: StreamingDataSourceV2ScanRelation => s.stream.isInstanceOf[MicroBatchStream]
-        case _: StreamingExecutionRelation => false
-      }
-      allStreamingLeaves.forall(_ == true)
-    }
-
-    if (onlyDataSourceV2Sources) {
-      // It's possible that multiple DataSourceV2ScanExec instances may refer to the same source
-      // (can happen with self-unions or self-joins). This means the source is scanned multiple
-      // times in the query, we should count the numRows for each scan.
+    if (uuidToStream != null) {
       val sourceToInputRowsTuples = lastExecution.executedPlan.collect {
-        case s: MicroBatchScanExec =>
-          val numRows = s.metrics.get("numOutputRows").map(_.value).getOrElse(0L)
-          val source = s.stream
-          source -> numRows
+        case c: CollectMetricsExec if uuidToStream.contains(c.name) =>
+          val stream = uuidToStream(c.name)
+          val numRows = c.collectedMetrics.getAs[Long]("row_count")
+          stream -> numRows
       }
+
       logDebug("Source -> # input rows\n\t" + sourceToInputRowsTuples.mkString("\n\t"))
-      sumRows(sourceToInputRowsTuples)
+      sumRows(sourceToInputRowsTuples.toSeq)
     } else {
-
-      // Since V1 source do not generate execution plan leaves that directly link with source that
-      // generated it, we can only do a best-effort association between execution plan leaves to the
-      // sources. This is known to fail in a few cases, see SPARK-24050.
-      //
-      // We want to associate execution plan leaves to sources that generate them, so that we match
-      // the their metrics (e.g. numOutputRows) to the sources. To do this we do the following.
-      // Consider the translation from the streaming logical plan to the final executed plan.
-      //
-      // streaming logical plan (with sources) <==> trigger's logical plan <==> executed plan
-      //
-      // 1. We keep track of streaming sources associated with each leaf in trigger's logical plan
-      //  - Each logical plan leaf will be associated with a single streaming source.
-      //  - There can be multiple logical plan leaves associated with a streaming source.
-      //  - There can be leaves not associated with any streaming source, because they were
-      //      generated from a batch source (e.g. stream-batch joins)
-      //
-      // 2. Assuming that the executed plan has same number of leaves in the same order as that of
-      //    the trigger logical plan, we associate executed plan leaves with corresponding
-      //    streaming sources.
-      //
-      // 3. For each source, we sum the metrics of the associated execution plan leaves.
-      //
-      val logicalPlanLeafToSource = newData.flatMap { case (source, logicalPlan) =>
-        logicalPlan.collectLeaves().map { leaf => leaf -> source }
-      }
-
-      // SPARK-41198: CTE is inlined in optimization phase, which ends up with having different
-      // number of leaf nodes between (analyzed) logical plan and executed plan. Here we apply
-      // inlining CTE against logical plan manually if there is a CTE node.
-      val finalLogicalPlan = unrollCTE(lastExecution.logical)
-
-      val allLogicalPlanLeaves = finalLogicalPlan.collectLeaves() // includes non-streaming
-      val allExecPlanLeaves = lastExecution.executedPlan.collectLeaves()
-      if (allLogicalPlanLeaves.size == allExecPlanLeaves.size) {
-        val execLeafToSource = allLogicalPlanLeaves.zip(allExecPlanLeaves).flatMap {
-          case (_, ep: MicroBatchScanExec) =>
-            // SPARK-41199: `logicalPlanLeafToSource` contains OffsetHolder instance for DSv2
-            // streaming source, hence we cannot lookup the actual source from the map.
-            // The physical node for DSv2 streaming source contains the information of the source
-            // by itself, so leverage it.
-            Some(ep -> ep.stream)
-          case (lp, ep) =>
-            logicalPlanLeafToSource.get(lp).map { source => ep -> source }
-        }
-        val sourceToInputRowsTuples = execLeafToSource.map { case (execLeaf, source) =>
-          val numRows = execLeaf.metrics.get("numOutputRows").map(_.value).getOrElse(0L)
-          source -> numRows
-        }
-        sumRows(sourceToInputRowsTuples)
-      } else {
-        if (!metricWarningLogged) {
-          def toString[T](seq: Seq[T]): String = s"(size = ${seq.size}), ${seq.mkString(", ")}"
-
-          logWarning(log"Could not report metrics as number leaves in trigger logical plan did " +
-            log"not match that of the execution plan:\nlogical plan leaves: " +
-            log"${MDC(LogKeys.LOGICAL_PLAN_LEAVES, toString(allLogicalPlanLeaves))}\nexecution " +
-            log"plan leaves: ${MDC(LogKeys.EXECUTION_PLAN_LEAVES, toString(allExecPlanLeaves))}\n")
-          metricWarningLogged = true
-        }
-        Map.empty
-      }
+      logWarning("Association for streaming source output has been lost.")
+      Map.empty
     }
   }
 
