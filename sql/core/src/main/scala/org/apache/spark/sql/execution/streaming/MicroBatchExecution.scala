@@ -17,14 +17,17 @@
 
 package org.apache.spark.sql.execution.streaming
 
+import java.util.UUID
+
 import scala.collection.mutable.{Map => MutableMap}
 import scala.collection.mutable
 
 import org.apache.spark.internal.{LogKeys, MDC}
-import org.apache.spark.sql.{Dataset, SparkSession}
+import org.apache.spark.sql.{Column, Dataset, SparkSession}
+import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, CurrentBatchTimestamp, CurrentDate, CurrentTimestamp, FileSourceMetadataAttribute, LocalTimestamp}
-import org.apache.spark.sql.catalyst.plans.logical.{LeafNode, LocalRelation, LogicalPlan, Project}
+import org.apache.spark.sql.catalyst.plans.logical.{CollectMetrics, LeafNode, LocalRelation, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.streaming.{StreamingRelationV2, WriteToStream}
 import org.apache.spark.sql.catalyst.trees.TreePattern.CURRENT_LIKE
 import org.apache.spark.sql.catalyst.util.truncatedString
@@ -35,6 +38,8 @@ import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, StreamingDataSourceV2Relation, StreamingDataSourceV2ScanRelation, StreamWriterCommitProgress, WriteToDataSourceV2Exec}
 import org.apache.spark.sql.execution.streaming.sources.{WriteToMicroBatchDataSource, WriteToMicroBatchDataSourceV1}
+import org.apache.spark.sql.functions.count
+import org.apache.spark.sql.internal
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.Trigger
 import org.apache.spark.util.{Clock, Utils}
@@ -731,10 +736,15 @@ class MicroBatchExecution(
     }
 
     // Replace sources in the logical plan with data that has arrived since the last batch.
+    import sparkSessionToRunBatch.RichColumn
+
+    val uuidToStream = new mutable.HashMap[String, SparkDataStream]()
+    val streamToCollectMetrics = new mutable.HashMap[SparkDataStream, CollectMetrics]()
+
     val newBatchesPlan = logicalPlan transform {
       // For v1 sources.
       case StreamingExecutionRelation(source, output, catalogTable) =>
-        mutableNewData.get(source).map { dataPlan =>
+        val node = mutableNewData.get(source).map { dataPlan =>
           val hasFileMetadata = output.exists {
             case FileSourceMetadataAttribute(_) => true
             case _ => false
@@ -782,16 +792,54 @@ class MicroBatchExecution(
           LocalRelation(output, isStreaming = true)
         }
 
+        val collectMetricsName = CollectMetrics.nameForStreamSource(
+          UUID.randomUUID().toString)
+        uuidToStream.put(collectMetricsName, source)
+        val cachedCollectMetrics = streamToCollectMetrics.getOrElseUpdate(source,
+          CollectMetrics(
+            collectMetricsName,
+            Seq(
+              count(
+                new Column(internal.Literal(1))).as("row_count")
+            ).map(_.named),
+            UnresolvedRelation(Seq("dummy")),
+            -1
+          )
+        )
+
+        val colMetrics = cachedCollectMetrics.copy(child = node)
+        sparkSessionToRunBatch.sessionState.analyzer.execute(colMetrics)
+
       // For v2 sources.
-      case r: StreamingDataSourceV2ScanRelation =>
-        mutableNewData.get(r.stream).map {
+      case r: StreamingDataSourceV2ScanRelation
+        if r.startOffset.isEmpty && r.endOffset.isEmpty =>
+        val node = mutableNewData.get(r.stream).map {
           case OffsetHolder(start, end) =>
             r.copy(startOffset = Some(start), endOffset = Some(end))
         }.getOrElse {
           LocalRelation(r.output, isStreaming = true)
         }
+
+        val collectMetricsName = CollectMetrics.nameForStreamSource(
+          UUID.randomUUID().toString)
+        uuidToStream.put(collectMetricsName, r.stream)
+        val cachedCollectMetrics = streamToCollectMetrics.getOrElseUpdate(r.stream,
+          CollectMetrics(
+            collectMetricsName,
+            Seq(
+              count(
+                new Column(internal.Literal(1))).as("row_count")
+            ).map(_.named),
+            UnresolvedRelation(Seq("dummy")),
+            -1
+          )
+        )
+
+        val colMetrics = cachedCollectMetrics.copy(child = node)
+        sparkSessionToRunBatch.sessionState.analyzer.execute(colMetrics)
     }
     execCtx.newData = mutableNewData.toMap
+    execCtx.uuidToStream = uuidToStream.toMap
     // Rewire the plan to use the new attributes that were returned by the source.
     val newAttributePlan = newBatchesPlan.transformAllExpressionsWithPruning(
       _.containsPattern(CURRENT_LIKE)) {

@@ -2024,8 +2024,15 @@ case class CollectMetrics(
     dataframeId: Long)
   extends UnaryNode {
 
+  import CollectMetrics._
+
   override lazy val resolved: Boolean = {
     name.nonEmpty && metrics.nonEmpty && metrics.forall(_.resolved) && childrenResolved
+  }
+
+  if (isForStreamSource(name)) {
+    assert(references.isEmpty,
+      "The node should not refer any column if it's used for stream source output counter!")
   }
 
   override def maxRows: Option[Long] = child.maxRows
@@ -2038,6 +2045,14 @@ case class CollectMetrics(
   override def doCanonicalize(): LogicalPlan = {
     super.doCanonicalize().asInstanceOf[CollectMetrics].copy(dataframeId = 0L)
   }
+}
+
+object CollectMetrics {
+  val STREAM_SOURCE_PREFIX = "__stream_source_"
+
+  def nameForStreamSource(name: String): String = s"$STREAM_SOURCE_PREFIX$name"
+
+  def isForStreamSource(name: String): Boolean = name.startsWith(STREAM_SOURCE_PREFIX)
 }
 
 /**

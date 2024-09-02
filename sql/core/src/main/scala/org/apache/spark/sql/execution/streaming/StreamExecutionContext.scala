@@ -49,6 +49,8 @@ abstract class StreamExecutionContext(
   /** Holds the most recent input data for each source. */
   var newData: Map[SparkDataStream, LogicalPlan] = _
 
+  var uuidToStream: Map[String, SparkDataStream] = _
+
   /**
    * Stores the start offset for this batch.
    * Only the scheduler thread should modify this field, and only in atomic steps.

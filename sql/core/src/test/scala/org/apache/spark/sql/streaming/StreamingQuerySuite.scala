@@ -1448,6 +1448,65 @@ class StreamingQuerySuite extends StreamTest with BeforeAndAfter with Logging wi
     }
   }
 
+  // FIXME: ...testing...
+  test("SPARK-XXXXX: partition filter is defined against parquet streaming source") {
+    withView("view1") {
+      withTable("table1") {
+        spark.conf.set(SQLConf.PLAN_CHANGE_LOG_LEVEL.key, "INFO")
+        spark.sql(
+          """
+            |CREATE TABLE table1
+            |(row_date date, value int)
+            |USING parquet
+            |PARTITIONED BY (row_date)
+            |""".stripMargin)
+
+        (1 to 31).foreach { day =>
+          val dateStr = f"2024-01-$day%02d"
+          spark.range(0 + 100 * day, 100 + 100 * day)
+            // .selectExpr(s"CAST('$dateStr' AS date) AS row_date", "id AS value")
+            // FIXME: why the order of column has reversed???
+            .selectExpr("id AS value", s"CAST('$dateStr' AS date) AS row_date")
+            // intended to write a single file
+            .repartition(1)
+            .write
+            .insertInto("table1")
+        }
+
+        val df1 = spark.readStream
+          .format("parquet")
+          // This is just to simplify the case. In production, it won't be 1 but 1000 by default,
+          // but the amount of backlog could be also huge as well, which would have the same issue.
+          .option("maxFilesPerTrigger", "1")
+          .table("table1")
+          .where("row_date > CAST('2024-01-15' AS date)")
+
+        val query1 = df1
+          .selectExpr("CAST(row_date AS string)", "value")
+          .writeStream
+          .format("memory")
+          .queryName("table1output")
+          .trigger(Trigger.AvailableNow())
+          .start()
+
+        query1.processAllAvailable()
+
+        val (batchesZeroInputRows, batchesNonZeroInputRows) = query1.recentProgress
+          // This filters out update events from idle trigger
+          .filter(_.durationMs.containsKey("addBatch"))
+          .partition(_.numInputRows == 0)
+
+        // FIXME: This requires filter pushdown to take effect in DSv1 streaming source.
+        assert(batchesZeroInputRows.map(_.batchId) === (0 until 15))
+        assert(batchesNonZeroInputRows.map(_.batchId) === (15 until 31))
+
+        logWarning(s"DEBUG: progresses: ${query1.recentProgress.mkString("Array(", ", ", ")")}")
+
+        query1.explain(extended = true)
+      }
+    }
+  }
+
   private def checkAppendOutputModeException(df: DataFrame): Unit = {
     withTempDir { outputDir =>
       withTempDir { checkpointDir =>
