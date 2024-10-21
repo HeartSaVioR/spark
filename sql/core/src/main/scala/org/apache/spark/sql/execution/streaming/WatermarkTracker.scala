@@ -124,6 +124,8 @@ case class WatermarkTracker(policy: MultipleWatermarkPolicy) extends Logging {
   }
 
   def currentWatermark: Long = synchronized { globalWatermarkMs }
+
+  def watermarkMap: Map[Int, Long] = synchronized { operatorToWatermarkMap.toMap }
 }
 
 object WatermarkTracker {
