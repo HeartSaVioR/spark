@@ -387,6 +387,15 @@ case class TransformWithStateInPandasExec(
     }
 
     val data = groupAndProject(filteredIter, groupingAttributes, child.output, dedupAttributes)
+      .map { case (key, valueIter) =>
+        // FIXME: This is tightly coupled with the implementation of the test case, we are
+        //   setting up grouping key as only one string type column, and each input data will
+        //   have its own grouping key.
+        val keyUUID = key.getUTF8String(0)
+        logWarning(s"[TIME-SCALA][KEY=$keyUUID][TS=${System.currentTimeMillis()}] " +
+          "Spark pulls the iterators for the key to feed to Python worker.")
+        (key, valueIter)
+      }
 
     val processorHandle = new StatefulProcessorHandleImpl(store, getStateInfo.queryRunId,
       groupingKeyExprEncoder, timeMode, isStreaming, batchTimestampMs, metrics)
@@ -407,6 +416,15 @@ case class TransformWithStateInPandasExec(
         eventTimeWatermarkForEviction
       )
       executePython(data, output, runner)
+        .map { row =>
+          // FIXME: This is tightly coupled with the implementation of the benchmark case, we are
+          //   producing grouping key as the first column of the output.
+          val keyUUID = row.getUTF8String(0)
+          logWarning(s"[TIME-SCALA][KEY=$keyUUID][TS=${System.currentTimeMillis()}] " +
+            "The data is being retrieved from Python worker and evaluated from the " +
+            "output iterator.")
+          row
+        }
     } else {
       // dedup attributes here because grouping attributes appear twice (key and value)
       val (initDedupAttributes, initArgOffsets) =
