@@ -1705,20 +1705,32 @@ class TransformWithStateInPySparkRowSerializer(ArrowStreamUDFSerializer):
         import pyarrow as pa
 
         def flatten_iterator():
+            rows_as_dict = []
+
+            pdf_type = None
+            pdf_schema = None
+
             # iterator: iter[list[(iter[Row], pdf_type)]]
             for packed in iterator:
                 iter_row_with_type = packed[0]
                 iter_row = iter_row_with_type[0]
-                pdf_type = iter_row_with_type[1]
 
-                rows_as_dict = []
+                if pdf_type is None:
+                    pdf_type = iter_row_with_type[1]
+                    pdf_schema = pa.schema(list(pdf_type))
+
                 for row in iter_row:
                     row_as_dict = row.asDict(True)
                     rows_as_dict.append(row_as_dict)
 
-                pdf_schema = pa.schema(list(pdf_type))
-                record_batch = pa.RecordBatch.from_pylist(rows_as_dict, schema=pdf_schema)
+                    if len(rows_as_dict) >= self.arrow_max_records_per_batch:
+                        # If the number of rows exceeds the limit, yield a RecordBatch
+                        record_batch = pa.RecordBatch.from_pylist(rows_as_dict, schema=pdf_schema)
+                        yield (record_batch, pdf_type)
+                        rows_as_dict = []
 
+            if len(rows_as_dict) > 0:
+                record_batch = pa.RecordBatch.from_pylist(rows_as_dict, schema=pdf_schema)
                 yield (record_batch, pdf_type)
 
         return ArrowStreamUDFSerializer.dump_stream(self, flatten_iterator(), stream)
