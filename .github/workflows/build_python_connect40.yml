@@ -64,6 +64,7 @@ jobs:
           architecture: x64
       - name: Build Spark
         run: |
+          echo "current commit sha of master:" `git rev-parse HEAD`
           ./build/sbt -Phive Test/package
       - name: Install Python dependencies
         run: |
@@ -97,6 +98,7 @@ jobs:
           cd ..
           git clone --single-branch --branch branch-4.0-SC-213385 $GITHUB_SERVER_URL/$GITHUB_REPOSITORY spark-4.0
           cd spark-4.0
+          echo "current commit sha of branch-4.0:" `git rev-parse HEAD`
 
           # Several tests related to catalog requires to run them sequencially, e.g., writing a table in a listener.
           # Run branch-4.0-SC-213385 tests
