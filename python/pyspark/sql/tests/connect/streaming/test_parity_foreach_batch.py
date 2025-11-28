@@ -26,9 +26,10 @@ if should_test_connect:
     from pyspark.errors.exceptions.connect import StreamingPythonRunnerInitializationException
 
 
-@unittest.skipIf(
-    os.environ.get("SPARK_SKIP_CONNECT_COMPAT_TESTS") == "1", "SPARK-54480: To be reenabled"
-)
+# FIXME: re-enabling compat tests...
+# @unittest.skipIf(
+#     os.environ.get("SPARK_SKIP_CONNECT_COMPAT_TESTS") == "1", "SPARK-54480: To be reenabled"
+# )
 class StreamingForeachBatchParityTests(StreamingTestsForeachBatchMixin, ReusedConnectTestCase):
     def test_streaming_foreach_batch_propagates_python_errors(self):
         super().test_streaming_foreach_batch_propagates_python_errors()
