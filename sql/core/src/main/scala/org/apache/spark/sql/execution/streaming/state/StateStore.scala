@@ -242,6 +242,8 @@ trait StateStore extends ReadStateStore {
       key: UnsafeRow,
       colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Unit
 
+  // FIXME: remove range API - for RangeScan
+
   /**
    * Merges the provided value with existing values of a non-null key. If a existing
    * value does not exist, this operation behaves as [[StateStore.put()]].

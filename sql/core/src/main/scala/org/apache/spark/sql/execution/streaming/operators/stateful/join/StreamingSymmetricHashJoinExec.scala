@@ -262,6 +262,7 @@ case class StreamingSymmetricHashJoinExec(
     }
   }
 
+  // FIXME: stream-stream join version 3
   override def getColFamilySchemas(
       shouldBeNullable: Boolean): Map[String, StateStoreColFamilySchema] = {
     assert(useVirtualColumnFamilies)
@@ -288,6 +289,7 @@ case class StreamingSymmetricHashJoinExec(
       hadoopConf: Configuration,
       batchId: Long,
       stateSchemaVersion: Int): List[StateSchemaValidationResult] = {
+    // FIXME: stream-stream join version 3
     if (useVirtualColumnFamilies) {
       val info = getStateInfo
       val stateSchemaDir = stateSchemaDirPath()
