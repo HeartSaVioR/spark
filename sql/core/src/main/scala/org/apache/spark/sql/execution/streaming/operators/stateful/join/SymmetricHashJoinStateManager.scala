@@ -71,7 +71,9 @@ trait SymmetricHashJoinStateManager {
 trait SupportsEvictByTimestamp {
   import SymmetricHashJoinStateManager._
 
-  def evictByTimestamp(endTimestamp: Long): Iterator[KeyToValuePair]
+  def evictByTimestamp(endTimestamp: Long): Int
+
+  def evictAndReturnByTimestamp(endTimestamp: Long): Iterator[KeyToValuePair]
 }
 
 class SymmetricHashJoinStateManagerV4(
@@ -189,7 +191,20 @@ class SymmetricHashJoinStateManagerV4(
     }
   }
 
-  override def evictByTimestamp(endTimestamp: Long): Iterator[KeyToValuePair] = {
+  override def evictByTimestamp(endTimestamp: Long): Int = {
+    var removed = 0
+    tsWithKey.evictKeys(endTimestamp).foreach { evicted =>
+      val key = evicted.key
+      val timestamp = evicted.timestamp
+      // Remove from both primary and secondary stores
+      keyWithTsToValues.remove(key, timestamp)
+      tsWithKey.remove(key, timestamp)
+      removed += 1
+    }
+    removed
+  }
+
+  override def evictAndReturnByTimestamp(endTimestamp: Long): Iterator[KeyToValuePair] = {
     tsWithKey.evictKeys(endTimestamp).flatMap { evicted =>
       val key = evicted.key
       val timestamp = evicted.timestamp
@@ -529,10 +544,7 @@ class SymmetricHashJoinStateManagerV4(
 
     def exists(timestamp: Long, key: UnsafeRow): Boolean = {
       val row = tsWithKeyRow(timestamp, key)
-      stateStore.get(row, colFamilyName) match {
-        case null => false
-        case _ => true
-      }
+      stateStore.keyExists(row, colFamilyName)
     }
 
     def remove(key: UnsafeRow, timestamp: Long): Unit = {

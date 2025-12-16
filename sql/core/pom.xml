@@ -290,6 +290,14 @@
       <groupId>org.apache.arrow</groupId>
       <artifactId>arrow-compression</artifactId>
     </dependency>
+
+    <!-- temporary dependency -->
+    <dependency>
+      <groupId>tools.profiler</groupId>
+      <artifactId>async-profiler</artifactId>
+      <version>3.0</version>
+      <!-- <scope>test</scope> -->
+    </dependency>
   </dependencies>
   <build>
     <outputDirectory>target/scala-${scala.binary.version}/classes</outputDirectory>

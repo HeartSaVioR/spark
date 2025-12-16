@@ -505,9 +505,7 @@ class SymmetricHashJoinStateManagerV4EventTimeInKeySuite extends StreamTest with
   def removeByKey(threshold: Long)(implicit manager: SymmetricHashJoinStateManager): Unit = {
     manager match {
       case s: SupportsEvictByTimestamp =>
-        s.evictByTimestamp(threshold).foreach { _ =>
-          // no-op, just to consume the iterator
-        }
+        s.evictByTimestamp(threshold)
 
       case _ => throw new IllegalStateException("Should not reach here")
     }
@@ -757,9 +755,7 @@ class SymmetricHashJoinStateManagerV4EventTimeInValueSuite extends StreamTest wi
   def removeByValue(threshold: Long)(implicit manager: SymmetricHashJoinStateManager): Unit = {
     manager match {
       case s: SupportsEvictByTimestamp =>
-        s.evictByTimestamp(threshold).foreach { _ =>
-          // no-op, just to consume the iterator
-        }
+        s.evictByTimestamp(threshold)
 
       case _ => throw new IllegalStateException("Should not reach here")
     }
