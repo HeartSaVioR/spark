@@ -101,7 +101,17 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
       new StateStoreIterator(iter)
     }
 
+    override def prefixScanWithMultiValues(
+        prefixKey: UnsafeRow, colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+      throw StateStoreErrors.unsupportedOperationException("multipleValuesPerKey", "HDFSStateStore")
+    }
+
     override def valuesIterator(key: UnsafeRow, colFamilyName: String): Iterator[UnsafeRow] = {
+      throw StateStoreErrors.unsupportedOperationException("multipleValuesPerKey", "HDFSStateStore")
+    }
+
+    override def iteratorWithMultiValues(colFamilyName: String)
+      : StateStoreIterator[UnsafeRowPair] = {
       throw StateStoreErrors.unsupportedOperationException("multipleValuesPerKey", "HDFSStateStore")
     }
   }
@@ -307,6 +317,17 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
     override def mergeList(
         key: UnsafeRow, values: Array[UnsafeRow], colFamilyName: String): Unit = {
       throw StateStoreErrors.unsupportedOperationException("mergeList", providerName)
+    }
+
+    override def iteratorWithMultiValues(
+        colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+      throw StateStoreErrors.unsupportedOperationException("iteratorWithMultiValues", providerName)
+    }
+
+    override def prefixScanWithMultiValues(
+        prefixKey: UnsafeRow, colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+      throw StateStoreErrors.unsupportedOperationException(
+        "prefixScanWithMultiValues", providerName)
     }
   }
 

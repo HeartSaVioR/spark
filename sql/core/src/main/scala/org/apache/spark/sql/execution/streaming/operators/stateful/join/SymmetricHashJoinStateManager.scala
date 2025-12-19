@@ -33,7 +33,7 @@ import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.execution.streaming.operators.stateful.{StatefulOperatorStateInfo, StatefulOpStateStoreCheckpointInfo, WatermarkSupport}
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper._
 import org.apache.spark.sql.execution.streaming.state.{KeyStateEncoderSpec, NoPrefixKeyStateEncoderSpec, PrefixKeyScanStateEncoderSpec, RangeKeyScanStateEncoderSpec, StateSchemaBroadcast, StateStore, StateStoreCheckpointInfo, StateStoreColFamilySchema, StateStoreConf, StateStoreErrors, StateStoreId, StateStoreMetrics, StateStoreProvider, StateStoreProviderId, SupportsFineGrainedReplay}
-import org.apache.spark.sql.types.{BooleanType, DataType, DataTypes, LongType, NullType, StructField, StructType}
+import org.apache.spark.sql.types.{BooleanType, DataType, LongType, NullType, StructField, StructType}
 import org.apache.spark.util.NextIterator
 
 trait SymmetricHashJoinStateManager {
@@ -104,6 +104,7 @@ class SymmetricHashJoinStateManagerV4(
     allowMultipleEventTimeColumns = false)
 
   // FIXME: Does this even work well without event time column?
+  // FIXME: Maybe this could be "faster" if the values for a grouping key are not too many?
   assert(eventTimeColIdx.isDefined,
     s"Event time column is required for join state manager v4 with state format version " +
       s"$stateFormatVersion")
@@ -133,14 +134,12 @@ class SymmetricHashJoinStateManagerV4(
     val secondaryIndexExists = tsWithKey.exists(eventTime, key)
     if (!secondaryIndexExists) {
       // Primary store does not have this (key, eventTime), so we can put this without getting.
-      keyWithTsToValues.put(key, eventTime, Seq(value))
+      keyWithTsToValues.put(key, eventTime, Seq((value, matched)))
       // Same with secondary index.
       tsWithKey.put(eventTime, key)
     } else {
       // Primary store already has this (key, eventTime), so we need to get existing values first.
-      val existingValues = keyWithTsToValues.get(key, eventTime)
-      val newValues = existingValues :+ value
-      keyWithTsToValues.put(key, eventTime, newValues)
+      keyWithTsToValues.append(key, eventTime, value, matched)
       // No need to update secondary index as it already has the (eventTime, key).
     }
   }
@@ -152,20 +151,58 @@ class SymmetricHashJoinStateManagerV4(
       excludeRowsAlreadyMatched: Boolean): Iterator[JoinedRow] = {
     // FIXME: We could improve this method to get the scope of timestamp and scan keys
     //  more efficiently. For now, we just get all values for the key.
-    keyWithTsToValues.getValues(key).filterNot { evicted =>
-      // FIXME: Handle matched flag!
-      false
-    }.flatMap { case GetValuesResult(timestamp, values) =>
-      values.flatMap { value =>
-        val joinedRow = generateJoinedRow(value)
-        if (predicate(joinedRow)) {
-          // FIXME: Handle matched flag!
-          //   Note that this is tricky as we need to collect all values for the same timestamp
-          //   and update the flag of `matched` if necessary, and update back to the state store
-          //   only when necessary.
-          Some(joinedRow)
-        } else {
-          None
+    keyWithTsToValues.getValues(key).flatMap { result =>
+      val ts = result.timestamp
+      val valuesAndMatched = result.values.toArray
+
+      new NextIterator[JoinedRow] {
+        private var currentIndex = 0
+
+        private var shouldUpdateValuesIntoStateStore = false
+
+        override protected def getNext(): JoinedRow = {
+          var ret: JoinedRow = null
+          while (ret == null && currentIndex < valuesAndMatched.length) {
+            val vmp = valuesAndMatched(currentIndex)
+
+            if (excludeRowsAlreadyMatched && vmp.matched) {
+              // Skip this one
+            } else {
+              val joinedRow = generateJoinedRow(vmp.value)
+              if (predicate(joinedRow)) {
+                if (!vmp.matched) {
+                  // Update the array to contain the value having matched = true
+                  valuesAndMatched(currentIndex) = vmp.copy(matched = true)
+                  // Need to update matched flag
+                  shouldUpdateValuesIntoStateStore = true
+                }
+
+                ret = joinedRow
+              } else {
+                // skip this one
+              }
+            }
+
+            currentIndex += 1
+          }
+
+          if (ret == null) {
+            assert(currentIndex == valuesAndMatched.length)
+            finished = true
+            null
+          } else {
+            ret
+          }
+        }
+
+        override protected def close(): Unit = {
+          if (shouldUpdateValuesIntoStateStore) {
+            // Update back to the state store
+            val updatedValuesWithMatched = valuesAndMatched.map { vmp =>
+              (vmp.value, vmp.matched)
+            }.toSeq
+            keyWithTsToValues.put(key, ts, updatedValuesWithMatched)
+          }
         }
       }
     }.filter(_ != null)
@@ -183,9 +220,8 @@ class SymmetricHashJoinStateManagerV4(
       "removeByKeyCondition is not supported in SymmetricHashJoinStateManagerV4")
   }
 
-  private val reusableKeyToValuePair = KeyToValuePair()
-
   override def iterator: Iterator[KeyToValuePair] = {
+    val reusableKeyToValuePair = KeyToValuePair()
     keyWithTsToValues.iterator().map { kv =>
       reusableKeyToValuePair.withNew(kv.key, kv.value, kv.matched)
     }
@@ -205,6 +241,7 @@ class SymmetricHashJoinStateManagerV4(
   }
 
   override def evictAndReturnByTimestamp(endTimestamp: Long): Iterator[KeyToValuePair] = {
+    val reusableKeyToValuePair = KeyToValuePair()
     tsWithKey.evictKeys(endTimestamp).flatMap { evicted =>
       val key = evicted.key
       val timestamp = evicted.timestamp
@@ -213,8 +250,7 @@ class SymmetricHashJoinStateManagerV4(
       keyWithTsToValues.remove(key, timestamp)
       tsWithKey.remove(key, timestamp)
       values.map { value =>
-        // FIXME: handle matched flag!
-        reusableKeyToValuePair.withNew(key, value, newMatched = false)
+        reusableKeyToValuePair.withNew(key, value)
       }
     }
   }
@@ -277,7 +313,8 @@ class SymmetricHashJoinStateManagerV4(
         keySchema: StructType,
         valueSchema: StructType,
         useVirtualColumnFamilies: Boolean,
-        keyStateEncoderSpec: KeyStateEncoderSpec): StateStore = {
+        keyStateEncoderSpec: KeyStateEncoderSpec,
+        useMultipleValuesPerKey: Boolean): StateStore = {
       val storeName = if (useVirtualColumnFamilies) {
         StateStoreId.DEFAULT_STORE_NAME
       } else {
@@ -290,13 +327,14 @@ class SymmetricHashJoinStateManagerV4(
         joinStoreGenerator.getStore(
           storeProviderId, keySchema, valueSchema, keyStateEncoderSpec,
           stateInfo.get.storeVersion, stateStoreCkptId, None, useVirtualColumnFamilies,
-          storeConf, hadoopConf)
+          useMultipleValuesPerKey, storeConf, hadoopConf)
       } else {
         // This class will manage the state store provider by itself.
         stateStoreProvider = StateStoreProvider.createAndInit(
           storeProviderId, keySchema, valueSchema, keyStateEncoderSpec,
-          useColumnFamilies = useVirtualColumnFamilies, storeConf, hadoopConf,
-          useMultipleValuesPerKey = false, stateSchemaProvider = None)
+          useColumnFamilies = useVirtualColumnFamilies,
+          storeConf, hadoopConf, useMultipleValuesPerKey = useMultipleValuesPerKey,
+          stateSchemaProvider = None)
         if (handlerSnapshotOptions.isDefined) {
           if (!stateStoreProvider.isInstanceOf[SupportsFineGrainedReplay]) {
             throw StateStoreErrors.stateStoreProviderDoesNotSupportFineGrainedReplay(
@@ -319,7 +357,14 @@ class SymmetricHashJoinStateManagerV4(
     }
   }
 
-  case class GetValuesResult(timestamp: Long, values: Seq[UnsafeRow])
+  class GetValuesResult(var timestamp: Long = -1, var values: Seq[ValueAndMatchPair] = Seq.empty) {
+    def withNew(newTimestamp: Long, newValues: Seq[ValueAndMatchPair]): GetValuesResult = {
+      this.timestamp = newTimestamp
+      this.values = newValues
+      this
+    }
+  }
+
 
   // FIXME: virtual column family or not
   protected class KeyWithTsToValuesStore(
@@ -346,19 +391,46 @@ class SymmetricHashJoinStateManagerV4(
     private val keyRowGenerator = UnsafeProjection.create(
       keyAttributes, keyAttributes :+ AttributeReference("ts", LongType)())
 
-    private val valueArrayType = DataTypes.createArrayType(inputValueAttributes.toStructType)
-    private val valueStructType = StructType(
-      Seq(StructField("values", valueArrayType))
-    )
+    // FIXME: Deduplicate?
+    private class KeyWithIndexToValueRowConverterFormatV2 {
+      private val valueWithMatchedExprs = inputValueAttributes :+ Literal(true)
+      private val indexOrdinalInValueWithMatchedRow = inputValueAttributes.size
 
-    private val valueRowGenerator = UnsafeProjection.create(valueStructType)
+      private val valueWithMatchedRowGenerator = UnsafeProjection.create(valueWithMatchedExprs,
+        inputValueAttributes)
+
+      val valueAttributes: Seq[Attribute] = inputValueAttributes :+
+        AttributeReference("matched", BooleanType)()
+
+      // Projection to generate key row from (value + matched) row
+      private val valueRowGenerator = UnsafeProjection.create(
+        inputValueAttributes, valueAttributes)
+
+      def convertValue(value: UnsafeRow): ValueAndMatchPair = {
+        if (value != null) {
+          ValueAndMatchPair(valueRowGenerator(value).copy(),
+            value.getBoolean(indexOrdinalInValueWithMatchedRow))
+        } else {
+          null
+        }
+      }
+
+      def convertToValueRow(value: UnsafeRow, matched: Boolean): UnsafeRow = {
+        val row = valueWithMatchedRowGenerator(value)
+        row.setBoolean(indexOrdinalInValueWithMatchedRow, matched)
+        row
+      }
+    }
+
+    private val valueRowConverter = new KeyWithIndexToValueRowConverterFormatV2()
 
     private val keyStateEncoderSpec = PrefixKeyScanStateEncoderSpec(
       keyWithTsSchema, keyAttributes.size)
 
     /** StateStore that the subclasses of this class is going to operate on */
     override protected val stateStore: StateStore = getStateStore(keyWithTsSchema,
-      valueStructType, useVirtualColumnFamilies, keyStateEncoderSpec)
+      valueRowConverter.valueAttributes.toStructType, useVirtualColumnFamilies,
+      keyStateEncoderSpec, useMultipleValuesPerKey = true)
 
     // Set up virtual column family name in the store if it is being used
     private val colFamilyName = if (useVirtualColumnFamilies) {
@@ -372,36 +444,34 @@ class SymmetricHashJoinStateManagerV4(
       stateStore.createColFamilyIfAbsent(
         colFamilyName,
         keyWithTsSchema,
-        valueStructType,
-        PrefixKeyScanStateEncoderSpec(keyWithTsSchema, keyAttributes.size)
+        valueRowConverter.valueAttributes.toStructType,
+        PrefixKeyScanStateEncoderSpec(keyWithTsSchema, keyAttributes.size),
+        useMultipleValuesPerKey = true
       )
     }
 
-    def put(key: UnsafeRow, timestamp: Long, values: Seq[UnsafeRow]): Unit = {
-      val row = keyWithTsRow(key, timestamp)
-
-      val valueInternalRow = new SpecificInternalRow(valueStructType)
-      valueInternalRow.update(0,
-        org.apache.spark.sql.catalyst.util.ArrayData.toArrayData(values.toArray)
-      )
-      val valueRow = valueRowGenerator(valueInternalRow)
-
-      stateStore.put(row, valueRow, colFamilyName)
+    def append(key: UnsafeRow, timestamp: Long, value: UnsafeRow, matched: Boolean): Unit = {
+      val keyWithTs = keyWithTsRow(key, timestamp)
+      val valueWithMatched = valueRowConverter.convertToValueRow(value, matched)
+      stateStore.merge(keyWithTs, valueWithMatched, colFamilyName)
     }
 
-    def get(key: UnsafeRow, timestamp: Long): Seq[UnsafeRow] = {
+    def put(
+        key: UnsafeRow,
+        timestamp: Long,
+        valuesWithMatched: Seq[(UnsafeRow, Boolean)]): Unit = {
+      val keyWithTs = keyWithTsRow(key, timestamp)
+      val valuesToPut = valuesWithMatched.map { case (value, matched) =>
+        valueRowConverter.convertToValueRow(value, matched)
+      }.toArray
+
+      stateStore.putList(keyWithTs, valuesToPut, colFamilyName)
+    }
+
+    def get(key: UnsafeRow, timestamp: Long): Iterator[ValueAndMatchPair] = {
       val row = keyWithTsRow(key, timestamp)
-      stateStore.get(row, colFamilyName) match {
-        case null => Seq.empty[UnsafeRow]
-        case valueRow =>
-          val valuesArray = valueRow.getArray(0)
-          val numValues = valuesArray.numElements()
-          val valuesBuffer = scala.collection.mutable.ArrayBuffer[UnsafeRow]()
-          (0 until numValues).foreach { i =>
-            val value = valuesArray.getStruct(i, inputValueAttributes.length)
-            valuesBuffer += value
-          }
-          valuesBuffer.toSeq
+      stateStore.valuesIterator(row, colFamilyName).map { valueRow =>
+        valueRowConverter.convertValue(valueRow)
       }
     }
 
@@ -414,66 +484,86 @@ class SymmetricHashJoinStateManagerV4(
 
     // NOTE: This assumes we consume the whole iterator to trigger completion.
     def getValues(key: UnsafeRow): Iterator[GetValuesResult] = {
-      val iterator = stateStore.prefixScan(key, colFamilyName)
-      iterator.map { kv =>
-        val fullKeyRow = kv.key
-        val ts = extractEventTimeFn(fullKeyRow)
+      val reusableGetValuesResult = new GetValuesResult()
 
-        val valueRow = kv.value
-        val valuesArray = valueRow.getArray(0)
-        val numValues = valuesArray.numElements()
-        // FIXME: matched flag?
-        val valuesBuffer = scala.collection.mutable.ArrayBuffer[UnsafeRow]()
-        (0 until numValues).foreach { i =>
-          val value = valuesArray.getStruct(i, inputValueAttributes.length)
-          valuesBuffer += value
+      new NextIterator[GetValuesResult] {
+        private val iter = stateStore.prefixScanWithMultiValues(key, colFamilyName)
+
+        private var currentTs = -1L
+        private val valueAndMatchPairs = scala.collection.mutable.ArrayBuffer[ValueAndMatchPair]()
+
+        // FIXME: need to refine to understand this easily?
+        @tailrec
+        override protected def getNext(): GetValuesResult = {
+          if (iter.hasNext) {
+            val unsafeRowPair = iter.next()
+
+            val fullKeyRow = unsafeRowPair.key
+            val ts = extractEventTimeFn(fullKeyRow)
+
+            if (currentTs == -1L) {
+              // First time
+              currentTs = ts
+            }
+
+            if (currentTs != ts) {
+              assert(valueAndMatchPairs.nonEmpty,
+                "timestamp has changed but no values collected from previous timestamp! " +
+                s"This should not happen. currentTs: $currentTs, new ts: $ts")
+
+              // Return previous batch
+              val result = reusableGetValuesResult.withNew(
+                currentTs, valueAndMatchPairs.toSeq)
+
+              // Reset for new timestamp
+              currentTs = ts
+              valueAndMatchPairs.clear()
+
+              // Add current value
+              val value = valueRowConverter.convertValue(unsafeRowPair.value)
+              valueAndMatchPairs += value
+              result
+            } else {
+              // Same timestamp, accumulate values
+              val value = valueRowConverter.convertValue(unsafeRowPair.value)
+              valueAndMatchPairs += value
+
+              // Continue to next
+              getNext()
+            }
+          } else {
+            if (currentTs != -1L) {
+              assert(valueAndMatchPairs.nonEmpty)
+
+              // Return last batch
+              val result = reusableGetValuesResult.withNew(
+                currentTs, valueAndMatchPairs.toSeq)
+
+              // Mark as finished
+              currentTs = -1L
+              valueAndMatchPairs.clear()
+              result
+            } else {
+              finished = true
+              null
+            }
+          }
         }
-        GetValuesResult(ts, valuesBuffer.toSeq)
+
+        override protected def close(): Unit = iter.close()
       }
     }
 
-    def iterator(): Iterator[KeyToValuePair] = {
-      val iter = stateStore.iterator(colFamilyName)
-      new Iterator[KeyToValuePair] {
-        private val reusableKeyToValuePair = KeyToValuePair()
+    def iterator(): Iterator[KeyAndTsToValuePair] = {
+      val iter = stateStore.iteratorWithMultiValues(colFamilyName)
+      val reusableKeyAndTsToValuePair = KeyAndTsToValuePair()
+      iter.map { kv =>
+        val fullKeyRow = kv.key
+        val keyRow = keyRowGenerator(fullKeyRow)
+        val ts = fullKeyRow.getLong(indexOrdinalInKeyWithTsRow)
+        val value = valueRowConverter.convertValue(kv.value)
 
-        private var lastValuesBuffer: scala.collection.mutable.Queue[UnsafeRow] = null
-
-        override def hasNext: Boolean =
-          (lastValuesBuffer != null && lastValuesBuffer.nonEmpty) || iter.hasNext
-
-        override def next(): KeyToValuePair = {
-          if (lastValuesBuffer != null && lastValuesBuffer.nonEmpty) {
-            val currentValue = lastValuesBuffer.dequeue()
-            // FIXME: handle matched flag!
-            reusableKeyToValuePair.withNew(
-              reusableKeyToValuePair.key, currentValue, newMatched = false)
-          } else {
-            lastValuesBuffer = null
-
-            // FIXME: probably extract this into method and reuse the above?
-            // iterator.hasNext must be true here
-            val kv = iter.next()
-            val fullKeyRow = kv.key
-            val keyRow = keyRowGenerator(fullKeyRow)
-            // FIXME: Should we return ts here?
-            val ts = fullKeyRow.getLong(indexOrdinalInKeyWithTsRow)
-
-            val valueRow = kv.value
-            val valuesArray = valueRow.getArray(0)
-            val numValues = valuesArray.numElements()
-            val valuesBuffer = scala.collection.mutable.Queue[UnsafeRow]()
-            (0 until numValues).foreach { i =>
-              val value = valuesArray.getStruct(i, inputValueAttributes.length)
-              valuesBuffer += value
-            }
-
-            lastValuesBuffer = valuesBuffer
-            val currentValue = lastValuesBuffer.dequeue()
-            // FIXME: handle matched flag!
-            reusableKeyToValuePair.withNew(keyRow, currentValue, newMatched = false)
-          }
-        }
+        reusableKeyAndTsToValuePair.withNew(keyRow, ts, value)
       }
     }
 
@@ -518,7 +608,8 @@ class SymmetricHashJoinStateManagerV4(
 
     /** StateStore that the subclasses of this class is going to operate on */
     protected val stateStore: StateStore = getStateStore(tsWithKeySchema,
-      valueStructType, useVirtualColumnFamilies, keyStateEncoderSpec)
+      valueStructType, useVirtualColumnFamilies, keyStateEncoderSpec,
+      useMultipleValuesPerKey = false)
 
     // Set up virtual column family name in the store if it is being used
     private val colFamilyName = if (useVirtualColumnFamilies) {
@@ -591,8 +682,8 @@ class SymmetricHashJoinStateManagerV4(
   }
 
   override def get(key: UnsafeRow): Iterator[UnsafeRow] = {
-    keyWithTsToValues.getValues(key).flatMap { case GetValuesResult(timestamp, values) =>
-      values
+    keyWithTsToValues.getValues(key).flatMap { result =>
+      result.values.map(_.value)
     }.iterator
   }
 
@@ -1100,7 +1191,7 @@ abstract class SymmetricHashJoinStateManagerBase(
         joinStoreGenerator.getStore(
           storeProviderId, keySchema, valueSchema, NoPrefixKeyStateEncoderSpec(keySchema),
           stateInfo.get.storeVersion, stateStoreCkptId, None, useVirtualColumnFamilies,
-          storeConf, hadoopConf)
+          useMultipleValuesPerKey = false, storeConf, hadoopConf)
       } else {
         // This class will manage the state store provider by itself.
         stateStoreProvider = StateStoreProvider.createAndInit(
@@ -1593,6 +1684,7 @@ class JoinStateManagerStoreGenerator() extends Logging {
    * Creates the state store used for join operations, or returns the existing instance
    * if it has been previously created and virtual column families are enabled.
    */
+  // scalastyle:off argcount
   def getStore(
       storeProviderId: StateStoreProviderId,
       keySchema: StructType,
@@ -1602,6 +1694,7 @@ class JoinStateManagerStoreGenerator() extends Logging {
       stateStoreCkptId: Option[String],
       stateSchemaBroadcast: Option[StateSchemaBroadcast],
       useColumnFamilies: Boolean,
+      useMultipleValuesPerKey: Boolean,
       storeConf: StateStoreConf,
       hadoopConf: Configuration): StateStore = {
     if (useColumnFamilies) {
@@ -1611,7 +1704,7 @@ class JoinStateManagerStoreGenerator() extends Logging {
           StateStore.get(
             storeProviderId, keySchema, valueSchema, keyStateEncoderSpec, version,
             stateStoreCkptId, stateSchemaBroadcast, useColumnFamilies = useColumnFamilies,
-            storeConf, hadoopConf
+            storeConf, hadoopConf, useMultipleValuesPerKey = useMultipleValuesPerKey
           )
         )
       }
@@ -1621,10 +1714,11 @@ class JoinStateManagerStoreGenerator() extends Logging {
       StateStore.get(
         storeProviderId, keySchema, valueSchema, keyStateEncoderSpec, version,
         stateStoreCkptId, stateSchemaBroadcast, useColumnFamilies = useColumnFamilies,
-        storeConf, hadoopConf
+        storeConf, hadoopConf, useMultipleValuesPerKey = useMultipleValuesPerKey
       )
     }
   }
+  // scalastyle:on
 }
 
 object SymmetricHashJoinStateManager {
@@ -1911,6 +2005,35 @@ object SymmetricHashJoinStateManager {
         this.value = null
         this.matched = false
       }
+      this
+    }
+  }
+
+  case class KeyAndTsToValuePair(
+      var key: UnsafeRow = null,
+      var timestamp: Long = -1L,
+      var value: UnsafeRow = null,
+      var matched: Boolean = false) {
+    def withNew(
+        newKey: UnsafeRow,
+        newTimestamp: Long,
+        newValue: UnsafeRow,
+        newMatched: Boolean): this.type = {
+      this.key = newKey
+      this.timestamp = newTimestamp
+      this.value = newValue
+      this.matched = newMatched
+      this
+    }
+
+    def withNew(
+        newKey: UnsafeRow,
+        newTimestamp: Long,
+        newValue: ValueAndMatchPair): this.type = {
+      this.key = newKey
+      this.timestamp = newTimestamp
+      this.value = newValue.value
+      this.matched = newValue.matched
       this
     }
   }

@@ -78,6 +78,12 @@ class MemoryStateStore extends StateStore() {
     throw new UnsupportedOperationException("Doesn't support prefix scan!")
   }
 
+  override def prefixScanWithMultiValues(
+      prefixKey: UnsafeRow,
+      colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+    throw new UnsupportedOperationException("Doesn't support prefix scan with multi values!")
+  }
+
   override def merge(key: UnsafeRow, value: UnsafeRow, colFamilyName: String): Unit = {
     throw new UnsupportedOperationException("Doesn't support multiple values per key")
   }
@@ -92,5 +98,10 @@ class MemoryStateStore extends StateStore() {
 
   override def getStateStoreCheckpointInfo(): StateStoreCheckpointInfo = {
     StateStoreCheckpointInfo(id.partitionId, version + 1, None, None)
+  }
+
+  override def iteratorWithMultiValues(
+      colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+    throw new UnsupportedOperationException("Doesn't support multiple values per key")
   }
 }
