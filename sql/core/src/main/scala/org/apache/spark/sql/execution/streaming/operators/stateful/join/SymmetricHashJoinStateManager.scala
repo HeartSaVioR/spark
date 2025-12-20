@@ -91,7 +91,7 @@ class SymmetricHashJoinStateManagerV4(
     useStateStoreCoordinator: Boolean = true,
     snapshotOptions: Option[SnapshotOptions] = None,
     joinStoreGenerator: JoinStateManagerStoreGenerator)
-  extends SymmetricHashJoinStateManager with SupportsEvictByTimestamp {
+  extends SymmetricHashJoinStateManager with SupportsEvictByTimestamp with Logging {
 
   import SymmetricHashJoinStateManager._
 
@@ -121,13 +121,66 @@ class SymmetricHashJoinStateManagerV4(
     }
   }
 
-  private val keyWithTsToValues = new KeyWithTsToValuesStore(
-    stateFormatVersion,
-    snapshotOptions.map(_.getKeyToNumValuesHandlerOpts()))
+  private val dummySchema = StructType(
+    Seq(StructField("dummy", NullType, nullable = true))
+  )
 
-  private val tsWithKey = new TsWithKeyTypeStore(
-    stateFormatVersion,
-    snapshotOptions.map(_.getKeyWithIndexToValueHandlerOpts()))
+  private val stateStoreCkptId: Option[String] = None
+  private val handlerSnapshotOptions: Option[HandlerSnapshotOptions] = None
+  private var stateStoreProvider: StateStoreProvider = _
+
+  // We will use the dummy schema for the default CF since we will register CF separately.
+  private val stateStore = getStateStore(
+    dummySchema, dummySchema, useVirtualColumnFamilies = true,
+    NoPrefixKeyStateEncoderSpec(dummySchema), useMultipleValuesPerKey = false
+  )
+
+  private def getStateStore(
+      keySchema: StructType,
+      valueSchema: StructType,
+      useVirtualColumnFamilies: Boolean,
+      keyStateEncoderSpec: KeyStateEncoderSpec,
+      useMultipleValuesPerKey: Boolean): StateStore = {
+    val storeName = StateStoreId.DEFAULT_STORE_NAME
+    val storeProviderId = StateStoreProviderId(stateInfo.get, partitionId, storeName)
+    val store = if (useStateStoreCoordinator) {
+      assert(handlerSnapshotOptions.isEmpty, "Should not use state store coordinator " +
+        "when reading state as data source.")
+      joinStoreGenerator.getStore(
+        storeProviderId, keySchema, valueSchema, keyStateEncoderSpec,
+        stateInfo.get.storeVersion, stateStoreCkptId, None, useVirtualColumnFamilies,
+        useMultipleValuesPerKey, storeConf, hadoopConf)
+    } else {
+      // This class will manage the state store provider by itself.
+      stateStoreProvider = StateStoreProvider.createAndInit(
+        storeProviderId, keySchema, valueSchema, keyStateEncoderSpec,
+        useColumnFamilies = useVirtualColumnFamilies,
+        storeConf, hadoopConf, useMultipleValuesPerKey = useMultipleValuesPerKey,
+        stateSchemaProvider = None)
+      if (handlerSnapshotOptions.isDefined) {
+        if (!stateStoreProvider.isInstanceOf[SupportsFineGrainedReplay]) {
+          throw StateStoreErrors.stateStoreProviderDoesNotSupportFineGrainedReplay(
+            stateStoreProvider.getClass.toString)
+        }
+        val opts = handlerSnapshotOptions.get
+        stateStoreProvider.asInstanceOf[SupportsFineGrainedReplay]
+          .replayStateFromSnapshot(
+            opts.snapshotVersion,
+            opts.endVersion,
+            readOnly = true,
+            opts.startStateStoreCkptId,
+            opts.endStateStoreCkptId)
+      } else {
+        stateStoreProvider.getStore(stateInfo.get.storeVersion, stateStoreCkptId)
+      }
+    }
+    logInfo(log"Loaded store ${MDC(STATE_STORE_ID, store.id)}")
+    store
+  }
+
+  private val keyWithTsToValues = new KeyWithTsToValuesStore
+
+  private val tsWithKey = new TsWithKeyTypeStore
 
   override def append(key: UnsafeRow, value: UnsafeRow, matched: Boolean): Unit = {
     val eventTime = extractEventTimeFn(value)
@@ -229,7 +282,7 @@ class SymmetricHashJoinStateManagerV4(
 
   override def evictByTimestamp(endTimestamp: Long): Int = {
     var removed = 0
-    tsWithKey.evictKeys(endTimestamp).foreach { evicted =>
+    tsWithKey.scanEvictedKeys(endTimestamp).foreach { evicted =>
       val key = evicted.key
       val timestamp = evicted.timestamp
       // Remove from both primary and secondary stores
@@ -242,7 +295,7 @@ class SymmetricHashJoinStateManagerV4(
 
   override def evictAndReturnByTimestamp(endTimestamp: Long): Iterator[KeyToValuePair] = {
     val reusableKeyToValuePair = KeyToValuePair()
-    tsWithKey.evictKeys(endTimestamp).flatMap { evicted =>
+    tsWithKey.scanEvictedKeys(endTimestamp).flatMap { evicted =>
       val key = evicted.key
       val timestamp = evicted.timestamp
       val values = keyWithTsToValues.get(key, timestamp)
@@ -256,106 +309,24 @@ class SymmetricHashJoinStateManagerV4(
   }
 
   override def commit(): Unit = {
-    // Both keyToNumValues and keyWithIndexToValue are using the same state store, so only
-    // one commit is needed.
-    // FIXME: Is this correct?
-    keyWithTsToValues.commit()
-    tsWithKey.commit()
+    stateStore.commit()
+    logDebug("Committed, metrics = " + stateStore.metrics)
   }
 
   override def abortIfNeeded(): Unit = {
-    // Both keyToNumValues and keyWithIndexToValue are using the same state store, so only
-    // one commit is needed.
-    // FIXME: Is this correct?
-    keyWithTsToValues.abortIfNeeded()
-    tsWithKey.abortIfNeeded()
+    if (!stateStore.hasCommitted) {
+      logInfo(log"Aborted store ${MDC(STATE_STORE_ID, stateStore.id)}")
+      stateStore.abort()
+    }
+    // If this class manages a state store provider by itself, it should take care of closing
+    // provider instance as well.
+    if (stateStoreProvider != null) {
+      stateStoreProvider.close()
+    }
   }
 
   // Clean up any state store resources if necessary at the end of the task
   Option(TaskContext.get()).foreach { _.addTaskCompletionListener[Unit] { _ => abortIfNeeded() } }
-
-  // FIXME: How to deduplicate?
-  /** Helper trait for invoking common functionalities of a state store. */
-  protected abstract class StateStoreHandler(
-      stateStoreType: StateStoreType,
-      stateStoreCkptId: Option[String],
-      handlerSnapshotOptions: Option[HandlerSnapshotOptions] = None) extends Logging {
-    private var stateStoreProvider: StateStoreProvider = _
-
-    /** StateStore that the subclasses of this class is going to operate on */
-    protected def stateStore: StateStore
-
-    def commit(): Unit = {
-      stateStore.commit()
-      logDebug("Committed, metrics = " + stateStore.metrics)
-    }
-
-    def abortIfNeeded(): Unit = {
-      if (!stateStore.hasCommitted) {
-        logInfo(log"Aborted store ${MDC(STATE_STORE_ID, stateStore.id)}")
-        stateStore.abort()
-      }
-      // If this class manages a state store provider by itself, it should take care of closing
-      // provider instance as well.
-      if (stateStoreProvider != null) {
-        stateStoreProvider.close()
-      }
-    }
-
-    def metrics: StateStoreMetrics = stateStore.metrics
-
-    def getLatestCheckpointInfo(): StateStoreCheckpointInfo = {
-      stateStore.getStateStoreCheckpointInfo()
-    }
-
-    /** Get the StateStore with the given schema */
-    protected def getStateStore(
-        keySchema: StructType,
-        valueSchema: StructType,
-        useVirtualColumnFamilies: Boolean,
-        keyStateEncoderSpec: KeyStateEncoderSpec,
-        useMultipleValuesPerKey: Boolean): StateStore = {
-      val storeName = if (useVirtualColumnFamilies) {
-        StateStoreId.DEFAULT_STORE_NAME
-      } else {
-        getStateStoreName(joinSide, stateStoreType)
-      }
-      val storeProviderId = StateStoreProviderId(stateInfo.get, partitionId, storeName)
-      val store = if (useStateStoreCoordinator) {
-        assert(handlerSnapshotOptions.isEmpty, "Should not use state store coordinator " +
-          "when reading state as data source.")
-        joinStoreGenerator.getStore(
-          storeProviderId, keySchema, valueSchema, keyStateEncoderSpec,
-          stateInfo.get.storeVersion, stateStoreCkptId, None, useVirtualColumnFamilies,
-          useMultipleValuesPerKey, storeConf, hadoopConf)
-      } else {
-        // This class will manage the state store provider by itself.
-        stateStoreProvider = StateStoreProvider.createAndInit(
-          storeProviderId, keySchema, valueSchema, keyStateEncoderSpec,
-          useColumnFamilies = useVirtualColumnFamilies,
-          storeConf, hadoopConf, useMultipleValuesPerKey = useMultipleValuesPerKey,
-          stateSchemaProvider = None)
-        if (handlerSnapshotOptions.isDefined) {
-          if (!stateStoreProvider.isInstanceOf[SupportsFineGrainedReplay]) {
-            throw StateStoreErrors.stateStoreProviderDoesNotSupportFineGrainedReplay(
-              stateStoreProvider.getClass.toString)
-          }
-          val opts = handlerSnapshotOptions.get
-          stateStoreProvider.asInstanceOf[SupportsFineGrainedReplay]
-            .replayStateFromSnapshot(
-              opts.snapshotVersion,
-              opts.endVersion,
-              readOnly = true,
-              opts.startStateStoreCkptId,
-              opts.endStateStoreCkptId)
-        } else {
-          stateStoreProvider.getStore(stateInfo.get.storeVersion, stateStoreCkptId)
-        }
-      }
-      logInfo(log"Loaded store ${MDC(STATE_STORE_ID, store.id)}")
-      store
-    }
-  }
 
   class GetValuesResult(var timestamp: Long = -1, var values: Seq[ValueAndMatchPair] = Seq.empty) {
     def withNew(newTimestamp: Long, newValues: Seq[ValueAndMatchPair]): GetValuesResult = {
@@ -365,21 +336,7 @@ class SymmetricHashJoinStateManagerV4(
     }
   }
 
-
-  // FIXME: virtual column family or not
-  protected class KeyWithTsToValuesStore(
-      val stateFormatVersion: Int,
-      val handlerSnapshotOptions: Option[HandlerSnapshotOptions] = None)
-    extends StateStoreHandler(
-      KeyWithTsToValuesType,
-      // FIXME: how to change this?
-      keyToNumValuesStateStoreCkptId,
-      handlerSnapshotOptions) {
-
-    // FIXME: VCF does not seem work well here?
-    // private val useVirtualColumnFamilies: Boolean = true
-    private val useVirtualColumnFamilies: Boolean = false
-
+  private class KeyWithTsToValuesStore {
     private val keyWithTsExprs = keyAttributes :+ Literal(1L)
     private val keyWithTsSchema = keySchema.add("ts", LongType)
     private val indexOrdinalInKeyWithTsRow = keyAttributes.size
@@ -427,28 +384,17 @@ class SymmetricHashJoinStateManagerV4(
     private val keyStateEncoderSpec = PrefixKeyScanStateEncoderSpec(
       keyWithTsSchema, keyAttributes.size)
 
-    /** StateStore that the subclasses of this class is going to operate on */
-    override protected val stateStore: StateStore = getStateStore(keyWithTsSchema,
-      valueRowConverter.valueAttributes.toStructType, useVirtualColumnFamilies,
-      keyStateEncoderSpec, useMultipleValuesPerKey = true)
-
     // Set up virtual column family name in the store if it is being used
-    private val colFamilyName = if (useVirtualColumnFamilies) {
-      getStateStoreName(joinSide, KeyWithTsToValuesType)
-    } else {
-      StateStore.DEFAULT_COL_FAMILY_NAME
-    }
+    private val colFamilyName = getStateStoreName(joinSide, KeyWithTsToValuesType)
 
     // Create the specific column family in the store for this join side's KeyWithIndexToValueStore
-    if (useVirtualColumnFamilies) {
-      stateStore.createColFamilyIfAbsent(
-        colFamilyName,
-        keyWithTsSchema,
-        valueRowConverter.valueAttributes.toStructType,
-        PrefixKeyScanStateEncoderSpec(keyWithTsSchema, keyAttributes.size),
-        useMultipleValuesPerKey = true
-      )
-    }
+    stateStore.createColFamilyIfAbsent(
+      colFamilyName,
+      keyWithTsSchema,
+      valueRowConverter.valueAttributes.toStructType,
+      PrefixKeyScanStateEncoderSpec(keyWithTsSchema, keyAttributes.size),
+      useMultipleValuesPerKey = true
+    )
 
     def append(key: UnsafeRow, timestamp: Long, value: UnsafeRow, matched: Boolean): Unit = {
       val keyWithTs = keyWithTsRow(key, timestamp)
@@ -575,19 +521,8 @@ class SymmetricHashJoinStateManagerV4(
     }
   }
 
-  // FIXME: virtual column family or not
-  protected class TsWithKeyTypeStore(
-      val stateFormatVersion: Int,
-      val handlerSnapshotOptions: Option[HandlerSnapshotOptions] = None)
-    extends StateStoreHandler(
-      TsWithKeyType,
-      // FIXME: how to change this?
-      keyWithIndexToValueStateStoreCkptId,
-      handlerSnapshotOptions) {
-
-    // FIXME: VCF does not seem work well here?
-    // private val useVirtualColumnFamilies: Boolean = true
-    private val useVirtualColumnFamilies: Boolean = false
+  private class TsWithKeyTypeStore {
+    private val useVirtualColumnFamilies: Boolean = true
 
     private val tsWithKeyExprs = Literal(1L) +: keyAttributes
     private val tsWithKeySchema = StructType(StructField("ts", LongType) +: keySchema.fields)
@@ -606,27 +541,16 @@ class SymmetricHashJoinStateManagerV4(
       UnsafeProjection.create(Array[DataType](NullType)).apply(InternalRow.apply(null))
     private val keyStateEncoderSpec = RangeKeyScanStateEncoderSpec(tsWithKeySchema, Seq(0))
 
-    /** StateStore that the subclasses of this class is going to operate on */
-    protected val stateStore: StateStore = getStateStore(tsWithKeySchema,
-      valueStructType, useVirtualColumnFamilies, keyStateEncoderSpec,
-      useMultipleValuesPerKey = false)
-
     // Set up virtual column family name in the store if it is being used
-    private val colFamilyName = if (useVirtualColumnFamilies) {
-      getStateStoreName(joinSide, TsWithKeyType)
-    } else {
-      StateStore.DEFAULT_COL_FAMILY_NAME
-    }
+    private val colFamilyName = getStateStoreName(joinSide, TsWithKeyType)
 
     // Create the specific column family in the store for this join side's KeyWithIndexToValueStore
-    if (useVirtualColumnFamilies) {
-      stateStore.createColFamilyIfAbsent(
-        colFamilyName,
-        tsWithKeySchema,
-        valueStructType,
-        keyStateEncoderSpec
-      )
-    }
+    stateStore.createColFamilyIfAbsent(
+      colFamilyName,
+      tsWithKeySchema,
+      valueStructType,
+      keyStateEncoderSpec
+    )
 
     def put(timestamp: Long, key: UnsafeRow): Unit = {
       val row = tsWithKeyRow(timestamp, key)
@@ -646,7 +570,7 @@ class SymmetricHashJoinStateManagerV4(
     case class EvictedKeysResult(key: UnsafeRow, timestamp: Long)
 
     // NOTE: This assumes we consume the whole iterator to trigger completion.
-    def evictKeys(endTimestamp: Long): Iterator[EvictedKeysResult] = {
+    def scanEvictedKeys(endTimestamp: Long): Iterator[EvictedKeysResult] = {
       val evictIterator = stateStore.iterator(colFamilyName)
       new NextIterator[EvictedKeysResult]() {
         override protected def getNext(): EvictedKeysResult = {
@@ -687,22 +611,15 @@ class SymmetricHashJoinStateManagerV4(
     }.iterator
   }
 
-  override def metrics: StateStoreMetrics = {
-    keyWithTsToValues.metrics
-  }
+  def metrics: StateStoreMetrics = stateStore.metrics
 
-  override def getLatestCheckpointInfo(): JoinerStateStoreCkptInfo = {
-    // Note that both keyWithTsToValues and tsWithKey are using the same state store,
-    // so the latest checkpoint info should be the same.
-    // These are returned in a JoinerStateStoreCkptInfo object to remain consistent with
-    // the V1 implementation.
-    val keyWithTsToValuesCkptInfo = keyWithTsToValues.getLatestCheckpointInfo()
-    val tsWithKeyCkptInfo = tsWithKey.getLatestCheckpointInfo()
+  def getLatestCheckpointInfo(): JoinerStateStoreCkptInfo = {
+    val keyToNumValuesCkptInfo = stateStore.getStateStoreCheckpointInfo()
+    val keyWithIndexToValueCkptInfo = stateStore.getStateStoreCheckpointInfo()
 
-    assert(keyWithTsToValuesCkptInfo == tsWithKeyCkptInfo)
+    assert(keyToNumValuesCkptInfo == keyWithIndexToValueCkptInfo)
 
-    // FIXME: actually, we assign different state store name here.
-    JoinerStateStoreCkptInfo(keyWithTsToValuesCkptInfo, tsWithKeyCkptInfo)
+    JoinerStateStoreCkptInfo(keyToNumValuesCkptInfo, keyWithIndexToValueCkptInfo)
   }
 
   override def getInternalRowOfKeyWithIndex(currentKey: UnsafeRow): InternalRow = {

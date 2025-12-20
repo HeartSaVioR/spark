@@ -57,15 +57,15 @@ import org.apache.spark.util.Utils
  */
 object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with Logging {
   override def runBenchmarkSuite(mainArgs: Array[String]): Unit = {
-    // runTestWithTimeWindowJoin(numTotalRows = 1000000)
+    runTestWithTimeWindowJoin(numTotalRows = 1000000)
 
     val numTotalRows = 1000000
     Seq(
-      // (1000, 1) // ,
-      // (500, 2) // ,
-      // (200, 5) // ,
-      // (100, 10) // ,
-      (10, 100)
+      (1000, 1) // ,
+      // (500, 2),
+      // (200, 5),
+      // (100, 10),
+      // (10, 100)
     ).foreach { case (numTimestamps, numValuesPerTimestamp) =>
       runTestWithTimeIntervalJoin(
         numTotalRows = numTotalRows,
