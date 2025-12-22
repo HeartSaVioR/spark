@@ -104,4 +104,14 @@ class MemoryStateStore extends StateStore() {
       colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
     throw new UnsupportedOperationException("Doesn't support multiple values per key")
   }
+
+  override def initiateBatchWrite(): Unit = {
+    // No-op
+  }
+
+  override def finalizeBatchWrite(): Unit = {
+    // No-op
+  }
+
+  override def getStatsOfCurrentBatchWrite(): Option[BatchWriteStats] = None
 }

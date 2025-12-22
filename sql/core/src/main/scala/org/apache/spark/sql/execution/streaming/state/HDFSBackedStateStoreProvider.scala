@@ -329,6 +329,16 @@ private[sql] class HDFSBackedStateStoreProvider extends StateStoreProvider with 
       throw StateStoreErrors.unsupportedOperationException(
         "prefixScanWithMultiValues", providerName)
     }
+
+    override def initiateBatchWrite(): Unit = {
+      // NO-OP
+    }
+
+    override def finalizeBatchWrite(): Unit = {
+      // NO-OP
+    }
+
+    override def getStatsOfCurrentBatchWrite(): Option[BatchWriteStats] = None
   }
 
   def getMetricsForProvider(): Map[String, Long] = synchronized {

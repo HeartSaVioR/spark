@@ -168,6 +168,13 @@ case class CkptIdCollectingStateStoreWrapper(innerStore: StateStore) extends Sta
     innerStore.mergeList(key, values, colFamilyName)
   }
 
+  override def initiateBatchWrite(): Unit = innerStore.initiateBatchWrite()
+
+  override def finalizeBatchWrite(): Unit = innerStore.finalizeBatchWrite()
+
+  override def getStatsOfCurrentBatchWrite(): Option[BatchWriteStats] =
+    innerStore.getStatsOfCurrentBatchWrite()
+
   override def commit(): Long = innerStore.commit()
   override def metrics: StateStoreMetrics = innerStore.metrics
   override def getStateStoreCheckpointInfo(): StateStoreCheckpointInfo = {

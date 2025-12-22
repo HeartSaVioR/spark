@@ -86,6 +86,8 @@ object MaintenanceTaskType {
   case object FromLoadedProviders extends MaintenanceTaskType
 }
 
+case class BatchWriteStats(numWrites: Long, dataSizeBytes: Option[Long])
+
 /**
  * Base trait for a versioned key-value store which provides read operations. Each instance of a
  * `ReadStateStore` represents a specific version of state data, and such instances are created
@@ -290,6 +292,7 @@ trait StateStore extends ReadStateStore {
     throw new UnsupportedOperationException("Should only call release() on ReadStateStore")
   }
 
+  // FIXME: do we really need to redefine here?
   /**
    * Return an iterator containing all the key-value pairs in the StateStore. Implementations must
    * ensure that updates (puts, removes) can be made while iterating over this iterator.
@@ -301,9 +304,11 @@ trait StateStore extends ReadStateStore {
   override def iterator(colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
     : StateStoreIterator[UnsafeRowPair]
 
-  // FIXME: doc
-  override def iteratorWithMultiValues(colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
-    : StateStoreIterator[UnsafeRowPair]
+  def initiateBatchWrite(): Unit
+
+  def finalizeBatchWrite(): Unit
+
+  def getStatsOfCurrentBatchWrite(): Option[BatchWriteStats]
 
   /** Current metrics of the state store */
   def metrics: StateStoreMetrics

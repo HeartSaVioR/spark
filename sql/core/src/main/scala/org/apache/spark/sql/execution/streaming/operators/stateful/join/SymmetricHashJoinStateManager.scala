@@ -32,7 +32,7 @@ import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.execution.streaming.operators.stateful.{StatefulOperatorStateInfo, StatefulOpStateStoreCheckpointInfo, WatermarkSupport}
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper._
-import org.apache.spark.sql.execution.streaming.state.{KeyStateEncoderSpec, NoPrefixKeyStateEncoderSpec, PrefixKeyScanStateEncoderSpec, RangeKeyScanStateEncoderSpec, StateSchemaBroadcast, StateStore, StateStoreCheckpointInfo, StateStoreColFamilySchema, StateStoreConf, StateStoreErrors, StateStoreId, StateStoreMetrics, StateStoreProvider, StateStoreProviderId, SupportsFineGrainedReplay}
+import org.apache.spark.sql.execution.streaming.state.{BatchWriteStats, KeyStateEncoderSpec, NoPrefixKeyStateEncoderSpec, PrefixKeyScanStateEncoderSpec, RangeKeyScanStateEncoderSpec, StateSchemaBroadcast, StateStore, StateStoreCheckpointInfo, StateStoreColFamilySchema, StateStoreConf, StateStoreErrors, StateStoreId, StateStoreMetrics, StateStoreProvider, StateStoreProviderId, SupportsFineGrainedReplay}
 import org.apache.spark.sql.types.{BooleanType, DataType, LongType, NullType, StructField, StructType}
 import org.apache.spark.util.NextIterator
 
@@ -186,10 +186,12 @@ class SymmetricHashJoinStateManagerV4(
     val eventTime = extractEventTimeFn(value)
     val secondaryIndexExists = tsWithKey.exists(eventTime, key)
     if (!secondaryIndexExists) {
+      stateStore.initiateBatchWrite()
       // Primary store does not have this (key, eventTime), so we can put this without getting.
       keyWithTsToValues.put(key, eventTime, Seq((value, matched)))
       // Same with secondary index.
       tsWithKey.put(eventTime, key)
+      stateStore.finalizeBatchWrite()
     } else {
       // Primary store already has this (key, eventTime), so we need to get existing values first.
       keyWithTsToValues.append(key, eventTime, value, matched)
@@ -254,6 +256,8 @@ class SymmetricHashJoinStateManagerV4(
             val updatedValuesWithMatched = valuesAndMatched.map { vmp =>
               (vmp.value, vmp.matched)
             }.toSeq
+            // FIXME: This can be also batched with other update, but then we need to buffer
+            //   these writes.
             keyWithTsToValues.put(key, ts, updatedValuesWithMatched)
           }
         }
@@ -282,28 +286,52 @@ class SymmetricHashJoinStateManagerV4(
 
   override def evictByTimestamp(endTimestamp: Long): Int = {
     var removed = 0
+    stateStore.initiateBatchWrite()
     tsWithKey.scanEvictedKeys(endTimestamp).foreach { evicted =>
       val key = evicted.key
       val timestamp = evicted.timestamp
       // Remove from both primary and secondary stores
       keyWithTsToValues.remove(key, timestamp)
       tsWithKey.remove(key, timestamp)
+      mayFlushBatchWrite()
+
       removed += 1
     }
+    stateStore.finalizeBatchWrite()
     removed
   }
 
   override def evictAndReturnByTimestamp(endTimestamp: Long): Iterator[KeyToValuePair] = {
     val reusableKeyToValuePair = KeyToValuePair()
-    tsWithKey.scanEvictedKeys(endTimestamp).flatMap { evicted =>
+
+    stateStore.initiateBatchWrite()
+    val evictedIter = tsWithKey.scanEvictedKeys(endTimestamp).flatMap { evicted =>
       val key = evicted.key
       val timestamp = evicted.timestamp
       val values = keyWithTsToValues.get(key, timestamp)
+
       // Remove from both primary and secondary stores
       keyWithTsToValues.remove(key, timestamp)
       tsWithKey.remove(key, timestamp)
+      mayFlushBatchWrite()
+
       values.map { value =>
         reusableKeyToValuePair.withNew(key, value)
+      }
+    }
+
+    new NextIterator[KeyToValuePair] {
+      override protected def getNext(): KeyToValuePair = {
+        if (evictedIter.hasNext) {
+          evictedIter.next()
+        } else {
+          finished = true
+          null
+        }
+      }
+
+      override protected def close(): Unit = {
+        stateStore.finalizeBatchWrite()
       }
     }
   }
@@ -322,6 +350,19 @@ class SymmetricHashJoinStateManagerV4(
     // provider instance as well.
     if (stateStoreProvider != null) {
       stateStoreProvider.close()
+    }
+  }
+
+  private def mayFlushBatchWrite(): Unit = {
+    stateStore.getStatsOfCurrentBatchWrite() match {
+      case Some(BatchWriteStats(_, Some(dataSizeBytes))) =>
+        // 1MB writes
+        if (dataSizeBytes > 1_000_000) {
+          stateStore.finalizeBatchWrite()
+          stateStore.initiateBatchWrite()
+        }
+
+      case _ => // no-op
     }
   }
 

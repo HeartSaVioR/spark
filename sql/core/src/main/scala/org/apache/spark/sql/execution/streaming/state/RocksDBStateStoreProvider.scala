@@ -353,6 +353,8 @@ private[sql] class RocksDBStateStoreProvider
       rocksDB.put(kvEncoder._1.encodeKey(key), kvEncoder._2.encodeValue(value), colFamilyName)
     }
 
+    // FIXME: support WriteBatch
+
     override def putList(
         key: UnsafeRow,
         values: Array[UnsafeRow],
@@ -704,6 +706,24 @@ private[sql] class RocksDBStateStoreProvider
         keyValueEncoderMap.remove(colFamilyName)
       }
       result
+    }
+
+    override def initiateBatchWrite(): Unit = {
+      rocksDB.initiateWriteBatch()
+    }
+
+    override def finalizeBatchWrite(): Unit = {
+      rocksDB.flushWriteBatch()
+    }
+
+    override def getStatsOfCurrentBatchWrite(): Option[BatchWriteStats] = {
+      val numWrites = rocksDB.getNumWrites
+      val batchSizeBytes = rocksDB.getDataSizeOnCurrentWriteBatch
+      if (numWrites < 0) {
+        None
+      } else {
+        Some(BatchWriteStats(numWrites, Some(batchSizeBytes)))
+      }
     }
   }
 
