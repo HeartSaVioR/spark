@@ -134,7 +134,8 @@ class RocksDB(
   }
 
   private val dbLogger = createLogger() // for forwarding RocksDB native logs to log4j
-  rocksDbOptions.setStatistics(new Statistics())
+  private val statistics = new Statistics()
+  rocksDbOptions.setStatistics(statistics)
   private val nativeStats = rocksDbOptions.statistics()
 
   private val workingDir = createTempDir("workingDir")
@@ -714,6 +715,7 @@ class RocksDB(
     performedSnapshotAutoRepair = false
     // Reset the load metrics before loading
     loadMetrics.clear()
+    statistics.reset()
 
     logInfo(log"Loading ${MDC(LogKeys.VERSION_NUM, version)} with stateStoreCkptId: ${
       MDC(LogKeys.UUID, stateStoreCkptId.getOrElse(""))}")

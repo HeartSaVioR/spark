@@ -31,7 +31,7 @@ import org.apache.hadoop.fs.Path
 import org.json4s.{JInt, JString}
 import org.json4s.JsonAST.JValue
 import org.json4s.JsonDSL._
-import org.json4s.jackson.JsonMethods.{compact, render}
+import org.json4s.jackson.JsonMethods.{compact, pretty, render}
 
 import org.apache.spark.{SparkContext, SparkEnv, SparkException, TaskContext}
 import org.apache.spark.internal.{Logging, LogKeys}
@@ -385,7 +385,33 @@ case class StateStoreMetrics(
     numKeys: Long,
     memoryUsedBytes: Long,
     customMetrics: Map[StateStoreCustomMetric, Long],
-    instanceMetrics: Map[StateStoreInstanceMetric, Long] = Map.empty)
+    instanceMetrics: Map[StateStoreInstanceMetric, Long] = Map.empty) {
+  def json: String = {
+    compact(renderToJsonValue)
+  }
+
+  def jsonAsPretty: String = {
+    pretty(renderToJsonValue)
+  }
+
+  private def renderToJsonValue: JValue = {
+    val customMetricsJson = customMetrics.map { case (metric, value) =>
+      (metric.name -> JInt(value))
+    }
+
+    val instanceMetricsJson = instanceMetrics.map { case (metric, value) =>
+      (metric.name -> JInt(value))
+    }
+
+    val jsonValue: JValue =
+      ("numKeys" -> JInt(numKeys)) ~
+        ("memoryUsedBytes" -> JInt(memoryUsedBytes)) ~
+        ("customMetrics" -> customMetricsJson) ~
+        ("instanceMetrics" -> instanceMetricsJson)
+
+    render(jsonValue)
+  }
+}
 
 /**
  * State store checkpoint information, used to pass checkpointing information from executors

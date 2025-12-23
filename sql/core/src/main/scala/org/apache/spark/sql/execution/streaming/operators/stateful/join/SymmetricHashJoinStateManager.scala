@@ -1557,12 +1557,18 @@ class SymmetricHashJoinStateManagerV1(
     val keyWithIndexToValueMetrics = keyWithIndexToValue.metrics
     def newDesc(desc: String): String = s"${joinSide.toString.toUpperCase(Locale.ROOT)}: $desc"
 
+    val mergedCustomMetrics = (keyToNumValuesMetrics.customMetrics.toSeq ++
+      keyWithIndexToValueMetrics.customMetrics.toSeq)
+      .groupBy(_._1)
+      .map { case (metric, metrics) =>
+        val mergedValue = metrics.map(_._2).sum
+        (metric.withNewDesc(desc = newDesc(metric.desc)), mergedValue)
+      }
+
     StateStoreMetrics(
       keyWithIndexToValueMetrics.numKeys,       // represent each buffered row only once
       keyToNumValuesMetrics.memoryUsedBytes + keyWithIndexToValueMetrics.memoryUsedBytes,
-      keyWithIndexToValueMetrics.customMetrics.map {
-        case (metric, value) => (metric.withNewDesc(desc = newDesc(metric.desc)), value)
-      },
+      mergedCustomMetrics,
       // We want to collect instance metrics from both state stores
       keyWithIndexToValueMetrics.instanceMetrics ++ keyToNumValuesMetrics.instanceMetrics
     )

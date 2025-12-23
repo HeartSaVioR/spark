@@ -80,11 +80,14 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
       checkpointLocation: String,
       operatorId: Int)
 
+  // FIXME: add benchmark for regular joins
+
   private def runTestWithTimeWindowJoin(numTotalRows: Int): Unit = {
     val (joinKeys, inputAttributes) = getAttributesForTimeWindowJoin()
     // val stateFormatVersions = Seq(1, 2, 3, 4)
+    val stateFormatVersions = Seq(2, 4)
     // FIXME: testing...
-    val stateFormatVersions = Seq(4)
+    // val stateFormatVersions = Seq(4)
     // val changelogCheckpointOptions = Seq(true, false)
     val changelogCheckpointOptions = Seq(true)
 
@@ -103,8 +106,9 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
       numValuesPerTimestamp: Int): Unit = {
     val (joinKeys, inputAttributes) = getAttributesForTimeIntervalJoin()
     // val stateFormatVersions = Seq(1, 2, 3, 4)
+    val stateFormatVersions = Seq(2, 4)
     // FIXME: testing...
-    val stateFormatVersions = Seq(4)
+    // val stateFormatVersions = Seq(4)
     // val changelogCheckpointOptions = Seq(true, false)
     val changelogCheckpointOptions = Seq(true)
 
@@ -241,6 +245,9 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
             }
             joinStateManager.commit()
 
+            logInfo(s"[DEBUG][[Time-window][Append][stateFormatVersion=$stateFormatVersion] " +
+              s"metrics: ${joinStateManager.metrics.jsonAsPretty}")
+
             timer.stopTiming()
           }
         }
@@ -322,6 +329,10 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
               s"Expected $numKeysToGet joined rows, but got $joinedRowsCount")
 
             joinStateManagerVer1.commit()
+
+            logInfo(s"[DEBUG][Time-window][GetJoinedRows]" +
+              s"[stateFormatVersion=$stateFormatVersion] " +
+              s"metrics: ${joinStateManagerVer1.metrics.jsonAsPretty}")
 
             timer.stopTiming()
           }
@@ -421,6 +432,11 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
               s"Expected $actualNumRowsToExpectEviction joined rows, but got $evictedRowsCount")
 
             joinStateManagerVer1.commit()
+
+            logInfo(s"[DEBUG][Time-window][Eviction]" +
+              s"[actualEviction=$actualNumRowsToExpectEviction]" +
+              s"[stateFormatVersion=$stateFormatVersion] " +
+              s"metrics: ${joinStateManagerVer1.metrics.jsonAsPretty}")
 
             timer.stopTiming()
           }
@@ -522,6 +538,11 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
               s"Expected $actualNumRowsToExpectEviction joined rows, but got $evictedRowsCount")
 
             joinStateManagerVer1.commit()
+
+            logInfo(s"[DEBUG][Time-window][EvictionAndReturn]" +
+              s"[actualEviction=$actualNumRowsToExpectEviction]" +
+              s"[stateFormatVersion=$stateFormatVersion] " +
+              s"metrics: ${joinStateManagerVer1.metrics.jsonAsPretty}")
 
             timer.stopTiming()
           }
@@ -704,6 +725,10 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
             }
             joinStateManager.commit()
 
+            logInfo(s"[DEBUG][Time-interval][Append]" +
+              s"[stateFormatVersion=$stateFormatVersion] " +
+              s"metrics: ${joinStateManager.metrics.jsonAsPretty}")
+
             timer.stopTiming()
           }
         }
@@ -809,6 +834,10 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
 
             joinStateManagerVer1.commit()
 
+            logInfo(s"[DEBUG][Time-interval][GetJoinedRows]" +
+              s"[stateFormatVersion=$stateFormatVersion] " +
+              s"metrics: ${joinStateManagerVer1.metrics.jsonAsPretty}")
+
             timer.stopTiming()
           }
         }
@@ -909,6 +938,11 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
               s"Expected $actualNumRowsToExpectEviction joined rows, but got $evictedRowsCount")
 
             joinStateManagerVer1.commit()
+
+            logInfo(s"[DEBUG][Time-interval][Eviction][timestamps=$numTimestamps]" +
+              s"[actualEviction=$actualNumRowsToExpectEviction]" +
+              s"[stateFormatVersion=$stateFormatVersion] " +
+              s"metrics: ${joinStateManagerVer1.metrics.jsonAsPretty}")
 
             timer.stopTiming()
           }
@@ -1012,6 +1046,11 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
               s"Expected $actualNumRowsToExpectEviction joined rows, but got $evictedRowsCount")
 
             joinStateManagerVer1.commit()
+
+            logInfo(s"[DEBUG][Time-interval][EvictionAndReturn][timestamps=$numTimestamps]" +
+              s"[actualEviction=$actualNumRowsToExpectEviction]" +
+              s"[stateFormatVersion=$stateFormatVersion] " +
+              s"metrics: ${joinStateManagerVer1.metrics.jsonAsPretty}")
 
             timer.stopTiming()
           }
