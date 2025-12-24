@@ -57,9 +57,15 @@ import org.apache.spark.util.Utils
  */
 object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with Logging {
   override def runBenchmarkSuite(mainArgs: Array[String]): Unit = {
-    runTestWithTimeWindowJoin(numTotalRows = 1000000)
-
     val numTotalRows = 1000000
+
+    Seq(1, 10, 100, 1000, 10000, 100000, 1000000).foreach { numKeys =>
+      runTestWithRegularJoin(numTotalRows, numKeys = numKeys)
+    }
+
+    /*
+    runTestWithTimeWindowJoin(numTotalRows)
+
     Seq(
       (1000, 1) // ,
       // (500, 2),
@@ -73,6 +79,7 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
         numValuesPerTimestamp = numValuesPerTimestamp
       )
     }
+     */
   }
 
   case class StateOpInfo(
@@ -80,7 +87,22 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
       checkpointLocation: String,
       operatorId: Int)
 
-  // FIXME: add benchmark for regular joins
+  private def runTestWithRegularJoin(numTotalRows: Int, numKeys: Int): Unit = {
+    val (joinKeys, inputAttributes) = getAttributesForRegularJoin()
+    // val stateFormatVersions = Seq(1, 2, 3, 4)
+    val stateFormatVersions = Seq(2)
+    // FIXME: testing...
+    val changelogCheckpointOptions = Seq(true)
+
+    testWithRegularJoin(
+      inputAttributes = inputAttributes,
+      joinKeys = joinKeys,
+      stateFormatVersions = stateFormatVersions,
+      changelogCheckpointOptions = changelogCheckpointOptions,
+      numTotalRows = numTotalRows,
+      numKeys = numKeys
+    )
+  }
 
   private def runTestWithTimeWindowJoin(numTotalRows: Int): Unit = {
     val (joinKeys, inputAttributes) = getAttributesForTimeWindowJoin()
@@ -121,6 +143,214 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
       numTimestamps = numTimestamps,
       numValuesPerTimestamp = numValuesPerTimestamp
     )
+  }
+
+  private def testWithRegularJoin(
+      inputAttributes: Seq[Attribute],
+      joinKeys: Seq[Expression],
+      stateFormatVersions: Seq[Int],
+      changelogCheckpointOptions: Seq[Boolean],
+      numTotalRows: Int,
+      numKeys: Int): Unit = {
+    val inputData = prepareInputDataForRegularJoin(
+      joinKeys = joinKeys,
+      inputAttributes = inputAttributes,
+      numRows = numTotalRows,
+      numKeys = numKeys
+    )
+
+    val stateFormatVersionToStateOpInfo = mutable.HashMap[(Int, Boolean), StateOpInfo]()
+    for {
+      stateFormatVersion <- stateFormatVersions
+      useChangelogCheckpoint <- changelogCheckpointOptions
+    } {
+      val queryRunId = UUID.randomUUID()
+      val checkpointDir = newDir()
+      val operatorId = 0
+
+      stateFormatVersionToStateOpInfo.put(
+        (stateFormatVersion, useChangelogCheckpoint),
+        StateOpInfo(
+          queryRunId = queryRunId,
+          checkpointLocation = checkpointDir,
+          operatorId = operatorId
+        )
+      )
+    }
+
+    testAppendWithRegularJoin(
+      inputData = inputData,
+      joinKeys = joinKeys,
+      inputAttributes = inputAttributes,
+      stateFormatVersions = stateFormatVersions,
+      changelogCheckpointOptions = changelogCheckpointOptions,
+      stateFormatVersionToStateOpInfo = stateFormatVersionToStateOpInfo
+    )
+
+    testGetJoinedRowsWithRegularJoin(
+      inputData = inputData,
+      joinKeys = joinKeys,
+      inputAttributes = inputAttributes,
+      stateFormatVersions = stateFormatVersions,
+      changelogCheckpointOptions = changelogCheckpointOptions,
+      stateFormatVersionToStateOpInfo = stateFormatVersionToStateOpInfo,
+      numKeysToGet = numKeys / 10
+    )
+
+    // Regular join has no eviction
+  }
+
+  private def testAppendWithRegularJoin(
+      inputData: List[(UnsafeRow, UnsafeRow)],
+      joinKeys: Seq[Expression],
+      inputAttributes: Seq[Attribute],
+      stateFormatVersions: Seq[Int],
+      changelogCheckpointOptions: Seq[Boolean],
+      stateFormatVersionToStateOpInfo: mutable.HashMap[(Int, Boolean), StateOpInfo]): Unit = {
+    val numInputRows = inputData.size
+    val numKeys = inputData.groupBy(_._1).size
+
+    changelogCheckpointOptions.foreach { useChangelogCheckpoint =>
+      val benchmarkForPut = new Benchmark(
+        s"[Regular Join] Append $numInputRows rows (numKeys: $numKeys) ",
+        numInputRows,
+        minNumIters = 3,
+        output = output)
+
+      stateFormatVersions.foreach { stateFormatVersion =>
+        val stateOpInfo = stateFormatVersionToStateOpInfo(
+          (stateFormatVersion, useChangelogCheckpoint))
+
+        benchmarkForPut.addTimerCase(
+          s"state format version: $stateFormatVersion",
+          // enforce single iteration to avoid re-committing the same version multiple times
+          numIters = 1) { timer =>
+
+          ProfilingHelper.profile(
+            s"regular-append-$numInputRows-" +
+              s"state-version-$stateFormatVersion") {
+
+            val joinStateManager = createJoinStateManager(
+              queryRunId = stateOpInfo.queryRunId,
+              checkpointLocation = stateOpInfo.checkpointLocation,
+              operatorId = stateOpInfo.operatorId,
+              storeVersion = 0,
+              inputAttributes = inputAttributes,
+              joinKeys = joinKeys,
+              stateFormatVersion = stateFormatVersion,
+              useChangelogCheckpoint = useChangelogCheckpoint)
+
+            timer.startTiming()
+
+            inputData.foreach { case (keyRow, valueRow) =>
+              joinStateManager.append(keyRow, valueRow, matched = false)
+            }
+            joinStateManager.commit()
+
+            logInfo(s"[DEBUG][Regular][Append]" +
+              s"[stateFormatVersion=$stateFormatVersion] " +
+              s"metrics: ${joinStateManager.metrics.jsonAsPretty}")
+
+            timer.stopTiming()
+          }
+        }
+      }
+
+      benchmarkForPut.run()
+    }
+  }
+
+  private def testGetJoinedRowsWithRegularJoin(
+      inputData: List[(UnsafeRow, UnsafeRow)],
+      joinKeys: Seq[Expression],
+      inputAttributes: Seq[Attribute],
+      stateFormatVersions: Seq[Int],
+      changelogCheckpointOptions: Seq[Boolean],
+      stateFormatVersionToStateOpInfo: mutable.HashMap[(Int, Boolean), StateOpInfo],
+      numKeysToGet: Int): Unit = {
+
+    val numRowsInStateStore = inputData.size
+    changelogCheckpointOptions.foreach { useChangelogCheckpoint =>
+      val shuffledKeys = Random.shuffle(inputData).map(_._1).distinct
+      assert(numKeysToGet <= shuffledKeys.size,
+        s"numKeysToGet ($numKeysToGet) must be less than or equal to " +
+          s"the number of distinct keys in state store (${shuffledKeys.size})")
+      val shuffledKeysForJoinedRows = Random.shuffle(inputData).map(_._1).distinct
+        .take(numKeysToGet)
+
+      val actualMatchingValues = shuffledKeysForJoinedRows.map { keyRow =>
+        inputData.filter { case (k, _) => k == keyRow }.count(_ => true)
+      }.sum
+
+      val benchmarkForGetJoinedRows = new Benchmark(
+        s"[Regular Join] GetJoinedRows $numKeysToGet keys " +
+          s"(matching values: $actualMatchingValues) " +
+          s"from $numRowsInStateStore rows (numKeys: ${shuffledKeys.size})",
+        actualMatchingValues,
+        minNumIters = 3,
+        output = output)
+
+      val dummyValueRow = inputData.head._2
+
+      stateFormatVersions.foreach { stateFormatVersion =>
+        val stateOpInfo = stateFormatVersionToStateOpInfo(
+          (stateFormatVersion, useChangelogCheckpoint))
+
+        benchmarkForGetJoinedRows.addTimerCase(
+          s"state format version: $stateFormatVersion", numIters = 3) { timer =>
+
+          ProfilingHelper.profile(
+            s"regular-getjoinedrows-$actualMatchingValues-" +
+              s"state-version-$stateFormatVersion") {
+
+            val cloneCheckpointLocation = newDir()
+            Utils.copyDirectory(
+              new java.io.File(stateOpInfo.checkpointLocation),
+              new java.io.File(cloneCheckpointLocation))
+
+            val joinStateManagerVer1 = createJoinStateManager(
+              queryRunId = stateOpInfo.queryRunId,
+              checkpointLocation = cloneCheckpointLocation,
+              operatorId = stateOpInfo.operatorId,
+              storeVersion = 1,
+              inputAttributes = inputAttributes,
+              joinKeys = joinKeys,
+              stateFormatVersion = stateFormatVersion,
+              useChangelogCheckpoint = useChangelogCheckpoint)
+
+            val joinedRow = new JoinedRow()
+
+            timer.startTiming()
+
+            var joinedRowsCount = 0
+
+            shuffledKeysForJoinedRows.foreach { keyRow =>
+              val joinedRows = joinStateManagerVer1.getJoinedRows(
+                keyRow,
+                thatRow => joinedRow.withLeft(dummyValueRow).withRight(thatRow),
+                _ => true,
+                excludeRowsAlreadyMatched = false)
+              joinedRows.foreach { _ =>
+                joinedRowsCount += 1
+              }
+            }
+
+            assert(joinedRowsCount == actualMatchingValues,
+              s"Expected $actualMatchingValues joined rows, but got $joinedRowsCount")
+
+            joinStateManagerVer1.commit()
+
+            logInfo(s"[DEBUG][Regular][GetJoinedRows]" +
+              s"[stateFormatVersion=$stateFormatVersion] " +
+              s"metrics: ${joinStateManagerVer1.metrics.jsonAsPretty}")
+
+            timer.stopTiming()
+          }
+        }
+      }
+
+      benchmarkForGetJoinedRows.run()
+    }
   }
 
   private def testWithTimeWindowJoin(
@@ -740,7 +970,6 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
           s"(matching values: $actualMatchingValues) " +
           s"from $numRowsInStateStore rows (numTimestamp: $numTimestamps, " +
           s"numValuesPerTimestamp: $numValuesPerTimestamp)",
-        // FIXME: Should we measure this by keys or values?
         actualMatchingValues,
         minNumIters = 3,
         output = output)
@@ -1027,6 +1256,41 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
     }
   }
 
+  private def prepareInputDataForRegularJoin(
+      joinKeys: Seq[Expression],
+      inputAttributes: Seq[Attribute],
+      numRows: Int,
+      numKeys: Int): List[(UnsafeRow, UnsafeRow)] = {
+    val rowsToAppend = mutable.ArrayBuffer[(UnsafeRow, UnsafeRow)]()
+    val keyProj = UnsafeProjection.create(joinKeys, inputAttributes)
+    val valueProj = UnsafeProjection.create(inputAttributes, inputAttributes)
+
+    val numValuesPerKey = numRows / numKeys
+    assert(numRows % numKeys == 0, s"numRows ($numRows) must be divisible by numKeys ($numKeys)")
+
+    (0 until numKeys).foreach { keyIdx =>
+      val adId = keyIdx
+
+      (0 until numValuesPerKey).foreach { _ =>
+        // Below twos are not used in join criteria
+        val userId = Random.nextLong(10000)
+        val campaignId = Random.nextLong(100000)
+
+        val row = new GenericInternalRow(
+          Array[Any](
+            adId,
+            userId,
+            campaignId)
+        )
+
+        val keyUnsafeRow = keyProj(row).copy()
+        val valueUnsafeRow = valueProj(row).copy()
+        rowsToAppend.append((keyUnsafeRow, valueUnsafeRow))
+      }
+    }
+
+    Random.shuffle(rowsToAppend.toList)
+  }
 
   private def prepareInputDataForTimeWindowJoin(
       joinKeys: Seq[Expression],
@@ -1089,7 +1353,7 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
         val impressionTimestamp = timestampIdx * 1000L
 
         (0 until numValuesPerTimestamp).foreach { _ =>
-          // Below twos are effectively not used in join criteria and does not impact the benchmark
+          // Below twos are effectively not used in join criteria
           val userId = Random.nextLong(10000)
           val campaignId = Random.nextLong(100000)
 
@@ -1109,6 +1373,18 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
     }
 
     Random.shuffle(rowsToAppend.toList)
+  }
+
+  private def getAttributesForRegularJoin(): (Seq[Expression], Seq[Attribute]) = {
+    val inputAttributes = Seq(
+      AttributeReference("adId", IntegerType, nullable = false)(),
+      AttributeReference("userId", LongType, nullable = false)(),
+      AttributeReference("campaignId", LongType, nullable = false)()
+    )
+    val joinKeys = Seq(
+      inputAttributes(0) // adId
+    )
+    (joinKeys, inputAttributes)
   }
 
   private def getAttributesForTimeWindowJoin(): (Seq[Expression], Seq[Attribute]) = {
@@ -1186,7 +1462,6 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
       classOf[RocksDBStateStoreProvider].getName)
     sqlConf.setConfString("spark.sql.streaming.stateStore.rocksdb.changelogCheckpointing.enabled",
       useChangelogCheckpoint.toString)
-    // FIXME: temporarily enabling this to debug
     sqlConf.setConfString("spark.sql.streaming.stateStore.rocksdb.trackTotalNumberOfRows",
       false.toString)
     sqlConf.setConfString("spark.sql.streaming.stateStore.coordinatorReportSnapshotUploadLag",

@@ -98,19 +98,21 @@ class SymmetricHashJoinStateManagerV4(
   protected val keySchema = StructType(
     joinKeys.zipWithIndex.map { case (k, i) => StructField(s"field$i", k.dataType, k.nullable) })
   protected val keyAttributes = toAttributes(keySchema)
-  private val eventTimeColIdx = WatermarkSupport.findEventTimeColumnIndex(
+  private val eventTimeColIdxOpt = WatermarkSupport.findEventTimeColumnIndex(
     inputValueAttributes,
     // FIXME: config
     allowMultipleEventTimeColumns = false)
 
   // FIXME: Does this even work well without event time column?
   // FIXME: Maybe this could be "faster" if the values for a grouping key are not too many?
-  assert(eventTimeColIdx.isDefined,
-    s"Event time column is required for join state manager v4 with state format version " +
-      s"$stateFormatVersion")
+ assert(eventTimeColIdxOpt.isDefined,
+   s"Event time column is required for join state manager v4 with state format version " +
+   s"$stateFormatVersion")
+
+  private val eventTimeColIdx = eventTimeColIdxOpt.get
 
   private val extractEventTimeFn: UnsafeRow => Long = { row =>
-    val idx = eventTimeColIdx.get
+    val idx = eventTimeColIdx
     val attr = inputValueAttributes(idx)
 
     if (attr.dataType.isInstanceOf[StructType]) {
