@@ -553,40 +553,6 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
     }
   }
 
-  private def prepareInputDataForTimeWindowJoin(
-      joinKeys: Seq[Expression],
-      inputAttributes: Seq[Attribute],
-      numRows: Int): List[(UnsafeRow, UnsafeRow)] = {
-    val rowsToAppend = mutable.ArrayBuffer[(UnsafeRow, UnsafeRow)]()
-    val keyProj = UnsafeProjection.create(joinKeys, inputAttributes)
-    val valueProj = UnsafeProjection.create(inputAttributes, inputAttributes)
-
-    0.until(numRows).foreach { i =>
-      val deptId = i % 10
-      val windowStart = (i / 10) * 1000L
-      val windowEnd = (i / 10) * 1000L + 1000L
-
-      val sum = Random.nextInt(100)
-      val count = Random.nextInt(10)
-
-      val row = new GenericInternalRow(
-        Array[Any](
-          deptId,
-          new GenericInternalRow(
-            Array[Any](windowStart, windowEnd)
-          ),
-          sum.toLong,
-          count.toLong)
-      )
-
-      val keyUnsafeRow = keyProj(row).copy()
-      val valueUnsafeRow = valueProj(row).copy()
-      rowsToAppend.append((keyUnsafeRow, valueUnsafeRow))
-    }
-
-    Random.shuffle(rowsToAppend.toList)
-  }
-
   private def testWithTimeIntervalJoin(
       inputAttributes: Seq[Attribute],
       joinKeys: Seq[Expression],
@@ -1061,6 +1027,41 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
     }
   }
 
+
+  private def prepareInputDataForTimeWindowJoin(
+      joinKeys: Seq[Expression],
+      inputAttributes: Seq[Attribute],
+      numRows: Int): List[(UnsafeRow, UnsafeRow)] = {
+    val rowsToAppend = mutable.ArrayBuffer[(UnsafeRow, UnsafeRow)]()
+    val keyProj = UnsafeProjection.create(joinKeys, inputAttributes)
+    val valueProj = UnsafeProjection.create(inputAttributes, inputAttributes)
+
+    0.until(numRows).foreach { i =>
+      val deptId = i % 10
+      val windowStart = (i / 10) * 1000L
+      val windowEnd = (i / 10) * 1000L + 1000L
+
+      val sum = Random.nextLong(10000)
+      val count = Random.nextLong(100000)
+
+      val row = new GenericInternalRow(
+        Array[Any](
+          deptId,
+          new GenericInternalRow(
+            Array[Any](windowStart, windowEnd)
+          ),
+          sum,
+          count)
+      )
+
+      val keyUnsafeRow = keyProj(row).copy()
+      val valueUnsafeRow = valueProj(row).copy()
+      rowsToAppend.append((keyUnsafeRow, valueUnsafeRow))
+    }
+
+    Random.shuffle(rowsToAppend.toList)
+  }
+
   private def prepareInputDataForTimeIntervalJoin(
       joinKeys: Seq[Expression],
       inputAttributes: Seq[Attribute],
@@ -1089,8 +1090,8 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
 
         (0 until numValuesPerTimestamp).foreach { _ =>
           // Below twos are effectively not used in join criteria and does not impact the benchmark
-          val userId = Random.nextInt(1000)
-          val campaignId = Random.nextInt(10000)
+          val userId = Random.nextLong(10000)
+          val campaignId = Random.nextLong(100000)
 
           val row = new GenericInternalRow(
             Array[Any](
@@ -1142,8 +1143,8 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
         metadata = new MetadataBuilder()
           .putLong(EventTimeWatermark.delayKey, 0L)
           .build())(),
-      AttributeReference("userId", IntegerType, nullable = false)(),
-      AttributeReference("campaignId", IntegerType, nullable = false)()
+      AttributeReference("userId", LongType, nullable = false)(),
+      AttributeReference("campaignId", LongType, nullable = false)()
     )
     val joinKeys = Seq(
       inputAttributes(0) // adId
