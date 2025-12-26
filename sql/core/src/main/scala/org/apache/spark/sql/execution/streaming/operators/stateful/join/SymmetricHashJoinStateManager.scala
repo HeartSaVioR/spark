@@ -51,14 +51,6 @@ trait SymmetricHashJoinStateManager {
 
   def iterator: Iterator[KeyToValuePair]
 
-  def removeByKeyCondition(removalCondition: UnsafeRow => Boolean): Iterator[KeyToValuePair]
-
-  def removeByValueCondition(removalCondition: UnsafeRow => Boolean): Iterator[KeyToValuePair]
-
-  def getInternalRowOfKeyWithIndex(currentKey: UnsafeRow): InternalRow
-
-  protected[streaming] def updateNumValuesTestOnly(key: UnsafeRow, numValues: Long): Unit
-
   def commit(): Unit
 
   def abortIfNeeded(): Unit
@@ -68,7 +60,21 @@ trait SymmetricHashJoinStateManager {
   def getLatestCheckpointInfo(): JoinerStateStoreCkptInfo
 }
 
-trait SupportsEvictByTimestamp {
+trait SupportsIndexedKeys {
+  def getInternalRowOfKeyWithIndex(currentKey: UnsafeRow): InternalRow
+
+  protected[streaming] def updateNumValuesTestOnly(key: UnsafeRow, numValues: Long): Unit
+}
+
+trait SupportsEvictByCondition { self: SymmetricHashJoinStateManager =>
+  import SymmetricHashJoinStateManager._
+
+  def removeByKeyCondition(removalCondition: UnsafeRow => Boolean): Iterator[KeyToValuePair]
+
+  def removeByValueCondition(removalCondition: UnsafeRow => Boolean): Iterator[KeyToValuePair]
+}
+
+trait SupportsEvictByTimestamp { self: SymmetricHashJoinStateManager =>
   import SymmetricHashJoinStateManager._
 
   def evictByTimestamp(endTimestamp: Long): Int
@@ -100,11 +106,15 @@ class SymmetricHashJoinStateManagerV4(
   protected val keyAttributes = toAttributes(keySchema)
   private val eventTimeColIdxOpt = WatermarkSupport.findEventTimeColumnIndex(
     inputValueAttributes,
-    // FIXME: config
+    // NOTE: This does not accept multiple event time columns. This is not the same with the
+    // operator which we offer the backward compatibility, but it involves too many layers to
+    // pass the information. The information is in SQLConf.
     allowMultipleEventTimeColumns = false)
 
-  // FIXME: Does this even work well without event time column?
-  // FIXME: Maybe this could be "faster" if the values for a grouping key are not too many?
+  // This state format version has a huge performance gain on eviction, especially when we evict
+  // only a smaller part of the state. This is actually trading off performance from some
+  // scenarios of insertion and retrieval. Joins which do not have event time column do not do
+  // eviction, hence these joins won't gain any benefit from this state format version.
  assert(eventTimeColIdxOpt.isDefined,
    s"Event time column is required for join state manager v4 with state format version " +
    s"$stateFormatVersion")
@@ -206,7 +216,7 @@ class SymmetricHashJoinStateManagerV4(
       generateJoinedRow: InternalRow => JoinedRow,
       predicate: JoinedRow => Boolean,
       excludeRowsAlreadyMatched: Boolean): Iterator[JoinedRow] = {
-    // FIXME: We could improve this method to get the scope of timestamp and scan keys
+    // TODO: We could improve this method to get the scope of timestamp and scan keys
     //  more efficiently. For now, we just get all values for the key.
     keyWithTsToValues.getValues(key).flatMap { result =>
       val ts = result.timestamp
@@ -258,25 +268,14 @@ class SymmetricHashJoinStateManagerV4(
             val updatedValuesWithMatched = valuesAndMatched.map { vmp =>
               (vmp.value, vmp.matched)
             }.toSeq
-            // FIXME: This can be also batched with other update, but then we need to buffer
-            //   these writes.
+            // TODO: Potentially this can be also batched with other update, but then we need
+            //  to buffer these writes. Also, we should be careful that the batch write does
+            //  not interfere with other ongoing batch write.
             keyWithTsToValues.put(key, ts, updatedValuesWithMatched)
           }
         }
       }
     }.filter(_ != null)
-  }
-
-  override def removeByKeyCondition(
-      removalCondition: UnsafeRow => Boolean): Iterator[KeyToValuePair] = {
-    throw new UnsupportedOperationException(
-      "removeByKeyCondition is not supported in SymmetricHashJoinStateManagerV4")
-  }
-
-  override def removeByValueCondition(
-      removalCondition: UnsafeRow => Boolean): Iterator[KeyToValuePair] = {
-    throw new UnsupportedOperationException(
-      "removeByKeyCondition is not supported in SymmetricHashJoinStateManagerV4")
   }
 
   override def iterator: Iterator[KeyToValuePair] = {
@@ -391,41 +390,8 @@ class SymmetricHashJoinStateManagerV4(
     private val keyRowGenerator = UnsafeProjection.create(
       keyAttributes, keyAttributes :+ AttributeReference("ts", LongType)())
 
-    // FIXME: Deduplicate?
-    private class KeyWithIndexToValueRowConverterFormatV2 {
-      private val valueWithMatchedExprs = inputValueAttributes :+ Literal(true)
-      private val indexOrdinalInValueWithMatchedRow = inputValueAttributes.size
-
-      private val valueWithMatchedRowGenerator = UnsafeProjection.create(valueWithMatchedExprs,
-        inputValueAttributes)
-
-      val valueAttributes: Seq[Attribute] = inputValueAttributes :+
-        AttributeReference("matched", BooleanType)()
-
-      // Projection to generate key row from (value + matched) row
-      private val valueRowGenerator = UnsafeProjection.create(
-        inputValueAttributes, valueAttributes)
-
-      def convertValue(value: UnsafeRow): ValueAndMatchPair = {
-        if (value != null) {
-          ValueAndMatchPair(valueRowGenerator(value).copy(),
-            value.getBoolean(indexOrdinalInValueWithMatchedRow))
-        } else {
-          null
-        }
-      }
-
-      def convertToValueRow(value: UnsafeRow, matched: Boolean): UnsafeRow = {
-        val row = valueWithMatchedRowGenerator(value)
-        row.setBoolean(indexOrdinalInValueWithMatchedRow, matched)
-        row
-      }
-    }
-
-    private val valueRowConverter = new KeyWithIndexToValueRowConverterFormatV2()
-
-    private val keyStateEncoderSpec = PrefixKeyScanStateEncoderSpec(
-      keyWithTsSchema, keyAttributes.size)
+    private val valueRowConverter = StreamingSymmetricHashJoinValueRowConverter.create(
+      inputValueAttributes, stateFormatVersion = 4)
 
     // Set up virtual column family name in the store if it is being used
     private val colFamilyName = getStateStoreName(joinSide, KeyWithTsToValuesType)
@@ -565,8 +531,6 @@ class SymmetricHashJoinStateManagerV4(
   }
 
   private class TsWithKeyTypeStore {
-    private val useVirtualColumnFamilies: Boolean = true
-
     private val tsWithKeyExprs = Literal(1L) +: keyAttributes
     private val tsWithKeySchema = StructType(StructField("ts", LongType) +: keySchema.fields)
     private val indexOrdinalInTsWithKeyRow = 0
@@ -664,17 +628,6 @@ class SymmetricHashJoinStateManagerV4(
 
     JoinerStateStoreCkptInfo(keyToNumValuesCkptInfo, keyWithIndexToValueCkptInfo)
   }
-
-  override def getInternalRowOfKeyWithIndex(currentKey: UnsafeRow): InternalRow = {
-    throw new UnsupportedOperationException(
-      "getInternalRowOfKeyWithIndex is not supported in SymmetricHashJoinStateManagerV4")
-  }
-
-  override protected[streaming] def updateNumValuesTestOnly(
-      key: UnsafeRow, numValues: Long): Unit = {
-    throw new UnsupportedOperationException(
-      "updateNumValuesTestOnly is not supported in SymmetricHashJoinStateManagerV4")
-  }
 }
 
 /**
@@ -739,7 +692,11 @@ abstract class SymmetricHashJoinStateManagerBase(
     useStateStoreCoordinator: Boolean = true,
     snapshotOptions: Option[SnapshotOptions] = None,
     joinStoreGenerator: JoinStateManagerStoreGenerator)
-  extends SymmetricHashJoinStateManager with Logging {
+  extends SymmetricHashJoinStateManager
+  with SupportsEvictByCondition
+  with SupportsIndexedKeys
+  with Logging {
+
   import SymmetricHashJoinStateManager._
 
   protected val keySchema = StructType(
@@ -1192,7 +1149,6 @@ abstract class SymmetricHashJoinStateManagerBase(
     }
   }
 
-
   /** A wrapper around a [[StateStore]] that stores [key -> number of values]. */
   protected class KeyToNumValuesStore(
       val stateFormatVersion: Int,
@@ -1289,78 +1245,6 @@ SnapshotOptions
     }
   }
 
-  private trait KeyWithIndexToValueRowConverter {
-    /** Defines the schema of the value row (the value side of K-V in state store). */
-    def valueAttributes: Seq[Attribute]
-
-    /**
-     * Convert the value row to (actual value, match) pair.
-     *
-     * NOTE: implementations should ensure the result row is NOT reused during execution, so
-     * that caller can safely read the value in any time.
-     */
-    def convertValue(value: UnsafeRow): ValueAndMatchPair
-
-    /**
-     * Build the value row from (actual value, match) pair. This is expected to be called just
-     * before storing to the state store.
-     *
-     * NOTE: depending on the implementation, the result row "may" be reused during execution
-     * (to avoid initialization of object), so the caller should ensure that the logic doesn't
-     * affect by such behavior. Call copy() against the result row if needed.
-     */
-    def convertToValueRow(value: UnsafeRow, matched: Boolean): UnsafeRow
-  }
-
-  private object KeyWithIndexToValueRowConverter {
-    def create(version: Int): KeyWithIndexToValueRowConverter = version match {
-      case 1 => new KeyWithIndexToValueRowConverterFormatV1()
-      case 2 | 3 => new KeyWithIndexToValueRowConverterFormatV2()
-      case _ => throw new IllegalArgumentException("Incorrect state format version! " +
-        s"version $version")
-    }
-  }
-
-  private class KeyWithIndexToValueRowConverterFormatV1 extends KeyWithIndexToValueRowConverter {
-    override val valueAttributes: Seq[Attribute] = inputValueAttributes
-
-    override def convertValue(value: UnsafeRow): ValueAndMatchPair = {
-      if (value != null) ValueAndMatchPair(value, false) else null
-    }
-
-    override def convertToValueRow(value: UnsafeRow, matched: Boolean): UnsafeRow = value
-  }
-
-  private class KeyWithIndexToValueRowConverterFormatV2 extends KeyWithIndexToValueRowConverter {
-    private val valueWithMatchedExprs = inputValueAttributes :+ Literal(true)
-    private val indexOrdinalInValueWithMatchedRow = inputValueAttributes.size
-
-    private val valueWithMatchedRowGenerator = UnsafeProjection.create(valueWithMatchedExprs,
-      inputValueAttributes)
-
-    override val valueAttributes: Seq[Attribute] = inputValueAttributes :+
-      AttributeReference("matched", BooleanType)()
-
-    // Projection to generate key row from (value + matched) row
-    private val valueRowGenerator = UnsafeProjection.create(
-      inputValueAttributes, valueAttributes)
-
-    override def convertValue(value: UnsafeRow): ValueAndMatchPair = {
-      if (value != null) {
-        ValueAndMatchPair(valueRowGenerator(value).copy(),
-          value.getBoolean(indexOrdinalInValueWithMatchedRow))
-      } else {
-        null
-      }
-    }
-
-    override def convertToValueRow(value: UnsafeRow, matched: Boolean): UnsafeRow = {
-      val row = valueWithMatchedRowGenerator(value)
-      row.setBoolean(indexOrdinalInValueWithMatchedRow, matched)
-      row
-    }
-  }
-
   /**
    * A wrapper around a [[StateStore]] that stores the mapping; the mapping depends on the
    * state format version - please refer implementations of [[KeyWithIndexToValueRowConverter]].
@@ -1383,7 +1267,8 @@ SnapshotOptions
     private val keyRowGenerator = UnsafeProjection.create(
       keyAttributes, keyAttributes :+ AttributeReference("index", LongType)())
 
-    private val valueRowConverter = KeyWithIndexToValueRowConverter.create(stateFormatVersion)
+    private val valueRowConverter = StreamingSymmetricHashJoinValueRowConverter
+      .create(inputValueAttributes, stateFormatVersion)
 
     protected val stateStore = getStateStore(keyWithIndexSchema,
       valueRowConverter.valueAttributes.toStructType, useVirtualColumnFamilies)
@@ -1555,6 +1440,8 @@ class SymmetricHashJoinStateManagerV1(
   }
 
   override def metrics: StateStoreMetrics = {
+    // FIXME: purposed for benchmarking
+    /*
     val keyToNumValuesMetrics = keyToNumValues.metrics
     val keyWithIndexToValueMetrics = keyWithIndexToValue.metrics
     def newDesc(desc: String): String = s"${joinSide.toString.toUpperCase(Locale.ROOT)}: $desc"
@@ -1571,6 +1458,21 @@ class SymmetricHashJoinStateManagerV1(
       keyWithIndexToValueMetrics.numKeys,       // represent each buffered row only once
       keyToNumValuesMetrics.memoryUsedBytes + keyWithIndexToValueMetrics.memoryUsedBytes,
       mergedCustomMetrics,
+      // We want to collect instance metrics from both state stores
+      keyWithIndexToValueMetrics.instanceMetrics ++ keyToNumValuesMetrics.instanceMetrics
+    )
+     */
+
+    val keyToNumValuesMetrics = keyToNumValues.metrics
+    val keyWithIndexToValueMetrics = keyWithIndexToValue.metrics
+    def newDesc(desc: String): String = s"${joinSide.toString.toUpperCase(Locale.ROOT)}: $desc"
+
+    StateStoreMetrics(
+      keyWithIndexToValueMetrics.numKeys,       // represent each buffered row only once
+      keyToNumValuesMetrics.memoryUsedBytes + keyWithIndexToValueMetrics.memoryUsedBytes,
+      keyWithIndexToValueMetrics.customMetrics.map {
+        case (metric, value) => (metric.withNewDesc(desc = newDesc(metric.desc)), value)
+      },
       // We want to collect instance metrics from both state stores
       keyWithIndexToValueMetrics.instanceMetrics ++ keyToNumValuesMetrics.instanceMetrics
     )
@@ -1715,9 +1617,7 @@ object SymmetricHashJoinStateManager {
         stateFormatVersion, skippedNullValueCount, useStateStoreCoordinator, snapshotOptions,
         joinStoreGenerator
       )
-    }
-    // FIXME: Below are existing ones
-    else if (stateFormatVersion == 3) {
+    } else if (stateFormatVersion == 3) {
       new SymmetricHashJoinStateManagerV2(
         joinSide, inputValueAttributes, joinKeys, stateInfo, storeConf, hadoopConf,
         partitionId, keyToNumValuesStateStoreCkptId, keyWithIndexToValueStateStoreCkptId,
@@ -1735,7 +1635,6 @@ object SymmetricHashJoinStateManager {
   }
   // scalastyle:on
 
-  // FIXME: version 3 does not use this method
   def allStateStoreNames(joinSides: JoinSide*): Seq[String] = {
     val allStateStoreTypes: Seq[StateStoreType] = Seq(KeyToNumValuesType, KeyWithIndexToValueType)
     for (joinSide <- joinSides; stateStoreType <- allStateStoreTypes) yield {
@@ -1743,7 +1642,6 @@ object SymmetricHashJoinStateManager {
     }
   }
 
-  // FIXME: Being used by stream-stream join version 1, 2, 3
   def getSchemaForStateStores(
       joinSide: JoinSide,
       inputValueAttributes: Seq[Attribute],
@@ -1773,7 +1671,6 @@ object SymmetricHashJoinStateManager {
     result
   }
 
-  // FIXME: stream-stream join version 3
   /** Retrieves the schemas used for join operator state stores that use column families */
   def getSchemasForStateStoreWithColFamily(
       joinSide: JoinSide,
@@ -1793,7 +1690,6 @@ object SymmetricHashJoinStateManager {
     }
   }
 
-  // FIXME: being used by stream-stream join version 1, 2, 3
   /**
    * Stream-stream join has 4 state stores instead of one. So it will generate 4 different
    * checkpoint IDs. The approach we take here is to merge them into one array in the checkpointing
@@ -1841,7 +1737,6 @@ object SymmetricHashJoinStateManager {
       baseCkptIds)
   }
 
-  // FIXME: being used by stream-stream join version 1, 2, 3
   /**
    * Stream-stream join has 4 state stores instead of one. So it will generate 4 different
    * checkpoint IDs using stateStoreCkptIds. They are translated from each joiners' state
@@ -1880,7 +1775,6 @@ object SymmetricHashJoinStateManager {
     }
   }
 
-  // FIXME: being used by stream-stream join version 1, 2, 3
   /**
    * Stream-stream join has 4 state stores instead of one. So it will generate 4 different
    * checkpoint IDs when not using virtual column families.
@@ -2005,7 +1899,6 @@ object SymmetricHashJoinStateManager {
   }
 }
 
-// FIXME: stream-stream join version 1, 2, 3
 /**
  * Options controlling snapshot-based state replay for state data source reader.
  */

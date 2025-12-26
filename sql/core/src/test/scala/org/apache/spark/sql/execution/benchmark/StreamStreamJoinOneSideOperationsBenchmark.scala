@@ -32,7 +32,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, GenericInternalRow, JoinedRow, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
 import org.apache.spark.sql.execution.streaming.operators.stateful.StatefulOperatorStateInfo
-import org.apache.spark.sql.execution.streaming.operators.stateful.join.{JoinStateManagerStoreGenerator, SupportsEvictByTimestamp, SymmetricHashJoinStateManager}
+import org.apache.spark.sql.execution.streaming.operators.stateful.join.{JoinStateManagerStoreGenerator, SupportsEvictByCondition, SupportsEvictByTimestamp, SymmetricHashJoinStateManager}
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper.LeftSide
 import org.apache.spark.sql.execution.streaming.runtime.StreamExecution
 import org.apache.spark.sql.execution.streaming.state.{RocksDBStateStoreProvider, StateStoreConf}
@@ -646,8 +646,8 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
               case m: SupportsEvictByTimestamp =>
                 evictedRowsCount = m.evictByTimestamp(windowEndForEviction)
 
-              case _ =>
-                val evictedRows = joinStateManagerVer1.removeByKeyCondition {
+              case m: SupportsEvictByCondition =>
+                val evictedRows = m.removeByKeyCondition {
                   keyRow =>
                     val windowRow = keyRow.getStruct(1, 2)
                     val windowEnd = windowRow.getLong(1)
@@ -752,8 +752,8 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
                   evictedRowsCount += 1
                 }
 
-              case _ =>
-                val evictedRows = joinStateManagerVer1.removeByKeyCondition {
+              case m: SupportsEvictByCondition =>
+                val evictedRows = m.removeByKeyCondition {
                   keyRow =>
                     val windowRow = keyRow.getStruct(1, 2)
                     val windowEnd = windowRow.getLong(1)
@@ -1120,8 +1120,8 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
               case m: SupportsEvictByTimestamp =>
                 evictedRowsCount = m.evictByTimestamp(tsForEviction) * numValuesPerTimestamp
 
-              case _ =>
-                val evictedRows = joinStateManagerVer1.removeByValueCondition { valueRow =>
+              case m: SupportsEvictByCondition =>
+                val evictedRows = m.removeByValueCondition { valueRow =>
                   valueRow.getLong(1) <= tsForEviction
                 }
                 evictedRows.foreach { _ =>
@@ -1228,8 +1228,8 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
                   evictedRowsCount += 1
                 }
 
-              case _ =>
-                val evictedRows = joinStateManagerVer1.removeByValueCondition { valueRow =>
+              case m: SupportsEvictByCondition =>
+                val evictedRows = m.removeByValueCondition { valueRow =>
                   valueRow.getLong(1) <= tsForEviction
                 }
                 evictedRows.foreach { _ =>

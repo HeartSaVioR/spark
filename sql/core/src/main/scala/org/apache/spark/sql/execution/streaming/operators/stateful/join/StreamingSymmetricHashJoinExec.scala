@@ -262,7 +262,6 @@ case class StreamingSymmetricHashJoinExec(
     }
   }
 
-  // FIXME: stream-stream join version 3
   override def getColFamilySchemas(
       shouldBeNullable: Boolean): Map[String, StateStoreColFamilySchema] = {
     assert(useVirtualColumnFamilies)
@@ -289,7 +288,6 @@ case class StreamingSymmetricHashJoinExec(
       hadoopConf: Configuration,
       batchId: Long,
       stateSchemaVersion: Int): List[StateSchemaValidationResult] = {
-    // FIXME: stream-stream join version 3
     if (useVirtualColumnFamilies) {
       val info = getStateInfo
       val stateSchemaDir = stateSchemaDirPath()
@@ -807,9 +805,21 @@ case class StreamingSymmetricHashJoinExec(
     def removeOldState(): Iterator[KeyToValuePair] = {
       stateWatermarkPredicate match {
         case Some(JoinStateKeyWatermarkPredicate(expr)) =>
-          joinStateManager.removeByKeyCondition(stateKeyWatermarkPredicateFunc)
+          joinStateManager match {
+            case s: SupportsEvictByCondition =>
+              s.removeByKeyCondition(stateKeyWatermarkPredicateFunc)
+
+            case s => throw new IllegalStateException(
+              s"Join state manager $s for $joinSide is not supported yet")
+          }
         case Some(JoinStateValueWatermarkPredicate(expr)) =>
-          joinStateManager.removeByValueCondition(stateValueWatermarkPredicateFunc)
+          joinStateManager match {
+            case s: SupportsEvictByCondition =>
+              s.removeByValueCondition(stateValueWatermarkPredicateFunc)
+
+            case s => throw new IllegalStateException(
+              s"Join state manager $s for $joinSide is not supported yet")
+          }
         case _ => Iterator.empty
       }
     }
