@@ -18,8 +18,11 @@
 package org.apache.spark.sql.execution.streaming.operators.stateful.join
 
 import java.util.Locale
+
 import scala.annotation.tailrec
+
 import org.apache.hadoop.conf.Configuration
+
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{END_INDEX, START_INDEX, STATE_STORE_ID}
@@ -27,7 +30,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, JoinedRow, Literal, SafeProjection, SpecificInternalRow, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
 import org.apache.spark.sql.execution.metric.SQLMetric
-import org.apache.spark.sql.execution.streaming.operators.stateful.{StatefulOpStateStoreCheckpointInfo, StatefulOperatorStateInfo, WatermarkSupport}
+import org.apache.spark.sql.execution.streaming.operators.stateful.{StatefulOperatorStateInfo, StatefulOpStateStoreCheckpointInfo, WatermarkSupport}
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper._
 import org.apache.spark.sql.execution.streaming.state.{BatchWriteStats, KeyStateEncoderSpec, NoPrefixKeyStateEncoderSpec, PrefixKeyScanStateEncoderSpec, RangeKeyScanStateEncoderSpec, StateSchemaBroadcast, StateStore, StateStoreCheckpointInfo, StateStoreColFamilySchema, StateStoreConf, StateStoreErrors, StateStoreId, StateStoreMetrics, StateStoreProvider, StateStoreProviderId, SupportsFineGrainedReplay}
 import org.apache.spark.sql.types.{BooleanType, DataType, IntegerType, LongType, NullType, StructField, StructType}
@@ -554,7 +557,7 @@ class SymmetricHashJoinStateManagerV4(
     private val reusedValueRowTemplate: UnsafeRow = {
       val valueRowGenerator = UnsafeProjection.create(
         Seq(Literal(-1)), Seq(AttributeReference("numValues", IntegerType)()))
-      val row = new SpecificInternalRow(Array[DataType](IntegerType))
+      val row = new SpecificInternalRow(Seq[DataType](IntegerType))
       row.setInt(0, -1)
       valueRowGenerator(row)
     }
@@ -783,7 +786,7 @@ abstract class SymmetricHashJoinStateManagerBase(
       if (removalCondition(key)) {
         val numValue = keyAndNumValues.numValue
 
-        (0 until numValue).map { idx =>
+        (0L until numValue).foreach { idx =>
           keyWithIndexToValue.remove(key, idx)
         }
 

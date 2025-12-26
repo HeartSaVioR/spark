@@ -97,8 +97,7 @@ abstract class SymmetricHashJoinStateManagerBaseSuite extends StreamTest with Be
               inputValueAttributesWithWatermark.dataType,
               inputValueAttributesWithWatermark.nullable),
             Literal(threshold))
-        val iter = evictByCondition.evictByKeyCondition(GeneratePredicate.generate(expr).eval _)
-        while (iter.hasNext) iter.next()
+        evictByCondition.evictByKeyCondition(GeneratePredicate.generate(expr).eval _)
     }
   }
 
@@ -111,9 +110,8 @@ abstract class SymmetricHashJoinStateManagerBaseSuite extends StreamTest with Be
 
       case evictByCondition: SupportsEvictByCondition =>
         val expr = LessThanOrEqual(inputValueAttributesWithWatermark, Literal(watermark))
-        val iter = evictByCondition.evictByValueCondition(
+        evictByCondition.evictByValueCondition(
           GeneratePredicate.generate(expr, inputValueAttributes).eval _)
-        while (iter.hasNext) iter.next()
     }
   }
 
