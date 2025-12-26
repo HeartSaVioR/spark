@@ -18,11 +18,8 @@
 package org.apache.spark.sql.execution.streaming.operators.stateful.join
 
 import java.util.Locale
-
 import scala.annotation.tailrec
-
 import org.apache.hadoop.conf.Configuration
-
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{END_INDEX, START_INDEX, STATE_STORE_ID}
@@ -30,10 +27,10 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, JoinedRow, Literal, SafeProjection, SpecificInternalRow, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
 import org.apache.spark.sql.execution.metric.SQLMetric
-import org.apache.spark.sql.execution.streaming.operators.stateful.{StatefulOperatorStateInfo, StatefulOpStateStoreCheckpointInfo, WatermarkSupport}
+import org.apache.spark.sql.execution.streaming.operators.stateful.{StatefulOpStateStoreCheckpointInfo, StatefulOperatorStateInfo, WatermarkSupport}
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper._
 import org.apache.spark.sql.execution.streaming.state.{BatchWriteStats, KeyStateEncoderSpec, NoPrefixKeyStateEncoderSpec, PrefixKeyScanStateEncoderSpec, RangeKeyScanStateEncoderSpec, StateSchemaBroadcast, StateStore, StateStoreCheckpointInfo, StateStoreColFamilySchema, StateStoreConf, StateStoreErrors, StateStoreId, StateStoreMetrics, StateStoreProvider, StateStoreProviderId, SupportsFineGrainedReplay}
-import org.apache.spark.sql.types.{BooleanType, DataType, LongType, NullType, StructField, StructType}
+import org.apache.spark.sql.types.{BooleanType, DataType, IntegerType, LongType, NullType, StructField, StructType}
 import org.apache.spark.util.NextIterator
 
 trait SymmetricHashJoinStateManager {
@@ -69,15 +66,21 @@ trait SupportsIndexedKeys {
 trait SupportsEvictByCondition { self: SymmetricHashJoinStateManager =>
   import SymmetricHashJoinStateManager._
 
-  def removeByKeyCondition(removalCondition: UnsafeRow => Boolean): Iterator[KeyToValuePair]
+  def evictByKeyCondition(removalCondition: UnsafeRow => Boolean): Long
 
-  def removeByValueCondition(removalCondition: UnsafeRow => Boolean): Iterator[KeyToValuePair]
+  def evictAndReturnByKeyCondition(
+      removalCondition: UnsafeRow => Boolean): Iterator[KeyToValuePair]
+
+  def evictByValueCondition(removalCondition: UnsafeRow => Boolean): Long
+
+  def evictAndReturnByValueCondition(
+      removalCondition: UnsafeRow => Boolean): Iterator[KeyToValuePair]
 }
 
 trait SupportsEvictByTimestamp { self: SymmetricHashJoinStateManager =>
   import SymmetricHashJoinStateManager._
 
-  def evictByTimestamp(endTimestamp: Long): Int
+  def evictByTimestamp(endTimestamp: Long): Long
 
   def evictAndReturnByTimestamp(endTimestamp: Long): Iterator[KeyToValuePair]
 }
@@ -196,19 +199,22 @@ class SymmetricHashJoinStateManagerV4(
 
   override def append(key: UnsafeRow, value: UnsafeRow, matched: Boolean): Unit = {
     val eventTime = extractEventTimeFn(value)
-    val secondaryIndexExists = tsWithKey.exists(eventTime, key)
-    if (!secondaryIndexExists) {
-      stateStore.initiateBatchWrite()
+    val numValuesFromSecondaryIndex = tsWithKey.get(eventTime, key)
+
+    stateStore.initiateBatchWrite()
+    if (numValuesFromSecondaryIndex == 0) {
       // Primary store does not have this (key, eventTime), so we can put this without getting.
       keyWithTsToValues.put(key, eventTime, Seq((value, matched)))
       // Same with secondary index.
-      tsWithKey.put(eventTime, key)
-      stateStore.finalizeBatchWrite()
+      tsWithKey.put(eventTime, key, 1)
     } else {
       // Primary store already has this (key, eventTime), so we need to get existing values first.
       keyWithTsToValues.append(key, eventTime, value, matched)
-      // No need to update secondary index as it already has the (eventTime, key).
+      // Update secondary index to contain the new number of values.
+      tsWithKey.put(eventTime, key, numValuesFromSecondaryIndex + 1)
     }
+
+    stateStore.finalizeBatchWrite()
   }
 
   override def getJoinedRows(
@@ -285,18 +291,20 @@ class SymmetricHashJoinStateManagerV4(
     }
   }
 
-  override def evictByTimestamp(endTimestamp: Long): Int = {
-    var removed = 0
+  override def evictByTimestamp(endTimestamp: Long): Long = {
+    var removed = 0L
     stateStore.initiateBatchWrite()
     tsWithKey.scanEvictedKeys(endTimestamp).foreach { evicted =>
       val key = evicted.key
       val timestamp = evicted.timestamp
+      val numValues = evicted.numValues
+
       // Remove from both primary and secondary stores
       keyWithTsToValues.remove(key, timestamp)
       tsWithKey.remove(key, timestamp)
       mayFlushBatchWrite()
 
-      removed += 1
+      removed += numValues
     }
     stateStore.finalizeBatchWrite()
     removed
@@ -542,10 +550,14 @@ class SymmetricHashJoinStateManagerV4(
     private val keyRowGenerator = UnsafeProjection.create(
       keyAttributes, AttributeReference("ts", LongType)() +: keyAttributes)
 
-    // NOTE: We don't use value from this state store.
-    private val valueStructType = StructType(Array(StructField("__dummy__", NullType)))
-    private val EMPTY_ROW =
-      UnsafeProjection.create(Array[DataType](NullType)).apply(InternalRow.apply(null))
+    private val valueStructType = StructType(Seq(StructField("numValues", IntegerType)))
+    private val reusedValueRowTemplate: UnsafeRow = {
+      val valueRowGenerator = UnsafeProjection.create(
+        Seq(Literal(-1)), Seq(AttributeReference("numValues", IntegerType)()))
+      val row = new SpecificInternalRow(Array[DataType](IntegerType))
+      row.setInt(0, -1)
+      valueRowGenerator(row)
+    }
     private val keyStateEncoderSpec = RangeKeyScanStateEncoderSpec(tsWithKeySchema, Seq(0))
 
     // Set up virtual column family name in the store if it is being used
@@ -559,14 +571,17 @@ class SymmetricHashJoinStateManagerV4(
       keyStateEncoderSpec
     )
 
-    def put(timestamp: Long, key: UnsafeRow): Unit = {
+    def put(timestamp: Long, key: UnsafeRow, numValues: Int): Unit = {
       val row = tsWithKeyRow(timestamp, key)
-      stateStore.put(row, EMPTY_ROW, colFamilyName)
+      reusedValueRowTemplate.setLong(0, numValues)
+      stateStore.put(row, reusedValueRowTemplate, colFamilyName)
     }
 
-    def exists(timestamp: Long, key: UnsafeRow): Boolean = {
+    def get(timestamp: Long, key: UnsafeRow): Int = {
       val row = tsWithKeyRow(timestamp, key)
-      stateStore.keyExists(row, colFamilyName)
+      Option(stateStore.get(row, colFamilyName)).map { valueRow =>
+        valueRow.getInt(0)
+      }.getOrElse(0)
     }
 
     def remove(key: UnsafeRow, timestamp: Long): Unit = {
@@ -574,7 +589,7 @@ class SymmetricHashJoinStateManagerV4(
       stateStore.remove(row, colFamilyName)
     }
 
-    case class EvictedKeysResult(key: UnsafeRow, timestamp: Long)
+    case class EvictedKeysResult(key: UnsafeRow, timestamp: Long, numValues: Int)
 
     // NOTE: This assumes we consume the whole iterator to trigger completion.
     def scanEvictedKeys(endTimestamp: Long): Iterator[EvictedKeysResult] = {
@@ -587,7 +602,8 @@ class SymmetricHashJoinStateManagerV4(
             val ts = tsWithKeyRow.getLong(indexOrdinalInTsWithKeyRow)
             if (ts <= endTimestamp) {
               val keyRow = keyRowGenerator(tsWithKeyRow)
-              EvictedKeysResult(keyRow, ts)
+              val numValues = kv.value.getInt(0)
+              EvictedKeysResult(keyRow, ts, numValues)
             } else {
               finished = true
               null
@@ -759,6 +775,24 @@ abstract class SymmetricHashJoinStateManagerBase(
     }.filter(_ != null)
   }
 
+  /** Remove using a predicate on keys. */
+  override def evictByKeyCondition(removalCondition: UnsafeRow => Boolean): Long = {
+    var numRemoved = 0L
+    keyToNumValues.iterator.foreach { keyAndNumValues =>
+      val key = keyAndNumValues.key
+      if (removalCondition(key)) {
+        val numValue = keyAndNumValues.numValue
+
+        (0 until numValue).map { idx =>
+          keyWithIndexToValue.remove(key, idx)
+        }
+
+        numRemoved += numValue
+      }
+    }
+    numRemoved
+  }
+
   /**
    * Remove using a predicate on keys.
    *
@@ -768,7 +802,8 @@ abstract class SymmetricHashJoinStateManagerBase(
    * This implies the iterator must be consumed fully without any other operations on this manager
    * or the underlying store being interleaved.
    */
-  def removeByKeyCondition(removalCondition: UnsafeRow => Boolean): Iterator[KeyToValuePair] = {
+  override def evictAndReturnByKeyCondition(
+      removalCondition: UnsafeRow => Boolean): Iterator[KeyToValuePair] = {
     new NextIterator[KeyToValuePair] {
 
       private val allKeyToNumValues = keyToNumValues.iterator
@@ -866,6 +901,14 @@ abstract class SymmetricHashJoinStateManagerBase(
     }
   }
 
+  override def evictByValueCondition(removalCondition: UnsafeRow => Boolean): Long = {
+    var numRemoved = 0L
+    evictAndReturnByValueCondition(removalCondition).foreach { _ =>
+      numRemoved += 1
+    }
+    numRemoved
+  }
+
   /**
    * Remove using a predicate on values.
    *
@@ -876,7 +919,8 @@ abstract class SymmetricHashJoinStateManagerBase(
    * This implies the iterator must be consumed fully without any other operations on this manager
    * or the underlying store being interleaved.
    */
-  def removeByValueCondition(removalCondition: UnsafeRow => Boolean): Iterator[KeyToValuePair] = {
+  override def evictAndReturnByValueCondition(
+      removalCondition: UnsafeRow => Boolean): Iterator[KeyToValuePair] = {
     new NextIterator[KeyToValuePair] {
 
       // Reuse this object to avoid creation+GC overhead.

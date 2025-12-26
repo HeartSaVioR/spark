@@ -640,21 +640,16 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
 
             timer.startTiming()
 
-            var evictedRowsCount = 0
-
-            joinStateManagerVer1 match {
+            val evictedRowsCount = joinStateManagerVer1 match {
               case m: SupportsEvictByTimestamp =>
-                evictedRowsCount = m.evictByTimestamp(windowEndForEviction)
+                m.evictByTimestamp(windowEndForEviction)
 
               case m: SupportsEvictByCondition =>
-                val evictedRows = m.removeByKeyCondition {
+                m.evictByKeyCondition {
                   keyRow =>
                     val windowRow = keyRow.getStruct(1, 2)
                     val windowEnd = windowRow.getLong(1)
                     windowEnd <= windowEndForEviction
-                }
-                evictedRows.foreach { _ =>
-                  evictedRowsCount += 1
                 }
             }
 
@@ -753,7 +748,7 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
                 }
 
               case m: SupportsEvictByCondition =>
-                val evictedRows = m.removeByKeyCondition {
+                val evictedRows = m.evictAndReturnByKeyCondition {
                   keyRow =>
                     val windowRow = keyRow.getStruct(1, 2)
                     val windowEnd = windowRow.getLong(1)
@@ -1114,18 +1109,12 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
 
             timer.startTiming()
 
-            var evictedRowsCount = 0
-
-            joinStateManagerVer1 match {
-              case m: SupportsEvictByTimestamp =>
-                evictedRowsCount = m.evictByTimestamp(tsForEviction) * numValuesPerTimestamp
+            val evictedRowsCount = joinStateManagerVer1 match {
+              case m: SupportsEvictByTimestamp => m.evictByTimestamp(tsForEviction)
 
               case m: SupportsEvictByCondition =>
-                val evictedRows = m.removeByValueCondition { valueRow =>
+                val evictedRows = m.evictByValueCondition { valueRow =>
                   valueRow.getLong(1) <= tsForEviction
-                }
-                evictedRows.foreach { _ =>
-                  evictedRowsCount += 1
                 }
             }
 
@@ -1229,7 +1218,7 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
                 }
 
               case m: SupportsEvictByCondition =>
-                val evictedRows = m.removeByValueCondition { valueRow =>
+                val evictedRows = m.evictAndReturnByValueCondition { valueRow =>
                   valueRow.getLong(1) <= tsForEviction
                 }
                 evictedRows.foreach { _ =>

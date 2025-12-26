@@ -807,7 +807,7 @@ case class StreamingSymmetricHashJoinExec(
         case Some(JoinStateKeyWatermarkPredicate(expr)) =>
           joinStateManager match {
             case s: SupportsEvictByCondition =>
-              s.removeByKeyCondition(stateKeyWatermarkPredicateFunc)
+              s.evictByKeyCondition(stateKeyWatermarkPredicateFunc)
 
             case s => throw new IllegalStateException(
               s"Join state manager $s for $joinSide is not supported yet")
@@ -815,7 +815,7 @@ case class StreamingSymmetricHashJoinExec(
         case Some(JoinStateValueWatermarkPredicate(expr)) =>
           joinStateManager match {
             case s: SupportsEvictByCondition =>
-              s.removeByValueCondition(stateValueWatermarkPredicateFunc)
+              s.evictByValueCondition(stateValueWatermarkPredicateFunc)
 
             case s => throw new IllegalStateException(
               s"Join state manager $s for $joinSide is not supported yet")
