@@ -757,13 +757,10 @@ private[sql] class RocksDBStateStoreProvider
     val queryRunId = UUID.fromString(StateStoreProvider.getRunId(hadoopConf))
     this.stateStoreProviderId = StateStoreProviderId(stateStoreId, queryRunId)
 
-    // FIXME: temporarily disable - actually not sure why this is needed.
-    /*
     if (useMultipleValuesPerKey) {
       require(useColumnFamilies, "Multiple values per key support requires column families to be" +
         " enabled in RocksDBStateStore.")
     }
-     */
 
     rocksDB // lazy initialization
 

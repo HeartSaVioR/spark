@@ -193,16 +193,12 @@ class RocksDBFileManager(
   private def getChangelogWriterVersion(
       useColumnFamilies: Boolean,
       stateStoreCheckpointIdEnabled: Boolean): Short = {
-    // FIXME: temporary workaround
-    if (stateStoreCheckpointIdEnabled) 4 else 2
-    /*
     (useColumnFamilies, stateStoreCheckpointIdEnabled) match {
       case (false, false) => 1
       case (true, false) => 2
       case (false, true) => 3
       case _ => 4
     }
-     */
   }
 
   def getChangeLogWriter(

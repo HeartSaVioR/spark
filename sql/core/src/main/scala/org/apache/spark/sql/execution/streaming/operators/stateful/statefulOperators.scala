@@ -1532,7 +1532,6 @@ trait SchemaValidationUtils extends Logging {
   // schema are nullable. If Avro encoding is used, we want to enforce nullability
   def getColFamilySchemas(shouldBeNullable: Boolean): Map[String, StateStoreColFamilySchema]
 
-  // FIXME: This is used for stream-stream join version 3
   def validateAndWriteStateSchema(
       hadoopConf: Configuration,
       batchId: Long,
