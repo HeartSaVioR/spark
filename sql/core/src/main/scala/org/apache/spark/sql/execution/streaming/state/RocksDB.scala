@@ -1351,6 +1351,7 @@ class RocksDB(
   }
 
   def initiateWriteBatch(): Unit = {
+    /*
     updateMemoryUsageIfNeeded()
     if (batchWritesInProgress) {
       throw new IllegalStateException("A write batch is already in progress.")
@@ -1361,9 +1362,11 @@ class RocksDB(
       writeBatch.clear()
     }
     batchWritesInProgress = true
+    */
   }
 
   def flushWriteBatch(): Unit = {
+    /*
     updateMemoryUsageIfNeeded()
     // FIXME: should we be aggressive in checking whether there is an active write batch?
     if (batchWritesInProgress) {
@@ -1377,6 +1380,7 @@ class RocksDB(
         writeBatch.clear()
       }
     }
+    */
   }
 
   def getDataSizeOnCurrentWriteBatch: Long = {

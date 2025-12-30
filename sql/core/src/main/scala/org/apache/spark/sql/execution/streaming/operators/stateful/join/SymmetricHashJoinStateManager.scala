@@ -791,6 +791,7 @@ abstract class SymmetricHashJoinStateManagerBase(
         }
 
         numRemoved += numValue
+        keyToNumValues.remove(key)
       }
     }
     numRemoved
@@ -1488,7 +1489,7 @@ class SymmetricHashJoinStateManagerV1(
 
   override def metrics: StateStoreMetrics = {
     // FIXME: purposed for benchmarking
-    /*
+    // /*
     val keyToNumValuesMetrics = keyToNumValues.metrics
     val keyWithIndexToValueMetrics = keyWithIndexToValue.metrics
     def newDesc(desc: String): String = s"${joinSide.toString.toUpperCase(Locale.ROOT)}: $desc"
@@ -1508,8 +1509,9 @@ class SymmetricHashJoinStateManagerV1(
       // We want to collect instance metrics from both state stores
       keyWithIndexToValueMetrics.instanceMetrics ++ keyToNumValuesMetrics.instanceMetrics
     )
-     */
+    // */
 
+    /*
     val keyToNumValuesMetrics = keyToNumValues.metrics
     val keyWithIndexToValueMetrics = keyWithIndexToValue.metrics
     def newDesc(desc: String): String = s"${joinSide.toString.toUpperCase(Locale.ROOT)}: $desc"
@@ -1523,6 +1525,7 @@ class SymmetricHashJoinStateManagerV1(
       // We want to collect instance metrics from both state stores
       keyWithIndexToValueMetrics.instanceMetrics ++ keyToNumValuesMetrics.instanceMetrics
     )
+     */
   }
 }
 
