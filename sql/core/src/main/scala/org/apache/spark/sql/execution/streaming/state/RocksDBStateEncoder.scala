@@ -47,6 +47,11 @@ sealed trait RocksDBKeyStateEncoder {
   def encodePrefixKey(prefixKey: UnsafeRow): Array[Byte]
   def encodeKey(row: UnsafeRow): Array[Byte]
   def decodeKey(keyBytes: Array[Byte]): UnsafeRow
+
+  def supportEventTime: Boolean
+  def encodeKeyWithEventTime(row: UnsafeRow, eventTime: Long): Array[Byte]
+  // FIXME: consider returning UnsafeRowWithEventTime instead of tuple
+  def decodeKeyWithEventTime(keyBytes: Array[Byte]): (UnsafeRow, Long)
 }
 
 sealed trait RocksDBValueStateEncoder {
@@ -327,6 +332,10 @@ trait DataEncoder {
    */
   def encodePrefixKeyForRangeScan(row: UnsafeRow): Array[Byte]
 
+  def encodeKeyForEventTimeAsPostfix(row: UnsafeRow, eventTime: Long): Array[Byte]
+
+  def encodeKeyForEventTimeAsPrefix(row: UnsafeRow, eventTime: Long): Array[Byte]
+
   /**
    * Encodes a value row into bytes.
    *
@@ -372,6 +381,10 @@ trait DataEncoder {
    * @throws UnsupportedOperationException if called on an encoder that doesn't support range scans
    */
   def decodePrefixKeyForRangeScan(bytes: Array[Byte]): UnsafeRow
+
+  def decodeKeyForEventTimeAsPostfix(bytes: Array[Byte]): (UnsafeRow, Long)
+
+  def decodeKeyForEventTimeAsPrefix(bytes: Array[Byte]): (UnsafeRow, Long)
 
   /**
    * Decodes a value from its serialized byte form.
@@ -697,6 +710,77 @@ class UnsafeRowDataEncoder(
   }
 
   override def decodeValue(bytes: Array[Byte]): UnsafeRow = decodeToUnsafeRow(bytes, reusedValueRow)
+
+  private val buffForBigEndianLong = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN)
+
+  override def encodeKeyForEventTimeAsPostfix(row: UnsafeRow, eventTime: Long): Array[Byte] = {
+    val prefix = encodeKey(row)
+    val byteArray = new Array[Byte](prefix.length + 8)
+
+    Platform.copyMemory(prefix, Platform.BYTE_ARRAY_OFFSET,
+      byteArray, Platform.BYTE_ARRAY_OFFSET, prefix.length)
+    Platform.copyMemory(
+      encodeEventTime(eventTime), Platform.BYTE_ARRAY_OFFSET,
+      byteArray, Platform.BYTE_ARRAY_OFFSET + prefix.length,
+      8
+    )
+
+    byteArray
+  }
+
+  override def encodeKeyForEventTimeAsPrefix(row: UnsafeRow, eventTime: Long): Array[Byte] = {
+    val prefix = encodeKey(row)
+    val byteArray = new Array[Byte](prefix.length + 8)
+
+    Platform.copyMemory(
+      encodeEventTime(eventTime), Platform.BYTE_ARRAY_OFFSET,
+      byteArray, Platform.BYTE_ARRAY_OFFSET, 8)
+    Platform.copyMemory(prefix, Platform.BYTE_ARRAY_OFFSET,
+      byteArray, Platform.BYTE_ARRAY_OFFSET + 8, prefix.length)
+
+    byteArray
+  }
+
+  private def encodeEventTime(eventTime: Long): Array[Byte] = {
+    buffForBigEndianLong.clear()
+    buffForBigEndianLong.putLong(0, eventTime)
+    buffForBigEndianLong.array()
+  }
+
+  override def decodeKeyForEventTimeAsPostfix(bytes: Array[Byte]): (UnsafeRow, Long) = {
+    val rowBytesLength = bytes.length - 8
+
+    val rowBytes = new Array[Byte](rowBytesLength)
+    Platform.copyMemory(
+      bytes, Platform.BYTE_ARRAY_OFFSET,
+      rowBytes, Platform.BYTE_ARRAY_OFFSET,
+      rowBytesLength
+    )
+    val row = decodeToUnsafeRow(rowBytes, keySchema.length)
+
+    buffForBigEndianLong.clear()
+    buffForBigEndianLong.put(0, bytes, rowBytesLength, 8)
+    val eventTime = buffForBigEndianLong.getLong(0)
+
+    (row, eventTime)
+  }
+
+  override def decodeKeyForEventTimeAsPrefix(bytes: Array[Byte]): (UnsafeRow, Long) = {
+    buffForBigEndianLong.clear()
+    buffForBigEndianLong.put(0, bytes, 0, 8)
+    val eventTime = buffForBigEndianLong.getLong(0)
+
+    val rowBytesLength = bytes.length - 8
+    val rowBytes = new Array[Byte](rowBytesLength)
+    Platform.copyMemory(
+      bytes, Platform.BYTE_ARRAY_OFFSET + 8,
+      rowBytes, Platform.BYTE_ARRAY_OFFSET,
+      rowBytesLength
+    )
+    val row = decodeToUnsafeRow(rowBytes, keySchema.length)
+
+    (row, eventTime)
+  }
 }
 
 /**
@@ -845,6 +929,8 @@ class AvroStateEncoder(
           }
         }
         StructType(remainingSchema)
+      case _ =>
+        throw unsupportedOperationForKeyStateEncoder("createAvroEnc")
     }
 
     // Handle suffix key schema for prefix scan case
@@ -1315,6 +1401,30 @@ class AvroStateEncoder(
       valueAvroType, valueProj
     )
   }
+
+  // FIXME: work!
+  override def encodeKeyForEventTimeAsPostfix(row: UnsafeRow, eventTime: Long): Array[Byte] = {
+    throw new UnsupportedOperationException(
+      "Event time postfix encoding is not supported in AvroStateEncoder")
+  }
+
+  // FIXME: work!
+  override def encodeKeyForEventTimeAsPrefix(row: UnsafeRow, eventTime: Long): Array[Byte] = {
+    throw new UnsupportedOperationException(
+      "Event time prefix encoding is not supported in AvroStateEncoder")
+  }
+
+  // FIXME: work!
+  override def decodeKeyForEventTimeAsPostfix(bytes: Array[Byte]): (UnsafeRow, Long) = {
+    throw new UnsupportedOperationException(
+      "Event time postfix encoding is not supported in AvroStateEncoder")
+  }
+
+  // FIXME: work!
+  override def decodeKeyForEventTimeAsPrefix(bytes: Array[Byte]): (UnsafeRow, Long) = {
+    throw new UnsupportedOperationException(
+      "Event time prefix encoding is not supported in AvroStateEncoder")
+  }
 }
 
 /**
@@ -1472,6 +1582,16 @@ class PrefixKeyScanStateEncoder(
   }
 
   override def supportPrefixKeyScan: Boolean = true
+
+  override def supportEventTime: Boolean = false
+
+  override def encodeKeyWithEventTime(row: UnsafeRow, eventTime: Long): Array[Byte] = {
+    throw new IllegalStateException("This encoder doesn't support key with event time!")
+  }
+
+  override def decodeKeyWithEventTime(keyBytes: Array[Byte]): (UnsafeRow, Long) = {
+    throw new IllegalStateException("This encoder doesn't support key with event time!")
+  }
 }
 
 /**
@@ -1669,6 +1789,16 @@ class RangeKeyScanStateEncoder(
   }
 
   override def supportPrefixKeyScan: Boolean = true
+
+  override def supportEventTime: Boolean = false
+
+  override def encodeKeyWithEventTime(row: UnsafeRow, eventTime: Long): Array[Byte] = {
+    throw new IllegalStateException("This encoder doesn't support key with event time!")
+  }
+
+  override def decodeKeyWithEventTime(keyBytes: Array[Byte]): (UnsafeRow, Long) = {
+    throw new IllegalStateException("This encoder doesn't support key with event time!")
+  }
 }
 
 /**
@@ -1701,6 +1831,80 @@ class NoPrefixKeyStateEncoder(
 
   override def encodePrefixKey(prefixKey: UnsafeRow): Array[Byte] = {
     throw new IllegalStateException("This encoder doesn't support prefix key!")
+  }
+
+  override def supportEventTime: Boolean = false
+
+  override def encodeKeyWithEventTime(row: UnsafeRow, eventTime: Long): Array[Byte] = {
+    throw new IllegalStateException("This encoder doesn't support key with event time!")
+  }
+
+  override def decodeKeyWithEventTime(keyBytes: Array[Byte]): (UnsafeRow, Long) = {
+    throw new IllegalStateException("This encoder doesn't support key with event time!")
+  }
+}
+
+class EventTimeAsPrefixStateEncoder(
+    dataEncoder: RocksDBDataEncoder,
+    keySchema: StructType,
+    useColumnFamilies: Boolean = false)
+  extends RocksDBKeyStateEncoder with Logging {
+
+  // FIXME: Does this make sense?
+  override def supportPrefixKeyScan: Boolean = false
+
+  override def encodePrefixKey(prefixKey: UnsafeRow): Array[Byte] = {
+    throw new IllegalStateException("This encoder doesn't support key without event time!")
+  }
+
+  override def encodeKey(row: UnsafeRow): Array[Byte] = {
+    throw new IllegalStateException("This encoder doesn't support key without event time!")
+  }
+
+  override def decodeKey(keyBytes: Array[Byte]): UnsafeRow = {
+    throw new IllegalStateException("This encoder doesn't support key without event time!")
+  }
+
+  override def supportEventTime: Boolean = true
+
+  override def encodeKeyWithEventTime(row: UnsafeRow, eventTime: Long): Array[Byte] = {
+    dataEncoder.encodeKeyForEventTimeAsPrefix(row, eventTime)
+  }
+
+  override def decodeKeyWithEventTime(keyBytes: Array[Byte]): (UnsafeRow, Long) = {
+    dataEncoder.decodeKeyForEventTimeAsPrefix(keyBytes)
+  }
+}
+
+class EventTimeAsPostfixStateEncoder(
+    dataEncoder: RocksDBDataEncoder,
+    keySchema: StructType,
+    useColumnFamilies: Boolean = false)
+  extends RocksDBKeyStateEncoder with Logging {
+
+  // FIXME: Does this make sense?
+  override def supportPrefixKeyScan: Boolean = true
+
+  override def encodePrefixKey(prefixKey: UnsafeRow): Array[Byte] = {
+    dataEncoder.encodeKey(prefixKey)
+  }
+
+  override def encodeKey(row: UnsafeRow): Array[Byte] = {
+    throw new IllegalStateException("This encoder doesn't support key without event time!")
+  }
+
+  override def decodeKey(keyBytes: Array[Byte]): UnsafeRow = {
+    throw new IllegalStateException("This encoder doesn't support key without event time!")
+  }
+
+  override def supportEventTime: Boolean = true
+
+  override def encodeKeyWithEventTime(row: UnsafeRow, eventTime: Long): Array[Byte] = {
+    dataEncoder.encodeKeyForEventTimeAsPostfix(row, eventTime)
+  }
+
+  override def decodeKeyWithEventTime(keyBytes: Array[Byte]): (UnsafeRow, Long) = {
+    dataEncoder.decodeKeyForEventTimeAsPostfix(keyBytes)
   }
 }
 

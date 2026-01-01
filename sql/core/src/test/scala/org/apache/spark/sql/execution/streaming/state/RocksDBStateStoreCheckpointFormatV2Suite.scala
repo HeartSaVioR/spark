@@ -183,6 +183,81 @@ case class CkptIdCollectingStateStoreWrapper(innerStore: StateStore) extends Sta
     ret
   }
   override def hasCommitted: Boolean = innerStore.hasCommitted
+
+  override def getWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      colFamilyName: String): UnsafeRow = {
+    innerStore.getWithEventTime(key, eventTime, colFamilyName)
+  }
+
+  override def valuesIteratorWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      colFamilyName: String): Iterator[UnsafeRow] = {
+    innerStore.valuesIteratorWithEventTime(key, eventTime, colFamilyName)
+  }
+
+  override def prefixScanWithEventTime(
+      prefixKey: UnsafeRow,
+      colFamilyName: String): StateStoreIterator[UnsafeRowWithEventTimePair] = {
+    innerStore.prefixScanWithEventTime(prefixKey, colFamilyName)
+  }
+
+  override def prefixScanWithMultiValuesWithEventTime(
+      prefixKey: UnsafeRow,
+      colFamilyName: String): StateStoreIterator[UnsafeRowWithEventTimePair] = {
+    innerStore.prefixScanWithMultiValuesWithEventTime(prefixKey, colFamilyName)
+  }
+
+  override def iteratorWithEventTime(
+      colFamilyName: String): StateStoreIterator[UnsafeRowWithEventTimePair] = {
+    innerStore.iteratorWithEventTime(colFamilyName)
+  }
+
+  override def iteratorWithMultiValuesWithEventTime(
+      colFamilyName: String): StateStoreIterator[UnsafeRowWithEventTimePair] = {
+    innerStore.iteratorWithMultiValuesWithEventTime(colFamilyName)
+  }
+
+  override def putWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      value: UnsafeRow,
+      colFamilyName: String): Unit = {
+    innerStore.putWithEventTime(key, eventTime, value, colFamilyName)
+  }
+
+  override def putListWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      values: Array[UnsafeRow],
+      colFamilyName: String): Unit = {
+    innerStore.putListWithEventTime(key, eventTime, values, colFamilyName)
+  }
+
+  override def removeWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      colFamilyName: String): Unit = {
+    innerStore.removeWithEventTime(key, eventTime, colFamilyName)
+  }
+
+  override def mergeWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      value: UnsafeRow,
+      colFamilyName: String): Unit = {
+    innerStore.mergeWithEventTime(key, eventTime, value, colFamilyName)
+  }
+
+  override def mergeListWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      values: Array[UnsafeRow],
+      colFamilyName: String): Unit = {
+    innerStore.mergeListWithEventTime(key, eventTime, values, colFamilyName)
+  }
 }
 
 class CkptIdCollectingStateStoreProviderWrapper extends StateStoreProvider {
