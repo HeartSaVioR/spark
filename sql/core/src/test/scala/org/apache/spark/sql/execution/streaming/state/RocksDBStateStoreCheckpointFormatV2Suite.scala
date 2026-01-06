@@ -200,23 +200,23 @@ case class CkptIdCollectingStateStoreWrapper(innerStore: StateStore) extends Sta
 
   override def prefixScanWithEventTime(
       prefixKey: UnsafeRow,
-      colFamilyName: String): StateStoreIterator[UnsafeRowWithEventTimePair] = {
+      colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
     innerStore.prefixScanWithEventTime(prefixKey, colFamilyName)
   }
 
   override def prefixScanWithMultiValuesWithEventTime(
       prefixKey: UnsafeRow,
-      colFamilyName: String): StateStoreIterator[UnsafeRowWithEventTimePair] = {
+      colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
     innerStore.prefixScanWithMultiValuesWithEventTime(prefixKey, colFamilyName)
   }
 
   override def iteratorWithEventTime(
-      colFamilyName: String): StateStoreIterator[UnsafeRowWithEventTimePair] = {
+      colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
     innerStore.iteratorWithEventTime(colFamilyName)
   }
 
   override def iteratorWithMultiValuesWithEventTime(
-      colFamilyName: String): StateStoreIterator[UnsafeRowWithEventTimePair] = {
+      colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
     innerStore.iteratorWithMultiValuesWithEventTime(colFamilyName)
   }
 

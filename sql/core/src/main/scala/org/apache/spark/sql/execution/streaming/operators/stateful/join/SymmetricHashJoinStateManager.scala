@@ -484,8 +484,7 @@ class SymmetricHashJoinStateManagerV4(
           if (iter.hasNext) {
             val unsafeRowPair = iter.next()
 
-            val keyRowWithEventTime = unsafeRowPair.key
-            val ts = keyRowWithEventTime.eventTime
+            val ts = unsafeRowPair.eventTime
 
             if (currentTs == -1L) {
               // First time
@@ -544,9 +543,8 @@ class SymmetricHashJoinStateManagerV4(
       val iter = stateStore.iteratorWithMultiValuesWithEventTime(colFamilyName)
       val reusableKeyAndTsToValuePair = KeyAndTsToValuePair()
       iter.map { kv =>
-        val keyWithTimestamp = kv.key
-        val keyRow = keyWithTimestamp.row
-        val ts = keyWithTimestamp.eventTime
+        val keyRow = kv.key
+        val ts = kv.eventTime
         val value = valueRowConverter.convertValue(kv.value)
 
         reusableKeyAndTsToValuePair.withNew(keyRow, ts, value)
@@ -599,9 +597,8 @@ class SymmetricHashJoinStateManagerV4(
         override protected def getNext(): EvictedKeysResult = {
           if (evictIterator.hasNext) {
             val kv = evictIterator.next()
-            val rowWithEventTime = kv.key
-            val keyRow = rowWithEventTime.row
-            val ts = rowWithEventTime.eventTime
+            val keyRow = kv.key
+            val ts = kv.eventTime
             if (ts <= endTimestamp) {
               val numValues = kv.value.getInt(0)
               EvictedKeysResult(keyRow, ts, numValues)

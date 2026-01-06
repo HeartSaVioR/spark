@@ -583,7 +583,7 @@ private[sql] class RocksDBStateStoreProvider
 
     override def prefixScanWithEventTime(
         prefixKey: UnsafeRow,
-        colFamilyName: String): StateStoreIterator[UnsafeRowWithEventTimePair] = {
+        colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
       validateAndTransitionState(UPDATE)
       verifyColFamilyOperations("prefixScanWithEventTime", colFamilyName)
 
@@ -593,16 +593,16 @@ private[sql] class RocksDBStateStoreProvider
       require(kvEncoder._1.supportPrefixKeyScan,
         "prefixScanWithEventTime requires encoder supporting prefix scan!")
 
-      val rowPair = new UnsafeRowWithEventTimePair()
+      val rowPair = new UnsafeRowPairWithEventTime()
       val prefix = kvEncoder._1.encodeKey(prefixKey)
 
       val rocksDbIter = rocksDB.prefixScan(prefix, colFamilyName)
       val iter = rocksDbIter.map { kv =>
         val keyWithEventTime = kvEncoder._1.decodeKeyWithEventTime(kv.key)
-        rowPair.withRows(
-          // FIXME: should we reuse UnsafeRowWithEventTime instance here as well?
-          new UnsafeRowWithEventTime(keyWithEventTime._1, keyWithEventTime._2),
-          kvEncoder._2.decodeValue(kv.value))
+        val keyRow = keyWithEventTime._1
+        val ts = keyWithEventTime._2
+        val valueRow = kvEncoder._2.decodeValue(kv.value)
+        rowPair.withRows(keyRow, ts, valueRow)
         rowPair
       }
 
@@ -611,7 +611,7 @@ private[sql] class RocksDBStateStoreProvider
 
     override def prefixScanWithMultiValuesWithEventTime(
         prefixKey: UnsafeRow,
-        colFamilyName: String): StateStoreIterator[UnsafeRowWithEventTimePair] = {
+        colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
       validateAndTransitionState(UPDATE)
       verifyColFamilyOperations("prefixScanWithMultiValuesWithEventTime", colFamilyName)
 
@@ -629,14 +629,11 @@ private[sql] class RocksDBStateStoreProvider
 
       val rocksDbIter = rocksDB.prefixScan(prefix, colFamilyName)
 
-      val rowPair = new UnsafeRowWithEventTimePair()
+      val rowPair = new UnsafeRowPairWithEventTime()
       val iter = rocksDbIter.flatMap { kv =>
         val (keyRow, ts) = kvEncoder._1.decodeKeyWithEventTime(kv.key)
         valueEncoder.decodeValues(kv.value).map { valueRow =>
-          rowPair.withRows(
-            // FIXME: should we reuse UnsafeRowWithEventTime instance here as well?
-            new UnsafeRowWithEventTime(keyRow, ts),
-            valueRow)
+          rowPair.withRows(keyRow, ts, valueRow)
           rowPair
         }
       }
@@ -646,7 +643,7 @@ private[sql] class RocksDBStateStoreProvider
 
     // FIXME: probably not a good name since it's only to iterate keys sorted with event time
     override def iteratorWithEventTime(
-        colFamilyName: String): StateStoreIterator[UnsafeRowWithEventTimePair] = {
+        colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
       validateAndTransitionState(UPDATE)
       // Note this verify function only verify on the colFamilyName being valid,
       // we are actually doing prefix when useColumnFamilies,
@@ -661,18 +658,16 @@ private[sql] class RocksDBStateStoreProvider
       // FIXME: should we have a marker to denote that keyEncoder supports range scan
       //  with event time?
 
-      val rowPair = new UnsafeRowWithEventTimePair()
+      val rowPair = new UnsafeRowPairWithEventTime()
       val rocksDbIter = rocksDB.iterator(colFamilyName)
 
       val iter = rocksDbIter.map { kv =>
         val keyWithEventTime = kvEncoder._1.decodeKeyWithEventTime(kv.key)
         val keyRow = keyWithEventTime._1
         val ts = keyWithEventTime._2
+        val valueRow = kvEncoder._2.decodeValue(kv.value)
 
-        rowPair.withRows(
-          // FIXME: should we reuse UnsafeRowWithEventTime instance here as well?
-          new UnsafeRowWithEventTime(keyRow, ts),
-          kvEncoder._2.decodeValue(kv.value))
+        rowPair.withRows(keyRow, ts, valueRow)
 
         if (!isValidated && rowPair.value != null && !useColumnFamilies) {
           StateStoreProvider.validateStateRowFormat(
@@ -686,7 +681,7 @@ private[sql] class RocksDBStateStoreProvider
     }
 
     override def iteratorWithMultiValuesWithEventTime(
-        colFamilyName: String): StateStoreIterator[UnsafeRowWithEventTimePair] = {
+        colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
       validateAndTransitionState(UPDATE)
       // Note this verify function only verify on the colFamilyName being valid,
       // we are actually doing prefix when useColumnFamilies,
@@ -703,20 +698,16 @@ private[sql] class RocksDBStateStoreProvider
       // FIXME: should we have a marker to denote that keyEncoder supports range scan
       //  with event time?
 
-      val rowPair = new UnsafeRowWithEventTimePair()
+      val rowPair = new UnsafeRowPairWithEventTime()
       val rocksDbIter = rocksDB.iterator(colFamilyName)
 
       val iter = rocksDbIter.flatMap { kv =>
         val keyWithEventTime = kvEncoder._1.decodeKeyWithEventTime(kv.key)
         val keyRow = keyWithEventTime._1
         val ts = keyWithEventTime._2
-
         val valueRows = kvEncoder._2.decodeValues(kv.value)
         valueRows.map { valueRow =>
-          rowPair.withRows(
-            // FIXME: should we reuse UnsafeRowWithEventTime instance here as well?
-            new UnsafeRowWithEventTime(keyRow, ts),
-            valueRow)
+          rowPair.withRows(keyRow, ts, valueRow)
           if (!isValidated && rowPair.value != null && !useColumnFamilies) {
             StateStoreProvider.validateStateRowFormat(
               keyRow, keySchema, rowPair.value, valueSchema, stateStoreId, storeConf)

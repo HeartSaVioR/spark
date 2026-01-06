@@ -345,20 +345,20 @@ trait StateStore extends ReadStateStore {
   def prefixScanWithEventTime(
       prefixKey: UnsafeRow,
       colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
-    : StateStoreIterator[UnsafeRowWithEventTimePair]
+    : StateStoreIterator[UnsafeRowPairWithEventTime]
 
   def prefixScanWithMultiValuesWithEventTime(
       prefixKey: UnsafeRow,
       colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
-    : StateStoreIterator[UnsafeRowWithEventTimePair]
+    : StateStoreIterator[UnsafeRowPairWithEventTime]
 
   def iteratorWithEventTime(
       colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
-    : StateStoreIterator[UnsafeRowWithEventTimePair]
+    : StateStoreIterator[UnsafeRowPairWithEventTime]
 
   def iteratorWithMultiValuesWithEventTime(
       colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
-    : StateStoreIterator[UnsafeRowWithEventTimePair]
+    : StateStoreIterator[UnsafeRowPairWithEventTime]
 
   def putWithEventTime(
       key: UnsafeRow,
@@ -1172,13 +1172,13 @@ class UnsafeRowPair(var key: UnsafeRow = null, var value: UnsafeRow = null) {
   }
 }
 
-class UnsafeRowWithEventTime(val row: UnsafeRow, val eventTime: Long)
-
-class UnsafeRowWithEventTimePair(
-    var key: UnsafeRowWithEventTime = null,
+class UnsafeRowPairWithEventTime(
+    var key: UnsafeRow = null,
+    var eventTime: Long = -1L,
     var value: UnsafeRow = null) {
-  def withRows(key: UnsafeRowWithEventTime, value: UnsafeRow): UnsafeRowWithEventTimePair = {
+  def withRows(key: UnsafeRow, eventTime: Long, value: UnsafeRow): UnsafeRowPairWithEventTime = {
     this.key = key
+    this.eventTime = eventTime
     this.value = value
     this
   }

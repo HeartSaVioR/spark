@@ -134,25 +134,25 @@ class MemoryStateStore extends StateStore() {
 
   override def prefixScanWithEventTime(
       prefixKey: UnsafeRow,
-      colFamilyName: String): StateStoreIterator[UnsafeRowWithEventTimePair] = {
+      colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
     throw StateStoreErrors.unsupportedOperationException("prefixScanWithEventTime", providerName)
   }
 
   override def prefixScanWithMultiValuesWithEventTime(
       prefixKey: UnsafeRow,
-      colFamilyName: String): StateStoreIterator[UnsafeRowWithEventTimePair] = {
+      colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
     throw StateStoreErrors.unsupportedOperationException(
       "prefixScanWithMultiValuesWithEventTime", providerName)
   }
 
   override def iteratorWithEventTime(
-      colFamilyName: String): StateStoreIterator[UnsafeRowWithEventTimePair] = {
+      colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
     throw StateStoreErrors.unsupportedOperationException(
       "iteratorWithEventTime", providerName)
   }
 
   override def iteratorWithMultiValuesWithEventTime(
-      colFamilyName: String): StateStoreIterator[UnsafeRowWithEventTimePair] = {
+      colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
     throw StateStoreErrors.unsupportedOperationException(
       "iteratorWithMultiValuesWithEventTime", providerName)
   }
