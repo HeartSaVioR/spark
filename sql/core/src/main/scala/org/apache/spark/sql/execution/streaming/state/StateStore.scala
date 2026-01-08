@@ -329,65 +329,37 @@ trait StateStore extends ReadStateStore {
    */
   def hasCommitted: Boolean
 
-  // FIXME: Methods for event time aware state store operations
-  //   These methods will require RocksDB state store provider with specific key encoders
+  def doEventTimeAwareStateOperations(columnFamilyName: String): EventTimeAwareStateOperations
+}
 
-  def getWithEventTime(
-      key: UnsafeRow,
-      eventTime: Long,
-      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): UnsafeRow
+// FIXME: Should we make this to control the lifecycle of the state store as well, or just limit
+//  to the operations? We may name this a bit differently if we want to make this also control
+//  the lifecycle.
+trait EventTimeAwareStateOperations {
+  def columnFamilyName: String
 
-  def valuesIteratorWithEventTime(
-      key: UnsafeRow,
-      eventTime: Long,
-      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Iterator[UnsafeRow]
+  def get(key: UnsafeRow, eventTime: Long): UnsafeRow
 
-  def prefixScanWithEventTime(
-      prefixKey: UnsafeRow,
-      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
-    : StateStoreIterator[UnsafeRowPairWithEventTime]
+  def valuesIterator(key: UnsafeRow, eventTime: Long): Iterator[UnsafeRow]
 
-  def prefixScanWithMultiValuesWithEventTime(
-      prefixKey: UnsafeRow,
-      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
-    : StateStoreIterator[UnsafeRowPairWithEventTime]
+  def prefixScan(prefixKey: UnsafeRow): StateStoreIterator[UnsafeRowPairWithEventTime]
 
-  def iteratorWithEventTime(
-      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
-    : StateStoreIterator[UnsafeRowPairWithEventTime]
+  def prefixScanWithMultiValues(prefixKey: UnsafeRow)
+  : StateStoreIterator[UnsafeRowPairWithEventTime]
 
-  def iteratorWithMultiValuesWithEventTime(
-      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
-    : StateStoreIterator[UnsafeRowPairWithEventTime]
+  def iterator(): StateStoreIterator[UnsafeRowPairWithEventTime]
 
-  def putWithEventTime(
-      key: UnsafeRow,
-      eventTime: Long,
-      value: UnsafeRow,
-      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Unit
+  def iteratorWithMultiValues(): StateStoreIterator[UnsafeRowPairWithEventTime]
 
-  def putListWithEventTime(
-      key: UnsafeRow,
-      eventTime: Long,
-      values: Array[UnsafeRow],
-      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Unit
+  def put(key: UnsafeRow, eventTime: Long, value: UnsafeRow): Unit
 
-  def removeWithEventTime(
-      key: UnsafeRow,
-      eventTime: Long,
-      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Unit
+  def putList(key: UnsafeRow, eventTime: Long, values: Array[UnsafeRow]): Unit
 
-  def mergeWithEventTime(
-      key: UnsafeRow,
-      eventTime: Long,
-      value: UnsafeRow,
-      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Unit
+  def remove(key: UnsafeRow, eventTime: Long): Unit
 
-  def mergeListWithEventTime(
-      key: UnsafeRow,
-      eventTime: Long,
-      values: Array[UnsafeRow],
-      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Unit
+  def merge(key: UnsafeRow, eventTime: Long, value: UnsafeRow): Unit
+
+  def mergeList(key: UnsafeRow, eventTime: Long, values: Array[UnsafeRow]): Unit
 }
 
 /** Wraps the instance of StateStore to make the instance read-only. */

@@ -440,9 +440,11 @@ class SymmetricHashJoinStateManagerV4(
       useMultipleValuesPerKey = true
     )
 
+    private val stateOps = stateStore.doEventTimeAwareStateOperations(colFamilyName)
+
     def append(key: UnsafeRow, timestamp: Long, value: UnsafeRow, matched: Boolean): Unit = {
       val valueWithMatched = valueRowConverter.convertToValueRow(value, matched)
-      stateStore.mergeWithEventTime(key, timestamp, valueWithMatched, colFamilyName)
+      stateOps.merge(key, timestamp, valueWithMatched)
     }
 
     def put(
@@ -453,11 +455,11 @@ class SymmetricHashJoinStateManagerV4(
         valueRowConverter.convertToValueRow(value, matched)
       }.toArray
 
-      stateStore.putListWithEventTime(key, timestamp, valuesToPut, colFamilyName)
+      stateOps.putList(key, timestamp, valuesToPut)
     }
 
     def get(key: UnsafeRow, timestamp: Long): Iterator[ValueAndMatchPair] = {
-      stateStore.valuesIteratorWithEventTime(key, timestamp, colFamilyName).map { valueRow =>
+      stateOps.valuesIterator(key, timestamp).map { valueRow =>
         valueRowConverter.convertValue(valueRow)
       }
     }
@@ -465,7 +467,7 @@ class SymmetricHashJoinStateManagerV4(
     // NOTE: We do not have a case where we only remove a part of values. Even if that is needed
     // we handle it via put() with writing a new array.
     def remove(key: UnsafeRow, timestamp: Long): Unit = {
-      stateStore.removeWithEventTime(key, timestamp, colFamilyName)
+      stateOps.remove(key, timestamp)
     }
 
     // NOTE: This assumes we consume the whole iterator to trigger completion.
@@ -473,7 +475,7 @@ class SymmetricHashJoinStateManagerV4(
       val reusableGetValuesResult = new GetValuesResult()
 
       new NextIterator[GetValuesResult] {
-        private val iter = stateStore.prefixScanWithMultiValuesWithEventTime(key, colFamilyName)
+        private val iter = stateOps.prefixScanWithMultiValues(key)
 
         private var currentTs = -1L
         private val valueAndMatchPairs = scala.collection.mutable.ArrayBuffer[ValueAndMatchPair]()
@@ -540,7 +542,7 @@ class SymmetricHashJoinStateManagerV4(
     }
 
     def iterator(): Iterator[KeyAndTsToValuePair] = {
-      val iter = stateStore.iteratorWithMultiValuesWithEventTime(colFamilyName)
+      val iter = stateOps.iteratorWithMultiValues()
       val reusableKeyAndTsToValuePair = KeyAndTsToValuePair()
       iter.map { kv =>
         val keyRow = kv.key
@@ -573,26 +575,28 @@ class SymmetricHashJoinStateManagerV4(
       EventTimeAsPrefixStateEncoderSpec(keySchema)
     )
 
+    private val stateOps = stateStore.doEventTimeAwareStateOperations(colFamilyName)
+
     def put(timestamp: Long, key: UnsafeRow, numValues: Int): Unit = {
       reusedValueRowTemplate.setLong(0, numValues)
-      stateStore.putWithEventTime(key, timestamp, reusedValueRowTemplate, colFamilyName)
+      stateOps.put(key, timestamp, reusedValueRowTemplate)
     }
 
     def get(timestamp: Long, key: UnsafeRow): Int = {
-      Option(stateStore.getWithEventTime(key, timestamp, colFamilyName)).map { valueRow =>
+      Option(stateOps.get(key, timestamp)).map { valueRow =>
         valueRow.getInt(0)
       }.getOrElse(0)
     }
 
     def remove(key: UnsafeRow, timestamp: Long): Unit = {
-      stateStore.removeWithEventTime(key, timestamp, colFamilyName)
+      stateOps.remove(key, timestamp)
     }
 
     case class EvictedKeysResult(key: UnsafeRow, timestamp: Long, numValues: Int)
 
     // NOTE: This assumes we consume the whole iterator to trigger completion.
     def scanEvictedKeys(endTimestamp: Long): Iterator[EvictedKeysResult] = {
-      val evictIterator = stateStore.iteratorWithEventTime(colFamilyName)
+      val evictIterator = stateOps.iterator()
       new NextIterator[EvictedKeysResult]() {
         override protected def getNext(): EvictedKeysResult = {
           if (evictIterator.hasNext) {
