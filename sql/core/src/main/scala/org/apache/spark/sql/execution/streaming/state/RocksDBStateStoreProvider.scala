@@ -528,8 +528,12 @@ private[sql] class RocksDBStateStoreProvider
         validateAndTransitionState(UPDATE)
         verifyColFamilyOperations("prefixScanWithMultiValues", columnFamilyName)
 
-        require(keyEncoder.supportPrefixKeyScan,
+        verify(keyEncoder.supportPrefixKeyScan,
           "prefixScanWithMultiValues requires encoder supporting prefix scan!")
+        verify(
+          valueEncoder.supportsMultipleValuesPerKey,
+          "Multi-value iterator operation requires an encoder" +
+            " which supports multiple values for a single key")
 
         val prefix = keyEncoder.encodePrefixKey(prefixKey)
 
@@ -553,10 +557,7 @@ private[sql] class RocksDBStateStoreProvider
         // we are actually doing prefix when useColumnFamilies,
         // but pass "iterator" to throw correct error message
         verifyColFamilyOperations("iterator", columnFamilyName)
-        require(useColumnFamilies, "iterator requires using column families!")
-
-        require(keyEncoder.supportEventTime,
-          "iterator requires encoder supporting event time!")
+        verify(useColumnFamilies, "iterator requires using column families!")
 
         val rowPair = new UnsafeRowPairWithEventTime()
         val rocksDbIter = rocksDB.iterator(columnFamilyName)
@@ -587,8 +588,10 @@ private[sql] class RocksDBStateStoreProvider
         // but pass "iteratorWithMultiValues" to throw correct error message
         verifyColFamilyOperations("iteratorWithMultiValues", columnFamilyName)
 
-        require(useColumnFamilies, "iteratorWithMultiValues requires using " +
-          "column families!")
+        verify(
+          valueEncoder.supportsMultipleValuesPerKey,
+          "Multi-value iterator operation requires an encoder" +
+            " which supports multiple values for a single key")
 
         val rowPair = new UnsafeRowPairWithEventTime()
         val rocksDbIter = rocksDB.iterator(columnFamilyName)
@@ -619,7 +622,7 @@ private[sql] class RocksDBStateStoreProvider
         validateAndTransitionState(UPDATE)
         verify(state == UPDATING, "Cannot put after already committed or aborted")
         verify(key != null, "Key cannot be null")
-        require(value != null, "Cannot put a null value")
+        verify(value != null, "Cannot put a null value")
         verifyColFamilyOperations("put", columnFamilyName)
 
         rocksDB.put(
@@ -635,7 +638,7 @@ private[sql] class RocksDBStateStoreProvider
         validateAndTransitionState(UPDATE)
         verify(state == UPDATING, "Cannot put after already committed or aborted")
         verify(key != null, "Key cannot be null")
-        require(values != null, "Cannot put a null value")
+        verify(values != null, "Cannot put a null value")
         verifyColFamilyOperations("putList", columnFamilyName)
 
         verify(
@@ -667,7 +670,7 @@ private[sql] class RocksDBStateStoreProvider
         validateAndTransitionState(UPDATE)
         verify(state == UPDATING, "Cannot merge after already committed or aborted")
         verify(key != null, "Key cannot be null")
-        require(value != null, "Cannot put a null value")
+        verify(value != null, "Cannot put a null value")
         verifyColFamilyOperations("merge", columnFamilyName)
 
         verify(valueEncoder.supportsMultipleValuesPerKey, "Merge operation requires an encoder" +
