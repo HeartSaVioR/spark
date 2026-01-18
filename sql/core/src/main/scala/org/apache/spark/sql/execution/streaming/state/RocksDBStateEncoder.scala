@@ -1965,7 +1965,16 @@ class MultiValuedStateEncoder(
       Seq().iterator
     } else {
       new Iterator[UnsafeRow] {
-        private var pos: Int = Platform.BYTE_ARRAY_OFFSET
+        private var pos: Int = {
+          // FIXME: leave it to configuration, default (',': 44) vs 0xFF
+          if (Platform.getByte(valueBytes, Platform.BYTE_ARRAY_OFFSET) == 0xFF.toByte) {
+          // if (Platform.getByte(valueBytes, Platform.BYTE_ARRAY_OFFSET) == 44.toByte) {
+            // if the first byte is a delimiter (","), skip it
+            Platform.BYTE_ARRAY_OFFSET + 1
+          } else {
+            Platform.BYTE_ARRAY_OFFSET
+          }
+        }
         private val maxPos = Platform.BYTE_ARRAY_OFFSET + valueBytes.length
 
         override def hasNext: Boolean = pos < maxPos

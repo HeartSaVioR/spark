@@ -637,6 +637,573 @@ class SymmetricHashJoinStateManagerV4(
   }
 }
 
+class SymmetricHashJoinStateManagerV5(
+    joinSide: JoinSide,
+    inputValueAttributes: Seq[Attribute],
+    joinKeys: Seq[Expression],
+    stateInfo: Option[StatefulOperatorStateInfo],
+    storeConf: StateStoreConf,
+    hadoopConf: Configuration,
+    partitionId: Int,
+    keyToNumValuesStateStoreCkptId: Option[String],
+    keyWithIndexToValueStateStoreCkptId: Option[String],
+    stateFormatVersion: Int,
+    skippedNullValueCount: Option[SQLMetric] = None,
+    useStateStoreCoordinator: Boolean = true,
+    snapshotOptions: Option[SnapshotOptions] = None,
+    joinStoreGenerator: JoinStateManagerStoreGenerator)
+  extends SymmetricHashJoinStateManager with SupportsEvictByTimestamp with Logging {
+
+  import SymmetricHashJoinStateManager._
+
+  protected val keySchema = StructType(
+    joinKeys.zipWithIndex.map { case (k, i) => StructField(s"field$i", k.dataType, k.nullable) })
+  protected val keyAttributes = toAttributes(keySchema)
+  private val eventTimeColIdxOpt = WatermarkSupport.findEventTimeColumnIndex(
+    inputValueAttributes,
+    // NOTE: This does not accept multiple event time columns. This is not the same with the
+    // operator which we offer the backward compatibility, but it involves too many layers to
+    // pass the information. The information is in SQLConf.
+    allowMultipleEventTimeColumns = false)
+
+  // This state format version has a huge performance gain on eviction, especially when we evict
+  // only a smaller part of the state. This is actually trading off performance from some
+  // scenarios of insertion and retrieval. Joins which do not have event time column do not do
+  // eviction, hence these joins won't gain any benefit from this state format version.
+ assert(eventTimeColIdxOpt.isDefined,
+   s"Event time column is required for join state manager v4 with state format version " +
+   s"$stateFormatVersion")
+
+  private val eventTimeColIdx = eventTimeColIdxOpt.get
+
+  private val extractEventTimeFn: UnsafeRow => Long = { row =>
+    val idx = eventTimeColIdx
+    val attr = inputValueAttributes(idx)
+
+    if (attr.dataType.isInstanceOf[StructType]) {
+      // NOTE: We assume this is window struct, as same as WatermarkSupport.watermarkExpression
+      row.getStruct(idx, 2).getLong(1)
+    } else {
+      row.getLong(idx)
+    }
+  }
+
+  private val eventTimeColIdxOptInKey: Option[Int] = {
+    joinKeys.zipWithIndex.collectFirst {
+      case (ne: NamedExpression, index)
+        if ne.metadata.contains(EventTimeWatermark.delayKey) => index
+    }
+  }
+
+  private val extractEventTimeFnFromKey: UnsafeRow => Option[Long] = { row =>
+    eventTimeColIdxOptInKey.map { idx =>
+      val attr = keyAttributes(idx)
+      if (attr.dataType.isInstanceOf[StructType]) {
+        // NOTE: We assume this is window struct, as same as WatermarkSupport.watermarkExpression
+        row.getStruct(idx, 2).getLong(1)
+      } else {
+        row.getLong(idx)
+      }
+    }
+  }
+
+  private val dummySchema = StructType(
+    Seq(StructField("dummy", NullType, nullable = true))
+  )
+
+  private val stateStoreCkptId: Option[String] = None
+  private val handlerSnapshotOptions: Option[HandlerSnapshotOptions] = None
+  private var stateStoreProvider: StateStoreProvider = _
+
+  // We will use the dummy schema for the default CF since we will register CF separately.
+  private val stateStore = getStateStore(
+    dummySchema, dummySchema, useVirtualColumnFamilies = true,
+    NoPrefixKeyStateEncoderSpec(dummySchema), useMultipleValuesPerKey = false
+  )
+
+  private def getStateStore(
+      keySchema: StructType,
+      valueSchema: StructType,
+      useVirtualColumnFamilies: Boolean,
+      keyStateEncoderSpec: KeyStateEncoderSpec,
+      useMultipleValuesPerKey: Boolean): StateStore = {
+    val storeName = StateStoreId.DEFAULT_STORE_NAME
+    val storeProviderId = StateStoreProviderId(stateInfo.get, partitionId, storeName)
+    val store = if (useStateStoreCoordinator) {
+      assert(handlerSnapshotOptions.isEmpty, "Should not use state store coordinator " +
+        "when reading state as data source.")
+      joinStoreGenerator.getStore(
+        storeProviderId, keySchema, valueSchema, keyStateEncoderSpec,
+        stateInfo.get.storeVersion, stateStoreCkptId, None, useVirtualColumnFamilies,
+        useMultipleValuesPerKey, storeConf, hadoopConf)
+    } else {
+      // This class will manage the state store provider by itself.
+      stateStoreProvider = StateStoreProvider.createAndInit(
+        storeProviderId, keySchema, valueSchema, keyStateEncoderSpec,
+        useColumnFamilies = useVirtualColumnFamilies,
+        storeConf, hadoopConf, useMultipleValuesPerKey = useMultipleValuesPerKey,
+        stateSchemaProvider = None)
+      if (handlerSnapshotOptions.isDefined) {
+        if (!stateStoreProvider.isInstanceOf[SupportsFineGrainedReplay]) {
+          throw StateStoreErrors.stateStoreProviderDoesNotSupportFineGrainedReplay(
+            stateStoreProvider.getClass.toString)
+        }
+        val opts = handlerSnapshotOptions.get
+        stateStoreProvider.asInstanceOf[SupportsFineGrainedReplay]
+          .replayStateFromSnapshot(
+            opts.snapshotVersion,
+            opts.endVersion,
+            readOnly = true,
+            opts.startStateStoreCkptId,
+            opts.endStateStoreCkptId)
+      } else {
+        stateStoreProvider.getStore(stateInfo.get.storeVersion, stateStoreCkptId)
+      }
+    }
+    logInfo(log"Loaded store ${MDC(STATE_STORE_ID, store.id)}")
+    store
+  }
+
+  private val keyWithTsToValues = new KeyWithTsToValuesStore
+
+  private val tsWithKey = new TsWithKeyTypeStore
+
+  override def append(key: UnsafeRow, value: UnsafeRow, matched: Boolean): Unit = {
+    val eventTime = extractEventTimeFn(value)
+
+    stateStore.initiateBatchWrite()
+
+    // We always do blind merge for appending new value.
+    keyWithTsToValues.append(key, eventTime, value, matched)
+    tsWithKey.add(eventTime, key)
+
+    stateStore.finalizeBatchWrite()
+  }
+
+  override def getJoinedRows(
+      key: UnsafeRow,
+      generateJoinedRow: InternalRow => JoinedRow,
+      predicate: JoinedRow => Boolean,
+      excludeRowsAlreadyMatched: Boolean): Iterator[JoinedRow] = {
+    // TODO: We could improve this method to get the scope of timestamp and scan keys
+    //  more efficiently. For now, we just get all values for the key.
+
+    def getJoinedRowsFromTsAndValues(
+        ts: Long,
+        valuesAndMatched: Array[ValueAndMatchPair]): Iterator[JoinedRow] = {
+      new NextIterator[JoinedRow] {
+        private var currentIndex = 0
+
+        private var shouldUpdateValuesIntoStateStore = false
+
+        override protected def getNext(): JoinedRow = {
+          var ret: JoinedRow = null
+          while (ret == null && currentIndex < valuesAndMatched.length) {
+            val vmp = valuesAndMatched(currentIndex)
+
+            if (excludeRowsAlreadyMatched && vmp.matched) {
+              // Skip this one
+            } else {
+              val joinedRow = generateJoinedRow(vmp.value)
+              if (predicate(joinedRow)) {
+                if (!vmp.matched) {
+                  // Update the array to contain the value having matched = true
+                  valuesAndMatched(currentIndex) = vmp.copy(matched = true)
+                  // Need to update matched flag
+                  shouldUpdateValuesIntoStateStore = true
+                }
+
+                ret = joinedRow
+              } else {
+                // skip this one
+              }
+            }
+
+            currentIndex += 1
+          }
+
+          if (ret == null) {
+            assert(currentIndex == valuesAndMatched.length)
+            finished = true
+            null
+          } else {
+            ret
+          }
+        }
+
+        override protected def close(): Unit = {
+          if (shouldUpdateValuesIntoStateStore) {
+            // Update back to the state store
+            val updatedValuesWithMatched = valuesAndMatched.map { vmp =>
+              (vmp.value, vmp.matched)
+            }.toSeq
+            // TODO: Potentially this can be also batched with other update, but then we need
+            //  to buffer these writes. Also, we should be careful that the batch write does
+            //  not interfere with other ongoing batch write.
+            keyWithTsToValues.put(key, ts, updatedValuesWithMatched)
+          }
+        }
+      }
+    }
+
+    val ret = extractEventTimeFnFromKey(key) match {
+      case Some(ts) =>
+        val valuesAndMatchedIter = keyWithTsToValues.get(key, ts)
+        getJoinedRowsFromTsAndValues(ts, valuesAndMatchedIter.toArray)
+
+      case _ =>
+        keyWithTsToValues.getValues(key).flatMap { result =>
+          val ts = result.timestamp
+          val valuesAndMatched = result.values.toArray
+          getJoinedRowsFromTsAndValues(ts, valuesAndMatched)
+        }
+    }
+    ret.filter(_ != null)
+  }
+
+  override def iterator: Iterator[KeyToValuePair] = {
+    val reusableKeyToValuePair = KeyToValuePair()
+    keyWithTsToValues.iterator().map { kv =>
+      reusableKeyToValuePair.withNew(kv.key, kv.value, kv.matched)
+    }
+  }
+
+  override def evictByTimestamp(endTimestamp: Long): Long = {
+    var removed = 0L
+    stateStore.initiateBatchWrite()
+    tsWithKey.scanEvictedKeys(endTimestamp).foreach { evicted =>
+      val key = evicted.key
+      val timestamp = evicted.timestamp
+      val numValues = evicted.numValues
+
+      // Remove from both primary and secondary stores
+      keyWithTsToValues.remove(key, timestamp)
+      tsWithKey.remove(key, timestamp)
+      mayFlushBatchWrite()
+
+      removed += numValues
+    }
+    stateStore.finalizeBatchWrite()
+    removed
+  }
+
+  override def evictAndReturnByTimestamp(endTimestamp: Long): Iterator[KeyToValuePair] = {
+    val reusableKeyToValuePair = KeyToValuePair()
+
+    stateStore.initiateBatchWrite()
+    val evictedIter = tsWithKey.scanEvictedKeys(endTimestamp).flatMap { evicted =>
+      val key = evicted.key
+      val timestamp = evicted.timestamp
+      val values = keyWithTsToValues.get(key, timestamp)
+
+      // Remove from both primary and secondary stores
+      keyWithTsToValues.remove(key, timestamp)
+      tsWithKey.remove(key, timestamp)
+      mayFlushBatchWrite()
+
+      values.map { value =>
+        reusableKeyToValuePair.withNew(key, value)
+      }
+    }
+
+    new NextIterator[KeyToValuePair] {
+      override protected def getNext(): KeyToValuePair = {
+        if (evictedIter.hasNext) {
+          evictedIter.next()
+        } else {
+          finished = true
+          null
+        }
+      }
+
+      override protected def close(): Unit = {
+        stateStore.finalizeBatchWrite()
+      }
+    }
+  }
+
+  override def commit(): Unit = {
+    stateStore.commit()
+    logDebug("Committed, metrics = " + stateStore.metrics)
+  }
+
+  override def abortIfNeeded(): Unit = {
+    if (!stateStore.hasCommitted) {
+      logInfo(log"Aborted store ${MDC(STATE_STORE_ID, stateStore.id)}")
+      stateStore.abort()
+    }
+    // If this class manages a state store provider by itself, it should take care of closing
+    // provider instance as well.
+    if (stateStoreProvider != null) {
+      stateStoreProvider.close()
+    }
+  }
+
+  private def mayFlushBatchWrite(): Unit = {
+    stateStore.getStatsOfCurrentBatchWrite() match {
+      case Some(BatchWriteStats(_, Some(dataSizeBytes))) =>
+        // 1MB writes
+        if (dataSizeBytes > 1_000_000) {
+          stateStore.finalizeBatchWrite()
+          stateStore.initiateBatchWrite()
+        }
+
+      case _ => // no-op
+    }
+  }
+
+  // Clean up any state store resources if necessary at the end of the task
+  Option(TaskContext.get()).foreach { _.addTaskCompletionListener[Unit] { _ => abortIfNeeded() } }
+
+  class GetValuesResult(var timestamp: Long = -1, var values: Seq[ValueAndMatchPair] = Seq.empty) {
+    def withNew(newTimestamp: Long, newValues: Seq[ValueAndMatchPair]): GetValuesResult = {
+      this.timestamp = newTimestamp
+      this.values = newValues
+      this
+    }
+  }
+
+  private class KeyWithTsToValuesStore {
+
+    private val valueRowConverter = StreamingSymmetricHashJoinValueRowConverter.create(
+      inputValueAttributes, stateFormatVersion = 4)
+
+    // Set up virtual column family name in the store if it is being used
+    private val colFamilyName = getStateStoreName(joinSide, KeyWithTsToValuesType)
+
+    // Create the specific column family in the store for this join side's KeyWithIndexToValueStore
+    stateStore.createColFamilyIfAbsent(
+      colFamilyName,
+      keySchema,
+      valueRowConverter.valueAttributes.toStructType,
+      EventTimeAsPostfixStateEncoderSpec(keySchema),
+      useMultipleValuesPerKey = true
+    )
+
+    def append(key: UnsafeRow, timestamp: Long, value: UnsafeRow, matched: Boolean): Unit = {
+      val valueWithMatched = valueRowConverter.convertToValueRow(value, matched)
+      stateStore.mergeWithEventTime(key, timestamp, valueWithMatched, colFamilyName)
+    }
+
+    def put(
+        key: UnsafeRow,
+        timestamp: Long,
+        valuesWithMatched: Seq[(UnsafeRow, Boolean)]): Unit = {
+      val valuesToPut = valuesWithMatched.map { case (value, matched) =>
+        valueRowConverter.convertToValueRow(value, matched)
+      }.toArray
+
+      stateStore.putListWithEventTime(key, timestamp, valuesToPut, colFamilyName)
+    }
+
+    def get(key: UnsafeRow, timestamp: Long): Iterator[ValueAndMatchPair] = {
+      stateStore.valuesIteratorWithEventTime(key, timestamp, colFamilyName).map { valueRow =>
+        valueRowConverter.convertValue(valueRow)
+      }
+    }
+
+    // NOTE: We do not have a case where we only remove a part of values. Even if that is needed
+    // we handle it via put() with writing a new array.
+    def remove(key: UnsafeRow, timestamp: Long): Unit = {
+      stateStore.removeWithEventTime(key, timestamp, colFamilyName)
+    }
+
+    // NOTE: This assumes we consume the whole iterator to trigger completion.
+    def getValues(key: UnsafeRow): Iterator[GetValuesResult] = {
+      val reusableGetValuesResult = new GetValuesResult()
+
+      new NextIterator[GetValuesResult] {
+        private val iter = stateStore.prefixScanWithMultiValuesWithEventTime(key, colFamilyName)
+
+        private var currentTs = -1L
+        private val valueAndMatchPairs = scala.collection.mutable.ArrayBuffer[ValueAndMatchPair]()
+
+        // FIXME: need to refine to understand this easily?
+        @tailrec
+        override protected def getNext(): GetValuesResult = {
+          if (iter.hasNext) {
+            val unsafeRowPair = iter.next()
+
+            val ts = unsafeRowPair.eventTime
+
+            if (currentTs == -1L) {
+              // First time
+              currentTs = ts
+            }
+
+            if (currentTs != ts) {
+              assert(valueAndMatchPairs.nonEmpty,
+                "timestamp has changed but no values collected from previous timestamp! " +
+                s"This should not happen. currentTs: $currentTs, new ts: $ts")
+
+              // Return previous batch
+              val result = reusableGetValuesResult.withNew(
+                currentTs, valueAndMatchPairs.toSeq)
+
+              // Reset for new timestamp
+              currentTs = ts
+              valueAndMatchPairs.clear()
+
+              // Add current value
+              val value = valueRowConverter.convertValue(unsafeRowPair.value)
+              valueAndMatchPairs += value
+              result
+            } else {
+              // Same timestamp, accumulate values
+              val value = valueRowConverter.convertValue(unsafeRowPair.value)
+              valueAndMatchPairs += value
+
+              // Continue to next
+              getNext()
+            }
+          } else {
+            if (currentTs != -1L) {
+              assert(valueAndMatchPairs.nonEmpty)
+
+              // Return last batch
+              val result = reusableGetValuesResult.withNew(
+                currentTs, valueAndMatchPairs.toSeq)
+
+              // Mark as finished
+              currentTs = -1L
+              valueAndMatchPairs.clear()
+              result
+            } else {
+              finished = true
+              null
+            }
+          }
+        }
+
+        override protected def close(): Unit = iter.close()
+      }
+    }
+
+    def iterator(): Iterator[KeyAndTsToValuePair] = {
+      val iter = stateStore.iteratorWithMultiValuesWithEventTime(colFamilyName)
+      val reusableKeyAndTsToValuePair = KeyAndTsToValuePair()
+      iter.map { kv =>
+        val keyRow = kv.key
+        val ts = kv.eventTime
+        val value = valueRowConverter.convertValue(kv.value)
+
+        reusableKeyAndTsToValuePair.withNew(keyRow, ts, value)
+      }
+    }
+  }
+
+  private class TsWithKeyTypeStore {
+    private val valueStructType = StructType(Array(StructField("__dummy__", NullType)))
+    private val EMPTY_ROW =
+      UnsafeProjection.create(Array[DataType](NullType)).apply(InternalRow.apply(null))
+
+    // Set up virtual column family name in the store if it is being used
+    private val colFamilyName = getStateStoreName(joinSide, TsWithKeyType)
+
+    // Create the specific column family in the store for this join side's KeyWithIndexToValueStore
+    stateStore.createColFamilyIfAbsent(
+      colFamilyName,
+      keySchema,
+      valueStructType,
+      EventTimeAsPrefixStateEncoderSpec(keySchema),
+      useMultipleValuesPerKey = true
+    )
+
+    def add(timestamp: Long, key: UnsafeRow): Unit = {
+      stateStore.mergeWithEventTime(key, timestamp, EMPTY_ROW, colFamilyName)
+    }
+
+    def remove(key: UnsafeRow, timestamp: Long): Unit = {
+      stateStore.removeWithEventTime(key, timestamp, colFamilyName)
+    }
+
+    case class EvictedKeysResult(key: UnsafeRow, timestamp: Long, numValues: Int)
+
+    // NOTE: This assumes we consume the whole iterator to trigger completion.
+    def scanEvictedKeys(endTimestamp: Long): Iterator[EvictedKeysResult] = {
+      val evictIterator = stateStore.iteratorWithMultiValuesWithEventTime(colFamilyName)
+      new NextIterator[EvictedKeysResult]() {
+        var currentKeyRow: UnsafeRow = null
+        var currentEventTime: Long = -1L
+        var count: Int = 0
+        var isBeyondUpperBound: Boolean = false
+
+        override protected def getNext(): EvictedKeysResult = {
+          var ret: EvictedKeysResult = null
+          while (evictIterator.hasNext && ret == null && !isBeyondUpperBound) {
+            val kv = evictIterator.next()
+            val keyRow = kv.key
+            val ts = kv.eventTime
+
+            if (keyRow == currentKeyRow && ts == currentEventTime) {
+              // new value with same (key, ts)
+              count += 1
+            } else if (ts > endTimestamp) {
+              // we found the timestamp beyond the range - we shouldn't continue further
+              isBeyondUpperBound = true
+
+              // We don't need to construct the last (key, ts) into EvictedKeysResult - the code
+              // after loop will handle that if there is leftover. That said, we do not reset the
+              // current (key, ts) info here.
+            } else if (currentKeyRow == null && currentEventTime == -1L) {
+              // first value to process
+              currentKeyRow = keyRow.copy()
+              currentEventTime = ts
+              count = 1
+            } else {
+              // construct the last (key, ts) into EvictedKeysResult
+              ret = EvictedKeysResult(currentKeyRow, currentEventTime, count)
+
+              // register the next (key, ts) to process
+              currentKeyRow = keyRow.copy()
+              currentEventTime = ts
+              count = 1
+            }
+          }
+
+          if (ret != null) {
+            ret
+          } else if (count > 0) {
+            // there is a final leftover (key, ts) to return
+            ret = EvictedKeysResult(currentKeyRow, currentEventTime, count)
+
+            // we shouldn't continue further
+            currentKeyRow = null
+            currentEventTime = -1L
+            count = 0
+
+            ret
+          } else {
+            finished = true
+            null
+          }
+        }
+
+        override protected def close(): Unit = {
+          evictIterator.close()
+        }
+      }
+    }
+  }
+
+  override def get(key: UnsafeRow): Iterator[UnsafeRow] = {
+    keyWithTsToValues.getValues(key).flatMap { result =>
+      result.values.map(_.value)
+    }.iterator
+  }
+
+  def metrics: StateStoreMetrics = stateStore.metrics
+
+  def getLatestCheckpointInfo(): JoinerStateStoreCkptInfo = {
+    val keyToNumValuesCkptInfo = stateStore.getStateStoreCheckpointInfo()
+    val keyWithIndexToValueCkptInfo = stateStore.getStateStoreCheckpointInfo()
+
+    assert(keyToNumValuesCkptInfo == keyWithIndexToValueCkptInfo)
+
+    JoinerStateStoreCkptInfo(keyToNumValuesCkptInfo, keyWithIndexToValueCkptInfo)
+  }
+}
+
 /**
  * Helper class to manage state required by a single side of
  * [[org.apache.spark.sql.execution.streaming.StreamingSymmetricHashJoinExec]].
@@ -1628,7 +2195,7 @@ class JoinStateManagerStoreGenerator() extends Logging {
 }
 
 object SymmetricHashJoinStateManager {
-  val supportedVersions = Seq(1, 2, 3, 4)
+  val supportedVersions = Seq(1, 2, 3, 4, 5)
   val legacyVersion = 1
 
   // scalastyle:off argcount
@@ -1648,7 +2215,14 @@ object SymmetricHashJoinStateManager {
       useStateStoreCoordinator: Boolean = true,
       snapshotOptions: Option[SnapshotOptions] = None,
       joinStoreGenerator: JoinStateManagerStoreGenerator): SymmetricHashJoinStateManager = {
-    if (stateFormatVersion == 4) {
+    if (stateFormatVersion == 5) {
+      new SymmetricHashJoinStateManagerV5(
+        joinSide, inputValueAttributes, joinKeys, stateInfo, storeConf, hadoopConf,
+        partitionId, keyToNumValuesStateStoreCkptId, keyWithIndexToValueStateStoreCkptId,
+        stateFormatVersion, skippedNullValueCount, useStateStoreCoordinator, snapshotOptions,
+        joinStoreGenerator
+      )
+    } else if (stateFormatVersion == 4) {
       new SymmetricHashJoinStateManagerV4(
         joinSide, inputValueAttributes, joinKeys, stateInfo, storeConf, hadoopConf,
         partitionId, keyToNumValuesStateStoreCkptId, keyWithIndexToValueStateStoreCkptId,

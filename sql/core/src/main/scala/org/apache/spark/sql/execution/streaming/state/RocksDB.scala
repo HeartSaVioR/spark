@@ -127,7 +127,8 @@ class RocksDB(
   rocksDbOptions.setMaxOpenFiles(conf.maxOpenFiles)
   rocksDbOptions.setAllowFAllocate(conf.allowFAllocate)
   rocksDbOptions.setAvoidFlushDuringShutdown(true)
-  rocksDbOptions.setMergeOperator(new StringAppendOperator())
+  // FIXME: leave it to configuration, default (',': 44) vs 0xFF
+  rocksDbOptions.setMergeOperator(new StringAppendOperator(0xFF.toChar))
 
   if (conf.boundedMemoryUsage) {
     rocksDbOptions.setWriteBufferManager(writeBufferManager)
@@ -1161,7 +1162,8 @@ class RocksDB(
 
       // Add the delimiter - we are using "," as the delimiter
       if (idx < delimiterNum) {
-        result(pos - Platform.BYTE_ARRAY_OFFSET) = 44.toByte
+ // FIXME: leave it to configuration, default (',': 44) vs 0xFF
+        result(pos - Platform.BYTE_ARRAY_OFFSET) = 0xFF.toByte
       }
       // Move the position for delimiter
       pos += 1

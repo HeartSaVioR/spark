@@ -110,7 +110,7 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
   private def runTestWithTimeWindowJoin(numTotalRows: Int): Unit = {
     val (joinKeys, inputAttributes) = getAttributesForTimeWindowJoin()
     // val stateFormatVersions = Seq(1, 2, 3, 4)
-    val stateFormatVersions = Seq(2, 4)
+    val stateFormatVersions = Seq(2, 4, 5)
     // FIXME: testing...
     // val stateFormatVersions = Seq(4)
     // val changelogCheckpointOptions = Seq(true, false)
@@ -131,7 +131,7 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
       numValuesPerTimestamp: Int): Unit = {
     val (joinKeys, inputAttributes) = getAttributesForTimeIntervalJoin()
     // val stateFormatVersions = Seq(1, 2, 3, 4)
-    val stateFormatVersions = Seq(2, 4)
+    val stateFormatVersions = Seq(2, 4, 5)
     // FIXME: testing...
     // val stateFormatVersions = Seq(4)
     // val changelogCheckpointOptions = Seq(true, false)
