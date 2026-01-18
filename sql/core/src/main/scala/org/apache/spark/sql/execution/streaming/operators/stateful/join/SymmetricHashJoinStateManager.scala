@@ -670,21 +670,30 @@ class SymmetricHashJoinStateManagerV5(
   // only a smaller part of the state. This is actually trading off performance from some
   // scenarios of insertion and retrieval. Joins which do not have event time column do not do
   // eviction, hence these joins won't gain any benefit from this state format version.
+  /*
  assert(eventTimeColIdxOpt.isDefined,
    s"Event time column is required for join state manager v4 with state format version " +
    s"$stateFormatVersion")
+   */
 
-  private val eventTimeColIdx = eventTimeColIdxOpt.get
-
+  private val random = new scala.util.Random(System.currentTimeMillis())
+  private val bucketSizeForNoEventTime = 1024
   private val extractEventTimeFn: UnsafeRow => Long = { row =>
-    val idx = eventTimeColIdx
-    val attr = inputValueAttributes(idx)
+    eventTimeColIdxOpt match {
+      case Some(idx) =>
+        val attr = inputValueAttributes(idx)
 
-    if (attr.dataType.isInstanceOf[StructType]) {
-      // NOTE: We assume this is window struct, as same as WatermarkSupport.watermarkExpression
-      row.getStruct(idx, 2).getLong(1)
-    } else {
-      row.getLong(idx)
+        if (attr.dataType.isInstanceOf[StructType]) {
+          // NOTE: We assume this is window struct, as same as WatermarkSupport.watermarkExpression
+          row.getStruct(idx, 2).getLong(1)
+        } else {
+          row.getLong(idx)
+        }
+
+      case _ =>
+        // FIXME: Need a strategy about bucketing when event time is not available
+        //   - first attempt: random bucketing
+        random.nextInt(bucketSizeForNoEventTime)
     }
   }
 

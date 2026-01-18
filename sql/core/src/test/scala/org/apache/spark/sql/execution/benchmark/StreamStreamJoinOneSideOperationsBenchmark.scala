@@ -60,11 +60,12 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
   override def runBenchmarkSuite(mainArgs: Array[String]): Unit = {
     val numTotalRows = 1000000
 
-    /*
-    Seq(1, 10, 100, 1000, 10000, 100000, 1000000).foreach { numKeys =>
+    // /*
+    // Seq(1, 10, 100, 1000, 10000, 100000, 1000000).foreach { numKeys =>
+    Seq(1, 100, 10000, 1000000).foreach { numKeys =>
       runTestWithRegularJoin(numTotalRows, numKeys = numKeys)
     }
-     */
+    // */
 
 //    /*
     runTestWithTimeWindowJoin(numTotalRows)
@@ -72,9 +73,9 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
     Seq(
       (1000, 1),
       // (500, 2),
-      (200, 5),
-      (100, 10),
-      (10, 100)
+      // (200, 5),
+      (100, 10) // ,
+      // (10, 100)
     ).foreach { case (numTimestamps, numValuesPerTimestamp) =>
       runTestWithTimeIntervalJoin(
         numTotalRows = numTotalRows,
@@ -93,7 +94,7 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
   private def runTestWithRegularJoin(numTotalRows: Int, numKeys: Int): Unit = {
     val (joinKeys, inputAttributes) = getAttributesForRegularJoin()
     // val stateFormatVersions = Seq(1, 2, 3, 4)
-    val stateFormatVersions = Seq(2)
+    val stateFormatVersions = Seq(2, 5)
     // FIXME: testing...
     val changelogCheckpointOptions = Seq(true)
 
