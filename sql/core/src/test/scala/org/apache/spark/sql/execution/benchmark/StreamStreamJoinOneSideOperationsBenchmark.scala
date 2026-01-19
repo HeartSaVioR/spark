@@ -279,12 +279,16 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
       assert(numKeysToGet <= shuffledKeys.size,
         s"numKeysToGet ($numKeysToGet) must be less than or equal to " +
           s"the number of distinct keys in state store (${shuffledKeys.size})")
-      val shuffledKeysForJoinedRows = Random.shuffle(inputData).map(_._1).distinct
-        .take(numKeysToGet)
+      val shuffledKeysForJoinedRows = shuffledKeys.take(numKeysToGet)
 
-      val actualMatchingValues = shuffledKeysForJoinedRows.map { keyRow =>
-        inputData.filter { case (k, _) => k == keyRow }.count(_ => true)
-      }.sum
+      // We assume that each key has the same amount of values
+      val numRowsInKey = inputData.size / shuffledKeys.size
+      assert(numRowsInKey * shuffledKeys.size == inputData.size,
+        s"Input data must have the same number of values for each key, " +
+          s"but got different counts. totalRows: ${inputData.size}, " +
+          s"numDistinctKeys: ${shuffledKeys.size}")
+
+      val actualMatchingValues = shuffledKeysForJoinedRows.size * numRowsInKey
 
       val benchmarkForGetJoinedRows = new Benchmark(
         s"[Regular Join] GetJoinedRows $numKeysToGet keys " +
