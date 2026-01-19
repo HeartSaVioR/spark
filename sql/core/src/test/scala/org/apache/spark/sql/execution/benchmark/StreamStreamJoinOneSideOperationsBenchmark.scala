@@ -1538,6 +1538,10 @@ object StreamStreamJoinOneSideOperationsBenchmark extends SqlBasedBenchmark with
       false.toString)
     sqlConf.setConfString("spark.sql.streaming.stateStore.coordinatorReportSnapshotUploadLag",
       false.toString)
+    // FIXME: The checksum threads do not seem to be cleaned up, at least in this benchmark,
+    //  hence disabling for now.
+    sqlConf.setConfString("spark.sql.streaming.checkpoint.fileChecksum.enabled",
+      false.toString)
     val storeConf = new StateStoreConf(sqlConf)
 
     val hadoopConf = new Configuration
