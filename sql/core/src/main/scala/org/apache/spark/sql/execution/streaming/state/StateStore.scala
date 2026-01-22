@@ -31,7 +31,7 @@ import org.apache.hadoop.fs.Path
 import org.json4s.{JInt, JString}
 import org.json4s.JsonAST.JValue
 import org.json4s.JsonDSL._
-import org.json4s.jackson.JsonMethods.{compact, render}
+import org.json4s.jackson.JsonMethods.{compact, pretty, render}
 
 import org.apache.spark.{SparkContext, SparkEnv, SparkException, TaskContext}
 import org.apache.spark.internal.{Logging, LogKeys}
@@ -85,6 +85,8 @@ object MaintenanceTaskType {
   case object FromTaskThread extends MaintenanceTaskType
   case object FromLoadedProviders extends MaintenanceTaskType
 }
+
+case class BatchWriteStats(numWrites: Long, dataSizeBytes: Option[Long])
 
 /**
  * Base trait for a versioned key-value store which provides read operations. Each instance of a
@@ -158,8 +160,17 @@ trait ReadStateStore {
       prefixKey: UnsafeRow,
       colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): StateStoreIterator[UnsafeRowPair]
 
+  // FIXME: doc
+  def prefixScanWithMultiValues(
+      prefixKey: UnsafeRow,
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): StateStoreIterator[UnsafeRowPair]
+
   /** Return an iterator containing all the key-value pairs in the StateStore. */
   def iterator(
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): StateStoreIterator[UnsafeRowPair]
+
+  // FIXME: doc
+  def iteratorWithMultiValues(
       colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): StateStoreIterator[UnsafeRowPair]
 
   /**
@@ -281,6 +292,7 @@ trait StateStore extends ReadStateStore {
     throw new UnsupportedOperationException("Should only call release() on ReadStateStore")
   }
 
+  // FIXME: do we really need to redefine here?
   /**
    * Return an iterator containing all the key-value pairs in the StateStore. Implementations must
    * ensure that updates (puts, removes) can be made while iterating over this iterator.
@@ -291,6 +303,12 @@ trait StateStore extends ReadStateStore {
    */
   override def iterator(colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
     : StateStoreIterator[UnsafeRowPair]
+
+  def initiateBatchWrite(): Unit
+
+  def finalizeBatchWrite(): Unit
+
+  def getStatsOfCurrentBatchWrite(): Option[BatchWriteStats]
 
   /** Current metrics of the state store */
   def metrics: StateStoreMetrics
@@ -310,6 +328,66 @@ trait StateStore extends ReadStateStore {
    * Whether all updates have been committed
    */
   def hasCommitted: Boolean
+
+  // FIXME: Methods for event time aware state store operations
+  //   These methods will require RocksDB state store provider with specific key encoders
+
+  def getWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): UnsafeRow
+
+  def valuesIteratorWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Iterator[UnsafeRow]
+
+  def prefixScanWithEventTime(
+      prefixKey: UnsafeRow,
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
+    : StateStoreIterator[UnsafeRowPairWithEventTime]
+
+  def prefixScanWithMultiValuesWithEventTime(
+      prefixKey: UnsafeRow,
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
+    : StateStoreIterator[UnsafeRowPairWithEventTime]
+
+  def iteratorWithEventTime(
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
+    : StateStoreIterator[UnsafeRowPairWithEventTime]
+
+  def iteratorWithMultiValuesWithEventTime(
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
+    : StateStoreIterator[UnsafeRowPairWithEventTime]
+
+  def putWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      value: UnsafeRow,
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Unit
+
+  def putListWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      values: Array[UnsafeRow],
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Unit
+
+  def removeWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Unit
+
+  def mergeWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      value: UnsafeRow,
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Unit
+
+  def mergeListWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      values: Array[UnsafeRow],
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Unit
 }
 
 /** Wraps the instance of StateStore to make the instance read-only. */
@@ -331,6 +409,9 @@ class WrappedReadStateStore(store: StateStore) extends ReadStateStore {
   override def iterator(colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
     : StateStoreIterator[UnsafeRowPair] = store.iterator(colFamilyName)
 
+  override def iteratorWithMultiValues(colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
+    : StateStoreIterator[UnsafeRowPair] = store.iteratorWithMultiValues(colFamilyName)
+
   override def abort(): Unit = store.abort()
 
   override def release(): Unit = store.release()
@@ -338,6 +419,10 @@ class WrappedReadStateStore(store: StateStore) extends ReadStateStore {
   override def prefixScan(prefixKey: UnsafeRow,
       colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
     : StateStoreIterator[UnsafeRowPair] = store.prefixScan(prefixKey, colFamilyName)
+
+  override def prefixScanWithMultiValues(prefixKey: UnsafeRow,
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
+    : StateStoreIterator[UnsafeRowPair] = store.prefixScanWithMultiValues(prefixKey, colFamilyName)
 
   override def valuesIterator(key: UnsafeRow, colFamilyName: String): Iterator[UnsafeRow] = {
     store.valuesIterator(key, colFamilyName)
@@ -360,7 +445,33 @@ case class StateStoreMetrics(
     numKeys: Long,
     memoryUsedBytes: Long,
     customMetrics: Map[StateStoreCustomMetric, Long],
-    instanceMetrics: Map[StateStoreInstanceMetric, Long] = Map.empty)
+    instanceMetrics: Map[StateStoreInstanceMetric, Long] = Map.empty) {
+  def json: String = {
+    compact(renderToJsonValue)
+  }
+
+  def jsonAsPretty: String = {
+    pretty(renderToJsonValue)
+  }
+
+  private def renderToJsonValue: JValue = {
+    val customMetricsJson = customMetrics.map { case (metric, value) =>
+      (metric.name -> JInt(value))
+    }
+
+    val instanceMetricsJson = instanceMetrics.map { case (metric, value) =>
+      (metric.name -> JInt(value))
+    }
+
+    val jsonValue: JValue =
+      ("numKeys" -> JInt(numKeys)) ~
+        ("memoryUsedBytes" -> JInt(memoryUsedBytes)) ~
+        ("customMetrics" -> customMetricsJson) ~
+        ("instanceMetrics" -> instanceMetricsJson)
+
+    render(jsonValue)
+  }
+}
 
 /**
  * State store checkpoint information, used to pass checkpointing information from executors
@@ -593,6 +704,30 @@ case class RangeKeyScanStateEncoderSpec(
   override def jsonValue: JValue = {
     ("keyStateEncoderType" -> JString("RangeKeyScanStateEncoderSpec")) ~
       ("orderingOrdinals" -> orderingOrdinals.map(JInt(_)))
+  }
+}
+
+case class EventTimeAsPrefixStateEncoderSpec(keySchema: StructType) extends KeyStateEncoderSpec {
+  override def toEncoder(
+      dataEncoder: RocksDBDataEncoder,
+      useColumnFamilies: Boolean): RocksDBKeyStateEncoder = {
+    new EventTimeAsPrefixStateEncoder(dataEncoder, keySchema, useColumnFamilies)
+  }
+
+  override def jsonValue: JValue = {
+    "keyStateEncoderType" -> JString("EventTimeAsPrefixStateEncoderSpec")
+  }
+}
+
+case class EventTimeAsPostfixStateEncoderSpec(keySchema: StructType) extends KeyStateEncoderSpec {
+  override def toEncoder(
+      dataEncoder: RocksDBDataEncoder,
+      useColumnFamilies: Boolean): RocksDBKeyStateEncoder = {
+    new EventTimeAsPostfixStateEncoder(dataEncoder, keySchema, useColumnFamilies)
+  }
+
+  override def jsonValue: JValue = {
+    "keyStateEncoderType" -> JString("EventTimeAsPostfixStateEncoderSpec")
   }
 }
 
@@ -1032,6 +1167,18 @@ object StateStoreId {
 class UnsafeRowPair(var key: UnsafeRow = null, var value: UnsafeRow = null) {
   def withRows(key: UnsafeRow, value: UnsafeRow): UnsafeRowPair = {
     this.key = key
+    this.value = value
+    this
+  }
+}
+
+class UnsafeRowPairWithEventTime(
+    var key: UnsafeRow = null,
+    var eventTime: Long = -1L,
+    var value: UnsafeRow = null) {
+  def withRows(key: UnsafeRow, eventTime: Long, value: UnsafeRow): UnsafeRowPairWithEventTime = {
+    this.key = key
+    this.eventTime = eventTime
     this.value = value
     this
   }

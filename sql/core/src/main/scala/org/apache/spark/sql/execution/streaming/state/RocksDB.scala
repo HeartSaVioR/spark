@@ -127,14 +127,16 @@ class RocksDB(
   rocksDbOptions.setMaxOpenFiles(conf.maxOpenFiles)
   rocksDbOptions.setAllowFAllocate(conf.allowFAllocate)
   rocksDbOptions.setAvoidFlushDuringShutdown(true)
-  rocksDbOptions.setMergeOperator(new StringAppendOperator())
+  // FIXME: leave it to configuration, default (',': 44) vs 0xFF
+  rocksDbOptions.setMergeOperator(new StringAppendOperator(0xFF.toChar))
 
   if (conf.boundedMemoryUsage) {
     rocksDbOptions.setWriteBufferManager(writeBufferManager)
   }
 
   private val dbLogger = createLogger() // for forwarding RocksDB native logs to log4j
-  rocksDbOptions.setStatistics(new Statistics())
+  private val statistics = new Statistics()
+  rocksDbOptions.setStatistics(statistics)
   private val nativeStats = rocksDbOptions.statistics()
 
   private val workingDir = createTempDir("workingDir")
@@ -250,6 +252,9 @@ class RocksDB(
     loggingId,
     conf.rowChecksumEnabled,
     conf.rowChecksumReadVerificationRatio)
+
+  private var writeBatch: WriteBatch = _
+  private var batchWritesInProgress: Boolean = false
 
   private def getColumnFamilyInfo(cfName: String): ColumnFamilyInfo = {
     colFamilyNameToInfoMap.get(cfName)
@@ -711,6 +716,7 @@ class RocksDB(
     performedSnapshotAutoRepair = false
     // Reset the load metrics before loading
     loadMetrics.clear()
+    statistics.reset()
 
     logInfo(log"Loading ${MDC(LogKeys.VERSION_NUM, version)} with stateStoreCkptId: ${
       MDC(LogKeys.UUID, stateStoreCkptId.getOrElse(""))}")
@@ -1113,7 +1119,13 @@ class RocksDB(
     }
 
     handleMetricsUpdate(keyWithPrefix, columnFamilyName, isPutOrMerge = true)
-    db.put(writeOptions, keyWithPrefix, valueWithChecksum)
+
+    if (batchWritesInProgress) {
+      writeBatch.put(keyWithPrefix, valueWithChecksum)
+    } else {
+      db.put(writeOptions, keyWithPrefix, valueWithChecksum)
+    }
+
     changelogWriter.foreach(_.put(keyWithPrefix, valueWithChecksum))
   }
 
@@ -1150,7 +1162,8 @@ class RocksDB(
 
       // Add the delimiter - we are using "," as the delimiter
       if (idx < delimiterNum) {
-        result(pos - Platform.BYTE_ARRAY_OFFSET) = 44.toByte
+ // FIXME: leave it to configuration, default (',': 44) vs 0xFF
+        result(pos - Platform.BYTE_ARRAY_OFFSET) = 0xFF.toByte
       }
       // Move the position for delimiter
       pos += 1
@@ -1187,7 +1200,12 @@ class RocksDB(
     }
 
     handleMetricsUpdate(keyWithPrefix, columnFamilyName, isPutOrMerge = true)
-    db.put(writeOptions, keyWithPrefix, valuesInArrayByte)
+
+    if (batchWritesInProgress) {
+      writeBatch.put(keyWithPrefix, valuesInArrayByte)
+    } else {
+      db.put(writeOptions, keyWithPrefix, valuesInArrayByte)
+    }
     changelogWriter.foreach(_.put(keyWithPrefix, valuesInArrayByte))
   }
 
@@ -1232,7 +1250,12 @@ class RocksDB(
     }
 
     handleMetricsUpdate(keyWithPrefix, columnFamilyName, isPutOrMerge = true)
-    db.merge(writeOptions, keyWithPrefix, valueWithChecksum)
+
+    if (batchWritesInProgress) {
+      writeBatch.merge(keyWithPrefix, valueWithChecksum)
+    } else {
+      db.merge(writeOptions, keyWithPrefix, valueWithChecksum)
+    }
     changelogWriter.foreach(_.merge(keyWithPrefix, valueWithChecksum))
   }
 
@@ -1266,7 +1289,12 @@ class RocksDB(
     val valueInArrayByte = getListValuesInArrayByte(keyWithPrefix, values, includesChecksum)
 
     handleMetricsUpdate(keyWithPrefix, columnFamilyName, isPutOrMerge = true)
-    db.merge(writeOptions, keyWithPrefix, valueInArrayByte)
+
+    if (batchWritesInProgress) {
+      writeBatch.merge(keyWithPrefix, valueInArrayByte)
+    } else {
+      db.merge(writeOptions, keyWithPrefix, valueInArrayByte)
+    }
     changelogWriter.foreach(_.merge(keyWithPrefix, valueInArrayByte))
   }
 
@@ -1303,7 +1331,13 @@ class RocksDB(
     }
 
     handleMetricsUpdate(keyWithPrefix, columnFamilyName, isPutOrMerge = false)
-    db.delete(writeOptions, keyWithPrefix)
+
+    if (batchWritesInProgress) {
+      writeBatch.delete(keyWithPrefix)
+    } else {
+      db.delete(writeOptions, keyWithPrefix)
+    }
+
     changelogWriter match {
       case Some(writer) =>
         val keyWithChecksum = if (conf.rowChecksumEnabled) {
@@ -1315,6 +1349,57 @@ class RocksDB(
         }
         writer.delete(keyWithChecksum)
       case None => // During changelog replay, there is no changelog writer.
+    }
+  }
+
+  def initiateWriteBatch(): Unit = {
+    /*
+    updateMemoryUsageIfNeeded()
+    if (batchWritesInProgress) {
+      throw new IllegalStateException("A write batch is already in progress.")
+    }
+    if (writeBatch == null) {
+      writeBatch = new WriteBatch()
+    } else {
+      writeBatch.clear()
+    }
+    batchWritesInProgress = true
+    */
+  }
+
+  def flushWriteBatch(): Unit = {
+    /*
+    updateMemoryUsageIfNeeded()
+    // FIXME: should we be aggressive in checking whether there is an active write batch?
+    if (batchWritesInProgress) {
+      assert(writeBatch != null)
+      db.write(writeOptions, writeBatch)
+      // reuse the write batch instance
+      writeBatch.clear()
+      batchWritesInProgress = false
+    } else {
+      if (writeBatch != null) {
+        writeBatch.clear()
+      }
+    }
+    */
+  }
+
+  def getDataSizeOnCurrentWriteBatch: Long = {
+    if (batchWritesInProgress) {
+      assert(writeBatch != null)
+      writeBatch.getDataSize
+    } else {
+      -1L
+    }
+  }
+
+  def getNumWrites: Long = {
+    if (batchWritesInProgress) {
+      assert(writeBatch != null)
+      writeBatch.count()
+    } else {
+      -1L
     }
   }
 
@@ -1470,6 +1555,14 @@ class RocksDB(
    * - Sync the checkpoint dir files to DFS
    */
   def commit(forceSnapshot: Boolean = false): (Long, StateStoreCheckpointInfo) = {
+    if (batchWritesInProgress) {
+      throw new IllegalStateException("Missed to close batch writes before committing.")
+    }
+    if (writeBatch != null) {
+      writeBatch.close()
+      writeBatch = null
+    }
+
     commitLatencyMs.clear()
     updateMemoryUsageIfNeeded()
     val newVersion = loadedVersion + 1
@@ -1650,6 +1743,12 @@ class RocksDB(
    * Drop uncommitted changes, and roll back to previous version.
    */
   def rollback(): Unit = {
+    if (writeBatch != null) {
+      writeBatch.close()
+      writeBatch = null
+    }
+    batchWritesInProgress = false
+
     numKeysOnWritingVersion = numKeysOnLoadedVersion
     numInternalKeysOnWritingVersion = numInternalKeysOnLoadedVersion
     loadedVersion = -1L

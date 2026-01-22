@@ -78,6 +78,12 @@ class MemoryStateStore extends StateStore() {
     throw new UnsupportedOperationException("Doesn't support prefix scan!")
   }
 
+  override def prefixScanWithMultiValues(
+      prefixKey: UnsafeRow,
+      colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+    throw new UnsupportedOperationException("Doesn't support prefix scan with multi values!")
+  }
+
   override def merge(key: UnsafeRow, value: UnsafeRow, colFamilyName: String): Unit = {
     throw new UnsupportedOperationException("Doesn't support multiple values per key")
   }
@@ -92,5 +98,106 @@ class MemoryStateStore extends StateStore() {
 
   override def getStateStoreCheckpointInfo(): StateStoreCheckpointInfo = {
     StateStoreCheckpointInfo(id.partitionId, version + 1, None, None)
+  }
+
+  override def iteratorWithMultiValues(
+      colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+    throw new UnsupportedOperationException("Doesn't support multiple values per key")
+  }
+
+  override def initiateBatchWrite(): Unit = {
+    // No-op
+  }
+
+  override def finalizeBatchWrite(): Unit = {
+    // No-op
+  }
+
+  override def getStatsOfCurrentBatchWrite(): Option[BatchWriteStats] = None
+
+  private val providerName = "memoryStateStore"
+
+  override def getWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      colFamilyName: String): UnsafeRow = {
+    throw StateStoreErrors.unsupportedOperationException("getWithEventTime", providerName)
+  }
+
+  override def valuesIteratorWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      colFamilyName: String): Iterator[UnsafeRow] = {
+    throw StateStoreErrors.unsupportedOperationException(
+      "valuesIteratorWithEventTime", providerName)
+  }
+
+  override def prefixScanWithEventTime(
+      prefixKey: UnsafeRow,
+      colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
+    throw StateStoreErrors.unsupportedOperationException("prefixScanWithEventTime", providerName)
+  }
+
+  override def prefixScanWithMultiValuesWithEventTime(
+      prefixKey: UnsafeRow,
+      colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
+    throw StateStoreErrors.unsupportedOperationException(
+      "prefixScanWithMultiValuesWithEventTime", providerName)
+  }
+
+  override def iteratorWithEventTime(
+      colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
+    throw StateStoreErrors.unsupportedOperationException(
+      "iteratorWithEventTime", providerName)
+  }
+
+  override def iteratorWithMultiValuesWithEventTime(
+      colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
+    throw StateStoreErrors.unsupportedOperationException(
+      "iteratorWithMultiValuesWithEventTime", providerName)
+  }
+
+  override def putWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      value: UnsafeRow,
+      colFamilyName: String): Unit = {
+    throw StateStoreErrors.unsupportedOperationException(
+      "putWithEventTime", providerName)
+  }
+
+  override def putListWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      values: Array[UnsafeRow],
+      colFamilyName: String): Unit = {
+    throw StateStoreErrors.unsupportedOperationException(
+      "putListWithEventTime", providerName)
+  }
+
+  override def removeWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      colFamilyName: String): Unit = {
+    throw StateStoreErrors.unsupportedOperationException(
+      "removeWithEventTime", providerName)
+  }
+
+  override def mergeWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      value: UnsafeRow,
+      colFamilyName: String): Unit = {
+    throw StateStoreErrors.unsupportedOperationException(
+      "mergeWithEventTime", providerName)
+  }
+
+  override def mergeListWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      values: Array[UnsafeRow],
+      colFamilyName: String): Unit = {
+    throw StateStoreErrors.unsupportedOperationException(
+      "mergeListWithEventTime", providerName)
   }
 }

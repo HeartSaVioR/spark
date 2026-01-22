@@ -89,10 +89,22 @@ case class CkptIdCollectingStateStoreWrapper(innerStore: StateStore) extends Sta
     innerStore.prefixScan(prefixKey, colFamilyName)
   }
 
+  override def prefixScanWithMultiValues(
+      prefixKey: UnsafeRow,
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
+    : StateStoreIterator[UnsafeRowPair] = {
+    innerStore.prefixScanWithMultiValues(prefixKey, colFamilyName)
+  }
+
   override def iterator(
       colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME)
     : StateStoreIterator[UnsafeRowPair] = {
     innerStore.iterator(colFamilyName)
+  }
+
+  override def iteratorWithMultiValues(
+      colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+    innerStore.iteratorWithMultiValues(colFamilyName)
   }
 
   override def abort(): Unit = innerStore.abort()
@@ -156,6 +168,13 @@ case class CkptIdCollectingStateStoreWrapper(innerStore: StateStore) extends Sta
     innerStore.mergeList(key, values, colFamilyName)
   }
 
+  override def initiateBatchWrite(): Unit = innerStore.initiateBatchWrite()
+
+  override def finalizeBatchWrite(): Unit = innerStore.finalizeBatchWrite()
+
+  override def getStatsOfCurrentBatchWrite(): Option[BatchWriteStats] =
+    innerStore.getStatsOfCurrentBatchWrite()
+
   override def commit(): Long = innerStore.commit()
   override def metrics: StateStoreMetrics = innerStore.metrics
   override def getStateStoreCheckpointInfo(): StateStoreCheckpointInfo = {
@@ -164,6 +183,81 @@ case class CkptIdCollectingStateStoreWrapper(innerStore: StateStore) extends Sta
     ret
   }
   override def hasCommitted: Boolean = innerStore.hasCommitted
+
+  override def getWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      colFamilyName: String): UnsafeRow = {
+    innerStore.getWithEventTime(key, eventTime, colFamilyName)
+  }
+
+  override def valuesIteratorWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      colFamilyName: String): Iterator[UnsafeRow] = {
+    innerStore.valuesIteratorWithEventTime(key, eventTime, colFamilyName)
+  }
+
+  override def prefixScanWithEventTime(
+      prefixKey: UnsafeRow,
+      colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
+    innerStore.prefixScanWithEventTime(prefixKey, colFamilyName)
+  }
+
+  override def prefixScanWithMultiValuesWithEventTime(
+      prefixKey: UnsafeRow,
+      colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
+    innerStore.prefixScanWithMultiValuesWithEventTime(prefixKey, colFamilyName)
+  }
+
+  override def iteratorWithEventTime(
+      colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
+    innerStore.iteratorWithEventTime(colFamilyName)
+  }
+
+  override def iteratorWithMultiValuesWithEventTime(
+      colFamilyName: String): StateStoreIterator[UnsafeRowPairWithEventTime] = {
+    innerStore.iteratorWithMultiValuesWithEventTime(colFamilyName)
+  }
+
+  override def putWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      value: UnsafeRow,
+      colFamilyName: String): Unit = {
+    innerStore.putWithEventTime(key, eventTime, value, colFamilyName)
+  }
+
+  override def putListWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      values: Array[UnsafeRow],
+      colFamilyName: String): Unit = {
+    innerStore.putListWithEventTime(key, eventTime, values, colFamilyName)
+  }
+
+  override def removeWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      colFamilyName: String): Unit = {
+    innerStore.removeWithEventTime(key, eventTime, colFamilyName)
+  }
+
+  override def mergeWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      value: UnsafeRow,
+      colFamilyName: String): Unit = {
+    innerStore.mergeWithEventTime(key, eventTime, value, colFamilyName)
+  }
+
+  override def mergeListWithEventTime(
+      key: UnsafeRow,
+      eventTime: Long,
+      values: Array[UnsafeRow],
+      colFamilyName: String): Unit = {
+    innerStore.mergeListWithEventTime(key, eventTime, values, colFamilyName)
+  }
 }
 
 class CkptIdCollectingStateStoreProviderWrapper extends StateStoreProvider {
