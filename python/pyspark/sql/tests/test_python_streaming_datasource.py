@@ -28,6 +28,13 @@ from pyspark.sql.datasource import (
     SimpleDataSourceStreamReader,
     WriterCommitMessage,
 )
+from pyspark.sql.streaming.datasource import (
+    ReadAllAvailable,
+    ReadLimit,
+    ReadMaxRows,
+    SupportsAdmissionControl,
+    SupportsTriggerAvailableNow,
+)
 from pyspark.sql.streaming import StreamingQueryException
 from pyspark.sql.types import Row
 from pyspark.testing.sqlutils import (
@@ -139,6 +146,45 @@ class BasePythonStreamingDataSourceTestsMixin:
 
         return TestDataSource
 
+    def _get_test_data_source_for_admission_control(self):
+        class TestDataStreamReader(DataSourceStreamReader, SupportsAdmissionControl):
+            def initialOffset(self):
+                return {"partition-1": 0}
+
+            def getDefaultReadLimit(self):
+                return ReadMaxRows(2)
+
+            def latestOffset(self, start: dict, readLimit: ReadLimit):
+                start_idx = start["partition-1"]
+                if isinstance(readLimit, ReadAllAvailable):
+                    end_offset = start_idx + 10
+                else:
+                    assert isinstance(
+                        readLimit, ReadMaxRows
+                    ), "Expected ReadMaxRows read limit but got " + str(type(readLimit))
+                    end_offset = start_idx + readLimit.max_rows
+                return {"partition-1": end_offset}
+
+            def reportLatestOffset(self):
+                return {"partition-1": 1000000}
+
+            def partitions(self, start: dict, end: dict):
+                start_index = start["partition-1"]
+                end_index = end["partition-1"]
+                return [InputPartition(i) for i in range(start_index, end_index)]
+
+            def read(self, partition):
+                yield (partition.value,)
+
+        class TestDataSource(DataSource):
+            def schema(self) -> str:
+                return "id INT"
+
+            def streamReader(self, schema):
+                return TestDataStreamReader()
+
+        return TestDataSource
+
     def test_stream_reader(self):
         self.spark.dataSource.register(self._get_test_data_source())
         df = self.spark.readStream.format("TestDataSource").load()
@@ -213,6 +259,35 @@ class BasePythonStreamingDataSourceTestsMixin:
 
         assertDataFrameEqual(df, expected_data)
 
+    def test_stream_reader_admission_control_trigger_once(self):
+        self.spark.dataSource.register(self._get_test_data_source_for_admission_control())
+        df = self.spark.readStream.format("TestDataSource").load()
+
+        def check_batch(df, batch_id):
+            assertDataFrameEqual(df, [Row(x) for x in range(10)])
+
+        q = df.writeStream.trigger(once=True).foreachBatch(check_batch).start()
+        q.awaitTermination()
+        self.assertIsNone(q.exception(), "No exception has to be propagated.")
+        self.assertTrue(q.recentProgress.length == 1)
+        self.assertTrue(q.lastProgress.numInputRows == 10)
+        self.assertTrue(q.lastProgress.sources[0].numInputRows == 10)
+        self.assertTrue(q.lastProgress.sources[0].latestOffset == """{"partition-1": 1000000}""")
+
+    def test_stream_reader_admission_control_processing_time_trigger(self):
+        self.spark.dataSource.register(self._get_test_data_source_for_admission_control())
+        df = self.spark.readStream.format("TestDataSource").load()
+
+        def check_batch(df, batch_id):
+            assertDataFrameEqual(df, [Row(batch_id * 2), Row(batch_id * 2 + 1)])
+
+        q = df.writeStream.foreachBatch(check_batch).start()
+        while len(q.recentProgress) < 10:
+            time.sleep(0.2)
+        q.stop()
+        q.awaitTermination()
+        self.assertIsNone(q.exception(), "No exception has to be propagated.")
+
     def test_simple_stream_reader(self):
         class SimpleStreamReader(SimpleDataSourceStreamReader):
             def initialOffset(self):
@@ -249,6 +324,50 @@ class BasePythonStreamingDataSourceTestsMixin:
             time.sleep(0.2)
         q.stop()
         q.awaitTermination()
+        self.assertIsNone(q.exception(), "No exception has to be propagated.")
+
+    def test_simple_stream_reader_trigger_available_now(self):
+        class SimpleStreamReader(SimpleDataSourceStreamReader, SupportsTriggerAvailableNow):
+            def initialOffset(self):
+                return {"offset": 0}
+
+            def read(self, start: dict):
+                start_idx = start["offset"]
+                end_offset = min(start_idx + 2, self.desired_end_offset["offset"])
+                it = iter([(i,) for i in range(start_idx, end_offset)])
+                return (it, {"offset": end_offset})
+
+            def commit(self, end):
+                pass
+
+            def readBetweenOffsets(self, start: dict, end: dict):
+                start_idx = start["offset"]
+                end_idx = end["offset"]
+                return iter([(i,) for i in range(start_idx, end_idx)])
+
+            def prepareForTriggerAvailableNow(self) -> None:
+                self.desired_end_offset = {"offset": 10}
+
+        class SimpleDataSource(DataSource):
+            def schema(self):
+                return "id INT"
+
+            def simpleStreamReader(self, schema):
+                return SimpleStreamReader()
+
+        self.spark.dataSource.register(SimpleDataSource)
+        df = self.spark.readStream.format("SimpleDataSource").load()
+
+        def check_batch(df, batch_id):
+            # the last offset for the data is 9 since the desired end offset is 10
+            # the batch isn't triggered with no data, so either we have one data or two data in each batch
+            if batch_id * 2 + 1 > 9:
+                assertDataFrameEqual(df, [Row(batch_id * 2)])
+            else:
+                assertDataFrameEqual(df, [Row(batch_id * 2), Row(batch_id * 2 + 1)])
+
+        q = df.writeStream.foreachBatch(check_batch).trigger(availableNow=True).start()
+        q.awaitTermination(timeout=30)
         self.assertIsNone(q.exception(), "No exception has to be propagated.")
 
     def test_stream_writer(self):
