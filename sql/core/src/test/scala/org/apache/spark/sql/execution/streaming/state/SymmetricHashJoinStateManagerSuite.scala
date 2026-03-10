@@ -622,6 +622,76 @@ class SymmetricHashJoinStateManagerEventTimeInKeySuite
       }
     }
   }
+
+  test("StreamingJoinStateManager V4 - skipUpdatingMatchedFlag skips matched flag update") {
+    withTempDir { checkpointDir =>
+      withJoinStateManagerWithCheckpointDir(
+        inputValueAttributes, joinKeyExpressions, stateFormatVersion = 4,
+        checkpointDir, storeVersion = 0, changelogCheckpoint = false) { manager =>
+        implicit val mgr = manager
+
+        append(20, 2)
+        append(20, 3)
+        append(30, 1)
+
+        val dummyRow = new GenericInternalRow(0)
+        val matched = manager.getJoinedRows(
+          toJoinKeyRow(20),
+          row => new JoinedRow(row, dummyRow),
+          jr => jr.getInt(1) == 2,
+          skipUpdatingMatchedFlag = true
+        ).toSeq
+        assert(matched.size == 1)
+
+        mgr.commit()
+      }
+
+      withJoinStateManagerWithCheckpointDir(
+        inputValueAttributes, joinKeyExpressions, stateFormatVersion = 4,
+        checkpointDir, storeVersion = 1, changelogCheckpoint = false) { manager =>
+        implicit val mgr = manager
+
+        val evicted = removeAndReturnByKey(25)
+        val evictedPairs = evicted.map(p => (toValueInt(p.value), p.matched)).toSeq
+        val matchedByValue = evictedPairs.toMap
+        assert(matchedByValue(2) === false)
+        assert(matchedByValue(3) === false)
+
+        mgr.commit()
+      }
+    }
+  }
+
+  test("StreamingJoinStateManager V4 - skipUpdatingMatchedFlag does not affect " +
+      "excludeRowsAlreadyMatched filtering") {
+    withJoinStateManager(
+      inputValueAttributes, joinKeyExpressions, stateFormatVersion = 4) { manager =>
+      implicit val mgr = manager
+
+      append(20, 2)
+      append(20, 3)
+      append(20, 4)
+
+      val dummyRow = new GenericInternalRow(0)
+      val firstPass = manager.getJoinedRows(
+        toJoinKeyRow(20),
+        row => new JoinedRow(row, dummyRow),
+        jr => jr.getInt(1) < 4,
+        skipUpdatingMatchedFlag = true
+      ).toSeq
+      assert(firstPass.size == 2)
+
+      // Since skipUpdatingMatchedFlag was true, all rows should still be returned
+      // even with excludeRowsAlreadyMatched = true
+      val secondPass = manager.getJoinedRows(
+        toJoinKeyRow(20),
+        row => new JoinedRow(row, dummyRow),
+        _ => true,
+        excludeRowsAlreadyMatched = true
+      ).map(_.getInt(1)).toSeq.sorted
+      assert(secondPass === Seq(2, 3, 4))
+    }
+  }
 }
 
 class SymmetricHashJoinStateManagerEventTimeInValueSuite
@@ -865,6 +935,71 @@ class SymmetricHashJoinStateManagerEventTimeInValueSuite
         ).map(_.getInt(1)).toSeq
         assert(secondPass === Seq(300))
       }
+    }
+  }
+
+  test("StreamingJoinStateManager V4 - skipUpdatingMatchedFlag skips matched flag update") {
+    withTempDir { checkpointDir =>
+      withJoinStateManagerWithCheckpointDir(
+        inputValueAttributes, joinKeyExpressions, stateFormatVersion = 4,
+        checkpointDir, storeVersion = 0, changelogCheckpoint = false) { manager =>
+        implicit val mgr = manager
+
+        appendAndTest(40, 100, 200, 300)
+
+        val dummyRow = new GenericInternalRow(0)
+        val matched = manager.getJoinedRows(
+          toJoinKeyRow(40),
+          row => new JoinedRow(row, dummyRow),
+          jr => jr.getInt(1) == 100,
+          skipUpdatingMatchedFlag = true
+        ).toSeq
+        assert(matched.size == 1)
+
+        mgr.commit()
+      }
+
+      withJoinStateManagerWithCheckpointDir(
+        inputValueAttributes, joinKeyExpressions, stateFormatVersion = 4,
+        checkpointDir, storeVersion = 1, changelogCheckpoint = false) { manager =>
+        implicit val mgr = manager
+
+        val evicted = removeAndReturnByValue(125)
+        val evictedPairs = evicted.map(p => (toValueInt(p.value), p.matched)).toSeq
+        val matchedByValue = evictedPairs.toMap
+        assert(matchedByValue(100) === false)
+
+        mgr.commit()
+      }
+    }
+  }
+
+  test("StreamingJoinStateManager V4 - skipUpdatingMatchedFlag does not affect " +
+      "excludeRowsAlreadyMatched filtering") {
+    withJoinStateManager(
+      inputValueAttributes, joinKeyExpressions, stateFormatVersion = 4) { manager =>
+      implicit val mgr = manager
+
+      appendAndTest(40, 100, 200, 300)
+
+      val dummyRow = new GenericInternalRow(0)
+      val firstPass = manager.getJoinedRows(
+        toJoinKeyRow(40),
+        row => new JoinedRow(row, dummyRow),
+        jr => jr.getInt(1) < 300,
+        skipUpdatingMatchedFlag = true
+      ).toSeq
+      assert(firstPass.size == 2)
+
+      // Since skipUpdatingMatchedFlag was true, all rows should still be returned
+      // even with excludeRowsAlreadyMatched = true
+      val secondPass = manager.getJoinedRows(
+        toJoinKeyRow(40),
+        row => new JoinedRow(row, dummyRow),
+        _ => true,
+        excludeRowsAlreadyMatched = true
+      ).map(_.getInt(1)).toSeq.sorted
+      assert(secondPass === Seq(100, 200, 300))
     }
   }
 }

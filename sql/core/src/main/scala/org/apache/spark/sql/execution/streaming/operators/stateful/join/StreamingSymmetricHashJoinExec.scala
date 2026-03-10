@@ -697,6 +697,19 @@ case class StreamingSymmetricHashJoinExec(
 
       val excludeRowsAlreadyMatched = joinType == LeftSemi && joinSide == RightSide
 
+      // For V4, skip updating the matched flag on the non-outer side to avoid unnecessary
+      // state store writes. The matched flag is only needed on the outer side (for evicting
+      // unmatched rows) and on the right side of left semi (for excludeRowsAlreadyMatched).
+      val needToUpdateMatchedOnOtherSide = joinType match {
+        case Inner => false
+        case LeftOuter => joinSide == RightSide
+        case RightOuter => joinSide == LeftSide
+        case FullOuter => true
+        case LeftSemi => joinSide == RightSide
+        case _ => true
+      }
+      val skipUpdatingMatchedFlag = stateFormatVersion == 4 && !needToUpdateMatchedOnOtherSide
+
       val generateOutputIter: (InternalRow, Iterator[JoinedRow]) => Iterator[InternalRow] =
         joinSide match {
           case LeftSide if joinType == LeftSemi =>
@@ -727,7 +740,8 @@ case class StreamingSymmetricHashJoinExec(
             key,
             thatRow => generateJoinedRow(thisRow, thatRow),
             postJoinFilter,
-            excludeRowsAlreadyMatched)
+            excludeRowsAlreadyMatched,
+            skipUpdatingMatchedFlag)
           val outputIter = generateOutputIter(thisRow, joinedRowIter)
           new AddingProcessedRowToStateCompletionIterator(key, thisRow, outputIter)
         } else {

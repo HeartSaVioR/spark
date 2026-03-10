@@ -68,13 +68,19 @@ trait SymmetricHashJoinStateManager {
    * values which have not been marked as matched yet. The matched flag will be updated to true
    * for the values being returned, if it is semantically required to do so.
    *
+   * For skipUpdatingMatchedFlag = true, the method will skip updating the matched flag for the
+   * values being returned. This is useful for the non-outer side of stream-stream join where
+   * the matched flag is never checked during state eviction. Only honored by V4; V1-V3
+   * always update the matched flag regardless of this parameter.
+   *
    * It is caller's responsibility to consume the whole iterator.
    */
   def getJoinedRows(
       key: UnsafeRow,
       generateJoinedRow: InternalRow => JoinedRow,
       predicate: JoinedRow => Boolean,
-      excludeRowsAlreadyMatched: Boolean = false): Iterator[JoinedRow]
+      excludeRowsAlreadyMatched: Boolean = false,
+      skipUpdatingMatchedFlag: Boolean = false): Iterator[JoinedRow]
 
   /**
    * Provide all key-value pairs in the state manager.
@@ -324,7 +330,8 @@ class SymmetricHashJoinStateManagerV4(
       key: UnsafeRow,
       generateJoinedRow: InternalRow => JoinedRow,
       predicate: JoinedRow => Boolean,
-      excludeRowsAlreadyMatched: Boolean): Iterator[JoinedRow] = {
+      excludeRowsAlreadyMatched: Boolean,
+      skipUpdatingMatchedFlag: Boolean = false): Iterator[JoinedRow] = {
     // TODO: [SPARK-55147] We could improve this method to get the scope of timestamp and scan keys
     //  more efficiently. For now, we just get all values for the key.
     def getJoinedRowsFromTsAndValues(
@@ -345,10 +352,8 @@ class SymmetricHashJoinStateManagerV4(
             } else {
               val joinedRow = generateJoinedRow(vmp.value)
               if (predicate(joinedRow)) {
-                if (!vmp.matched) {
-                  // Update the array to contain the value having matched = true
+                if (!skipUpdatingMatchedFlag && !vmp.matched) {
                   valuesAndMatched(currentIndex) = vmp.copy(matched = true)
-                  // Need to update matched flag
                   shouldUpdateValuesIntoStateStore = true
                 }
 
@@ -372,7 +377,6 @@ class SymmetricHashJoinStateManagerV4(
 
         override protected def close(): Unit = {
           if (shouldUpdateValuesIntoStateStore) {
-            // Update back to the state store
             val updatedValuesWithMatched = valuesAndMatched.map { vmp =>
               (vmp.value, vmp.matched)
             }.toSeq
@@ -866,12 +870,14 @@ abstract class SymmetricHashJoinStateManagerBase(
    * @param excludeRowsAlreadyMatched Do not join with rows already matched previously.
    *                                  This is used for right side of left semi join in
    *                                  [[StreamingSymmetricHashJoinExec]] only.
+   * @param skipUpdatingMatchedFlag Ignored in V1-V3 (always updates matched flag).
    */
   def getJoinedRows(
       key: UnsafeRow,
       generateJoinedRow: InternalRow => JoinedRow,
       predicate: JoinedRow => Boolean,
-      excludeRowsAlreadyMatched: Boolean = false): Iterator[JoinedRow] = {
+      excludeRowsAlreadyMatched: Boolean = false,
+      skipUpdatingMatchedFlag: Boolean = false): Iterator[JoinedRow] = {
     val numValues = keyToNumValues.get(key)
     keyWithIndexToValue.getAll(key, numValues).filterNot { keyIdxToValue =>
       excludeRowsAlreadyMatched && keyIdxToValue.matched
