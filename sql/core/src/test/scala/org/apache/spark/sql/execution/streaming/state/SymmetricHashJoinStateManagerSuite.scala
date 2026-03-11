@@ -622,6 +622,112 @@ class SymmetricHashJoinStateManagerEventTimeInKeySuite
       }
     }
   }
+
+  // V1 excluded: V1 converter does not persist matched flags (SPARK-26154)
+  versionsInTest.filter(_ >= 2).foreach { ver =>
+    test(s"StreamingJoinStateManager V$ver - getJoinedRowsAndRemoveMatched partial") {
+      withJoinStateManager(
+        inputValueAttributes, joinKeyExpressions, stateFormatVersion = ver) { manager =>
+        implicit val mgr = manager
+
+        append(20, 2)
+        append(20, 3)
+        append(20, 4)
+        append(30, 10)
+
+        val dummyRow = new GenericInternalRow(0)
+        val matched = manager.getJoinedRowsAndRemoveMatched(
+          toJoinKeyRow(20),
+          row => new JoinedRow(row, dummyRow),
+          jr => jr.getInt(1) < 4
+        ).map(_.getInt(1)).toSeq
+        assert(matched.sorted === Seq(2, 3))
+
+        // Matched rows should be removed, unmatched should remain
+        assert(get(20) === Seq(4))
+
+        // Other keys should be unaffected
+        assert(get(30) === Seq(10))
+
+        // Calling again with same predicate should return nothing (already removed)
+        val matchedAgain = manager.getJoinedRowsAndRemoveMatched(
+          toJoinKeyRow(20),
+          row => new JoinedRow(row, dummyRow),
+          jr => jr.getInt(1) < 4
+        ).toSeq
+        assert(matchedAgain.isEmpty)
+
+        // Non-existent key should return empty
+        val noMatch = manager.getJoinedRowsAndRemoveMatched(
+          toJoinKeyRow(99),
+          row => new JoinedRow(row, dummyRow),
+          _ => true
+        ).toSeq
+        assert(noMatch.isEmpty)
+      }
+    }
+  }
+
+  // V1 excluded: V1 converter does not persist matched flags (SPARK-26154)
+  versionsInTest.filter(_ >= 2).foreach { ver =>
+    test(s"StreamingJoinStateManager V$ver - getJoinedRowsAndRemoveMatched all matched") {
+      withJoinStateManager(
+        inputValueAttributes, joinKeyExpressions, stateFormatVersion = ver) { manager =>
+        implicit val mgr = manager
+
+        append(20, 2)
+        append(20, 3)
+
+        val dummyRow = new GenericInternalRow(0)
+        val matched = manager.getJoinedRowsAndRemoveMatched(
+          toJoinKeyRow(20),
+          row => new JoinedRow(row, dummyRow),
+          _ => true
+        ).map(_.getInt(1)).toSeq
+        assert(matched.sorted === Seq(2, 3))
+
+        // All matched, key should be fully removed
+        assert(get(20) === Seq.empty)
+      }
+    }
+  }
+
+  // V1 excluded: V1 converter does not persist matched flags (SPARK-26154)
+  versionsInTest.filter(_ >= 2).foreach { ver =>
+    test(s"StreamingJoinStateManager V$ver - " +
+        "getJoinedRowsAndRemoveMatched skips already-matched rows") {
+      withJoinStateManager(
+        inputValueAttributes, joinKeyExpressions, stateFormatVersion = ver) { manager =>
+        implicit val mgr = manager
+
+        append(20, 2)
+        append(20, 3)
+        append(20, 4)
+
+        val dummyRow = new GenericInternalRow(0)
+        // First, mark values 2 and 3 as matched via getJoinedRows
+        val firstPass = manager.getJoinedRows(
+          toJoinKeyRow(20),
+          row => new JoinedRow(row, dummyRow),
+          jr => jr.getInt(1) < 4
+        ).toSeq
+        assert(firstPass.size == 2)
+
+        // getJoinedRowsAndRemoveMatched always excludes already-matched rows.
+        // Only value 4 (unmatched) should be considered; it should match the predicate,
+        // be removed, and returned.
+        val matched = manager.getJoinedRowsAndRemoveMatched(
+          toJoinKeyRow(20),
+          row => new JoinedRow(row, dummyRow),
+          _ => true
+        ).map(_.getInt(1)).toSeq
+        assert(matched === Seq(4))
+
+        // Values 2 and 3 (already matched) should still be in state
+        assert(get(20).sorted === Seq(2, 3))
+      }
+    }
+  }
 }
 
 class SymmetricHashJoinStateManagerEventTimeInValueSuite
@@ -864,6 +970,102 @@ class SymmetricHashJoinStateManagerEventTimeInValueSuite
           excludeRowsAlreadyMatched = true
         ).map(_.getInt(1)).toSeq
         assert(secondPass === Seq(300))
+      }
+    }
+  }
+
+  // V1 excluded: V1 converter does not persist matched flags (SPARK-26154)
+  versionsInTest.filter(_ >= 2).foreach { ver =>
+    test(s"StreamingJoinStateManager V$ver - getJoinedRowsAndRemoveMatched partial") {
+      withJoinStateManager(
+        inputValueAttributes, joinKeyExpressions, stateFormatVersion = ver) { manager =>
+        implicit val mgr = manager
+
+        appendAndTest(40, 100, 200, 300)
+        append(50, 400)
+
+        val dummyRow = new GenericInternalRow(0)
+        val matched = manager.getJoinedRowsAndRemoveMatched(
+          toJoinKeyRow(40),
+          row => new JoinedRow(row, dummyRow),
+          jr => jr.getInt(1) < 300
+        ).map(_.getInt(1)).toSeq
+        assert(matched.sorted === Seq(100, 200))
+
+        assert(get(40) === Seq(300))
+
+        assert(get(50) === Seq(400))
+
+        val matchedAgain = manager.getJoinedRowsAndRemoveMatched(
+          toJoinKeyRow(40),
+          row => new JoinedRow(row, dummyRow),
+          jr => jr.getInt(1) < 300
+        ).toSeq
+        assert(matchedAgain.isEmpty)
+
+        val noMatch = manager.getJoinedRowsAndRemoveMatched(
+          toJoinKeyRow(99),
+          row => new JoinedRow(row, dummyRow),
+          _ => true
+        ).toSeq
+        assert(noMatch.isEmpty)
+      }
+    }
+  }
+
+  // V1 excluded: V1 converter does not persist matched flags (SPARK-26154)
+  versionsInTest.filter(_ >= 2).foreach { ver =>
+    test(s"StreamingJoinStateManager V$ver - getJoinedRowsAndRemoveMatched all matched") {
+      withJoinStateManager(
+        inputValueAttributes, joinKeyExpressions, stateFormatVersion = ver) { manager =>
+        implicit val mgr = manager
+
+        appendAndTest(40, 100, 200)
+
+        val dummyRow = new GenericInternalRow(0)
+        val matched = manager.getJoinedRowsAndRemoveMatched(
+          toJoinKeyRow(40),
+          row => new JoinedRow(row, dummyRow),
+          _ => true
+        ).map(_.getInt(1)).toSeq
+        assert(matched.sorted === Seq(100, 200))
+
+        assert(get(40) === Seq.empty)
+      }
+    }
+  }
+
+  // V1 excluded: V1 converter does not persist matched flags (SPARK-26154)
+  versionsInTest.filter(_ >= 2).foreach { ver =>
+    test(s"StreamingJoinStateManager V$ver - " +
+        "getJoinedRowsAndRemoveMatched skips already-matched rows") {
+      withJoinStateManager(
+        inputValueAttributes, joinKeyExpressions, stateFormatVersion = ver) { manager =>
+        implicit val mgr = manager
+
+        appendAndTest(40, 100, 200, 300)
+
+        val dummyRow = new GenericInternalRow(0)
+        // First, mark values 100 and 200 as matched via getJoinedRows
+        val firstPass = manager.getJoinedRows(
+          toJoinKeyRow(40),
+          row => new JoinedRow(row, dummyRow),
+          jr => jr.getInt(1) < 300
+        ).toSeq
+        assert(firstPass.size == 2)
+
+        // getJoinedRowsAndRemoveMatched always excludes already-matched rows.
+        // Only value 300 (unmatched) should be considered; it should match, be removed,
+        // and returned.
+        val matched = manager.getJoinedRowsAndRemoveMatched(
+          toJoinKeyRow(40),
+          row => new JoinedRow(row, dummyRow),
+          _ => true
+        ).map(_.getInt(1)).toSeq
+        assert(matched === Seq(300))
+
+        // Values 100 and 200 (already matched) should still be in state
+        assert(get(40).sorted === Seq(100, 200))
       }
     }
   }

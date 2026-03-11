@@ -76,6 +76,22 @@ trait SymmetricHashJoinStateManager {
       excludeRowsAlreadyMatched: Boolean = false): Iterator[JoinedRow]
 
   /**
+   * Specialized version of join processing for left semi join optimization. Instead of marking
+   * rows as matched (write #1) and then removing them in a separate pass (write #2), this method
+   * combines both operations: it finds unmatched rows that satisfy the join predicate, removes
+   * them from state directly, and returns them as JoinedRows.
+   *
+   * Rows already marked as matched are always excluded -- re-matching them would produce
+   * duplicate output and a redundant removal.
+   *
+   * It is caller's responsibility to consume the whole iterator.
+   */
+  def getJoinedRowsAndRemoveMatched(
+      key: UnsafeRow,
+      generateJoinedRow: InternalRow => JoinedRow,
+      predicate: JoinedRow => Boolean): Iterator[JoinedRow]
+
+  /**
    * Provide all key-value pairs in the state manager.
    *
    * It is caller's responsibility to consume the whole iterator.
@@ -396,6 +412,77 @@ class SymmetricHashJoinStateManagerV4(
     ret.filter(_ != null)
   }
 
+  override def getJoinedRowsAndRemoveMatched(
+      key: UnsafeRow,
+      generateJoinedRow: InternalRow => JoinedRow,
+      predicate: JoinedRow => Boolean): Iterator[JoinedRow] = {
+    def getJoinedRowsFromTsAndValues(
+        ts: Long,
+        valuesAndMatched: Array[ValueAndMatchPair]): Iterator[JoinedRow] = {
+      new NextIterator[JoinedRow] {
+        private var currentIndex = 0
+
+        private val toKeep = new scala.collection.mutable.ArrayBuffer[ValueAndMatchPair]()
+        private var hasRemovals = false
+
+        override protected def getNext(): JoinedRow = {
+          var ret: JoinedRow = null
+          while (ret == null && currentIndex < valuesAndMatched.length) {
+            val vmp = valuesAndMatched(currentIndex)
+
+            if (vmp.matched) {
+              toKeep += vmp
+            } else {
+              val joinedRow = generateJoinedRow(vmp.value)
+              if (predicate(joinedRow)) {
+                hasRemovals = true
+                ret = joinedRow
+              } else {
+                toKeep += vmp
+              }
+            }
+
+            currentIndex += 1
+          }
+
+          if (ret == null) {
+            assert(currentIndex == valuesAndMatched.length)
+            finished = true
+            null
+          } else {
+            ret
+          }
+        }
+
+        override protected def close(): Unit = {
+          if (hasRemovals) {
+            if (toKeep.isEmpty) {
+              keyWithTsToValues.remove(key, ts)
+              tsWithKey.remove(key, ts)
+            } else {
+              val valuesToPut = toKeep.map(vmp => (vmp.value, vmp.matched)).toSeq
+              keyWithTsToValues.put(key, ts, valuesToPut)
+            }
+          }
+        }
+      }
+    }
+
+    val ret = extractEventTimeFnFromKey(key) match {
+      case Some(ts) =>
+        val valuesAndMatchedIter = keyWithTsToValues.get(key, ts)
+        getJoinedRowsFromTsAndValues(ts, valuesAndMatchedIter.toArray)
+
+      case _ =>
+        keyWithTsToValues.getValues(key).flatMap { result =>
+          val ts = result.timestamp
+          val valuesAndMatched = result.values.toArray
+          getJoinedRowsFromTsAndValues(ts, valuesAndMatched)
+        }
+    }
+    ret.filter(_ != null)
+  }
+
   /**
    * NOTE: The entry provided by Iterator.next() will be reused. It is a caller's responsibility
    * to copy it properly if caller needs to keep the reference after next() is called again.
@@ -648,13 +735,15 @@ class SymmetricHashJoinStateManagerV4(
     private val attachTimestampProjection: UnsafeProjection =
       TimestampKeyStateEncoder.getAttachTimestampProjection(keySchema)
 
-    // Create the specific column family in the store for this join side's KeyWithIndexToValueStore
+    // Marked as internal since this is a secondary index for time-based eviction;
+    // KeyWithTsToValuesStore already tracks the actual data rows.
     stateStore.createColFamilyIfAbsent(
       colFamilyName,
       keySchema,
       valueStructType,
       TimestampAsPrefixKeyStateEncoderSpec(keySchemaWithTimestamp),
-      useMultipleValuesPerKey = true
+      useMultipleValuesPerKey = true,
+      isInternal = true
     )
 
     private def createKeyRow(key: UnsafeRow, timestamp: Long): UnsafeRow = {
@@ -854,6 +943,96 @@ abstract class SymmetricHashJoinStateManagerBase(
     val numExistingValues = keyToNumValues.get(key)
     keyWithIndexToValue.put(key, numExistingValues, value, matched)
     keyToNumValues.put(key, numExistingValues + 1)
+  }
+
+  /**
+   * Streaming implementation that processes one value at a time, using the same swap-with-last
+   * compaction strategy as [[evictAndReturnByValueCondition]] to avoid materializing all values
+   * into memory (a single key can have millions of values in v1-v3).
+   *
+   * The iterator must be consumed fully without any other operations on this manager
+   * or the underlying store being interleaved.
+   */
+  override def getJoinedRowsAndRemoveMatched(
+      key: UnsafeRow,
+      generateJoinedRow: InternalRow => JoinedRow,
+      predicate: JoinedRow => Boolean): Iterator[JoinedRow] = {
+    new NextIterator[JoinedRow] {
+      private var numValues: Long = keyToNumValues.get(key)
+      private var index: Long = 0L
+      private var valueRemoved: Boolean = false
+
+      private def updateNumValueForKey(): Unit = {
+        if (valueRemoved) {
+          if (numValues >= 1) {
+            keyToNumValues.put(key, numValues)
+          } else {
+            keyToNumValues.remove(key)
+          }
+        }
+      }
+
+      private def getRightMostNonNullIndex(stopIndex: Long): Option[Long] = {
+        (numValues - 1 to stopIndex by -1).find { idx =>
+          keyWithIndexToValue.get(key, idx) != null
+        }
+      }
+
+      private def removeCurrentIndexValue(): Unit = {
+        if (index != numValues - 1) {
+          val valuePairAtMaxIndex = keyWithIndexToValue.get(key, numValues - 1)
+          if (valuePairAtMaxIndex != null) {
+            keyWithIndexToValue.put(key, index, valuePairAtMaxIndex.value,
+              valuePairAtMaxIndex.matched)
+          } else {
+            val nonNullIndex = getRightMostNonNullIndex(index + 1).getOrElse(index)
+            if (nonNullIndex != index) {
+              val valuePair = keyWithIndexToValue.get(key, nonNullIndex)
+              keyWithIndexToValue.put(key, index, valuePair.value, valuePair.matched)
+            }
+
+            if (nonNullIndex != numValues - 1) {
+              logWarning(log"`keyWithIndexToValue` returns a null value for indices " +
+                log"with range from startIndex=${MDC(START_INDEX, nonNullIndex + 1)} " +
+                log"and endIndex=${MDC(END_INDEX, numValues - 1)}.")
+            }
+
+            (numValues - 1 to nonNullIndex + 1 by -1).foreach { removeIndex =>
+              keyWithIndexToValue.remove(key, removeIndex)
+              numValues -= 1
+            }
+          }
+        }
+        keyWithIndexToValue.remove(key, numValues - 1)
+        numValues -= 1
+        valueRemoved = true
+      }
+
+      override def getNext(): JoinedRow = {
+        while (index < numValues) {
+          val valuePair = keyWithIndexToValue.get(key, index)
+          if (valuePair == null && storeConf.skipNullsForStreamStreamJoins) {
+            index += 1
+          } else if (valuePair.matched) {
+            index += 1
+          } else {
+            val joinedRow = generateJoinedRow(valuePair.value)
+            if (predicate(joinedRow)) {
+              removeCurrentIndexValue()
+              return joinedRow
+            } else {
+              index += 1
+            }
+          }
+        }
+
+        updateNumValueForKey()
+        finished = true
+        null
+      }
+
+      override def close(): Unit = {}
+    }
   }
 
   /**
