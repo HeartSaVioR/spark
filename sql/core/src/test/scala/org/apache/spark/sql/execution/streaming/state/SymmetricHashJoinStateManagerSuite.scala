@@ -695,7 +695,7 @@ class SymmetricHashJoinStateManagerEventTimeInKeySuite
   // V1 excluded: V1 converter does not persist matched flags (SPARK-26154)
   versionsInTest.filter(_ >= 2).foreach { ver =>
     test(s"StreamingJoinStateManager V$ver - " +
-        "getJoinedRowsAndRemoveMatched skips already-matched rows") {
+        "getJoinedRowsAndRemoveMatched evicts already-matched rows") {
       withJoinStateManager(
         inputValueAttributes, joinKeyExpressions, stateFormatVersion = ver) { manager =>
         implicit val mgr = manager
@@ -713,9 +713,10 @@ class SymmetricHashJoinStateManagerEventTimeInKeySuite
         ).toSeq
         assert(firstPass.size == 2)
 
-        // getJoinedRowsAndRemoveMatched always excludes already-matched rows.
-        // Only value 4 (unmatched) should be considered; it should match the predicate,
-        // be removed, and returned.
+        // getJoinedRowsAndRemoveMatched proactively evicts already-matched rows
+        // and removes+returns unmatched rows that satisfy the predicate.
+        // Value 4 (unmatched) matches the predicate, so it is removed and returned.
+        // Values 2 and 3 (already matched) are proactively evicted.
         val matched = manager.getJoinedRowsAndRemoveMatched(
           toJoinKeyRow(20),
           row => new JoinedRow(row, dummyRow),
@@ -723,8 +724,8 @@ class SymmetricHashJoinStateManagerEventTimeInKeySuite
         ).map(_.getInt(1)).toSeq
         assert(matched === Seq(4))
 
-        // Values 2 and 3 (already matched) should still be in state
-        assert(get(20).sorted === Seq(2, 3))
+        // All rows should be removed: 2 and 3 were proactively evicted, 4 was matched
+        assert(get(20) === Seq.empty)
       }
     }
   }
@@ -1038,7 +1039,7 @@ class SymmetricHashJoinStateManagerEventTimeInValueSuite
   // V1 excluded: V1 converter does not persist matched flags (SPARK-26154)
   versionsInTest.filter(_ >= 2).foreach { ver =>
     test(s"StreamingJoinStateManager V$ver - " +
-        "getJoinedRowsAndRemoveMatched skips already-matched rows") {
+        "getJoinedRowsAndRemoveMatched evicts already-matched rows") {
       withJoinStateManager(
         inputValueAttributes, joinKeyExpressions, stateFormatVersion = ver) { manager =>
         implicit val mgr = manager
@@ -1054,9 +1055,10 @@ class SymmetricHashJoinStateManagerEventTimeInValueSuite
         ).toSeq
         assert(firstPass.size == 2)
 
-        // getJoinedRowsAndRemoveMatched always excludes already-matched rows.
-        // Only value 300 (unmatched) should be considered; it should match, be removed,
-        // and returned.
+        // getJoinedRowsAndRemoveMatched proactively evicts already-matched rows
+        // and removes+returns unmatched rows that satisfy the predicate.
+        // Value 300 (unmatched) matches the predicate, so it is removed and returned.
+        // Values 100 and 200 (already matched) are proactively evicted.
         val matched = manager.getJoinedRowsAndRemoveMatched(
           toJoinKeyRow(40),
           row => new JoinedRow(row, dummyRow),
@@ -1064,8 +1066,8 @@ class SymmetricHashJoinStateManagerEventTimeInValueSuite
         ).map(_.getInt(1)).toSeq
         assert(matched === Seq(300))
 
-        // Values 100 and 200 (already matched) should still be in state
-        assert(get(40).sorted === Seq(100, 200))
+        // All rows should be removed: 100 and 200 were proactively evicted, 300 was matched
+        assert(get(40) === Seq.empty)
       }
     }
   }

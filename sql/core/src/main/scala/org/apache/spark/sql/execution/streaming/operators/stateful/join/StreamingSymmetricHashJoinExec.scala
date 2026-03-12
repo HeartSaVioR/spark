@@ -670,8 +670,8 @@ case class StreamingSymmetricHashJoinExec(
     }
 
     private[this] var updatedStateRowsCount = 0
-    private[this] var _numRemovedFromOtherSideDuringJoin: Long = 0L
-    def numRemovedFromOtherSideDuringJoin: Long = _numRemovedFromOtherSideDuringJoin
+    private[this] var numRemovedFromOtherSideDuringJoinCount = 0
+    
     private[this] val allowMultipleStatefulOperators: Boolean =
       conf.getConf(SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE)
 
@@ -707,8 +707,6 @@ case class StreamingSymmetricHashJoinExec(
         case _ => (_: InternalRow) => Iterator.empty
       }
 
-      val excludeRowsAlreadyMatched = joinType == LeftSemi && joinSide == RightSide
-
       val generateOutputIter: (InternalRow, Iterator[JoinedRow]) => Iterator[InternalRow] =
         joinSide match {
           case LeftSide if joinType == LeftSemi =>
@@ -739,9 +737,6 @@ case class StreamingSymmetricHashJoinExec(
         if (preJoinFilter(thisRow)) {
           val key = keyGenerator(thisRow)
           val joinedRowIter: Iterator[JoinedRow] = if (removeMatchedFromOtherSideState) {
-            // For left semi join right-side processing: combine match and removal into a single
-            // pass. This avoids writing the matched flag first and then removing in a separate
-            // pass, reducing state store writes.
             otherSideJoiner.joinStateManager.getJoinedRowsAndRemoveMatched(
               key,
               thatRow => generateJoinedRow(thisRow, thatRow),
@@ -753,11 +748,9 @@ case class StreamingSymmetricHashJoinExec(
             otherSideJoiner.joinStateManager.getJoinedRows(
               key,
               thatRow => generateJoinedRow(thisRow, thatRow),
-              postJoinFilter,
-              excludeRowsAlreadyMatched)
+              postJoinFilter)
           }
           val outputIter = generateOutputIter(thisRow, joinedRowIter)
-
           new AddingProcessedRowToStateCompletionIterator(key, thisRow, outputIter)
         } else {
           generateFilteredJoinedRow(thisRow)
@@ -895,6 +888,8 @@ case class StreamingSymmetricHashJoinExec(
     }
 
     def numUpdatedStateRows: Long = updatedStateRowsCount
+
+    def numRemovedFromOtherSideDuringJoin: Long = numRemovedFromOtherSideDuringJoinCount
   }
 
   /**

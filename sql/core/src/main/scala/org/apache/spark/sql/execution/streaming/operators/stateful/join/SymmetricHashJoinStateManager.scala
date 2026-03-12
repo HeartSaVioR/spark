@@ -76,13 +76,20 @@ trait SymmetricHashJoinStateManager {
       excludeRowsAlreadyMatched: Boolean = false): Iterator[JoinedRow]
 
   /**
-   * Specialized version of join processing for left semi join optimization. Instead of marking
-   * rows as matched (write #1) and then removing them in a separate pass (write #2), this method
-   * combines both operations: it finds unmatched rows that satisfy the join predicate, removes
-   * them from state directly, and returns them as JoinedRows.
+   * Join processing optimized for left semi join: for each row matching the predicate, remove it
+   * from state and return it as a JoinedRow in a single pass. This avoids the two-step pattern of
+   * marking rows as matched (write #1) then removing them separately (write #2), reducing state
+   * store writes.
    *
-   * Rows already marked as matched are always excluded -- re-matching them would produce
-   * duplicate output and a redundant removal.
+   * Rows already marked as matched are proactively evicted from state. Under normal operation
+   * this should not happen, but it can occur if the join type was changed during query restart.
+   * We do not guarantee correct behavior for such changes; evicting these rows is safe and avoids
+   * wasting state storage.
+   *
+   * NOTE: There is a further optimization opportunity -- if a row does not pass the predicate
+   * (postJoinFilter), it may never match in future batches when expressions are deterministic.
+   * Eagerly removing such rows would reduce state size further, but requires careful handling of
+   * non-deterministic expressions (e.g., CURRENT_TIMESTAMP, RAND) and query changes.
    *
    * It is caller's responsibility to consume the whole iterator.
    */
@@ -431,7 +438,10 @@ class SymmetricHashJoinStateManagerV4(
             val vmp = valuesAndMatched(currentIndex)
 
             if (vmp.matched) {
-              toKeep += vmp
+              // Already-matched rows should not exist under normal operation; if they do
+              // (e.g., join type changed during restart), evict them proactively since
+              // keeping them serves no purpose.
+              hasRemovals = true
             } else {
               val joinedRow = generateJoinedRow(vmp.value)
               if (predicate(joinedRow)) {
@@ -946,6 +956,55 @@ abstract class SymmetricHashJoinStateManagerBase(
   }
 
   /**
+   * Find the first non-null value index starting from the end and going up to stopIndex.
+   * Used by swap-with-last compaction in both [[getJoinedRowsAndRemoveMatched]] and
+   * [[evictAndReturnByValueCondition]].
+   */
+  protected def getRightMostNonNullIndex(
+      key: UnsafeRow, stopIndex: Long, numValues: Long): Option[Long] = {
+    (numValues - 1 to stopIndex by -1).find { idx =>
+      keyWithIndexToValue.get(key, idx) != null
+    }
+  }
+
+  /**
+   * Remove the value at the given index using swap-with-last compaction: the last element is
+   * moved into the hole, trailing nulls are cleaned up, and the logical array is shortened.
+   *
+   * @return the updated numValues after removal
+   */
+  protected def removeValueAtIndex(key: UnsafeRow, index: Long, numValues: Long): Long = {
+    var currentNumValues = numValues
+    if (index != currentNumValues - 1) {
+      val valuePairAtMaxIndex = keyWithIndexToValue.get(key, currentNumValues - 1)
+      if (valuePairAtMaxIndex != null) {
+        keyWithIndexToValue.put(key, index, valuePairAtMaxIndex.value,
+          valuePairAtMaxIndex.matched)
+      } else {
+        val nonNullIndex = getRightMostNonNullIndex(key, index + 1, currentNumValues)
+          .getOrElse(index)
+        if (nonNullIndex != index) {
+          val valuePair = keyWithIndexToValue.get(key, nonNullIndex)
+          keyWithIndexToValue.put(key, index, valuePair.value, valuePair.matched)
+        }
+
+        if (nonNullIndex != currentNumValues - 1) {
+          logWarning(log"`keyWithIndexToValue` returns a null value for indices " +
+            log"with range from startIndex=${MDC(START_INDEX, nonNullIndex + 1)} " +
+            log"and endIndex=${MDC(END_INDEX, currentNumValues - 1)}.")
+        }
+
+        (currentNumValues - 1 to nonNullIndex + 1 by -1).foreach { removeIndex =>
+          keyWithIndexToValue.remove(key, removeIndex)
+          currentNumValues -= 1
+        }
+      }
+    }
+    keyWithIndexToValue.remove(key, currentNumValues - 1)
+    currentNumValues - 1
+  }
+
+  /**
    * Streaming implementation that processes one value at a time, using the same swap-with-last
    * compaction strategy as [[evictAndReturnByValueCondition]] to avoid materializing all values
    * into memory (a single key can have millions of values in v1-v3).
@@ -962,63 +1021,22 @@ abstract class SymmetricHashJoinStateManagerBase(
       private var index: Long = 0L
       private var valueRemoved: Boolean = false
 
-      private def updateNumValueForKey(): Unit = {
-        if (valueRemoved) {
-          if (numValues >= 1) {
-            keyToNumValues.put(key, numValues)
-          } else {
-            keyToNumValues.remove(key)
-          }
-        }
-      }
-
-      private def getRightMostNonNullIndex(stopIndex: Long): Option[Long] = {
-        (numValues - 1 to stopIndex by -1).find { idx =>
-          keyWithIndexToValue.get(key, idx) != null
-        }
-      }
-
-      private def removeCurrentIndexValue(): Unit = {
-        if (index != numValues - 1) {
-          val valuePairAtMaxIndex = keyWithIndexToValue.get(key, numValues - 1)
-          if (valuePairAtMaxIndex != null) {
-            keyWithIndexToValue.put(key, index, valuePairAtMaxIndex.value,
-              valuePairAtMaxIndex.matched)
-          } else {
-            val nonNullIndex = getRightMostNonNullIndex(index + 1).getOrElse(index)
-            if (nonNullIndex != index) {
-              val valuePair = keyWithIndexToValue.get(key, nonNullIndex)
-              keyWithIndexToValue.put(key, index, valuePair.value, valuePair.matched)
-            }
-
-            if (nonNullIndex != numValues - 1) {
-              logWarning(log"`keyWithIndexToValue` returns a null value for indices " +
-                log"with range from startIndex=${MDC(START_INDEX, nonNullIndex + 1)} " +
-                log"and endIndex=${MDC(END_INDEX, numValues - 1)}.")
-            }
-
-            (numValues - 1 to nonNullIndex + 1 by -1).foreach { removeIndex =>
-              keyWithIndexToValue.remove(key, removeIndex)
-              numValues -= 1
-            }
-          }
-        }
-        keyWithIndexToValue.remove(key, numValues - 1)
-        numValues -= 1
-        valueRemoved = true
-      }
-
       override def getNext(): JoinedRow = {
         while (index < numValues) {
           val valuePair = keyWithIndexToValue.get(key, index)
           if (valuePair == null && storeConf.skipNullsForStreamStreamJoins) {
             index += 1
           } else if (valuePair.matched) {
-            index += 1
+            // Already-matched rows should not exist under normal operation; if they do
+            // (e.g., join type changed during restart), evict them proactively since
+            // keeping them serves no purpose.
+            numValues = removeValueAtIndex(key, index, numValues)
+            valueRemoved = true
           } else {
             val joinedRow = generateJoinedRow(valuePair.value)
             if (predicate(joinedRow)) {
-              removeCurrentIndexValue()
+              numValues = removeValueAtIndex(key, index, numValues)
+              valueRemoved = true
               return joinedRow
             } else {
               index += 1
@@ -1026,7 +1044,13 @@ abstract class SymmetricHashJoinStateManagerBase(
           }
         }
 
-        updateNumValueForKey()
+        if (valueRemoved) {
+          if (numValues >= 1) {
+            keyToNumValues.put(key, numValues)
+          } else {
+            keyToNumValues.remove(key)
+          }
+        }
         finished = true
         null
       }
@@ -1281,16 +1305,6 @@ abstract class SymmetricHashJoinStateManagerBase(
         null
       }
 
-      /**
-       * Find the first non-null value index starting from end
-       * and going up-to stopIndex.
-       */
-      private def getRightMostNonNullIndex(stopIndex: Long): Option[Long] = {
-        (numValues - 1 to stopIndex by -1).find { idx =>
-          keyWithIndexToValue.get(currentKey, idx) != null
-        }
-      }
-
       override def getNext(): KeyToValuePair = {
         val currentValue = findNextValueForIndex()
 
@@ -1301,43 +1315,7 @@ abstract class SymmetricHashJoinStateManagerBase(
           return null
         }
 
-        // The backing store is arraylike - we as the caller are responsible for filling back in
-        // any hole. So we swap the last element into the hole and decrement numValues to shorten.
-        // clean
-        if (index != numValues - 1) {
-          val valuePairAtMaxIndex = keyWithIndexToValue.get(currentKey, numValues - 1)
-          if (valuePairAtMaxIndex != null) {
-            // Likely case where last element is non-null and we can simply swap with index.
-            keyWithIndexToValue.put(currentKey, index, valuePairAtMaxIndex.value,
-              valuePairAtMaxIndex.matched)
-          } else {
-            // Find the rightmost non null index and swap values with that index,
-            // if index returned is not the same as the passed one
-            val nonNullIndex = getRightMostNonNullIndex(index + 1).getOrElse(index)
-            if (nonNullIndex != index) {
-              val valuePair = keyWithIndexToValue.get(currentKey, nonNullIndex)
-              keyWithIndexToValue.put(currentKey, index, valuePair.value,
-                valuePair.matched)
-            }
-
-            // If nulls were found at the end, log a warning for the range of null indices.
-            if (nonNullIndex != numValues - 1) {
-              logWarning(log"`keyWithIndexToValue` returns a null value for indices " +
-                log"with range from startIndex=${MDC(START_INDEX, nonNullIndex + 1)} " +
-                log"and endIndex=${MDC(END_INDEX, numValues - 1)}.")
-            }
-
-            // Remove all null values from nonNullIndex + 1 onwards
-            // The nonNullIndex itself will be handled as removing the last entry,
-            // similar to finding the value as the last element
-            (numValues - 1 to nonNullIndex + 1 by -1).foreach { removeIndex =>
-              keyWithIndexToValue.remove(currentKey, removeIndex)
-              numValues -= 1
-            }
-          }
-        }
-        keyWithIndexToValue.remove(currentKey, numValues - 1)
-        numValues -= 1
+        numValues = removeValueAtIndex(currentKey, index, numValues)
         valueRemoved = true
 
         reusedRet.withNew(currentKey, currentValue.value, currentValue.matched)
