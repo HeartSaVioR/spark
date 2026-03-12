@@ -109,7 +109,6 @@ trait AlsoTestWithVirtualColumnFamilyJoins extends SQLTestUtils {
       super.afterEach()
     }
   }
-
 }
 
 abstract class StreamingJoinSuite
