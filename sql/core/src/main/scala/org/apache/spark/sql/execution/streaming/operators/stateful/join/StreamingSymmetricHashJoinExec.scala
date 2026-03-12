@@ -740,7 +740,7 @@ case class StreamingSymmetricHashJoinExec(
               key,
               thatRow => generateJoinedRow(thisRow, thatRow),
               postJoinFilter).map { row =>
-              _numRemovedFromOtherSideDuringJoin += 1
+              numRemovedFromOtherSideDuringJoinCount += 1
               row
             }
           } else {
