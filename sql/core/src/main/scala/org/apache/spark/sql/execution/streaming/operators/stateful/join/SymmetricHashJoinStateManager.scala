@@ -76,22 +76,28 @@ trait SymmetricHashJoinStateManager {
       excludeRowsAlreadyMatched: Boolean = false): Iterator[JoinedRow]
 
   /**
-   * Join processing optimized for left semi join: for each row matching the predicate, remove it
-   * from state and return it as a JoinedRow in a single pass. This avoids the two-step pattern of
-   * marking rows as matched (write #1) then removing them separately (write #2), reducing state
-   * store writes.
+   * Retrieve all joined rows for the given key and remove the matched rows from state. The joined
+   * rows are generated with the provided generateJoinedRow function and filtered with the provided
+   * predicate.
    *
-   * Rows already marked as matched are proactively evicted from state. Under normal operation
-   * this should not happen, but it can occur if the join type was changed during query restart.
-   * We do not guarantee correct behavior for such changes; evicting these rows is safe and avoids
-   * wasting state storage.
-   *
-   * NOTE: There is a further optimization opportunity -- if a row does not pass the predicate
-   * (postJoinFilter), it may never match in future batches when expressions are deterministic.
-   * Eagerly removing such rows would reduce state size further, but requires careful handling of
-   * non-deterministic expressions (e.g., CURRENT_TIMESTAMP, RAND) and query changes.
+   * The implementation of this method should consider the performance, for example, try making
+   * removal of the matched rows and retrieval of the joined rows happen in a single pass if
+   * possible; avoid using mark-and-sweep where mark requires write on the state store.
    *
    * It is caller's responsibility to consume the whole iterator.
+   *
+   * NOTE: For the rows which already have been marked as matched in the state, this method removes
+   * them from the state without returning them. Under normal operation, this should not happen and
+   * this should not be an issue, but it can occur if the join type was changed during query
+   * restart. We do not define an expected behavior for such changes, so we just optimize it rather
+   * than trying to provide some best-effort results.
+   *
+   * NOTE2: There is a further optimization opportunity -- if a row does not pass the predicate
+   * (postJoinFilter), it may never match in future batches as long as expressions are
+   * deterministic and also not changeable over batches (e.g. current batch timestamp). Eagerly
+   * removing such rows would reduce state size further, but we need to weigh the value of applying
+   * this optimization. This can be also impacted by the query changes during restart, as we
+   * mentioned in NOTE in above, we do not define expected behavior for such changes.
    */
   def getJoinedRowsAndRemoveMatched(
       key: UnsafeRow,
@@ -438,9 +444,7 @@ class SymmetricHashJoinStateManagerV4(
             val vmp = valuesAndMatched(currentIndex)
 
             if (vmp.matched) {
-              // Already-matched rows should not exist under normal operation; if they do
-              // (e.g., join type changed during restart), evict them proactively since
-              // keeping them serves no purpose.
+              // See the NOTE in the method doc about rationale.
               hasRemovals = true
             } else {
               val joinedRow = generateJoinedRow(vmp.value)
@@ -1027,9 +1031,7 @@ abstract class SymmetricHashJoinStateManagerBase(
           if (valuePair == null && storeConf.skipNullsForStreamStreamJoins) {
             index += 1
           } else if (valuePair.matched) {
-            // Already-matched rows should not exist under normal operation; if they do
-            // (e.g., join type changed during restart), evict them proactively since
-            // keeping them serves no purpose.
+            // See the NOTE in the method doc about rationale.
             numValues = removeValueAtIndex(key, index, numValues)
             valueRemoved = true
           } else {
