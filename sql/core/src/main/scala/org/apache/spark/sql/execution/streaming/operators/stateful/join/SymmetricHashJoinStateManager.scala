@@ -70,8 +70,7 @@ trait SymmetricHashJoinStateManager {
    *
    * For skipUpdatingMatchedFlag = true, the method will skip updating the matched flag for the
    * values being returned. This is useful for the non-outer side of stream-stream join where
-   * the matched flag is never checked during state eviction. Only honored by V4; V1-V3
-   * always update the matched flag regardless of this parameter.
+   * the matched flag is never checked during state eviction.
    *
    * It is caller's responsibility to consume the whole iterator.
    */
@@ -870,7 +869,8 @@ abstract class SymmetricHashJoinStateManagerBase(
    * @param excludeRowsAlreadyMatched Do not join with rows already matched previously.
    *                                  This is used for right side of left semi join in
    *                                  [[StreamingSymmetricHashJoinExec]] only.
-   * @param skipUpdatingMatchedFlag Ignored in V1-V3 (always updates matched flag).
+   * @param skipUpdatingMatchedFlag If true, do not update the matched flag even when the row
+   *                                matches.
    */
   def getJoinedRows(
       key: UnsafeRow,
@@ -884,7 +884,7 @@ abstract class SymmetricHashJoinStateManagerBase(
     }.map { keyIdxToValue =>
       val joinedRow = generateJoinedRow(keyIdxToValue.value)
       if (predicate(joinedRow)) {
-        if (!keyIdxToValue.matched) {
+        if (!skipUpdatingMatchedFlag && !keyIdxToValue.matched) {
           keyWithIndexToValue.put(key, keyIdxToValue.valueIndex, keyIdxToValue.value,
             matched = true)
         }
