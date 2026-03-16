@@ -700,6 +700,8 @@ case class StreamingSymmetricHashJoinExec(
       // For V4, skip updating the matched flag on the non-outer side to avoid unnecessary
       // state store writes. The matched flag is only needed on the outer side (for evicting
       // unmatched rows) and on the right side of left semi (for excludeRowsAlreadyMatched).
+      // For older versions, we do not apply the optimization as it is a behavioral change,
+      // although the optimization is valid for all versions.
       val needToUpdateMatchedOnOtherSide = joinType match {
         case Inner => false
         case LeftOuter => joinSide == RightSide
