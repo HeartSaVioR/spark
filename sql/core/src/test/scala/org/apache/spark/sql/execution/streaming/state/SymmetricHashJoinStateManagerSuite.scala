@@ -656,6 +656,7 @@ class SymmetricHashJoinStateManagerEventTimeInKeySuite
           val evicted = removeAndReturnByKey(25)
           val evictedPairs = evicted.map(p => (toValueInt(p.value), p.matched)).toSeq
           val matchedByValue = evictedPairs.toMap
+          // Without skipUpdatingMatchedFlag = true, the value would be true.
           assert(matchedByValue(2) === false)
           assert(matchedByValue(3) === false)
 
@@ -975,6 +976,7 @@ class SymmetricHashJoinStateManagerEventTimeInValueSuite
           val evicted = removeAndReturnByValue(125)
           val evictedPairs = evicted.map(p => (toValueInt(p.value), p.matched)).toSeq
           val matchedByValue = evictedPairs.toMap
+          // Without skipUpdatingMatchedFlag = true, the value would be true.
           assert(matchedByValue(100) === false)
 
           mgr.commit()
