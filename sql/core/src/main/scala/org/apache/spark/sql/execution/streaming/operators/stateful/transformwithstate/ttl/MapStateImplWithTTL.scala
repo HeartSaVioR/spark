@@ -49,10 +49,11 @@ class MapStateImplWithTTL[K, V](
     valEncoder: ExpressionEncoder[Any],
     ttlConfig: TTLConfig,
     batchTimestampMs: Long,
-metrics: Map[String, SQLMetric])
+    prevBatchTimestampMs: Option[Long] = None,
+    metrics: Map[String, SQLMetric])
   extends OneToOneTTLState(
     stateName, store, getCompositeKeySchema(keyExprEnc.schema, userKeyEnc.schema), ttlConfig,
-    batchTimestampMs, metrics) with MapState[K, V] with Logging {
+    batchTimestampMs, prevBatchTimestampMs, metrics) with MapState[K, V] with Logging {
 
   private val stateTypesEncoder = new CompositeKeyStateEncoder(
     keyExprEnc, userKeyEnc, valEncoder, stateName, hasTtl = true)

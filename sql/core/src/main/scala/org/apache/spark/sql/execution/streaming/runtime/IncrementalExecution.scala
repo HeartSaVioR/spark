@@ -384,6 +384,7 @@ class IncrementalExecution(
         t.copy(
           stateInfo = Some(nextStatefulOperationStateInfo()),
           batchTimestampMs = Some(offsetSeqMetadata.batchTimestampMs),
+          prevBatchTimestampMs = prevOffsetSeqMetadata.map(_.batchTimestampMs),
           eventTimeWatermarkForLateEvents = None,
           eventTimeWatermarkForEviction = None,
           hasInitialState = hasInitialState
@@ -394,6 +395,7 @@ class IncrementalExecution(
         t.copy(
           stateInfo = Some(nextStatefulOperationStateInfo()),
           batchTimestampMs = Some(offsetSeqMetadata.batchTimestampMs),
+          prevBatchTimestampMs = prevOffsetSeqMetadata.map(_.batchTimestampMs),
           eventTimeWatermarkForLateEvents = None,
           eventTimeWatermarkForEviction = None,
           hasInitialState = hasInitialState
@@ -534,7 +536,7 @@ class IncrementalExecution(
           stateWatermarkPredicates =
             StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
               j.left.output, j.right.output, j.leftKeys, j.rightKeys, j.condition.full,
-              iwEviction, !allowMultipleStatefulOperators)
+              iwEviction, !allowMultipleStatefulOperators, iwLateEvents)
         )
     }
   }

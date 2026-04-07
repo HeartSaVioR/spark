@@ -43,9 +43,11 @@ class ValueStateImplWithTTL[S](
     valEncoder: ExpressionEncoder[Any],
     ttlConfig: TTLConfig,
     batchTimestampMs: Long,
+    prevBatchTimestampMs: Option[Long] = None,
     metrics: Map[String, SQLMetric] = Map.empty)
   extends OneToOneTTLState(
-    stateName, store, keyExprEnc.schema, ttlConfig, batchTimestampMs, metrics) with ValueState[S] {
+    stateName, store, keyExprEnc.schema, ttlConfig, batchTimestampMs,
+    prevBatchTimestampMs, metrics) with ValueState[S] {
 
   private val stateTypesEncoder =
     StateTypesEncoder(keyExprEnc, valEncoder, stateName, hasTtl = true)

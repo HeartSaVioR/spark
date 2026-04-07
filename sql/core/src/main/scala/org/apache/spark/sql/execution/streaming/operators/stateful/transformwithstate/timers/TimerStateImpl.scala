@@ -195,9 +195,26 @@ class TimerStateImpl(
    *                          will return all timers that have timestamp less than passed threshold.
    * @return - iterator of all the registered timers for all grouping keys
    */
-  def getExpiredTimers(expiryTimestampMs: Long): Iterator[(Any, Long)] = {
-    // this iter is increasingly sorted on timestamp
-    val iter = store.iterator(tsToKeyCFName)
+  def getExpiredTimers(
+      expiryTimestampMs: Long,
+      prevExpiryTimestampMs: Option[Long] = None): Iterator[(Any, Long)] = {
+    val startKey = prevExpiryTimestampMs.flatMap { prevTs =>
+      if (prevTs < Long.MaxValue) {
+        val row = new GenericInternalRow(keySchemaForSecIndex.length)
+        row.setLong(0, prevTs + 1)
+        Some(UnsafeProjection.create(keySchemaForSecIndex).apply(row))
+      } else {
+        None
+      }
+    }
+    val endKey = if (expiryTimestampMs < Long.MaxValue) {
+      val row = new GenericInternalRow(keySchemaForSecIndex.length)
+      row.setLong(0, expiryTimestampMs + 1)
+      Some(UnsafeProjection.create(keySchemaForSecIndex).apply(row))
+    } else {
+      None
+    }
+    val iter = store.rangeScan(startKey, endKey, tsToKeyCFName)
 
     new NextIterator[(Any, Long)] {
       override protected def getNext(): (Any, Long) = {
