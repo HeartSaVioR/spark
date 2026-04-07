@@ -49,7 +49,7 @@ object StreamingSymmetricHashJoinHelper extends Logging {
   case class JoinStateKeyWatermarkPredicate(
       expr: Expression,
       stateWatermark: Long,
-      prevBatchStateWatermark: Option[Long] = None)
+      prevStateWatermark: Option[Long] = None)
     extends JoinStateWatermarkPredicate {
     def desc: String = "key predicate"
   }
@@ -57,7 +57,7 @@ object StreamingSymmetricHashJoinHelper extends Logging {
   case class JoinStateValueWatermarkPredicate(
       expr: Expression,
       stateWatermark: Long,
-      prevBatchStateWatermark: Option[Long] = None)
+      prevStateWatermark: Option[Long] = None)
     extends JoinStateWatermarkPredicate {
     def desc: String = "value predicate"
   }
@@ -220,6 +220,8 @@ object StreamingSymmetricHashJoinHelper extends Logging {
           oneSideJoinKeys(joinKeyOrdinalForWatermark.get).nullable)
         val expr = watermarkExpression(Some(keyExprWithWatermark), eventTimeWatermarkForEviction)
         expr.map { e =>
+          // watermarkExpression only provides the expression when eventTimeWatermarkForEviction
+          // is defined
           JoinStateKeyWatermarkPredicate(
             e,
             eventTimeWatermarkForEviction.get,
@@ -241,6 +243,8 @@ object StreamingSymmetricHashJoinHelper extends Logging {
         val inputAttributeWithWatermark = oneSideInputAttributes.find(_.metadata.contains(delayKey))
         val expr = watermarkExpression(inputAttributeWithWatermark, stateValueWatermark)
         expr.map { e =>
+          // watermarkExpression only provides the expression when eventTimeWatermarkForEviction
+          // is defined
           JoinStateValueWatermarkPredicate(e, stateValueWatermark.get, prevStateValueWatermark)
         }
       } else {

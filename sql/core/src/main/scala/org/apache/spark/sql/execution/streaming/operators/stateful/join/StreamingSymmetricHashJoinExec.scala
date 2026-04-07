@@ -893,7 +893,7 @@ case class StreamingSymmetricHashJoinExec(
      */
     def removeOldState(): Long = {
       stateWatermarkPredicate match {
-        case Some(JoinStateKeyWatermarkPredicate(_, stateWatermark, prevWatermark)) =>
+        case Some(JoinStateKeyWatermarkPredicate(_, stateWatermark, prevStateWatermark)) =>
           joinStateManager match {
             case s: SupportsEvictByCondition =>
               s.evictByKeyCondition(stateKeyWatermarkPredicateFunc)
@@ -901,9 +901,9 @@ case class StreamingSymmetricHashJoinExec(
             case s: SupportsEvictByTimestamp =>
               s.evictByTimestamp(
                 watermarkMsToStateTimestamp(stateWatermark),
-                prevWatermark.map(watermarkMsToStateTimestamp))
+                prevStateWatermark.map(watermarkMsToStateTimestamp))
           }
-        case Some(JoinStateValueWatermarkPredicate(_, stateWatermark, prevWatermark)) =>
+        case Some(JoinStateValueWatermarkPredicate(_, stateWatermark, prevStateWatermark)) =>
           joinStateManager match {
             case s: SupportsEvictByCondition =>
               s.evictByValueCondition(stateValueWatermarkPredicateFunc)
@@ -911,7 +911,7 @@ case class StreamingSymmetricHashJoinExec(
             case s: SupportsEvictByTimestamp =>
               s.evictByTimestamp(
                 watermarkMsToStateTimestamp(stateWatermark),
-                prevWatermark.map(watermarkMsToStateTimestamp))
+                prevStateWatermark.map(watermarkMsToStateTimestamp))
           }
         case _ => 0L
       }
@@ -929,7 +929,7 @@ case class StreamingSymmetricHashJoinExec(
      */
     def removeAndReturnOldState(): Iterator[KeyToValuePair] = {
       stateWatermarkPredicate match {
-        case Some(JoinStateKeyWatermarkPredicate(_, stateWatermark, prevWatermark)) =>
+        case Some(JoinStateKeyWatermarkPredicate(_, stateWatermark, prevStateWatermark)) =>
           joinStateManager match {
             case s: SupportsEvictByCondition =>
               s.evictAndReturnByKeyCondition(stateKeyWatermarkPredicateFunc)
@@ -937,9 +937,9 @@ case class StreamingSymmetricHashJoinExec(
             case s: SupportsEvictByTimestamp =>
               s.evictAndReturnByTimestamp(
                 watermarkMsToStateTimestamp(stateWatermark),
-                prevWatermark.map(watermarkMsToStateTimestamp))
+                prevStateWatermark.map(watermarkMsToStateTimestamp))
           }
-        case Some(JoinStateValueWatermarkPredicate(_, stateWatermark, prevWatermark)) =>
+        case Some(JoinStateValueWatermarkPredicate(_, stateWatermark, prevStateWatermark)) =>
           joinStateManager match {
             case s: SupportsEvictByCondition =>
               s.evictAndReturnByValueCondition(stateValueWatermarkPredicateFunc)
@@ -947,7 +947,7 @@ case class StreamingSymmetricHashJoinExec(
             case s: SupportsEvictByTimestamp =>
               s.evictAndReturnByTimestamp(
                 watermarkMsToStateTimestamp(stateWatermark),
-                prevWatermark.map(watermarkMsToStateTimestamp))
+                prevStateWatermark.map(watermarkMsToStateTimestamp))
           }
         case _ => Iterator.empty
       }

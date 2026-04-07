@@ -1105,6 +1105,96 @@ class SymmetricHashJoinStateManagerEventTimeInValueSuite
     }
   }
 
+  test("StreamingJoinStateManager V4 - getValuesInRange boundary edge cases") {
+    withJoinStateManager(
+      inputValueAttributes, joinKeyExpressions, stateFormatVersion = 4) { manager =>
+      implicit val mgr = manager
+
+      Seq(10, 20, 30, 40, 50).foreach(append(40, _))
+
+      // Exact boundary matches (both inclusive)
+      assert(getJoinedRowTimestamps(40, Some((10L, 10L))) === Seq(10))
+      assert(getJoinedRowTimestamps(40, Some((50L, 50L))) === Seq(50))
+
+      // Range with Long.MinValue / Long.MaxValue
+      assert(getJoinedRowTimestamps(40, Some((Long.MinValue, 30L))) === Seq(10, 20, 30))
+      assert(getJoinedRowTimestamps(40, Some((30L, Long.MaxValue))) === Seq(30, 40, 50))
+      assert(getJoinedRowTimestamps(40, Some((Long.MinValue, Long.MaxValue))) ===
+        Seq(10, 20, 30, 40, 50))
+
+      // Empty range (minTs > maxTs)
+      assert(getJoinedRowTimestamps(40, Some((50L, 10L))) === Seq.empty)
+
+      // Range entirely outside stored timestamps
+      assert(getJoinedRowTimestamps(40, Some((100L, 200L))) === Seq.empty)
+      assert(getJoinedRowTimestamps(40, Some((1L, 5L))) === Seq.empty)
+
+      // Full range via None (all entries)
+      assert(getJoinedRowTimestamps(40, None) === Seq(10, 20, 30, 40, 50))
+    }
+  }
+
+  test("StreamingJoinStateManager V4 - evictByTimestamp with startTimestamp boundary cases") {
+    withJoinStateManager(
+      inputValueAttributes, joinKeyExpressions, stateFormatVersion = 4) { manager =>
+      implicit val mgr = manager
+
+      Seq(10, 20, 30, 40, 50).foreach(append(40, _))
+
+      // startTimestamp is exclusive: evict entries where timestamp > 20 AND <= 40
+      val evictByTs = manager.asInstanceOf[SupportsEvictByTimestamp]
+      val removed = evictByTs.evictByTimestamp(40, Some(20))
+      assert(removed === 2) // timestamps 30 and 40
+      assert(get(40) === Seq(10, 20, 50))
+    }
+  }
+
+  test("StreamingJoinStateManager V4 - evictAndReturnByTimestamp with startTimestamp") {
+    withJoinStateManager(
+      inputValueAttributes, joinKeyExpressions, stateFormatVersion = 4) { manager =>
+      implicit val mgr = manager
+
+      Seq(10, 20, 30, 40, 50).foreach(append(40, _))
+
+      val evictByTs = manager.asInstanceOf[SupportsEvictByTimestamp]
+      val evictedValues = evictByTs.evictAndReturnByTimestamp(30, Some(10))
+        .map(p => toValueInt(p.value)).toSeq.sorted
+      // startTimestamp=10 is exclusive, endTimestamp=30 is inclusive: timestamps 20 and 30
+      assert(evictedValues === Seq(20, 30))
+      assert(get(40) === Seq(10, 40, 50))
+    }
+  }
+
+  test("StreamingJoinStateManager V4 - evictByTimestamp boundary: start equals end") {
+    withJoinStateManager(
+      inputValueAttributes, joinKeyExpressions, stateFormatVersion = 4) { manager =>
+      implicit val mgr = manager
+
+      Seq(10, 20, 30).foreach(append(40, _))
+
+      // startTimestamp=20 (exclusive) and endTimestamp=20 (inclusive): range is empty
+      val evictByTs = manager.asInstanceOf[SupportsEvictByTimestamp]
+      val removed = evictByTs.evictByTimestamp(20, Some(20))
+      assert(removed === 0)
+      assert(get(40) === Seq(10, 20, 30))
+    }
+  }
+
+  test("StreamingJoinStateManager V4 - evictByTimestamp boundary: start just below entry") {
+    withJoinStateManager(
+      inputValueAttributes, joinKeyExpressions, stateFormatVersion = 4) { manager =>
+      implicit val mgr = manager
+
+      Seq(10, 20, 30).foreach(append(40, _))
+
+      // startTimestamp=19 (exclusive) means entries >= 20 are scanned; endTimestamp=20 inclusive
+      val evictByTs = manager.asInstanceOf[SupportsEvictByTimestamp]
+      val removed = evictByTs.evictByTimestamp(20, Some(19))
+      assert(removed === 1) // only timestamp 20
+      assert(get(40) === Seq(10, 30))
+    }
+  }
+
   // V1 excluded: V1 converter does not persist matched flags (SPARK-26154)
   versionsInTest.filter(_ >= 2).foreach { ver =>
     test(s"StreamingJoinStateManager V$ver - skipUpdatingMatchedFlag skips matched flag update") {
