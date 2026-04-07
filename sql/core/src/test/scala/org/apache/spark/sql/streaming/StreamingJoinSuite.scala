@@ -352,8 +352,7 @@ abstract class StreamingInnerJoinBase extends StreamingJoinSuite {
     )
   }
 
-  // Update mode is equivalent to Append mode for stream-stream non-outer joins per the
-  // definition: "if the query does not contain aggregation, it is equivalent to Append mode."
+  // Stream-stream non-outer join produces the same behavior between Append mode and Update mode.
   // We only run a sanity test here rather than replicating the full Append mode test suite.
   test("stream stream inner join with Update mode on non-time column") {
     val input1 = MemoryStream[Int]
@@ -2237,8 +2236,7 @@ abstract class StreamingLeftSemiJoinBase extends StreamingJoinSuite {
 
   import testImplicits._
 
-  // Update mode is equivalent to Append mode for stream-stream non-outer joins per the
-  // definition: "if the query does not contain aggregation, it is equivalent to Append mode."
+  // Stream-stream non-outer join produces the same behavior between Append mode and Update mode.
   // We only run a sanity test here rather than replicating the full Append mode test suite.
   test("windowed left semi join with Update mode") {
     withTempDir { checkpointDir =>

@@ -442,17 +442,18 @@ object UnsupportedOperationChecker extends Logging {
 
         case j @ Join(left, right, joinType, condition, _) =>
           if (left.isStreaming && right.isStreaming) {
-            if (outputMode == InternalOutputModes.Complete) {
-              throwError("Join between two streaming DataFrames/Datasets is not supported" +
-                s" in ${outputMode} output mode, only in Append output mode")
-            }
-            if (outputMode == InternalOutputModes.Update) {
-              joinType match {
-                case LeftOuter | RightOuter | FullOuter =>
+            joinType match {
+              case LeftOuter | RightOuter | FullOuter =>
+                if (outputMode != InternalOutputModes.Append) {
                   throwError(s"$joinType join between two streaming DataFrames/Datasets" +
                     s" is not supported in ${outputMode} output mode, only in Append output mode")
-                case _ =>
-              }
+                }
+              case _ =>
+                if (outputMode != InternalOutputModes.Append &&
+                    outputMode != InternalOutputModes.Update) {
+                  throwError(s"Join between two streaming DataFrames/Datasets is not supported" +
+                    s" in ${outputMode} output mode, only in Append and Update output modes")
+                }
             }
           }
 
