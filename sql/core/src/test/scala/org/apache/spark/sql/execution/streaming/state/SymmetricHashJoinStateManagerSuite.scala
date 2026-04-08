@@ -1134,64 +1134,35 @@ class SymmetricHashJoinStateManagerEventTimeInValueSuite
     }
   }
 
-  test("StreamingJoinStateManager V4 - evictByTimestamp with startTimestamp boundary cases") {
+  test("StreamingJoinStateManager V4 - evictByTimestamp boundary edge cases") {
     withJoinStateManager(
       inputValueAttributes, joinKeyExpressions, stateFormatVersion = 4) { manager =>
       implicit val mgr = manager
-
-      Seq(10, 20, 30, 40, 50).foreach(append(40, _))
-
-      // startTimestamp is exclusive: evict entries where timestamp > 20 AND <= 40
       val evictByTs = manager.asInstanceOf[SupportsEvictByTimestamp]
-      val removed = evictByTs.evictByTimestamp(40, Some(20))
-      assert(removed === 2) // timestamps 30 and 40
+
+      // --- Range eviction with startTimestamp (exclusive) and endTimestamp (inclusive) ---
+      Seq(10, 20, 30, 40, 50).foreach(append(40, _))
+      // startTimestamp=20 is exclusive, endTimestamp=40 is inclusive: evicts timestamps 30, 40
+      assert(evictByTs.evictByTimestamp(40, Some(20)) === 2)
       assert(get(40) === Seq(10, 20, 50))
-    }
-  }
 
-  test("StreamingJoinStateManager V4 - evictAndReturnByTimestamp with startTimestamp") {
-    withJoinStateManager(
-      inputValueAttributes, joinKeyExpressions, stateFormatVersion = 4) { manager =>
-      implicit val mgr = manager
-
-      Seq(10, 20, 30, 40, 50).foreach(append(40, _))
-
-      val evictByTs = manager.asInstanceOf[SupportsEvictByTimestamp]
+      // --- evictAndReturnByTimestamp returns evicted values ---
+      Seq(30, 40).foreach(append(40, _)) // restore evicted entries
       val evictedValues = evictByTs.evictAndReturnByTimestamp(30, Some(10))
         .map(p => toValueInt(p.value)).toSeq.sorted
       // startTimestamp=10 is exclusive, endTimestamp=30 is inclusive: timestamps 20 and 30
       assert(evictedValues === Seq(20, 30))
       assert(get(40) === Seq(10, 40, 50))
-    }
-  }
 
-  test("StreamingJoinStateManager V4 - evictByTimestamp boundary: start equals end") {
-    withJoinStateManager(
-      inputValueAttributes, joinKeyExpressions, stateFormatVersion = 4) { manager =>
-      implicit val mgr = manager
+      // --- start equals end: empty range (exclusive start = inclusive end) ---
+      // startTimestamp=40 (exclusive) and endTimestamp=40 (inclusive): range is empty
+      assert(evictByTs.evictByTimestamp(40, Some(40)) === 0)
+      assert(get(40) === Seq(10, 40, 50))
 
-      Seq(10, 20, 30).foreach(append(40, _))
-
-      // startTimestamp=20 (exclusive) and endTimestamp=20 (inclusive): range is empty
-      val evictByTs = manager.asInstanceOf[SupportsEvictByTimestamp]
-      val removed = evictByTs.evictByTimestamp(20, Some(20))
-      assert(removed === 0)
-      assert(get(40) === Seq(10, 20, 30))
-    }
-  }
-
-  test("StreamingJoinStateManager V4 - evictByTimestamp boundary: start just below entry") {
-    withJoinStateManager(
-      inputValueAttributes, joinKeyExpressions, stateFormatVersion = 4) { manager =>
-      implicit val mgr = manager
-
-      Seq(10, 20, 30).foreach(append(40, _))
-
-      // startTimestamp=19 (exclusive) means entries >= 20 are scanned; endTimestamp=20 inclusive
-      val evictByTs = manager.asInstanceOf[SupportsEvictByTimestamp]
-      val removed = evictByTs.evictByTimestamp(20, Some(19))
-      assert(removed === 1) // only timestamp 20
-      assert(get(40) === Seq(10, 30))
+      // --- start just below entry: evicts exactly that entry ---
+      // startTimestamp=39 (exclusive) means entries >= 40 are scanned; endTimestamp=40 inclusive
+      assert(evictByTs.evictByTimestamp(40, Some(39)) === 1)
+      assert(get(40) === Seq(10, 50))
     }
   }
 

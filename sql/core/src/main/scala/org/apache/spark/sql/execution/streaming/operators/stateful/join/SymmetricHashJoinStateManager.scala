@@ -671,8 +671,8 @@ class SymmetricHashJoinStateManagerV4(
     def getValuesInRange(
         key: UnsafeRow, minTs: Long, maxTs: Long): Iterator[GetValuesResult] = {
       val reusableGetValuesResult = new GetValuesResult()
-      // Only use rangeScan when we have a bounded endKey (maxTs < Long.MaxValue);
-      // without an upper bound the scan could read beyond this key's entries.
+      // Only use rangeScan when maxTs < Long.MaxValue, since rangeScan requires
+      // an exclusive end key (maxTs + 1) which would overflow at Long.MaxValue.
       val useRangeScan = maxTs < Long.MaxValue
 
       new NextIterator[GetValuesResult] {
@@ -785,6 +785,8 @@ class SymmetricHashJoinStateManagerV4(
       isInternal = true
     )
 
+    // Returns an UnsafeRow backed by a reused projection buffer. Callers that need to
+    // hold the row beyond the immediate state store call must invoke copy() on the result.
     private def createKeyRow(key: UnsafeRow, timestamp: Long): UnsafeRow = {
       TimestampKeyStateEncoder.attachTimestamp(
         attachTimestampProjection, keySchemaWithTimestamp, key, timestamp)
@@ -851,6 +853,9 @@ class SymmetricHashJoinStateManagerV4(
         else None
       }
       // endTimestamp is inclusive, so we use endTimestamp + 1 as the exclusive upper bound.
+      // When endTimestamp == Long.MaxValue we cannot add 1, so endKeyRow is None. This is
+      // safe because rangeScanWithMultiValues with no end key uses the column-family prefix
+      // as the upper bound, naturally scoping the scan within this column family.
       val endKeyRow = if (endTimestamp < Long.MaxValue) {
         Some(createScanBoundaryRow(endTimestamp + 1))
       } else {
