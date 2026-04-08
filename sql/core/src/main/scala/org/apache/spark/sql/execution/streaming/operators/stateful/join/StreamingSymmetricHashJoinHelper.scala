@@ -191,8 +191,8 @@ object StreamingSymmetricHashJoinHelper extends Logging {
       rightKeys: Seq[Expression],
       condition: Option[Expression],
       eventTimeWatermarkForEviction: Option[Long],
-      useFirstEventTimeColumn: Boolean,
-      eventTimeWatermarkForLateEvents: Option[Long] = None): JoinStateWatermarkPredicates = {
+      eventTimeWatermarkForLateEvents: Option[Long],
+      useFirstEventTimeColumn: Boolean): JoinStateWatermarkPredicates = {
 
     // Perform assertions against multiple event time columns in the same DataFrame. This method
     // assumes there is only one event time column per each side (left / right) and it is not very
