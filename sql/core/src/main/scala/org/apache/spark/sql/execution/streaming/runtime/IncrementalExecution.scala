@@ -536,7 +536,7 @@ class IncrementalExecution(
           stateWatermarkPredicates =
             StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
               j.left.output, j.right.output, j.leftKeys, j.rightKeys, j.condition.full,
-              iwEviction, !allowMultipleStatefulOperators, iwLateEvents)
+              iwEviction, !allowMultipleStatefulOperators)
         )
     }
   }

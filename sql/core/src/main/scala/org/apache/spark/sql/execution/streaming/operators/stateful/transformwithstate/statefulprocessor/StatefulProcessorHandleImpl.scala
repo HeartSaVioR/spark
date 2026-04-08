@@ -172,8 +172,12 @@ class StatefulProcessorHandleImpl(
 
   /**
    * Function to retrieve all expired registered timers for all grouping keys
-   * @param expiryTimestampMs Threshold for expired timestamp in milliseconds, this function
-   *                          will return all timers that have timestamp less than passed threshold
+   * @param expiryTimestampMs Threshold for expired timestamp in milliseconds (inclusive),
+   *                          this function will return all timers that have timestamp
+   *                          less than or equal to the passed threshold.
+   * @param prevExpiryTimestampMs If provided, the lower bound (exclusive) of the scan range.
+   *                              Timers at or below this timestamp are assumed to have been
+   *                              already processed in the previous batch and will be skipped.
    * @return - iterator of registered timers for all grouping keys
    */
   def getExpiredTimers(

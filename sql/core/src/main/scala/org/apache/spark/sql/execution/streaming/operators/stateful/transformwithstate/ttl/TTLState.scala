@@ -110,6 +110,8 @@ trait TTLState {
 
   private final val TTL_ENCODER = new TTLEncoder(elementKeySchema)
 
+  private final val ELEMENT_KEY_PROJECTION = UnsafeProjection.create(elementKeySchema)
+
   // Empty row used for values
   private final val TTL_EMPTY_VALUE_ROW =
     UnsafeProjection.create(Array[DataType](NullType)).apply(InternalRow.apply(null))
@@ -166,7 +168,7 @@ trait TTLState {
   //
   // The schema of the UnsafeRow returned by this iterator is (expirationMs, elementKey).
   private[sql] def ttlEvictionIterator(): Iterator[UnsafeRow] = {
-    val dummyElementKey = UnsafeProjection.create(elementKeySchema)
+    val dummyElementKey = ELEMENT_KEY_PROJECTION
       .apply(new GenericInternalRow(elementKeySchema.length))
     val startKey = prevBatchTimestampMs.flatMap { prevTs =>
       if (prevTs < Long.MaxValue) {
@@ -182,6 +184,8 @@ trait TTLState {
     }
     val ttlIterator = store.rangeScan(startKey, endKey, TTL_INDEX)
 
+    // Recall that the format is (expirationMs, elementKey) -> TTL_EMPTY_VALUE_ROW, so
+    // kv.value doesn't ever need to be used.
     // Safety filter: keep only truly expired entries
     ttlIterator.takeWhile { kv =>
       val expirationMs = kv.key.getLong(0)
