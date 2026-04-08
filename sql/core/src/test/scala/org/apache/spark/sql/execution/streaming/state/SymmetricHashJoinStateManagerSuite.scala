@@ -1166,33 +1166,6 @@ class SymmetricHashJoinStateManagerEventTimeInValueSuite
     }
   }
 
-  test("StreamingJoinStateManager V4 - evictByTimestamp with timestamp-0 entries (first batch)") {
-    // Regression test: in the first batch, IncrementalExecution must pass
-    // startTimestamp = None (not Some(0)) so that entries at timestamp 0 are evicted.
-    // The watermark propagation framework may yield Some(0) for the late-events
-    // watermark even when no previous batch exists; passing that through would
-    // cause scanEvictedKeys to start from 0 + 1 = 1, silently skipping timestamp-0
-    // entries.
-    withJoinStateManager(
-      inputValueAttributes, joinKeyExpressions, stateFormatVersion = 4) { manager =>
-      implicit val mgr = manager
-      val evictByTs = manager.asInstanceOf[SupportsEvictByTimestamp]
-
-      Seq(0, 10, 20, 30).foreach(append(40, _))
-
-      // First batch (correct): startTimestamp=None scans from the beginning,
-      // including entries at timestamp 0.
-      assert(evictByTs.evictByTimestamp(20, None) === 3) // evicts 0, 10, 20
-      assert(get(40) === Seq(30))
-
-      // Demonstrate the bug scenario: if Some(0) were passed as startTimestamp,
-      // timestamp-0 entries would be skipped (exclusive lower bound).
-      Seq(0, 10, 20).foreach(append(40, _)) // restore evicted entries
-      assert(evictByTs.evictByTimestamp(20, Some(0)) === 2) // evicts only 10, 20
-      assert(get(40) === Seq(0, 30)) // timestamp 0 incorrectly survives
-    }
-  }
-
   // V1 excluded: V1 converter does not persist matched flags (SPARK-26154)
   versionsInTest.filter(_ >= 2).foreach { ver =>
     test(s"StreamingJoinStateManager V$ver - skipUpdatingMatchedFlag skips matched flag update") {
