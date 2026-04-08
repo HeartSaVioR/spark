@@ -261,7 +261,13 @@ case class TransformWithStateExec(
       case EventTime =>
         assert(eventTimeWatermarkForEviction.isDefined)
         val watermark = eventTimeWatermarkForEviction.get
-        processorHandle.getExpiredTimers(watermark, eventTimeWatermarkForLateEvents)
+        // Only use the late-events watermark as the scan lower bound when a previous batch
+        // actually existed (prevBatchTimestampMs is set).  In the very first batch the
+        // watermark propagation yields Some(0) for late events even though no timers have
+        // been processed yet, which would incorrectly skip timers registered at timestamp 0.
+        val prevWatermark =
+          if (prevBatchTimestampMs.isDefined) eventTimeWatermarkForLateEvents else None
+        processorHandle.getExpiredTimers(watermark, prevWatermark)
           .flatMap { case (keyObj, expiryTimestampMs) =>
             numExpiredTimers += 1
             handleTimerRows(keyObj, expiryTimestampMs, processorHandle)
