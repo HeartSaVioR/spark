@@ -60,6 +60,38 @@ class StreamingQueryManagerSuite extends StreamTest {
     }
   }
 
+  test("streaming EXCEPT compatibility is restored before unsupported-operation checks") {
+    withTempDir { checkpointDir =>
+      val input = MemoryStream[Int]
+      val result = input.toDS().except(Seq(100).toDS())
+      val checkpointLocation = checkpointDir.getCanonicalPath
+
+      def startQuery(): StreamingQuery = result.writeStream
+        .outputMode("update")
+        .foreachBatch { (batch: Dataset[Int], _: Long) =>
+          batch.collect()
+          ()
+        }
+        .option("checkpointLocation", checkpointLocation)
+        .start()
+
+      withSQLConf(SQLConf.ALLOW_EXCEPT_ON_STREAMING_DATAFRAME.key -> "true") {
+        val query = startQuery()
+        try {
+          input.addData(1)
+          query.processAllAvailable()
+        } finally {
+          query.stop()
+        }
+      }
+
+      withSQLConf(SQLConf.ALLOW_EXCEPT_ON_STREAMING_DATAFRAME.key -> "false") {
+        val query = startQuery()
+        query.stop()
+      }
+    }
+  }
+
   testQuietly("listing") {
     val (m1, ds1) = makeDataset
     val (m2, ds2) = makeDataset
