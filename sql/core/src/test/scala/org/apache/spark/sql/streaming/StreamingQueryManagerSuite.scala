@@ -87,7 +87,12 @@ class StreamingQueryManagerSuite extends StreamTest {
 
       withSQLConf(SQLConf.ALLOW_EXCEPT_ON_STREAMING_DATAFRAME.key -> "false") {
         val query = startQuery()
-        query.stop()
+        try {
+          input.addData(2)
+          query.processAllAvailable()
+        } finally {
+          query.stop()
+        }
       }
     }
   }

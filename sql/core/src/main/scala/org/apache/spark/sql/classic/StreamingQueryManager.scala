@@ -287,14 +287,16 @@ class StreamingQueryManager private[sql] (
     // Unsupported-operation checks run during this initial analysis, before the normal offset-log
     // configuration restoration. Read the compatibility value early for existing queries that
     // contain a streaming EXCEPT so that upgrading does not change whether the query is accepted.
+    def hasExceptWithStreamingLeft: Boolean = analyzedPlan.exists {
+      case Except(left, _, _) if left.isStreaming => true
+      case _ => false
+    }
+
     val streamWriteAnalysisSession = trigger match {
       case _: ContinuousTrigger => sparkSession
       case _ if recoverFromCheckpointLocation &&
           (!useTempCheckpointLocation || userSpecifiedCheckpointLocation.isDefined) &&
-          analyzedPlan.exists {
-          case Except(left, _, _) if left.isStreaming => true
-          case _ => false
-        } =>
+          hasExceptWithStreamingLeft =>
         val (resolvedCheckpointRoot, _) =
           ResolveWriteToStream.resolveCheckpointLocation(dataStreamWritePlan)
         val checkpointMetadata = new StreamingQueryCheckpointMetadata(

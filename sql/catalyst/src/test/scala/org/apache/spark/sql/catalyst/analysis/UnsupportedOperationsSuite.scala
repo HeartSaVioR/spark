@@ -782,11 +782,12 @@ class UnsupportedOperationsSuite extends SparkFunSuite with SQLHelper {
     streamBatchSupported = false,
     batchStreamSupported = false)
 
-  assertNotSupportedInStreamingPlan(
-    "except all with stream-batch relations",
-    streamRelation.except(batchRelation, isAll = true),
-    Append,
-    Seq("except"))
+  testBinaryOperationInStreamingPlan(
+    "except all",
+    _.except(_, isAll = true),
+    streamStreamSupported = false,
+    streamBatchSupported = false,
+    batchStreamSupported = false)
 
   assertSupportedInStreamingPlan(
     "except with stream-batch relations and legacy compatibility enabled",
