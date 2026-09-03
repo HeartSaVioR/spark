@@ -3692,7 +3692,7 @@ object SQLConf {
       .doc("When true, allow EXCEPT operations with a streaming DataFrame on the left side. " +
         "Such operations may produce incorrect results and are retained only for compatibility " +
         "with existing streaming queries.")
-      .version("4.2.0")
+      .version("4.4.0")
       .booleanConf
       .createWithDefault(false)
 
