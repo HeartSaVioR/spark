@@ -289,7 +289,8 @@ class StreamingQueryManager private[sql] (
     // contain a streaming EXCEPT so that upgrading does not change whether the query is accepted.
     val streamWriteAnalysisSession = trigger match {
       case _: ContinuousTrigger => sparkSession
-      case _ if recoverFromCheckpointLocation && userSpecifiedCheckpointLocation.isDefined &&
+      case _ if recoverFromCheckpointLocation &&
+          (!useTempCheckpointLocation || userSpecifiedCheckpointLocation.isDefined) &&
           analyzedPlan.exists {
           case Except(left, _, _) if left.isStreaming => true
           case _ => false
