@@ -3709,6 +3709,7 @@ object SQLConf {
         "Such operations may produce incorrect results and are retained only for compatibility " +
         "with existing streaming queries.")
       .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
       .createWithDefault(false)
 
