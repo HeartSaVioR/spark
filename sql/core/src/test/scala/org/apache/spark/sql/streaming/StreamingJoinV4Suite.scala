@@ -20,6 +20,7 @@ package org.apache.spark.sql.streaming
 import org.apache.hadoop.fs.Path
 import org.scalatest.Tag
 
+import org.apache.spark.SparkIllegalArgumentException
 import org.apache.spark.sql.execution.datasources.v2.state.StateSourceOptions
 import org.apache.spark.sql.execution.streaming.checkpointing.CheckpointFileManager
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinExec
@@ -86,6 +87,32 @@ class StreamingInnerJoinV4Suite
       },
       StopStream
     )
+  }
+
+  test("state format version 4 requires RocksDB merge operator version 2") {
+    withSQLConf(SQLConf.STATE_STORE_ROCKSDB_MERGE_OPERATOR_VERSION.key -> "1") {
+      val input1 = MemoryStream[Int]
+      val input2 = MemoryStream[Int]
+      val joined = input1.toDF().join(input2.toDF(), "value")
+
+      testStream(joined)(
+        StartStream(),
+        AddData(input1, 1),
+        ExpectFailure[SparkIllegalArgumentException] { error =>
+          checkError(
+            exception = error.asInstanceOf[SparkIllegalArgumentException],
+            condition = "STREAM_STREAM_JOIN_INCOMPATIBLE_STATE_STORE_CONFIGS",
+            sqlState = Some("42K06"),
+            parameters = Map(
+              "stateFormatVersionConfig" -> SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key,
+              "stateFormatVersion" -> "4",
+              "mergeOperatorVersionConfig" ->
+                SQLConf.STATE_STORE_ROCKSDB_MERGE_OPERATOR_VERSION.key,
+              "mergeOperatorVersion" -> "1",
+              "requiredMergeOperatorVersion" -> "2"))
+        }
+      )
+    }
   }
 
   // V4 uses different column families (keyWithTsToValues, tsWithKey)
