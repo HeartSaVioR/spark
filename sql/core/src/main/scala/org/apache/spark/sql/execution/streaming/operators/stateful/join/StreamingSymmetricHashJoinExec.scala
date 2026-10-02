@@ -464,6 +464,14 @@ case class StreamingSymmetricHashJoinExec(
       else leftOutputIter ++ rightOutputIter,
       onHashJoinOutputCompletion())
 
+    def trackStateRemovals(
+        removedRows: Iterator[KeyToValuePair]): Iterator[KeyToValuePair] = {
+      removedRows.map { row =>
+        numRemovedStateRows += 1
+        row
+      }
+    }
+
     val outputIter: Iterator[InternalRow] = joinType match {
       case Inner | LeftSemi =>
         hashJoinOutputIter
@@ -488,7 +496,8 @@ case class StreamingSymmetricHashJoinExec(
         }
 
         val initIterFn = { () =>
-          val removedRowIter = joinerManager.leftSideJoiner.removeAndReturnOldState()
+          val removedRowIter = trackStateRemovals(
+            joinerManager.leftSideJoiner.removeAndReturnOldState())
           removedRowIter.filterNot { kv =>
             stateFormatVersion match {
               case 1 => matchesWithRightSideState(new UnsafeRowPair(kv.key, kv.value))
@@ -514,7 +523,8 @@ case class StreamingSymmetricHashJoinExec(
         }
 
         val initIterFn = { () =>
-          val removedRowIter = joinerManager.rightSideJoiner.removeAndReturnOldState()
+          val removedRowIter = trackStateRemovals(
+            joinerManager.rightSideJoiner.removeAndReturnOldState())
           removedRowIter.filterNot { kv =>
             stateFormatVersion match {
               case 1 => matchesWithLeftSideState(new UnsafeRowPair(kv.key, kv.value))
@@ -539,13 +549,15 @@ case class StreamingSymmetricHashJoinExec(
           }
 
         val leftSideInitIterFn = { () =>
-          val removedRowIter = joinerManager.leftSideJoiner.removeAndReturnOldState()
+          val removedRowIter = trackStateRemovals(
+            joinerManager.leftSideJoiner.removeAndReturnOldState())
           removedRowIter.filterNot(isKeyToValuePairMatched)
             .map(pair => joinedRow.withLeft(pair.value).withRight(nullRight))
         }
 
         val rightSideInitIterFn = { () =>
-          val removedRowIter = joinerManager.rightSideJoiner.removeAndReturnOldState()
+          val removedRowIter = trackStateRemovals(
+            joinerManager.rightSideJoiner.removeAndReturnOldState())
           removedRowIter.filterNot(isKeyToValuePairMatched)
             .map(pair => joinedRow.withLeft(nullLeft).withRight(pair.value))
         }
@@ -684,6 +696,15 @@ case class StreamingSymmetricHashJoinExec(
     val preJoinFilter =
       Predicate.create(preJoinFilterExpr.getOrElse(Literal(true)), inputAttributes).eval _
 
+    private val stateValueWatermarkOrdinal = stateWatermarkPredicate.flatMap {
+      case JoinStateValueWatermarkPredicate(expr, _, _) =>
+        inputAttributes.indexWhere(expr.references.contains) match {
+          case ordinal if ordinal >= 0 => Some(ordinal)
+          case _ => None
+        }
+      case _ => None
+    }
+
     private val joinStateManager = SymmetricHashJoinStateManager(
       joinSide = joinSide,
       inputValueAttributes = inputAttributes,
@@ -697,7 +718,8 @@ case class StreamingSymmetricHashJoinExec(
       stateFormatVersion = stateFormatVersion,
       skippedNullValueCount = skippedNullValueCount,
       joinStoreGenerator = joinStateManagerStoreGenerator,
-      joinKeyOrdinalForWatermark = joinKeyOrdinalForWatermark)
+      joinKeyOrdinalForWatermark = joinKeyOrdinalForWatermark,
+      stateValueWatermarkOrdinal = stateValueWatermarkOrdinal)
 
     private[this] val keyGenerator = UnsafeProjection.create(joinKeys, inputAttributes)
 
@@ -753,8 +775,10 @@ case class StreamingSymmetricHashJoinExec(
     }
 
     private[this] val eventTimeIdxForRangeScan: Int = scanRangeOffsets.map { _ =>
-      WatermarkSupport.findEventTimeColumnIndex(
-        inputAttributes, !allowMultipleStatefulOperators).getOrElse(-1)
+      stateValueWatermarkOrdinal.orElse {
+        WatermarkSupport.findEventTimeColumnIndex(
+          inputAttributes, !allowMultipleStatefulOperators)
+      }.getOrElse(-1)
     }.getOrElse(-1)
 
     private def computeTimestampRange(thisRow: UnsafeRow): Option[(Long, Long)] = {

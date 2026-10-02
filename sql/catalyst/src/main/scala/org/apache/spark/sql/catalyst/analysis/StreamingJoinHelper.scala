@@ -73,6 +73,21 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
       attributesWithEventWatermark: AttributeSet,
       joinCondition: Option[Expression],
       eventWatermark: Option[Long]): Option[Long] = {
+    getStateValueWatermarkWithAttribute(
+      attributesToFindStateWatermarkFor,
+      attributesWithEventWatermark,
+      joinCondition,
+      eventWatermark).map(_._2)
+  }
+
+  /**
+   * Get the state value watermark together with the state attribute it applies to.
+   */
+  def getStateValueWatermarkWithAttribute(
+      attributesToFindStateWatermarkFor: AttributeSet,
+      attributesWithEventWatermark: AttributeSet,
+      joinCondition: Option[Expression],
+      eventWatermark: Option[Long]): Option[(Attribute, Long)] = {
 
     // If condition or event time watermark is not provided, then cannot calculate state watermark
     if (joinCondition.isEmpty || eventWatermark.isEmpty) return None
@@ -80,7 +95,7 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
     // If there is not watermark attribute, then cannot define state watermark
     if (!attributesWithEventWatermark.exists(_.metadata.contains(delayKey))) return None
 
-    def getStateWatermarkSafely(l: Expression, r: Expression): Option[Long] = {
+    def getStateWatermarkSafely(l: Expression, r: Expression): Option[(Attribute, Long)] = {
       try {
         getStateWatermarkFromLessThenPredicate(
           l, r, attributesToFindStateWatermarkFor, attributesWithEventWatermark, eventWatermark)
@@ -100,12 +115,16 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
       // up leftTime <= W. Rather we should clean up leftTime <= W - 1. Hence the -1 below.
       val stateWatermark = predicate match {
         case LessThan(l, r) => getStateWatermarkSafely(l, r)
-        case LessThanOrEqual(l, r) => getStateWatermarkSafely(l, r).map(_ - 1)
+        case LessThanOrEqual(l, r) =>
+          getStateWatermarkSafely(l, r).map { case (attr, value) => attr -> (value - 1) }
         case GreaterThan(l, r) => getStateWatermarkSafely(r, l)
-        case GreaterThanOrEqual(l, r) => getStateWatermarkSafely(r, l).map(_ - 1)
+        case GreaterThanOrEqual(l, r) =>
+          getStateWatermarkSafely(r, l).map { case (attr, value) => attr -> (value - 1) }
         case Between(input, lower, upper, _) =>
-          getStateWatermarkSafely(lower, input).map(_ - 1)
-            .orElse(getStateWatermarkSafely(input, upper).map(_ - 1))
+          getStateWatermarkSafely(lower, input)
+            .map { case (attr, value) => attr -> (value - 1) }
+            .orElse(getStateWatermarkSafely(input, upper)
+              .map { case (attr, value) => attr -> (value - 1) })
         case _ => None
       }
       if (stateWatermark.nonEmpty) {
@@ -114,7 +133,7 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
       }
       stateWatermark
     }
-    allStateWatermarks.reduceOption((x, y) => Math.min(x, y))
+    allStateWatermarks.reduceOption { (x, y) => if (x._2 < y._2) x else y }
   }
 
   /**
@@ -132,7 +151,7 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
       rightExpr: Expression,
       attributesToFindStateWatermarkFor: AttributeSet,
       attributesWithEventWatermark: AttributeSet,
-      eventWatermark: Option[Long]): Option[Long] = {
+      eventWatermark: Option[Long]): Option[(Attribute, Long)] = {
 
     val attributesInCondition = AttributeSet(
       leftExpr.collect { case a: AttributeReference => a } ++
@@ -185,6 +204,9 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
       // the constraintTerm would be `leftTime` and not `-leftTime`. Hence, we return None.
       return None
     }
+    val stateAttribute = constraintTerm.collectFirst {
+      case a: AttributeReference if attributesToFindStateWatermarkFor.contains(a) => a
+    }.get
 
     // Replace watermark attribute with watermark value, and generate the resolved expression
     // from the other terms. That is,
@@ -202,7 +224,7 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
     logInfo(log"Final expression to evaluate " +
       log"constraint:\t${MDC(WATERMARK_CONSTRAINT, exprWithWatermarkSubstituted)}")
     val constraintValue = exprWithWatermarkSubstituted.eval().asInstanceOf[java.lang.Double]
-    Some((Double2double(constraintValue) / 1000.0).toLong)
+    Some(stateAttribute -> (Double2double(constraintValue) / 1000.0).toLong)
   }
 
   /**
