@@ -593,8 +593,8 @@ trait WatermarkSupport extends SparkPlan {
   /** Generate an expression that matches data older than the watermark */
   private def watermarkExpression(watermark: Option[Long]): Option[Expression] = {
     WatermarkSupport.watermarkExpression(
-      WatermarkSupport.findEventTimeColumn(child.output,
-        allowMultipleEventTimeColumns = !allowMultipleStatefulOperators), watermark)
+      WatermarkSupport.findEventTimeColumnForStatefulOperator(child.output, keyExpressions),
+      watermark)
   }
 
   /** Predicate based on keys that matches data older than the late event filtering watermark */
@@ -647,6 +647,24 @@ trait WatermarkSupport extends SparkPlan {
 }
 
 object WatermarkSupport {
+
+  /**
+   * Select the event-time column to use for a stateful operator.
+   *
+   * Prefer an event-time column referenced by the operator. If the operator expressions do not
+   * identify one, choose the first event-time column in the input so the choice is stable across
+   * batches.
+   */
+  def findEventTimeColumnForStatefulOperator(
+      attrs: Seq[Attribute],
+      operatorExpressions: Seq[Expression]): Option[Attribute] = {
+    val eventTimeAttrs = attrs.filter(_.metadata.contains(EventTimeWatermark.delayKey))
+    operatorExpressions.iterator
+      .flatMap(_.collect { case attr: Attribute => attr })
+      .flatMap(ref => eventTimeAttrs.find(_.exprId == ref.exprId))
+      .nextOption()
+      .orElse(eventTimeAttrs.headOption)
+  }
 
   /** Generate an expression on given attributes that matches data older than the watermark */
   def watermarkExpression(
@@ -1658,8 +1676,8 @@ case class StreamingDeduplicateWithinWatermarkExec(
   // canonicalized plan. Specifically, attributes in child won't have an event time column in
   // the canonicalized plan. These variables are NOT referenced in canonicalized plan, hence
   // defining these variables as lazy would avoid such error.
-  private lazy val eventTimeCol: Attribute = WatermarkSupport.findEventTimeColumn(child.output,
-    allowMultipleEventTimeColumns = false).get
+  private lazy val eventTimeCol: Attribute =
+    WatermarkSupport.findEventTimeColumnForStatefulOperator(child.output, keyExpressions).get
   private lazy val delayThresholdMs = eventTimeCol.metadata.getLong(EventTimeWatermark.delayKey)
   private lazy val eventTimeColOrdinal: Int = child.output.indexOf(eventTimeCol)
 
