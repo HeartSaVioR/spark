@@ -19,8 +19,10 @@ package org.apache.spark.sql.streaming
 
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Literal}
+import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
 import org.apache.spark.sql.execution.LocalTableScanExec
-import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper.JoinConditionSplitPredicates
+import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper
+import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper.{JoinConditionSplitPredicates, JoinStateKeyWatermarkPredicate, JoinStateValueWatermarkPredicate}
 import org.apache.spark.sql.types._
 
 class StreamingSymmetricHashJoinHelperSuite extends StreamTest {
@@ -126,5 +128,90 @@ class StreamingSymmetricHashJoinHelperSuite extends StreamTest {
     assert(split.bothSides.contains(
       leftAttributeA === rightAttributeC && randAttribute > Literal(0)))
     assert(split.full.contains(predicate))
+  }
+
+  test("SPARK-58904: equality eviction uses the opposite input's watermark") {
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val lt = AttributeReference("lt", TimestampType)()
+    val rt = AttributeReference("rt", TimestampType, metadata = metadata)()
+    val predicates = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
+      Seq(lt), Seq(rt), Seq(lt), Seq(rt), None, Some(20000), Some(10000), false)
+    assert(predicates.right.isEmpty)
+    assert(predicates.left.exists {
+      case JoinStateKeyWatermarkPredicate(_, 20000, None) => true
+      case _ => false
+    })
+    assert(StreamingSymmetricHashJoinHelper.getStateWatermark(
+      Seq(lt), Seq(rt), Seq(lt), Seq(rt), None, Some(20000), false) === (None, Some(0L)))
+
+    val watermarkedLeft = lt.withMetadata(metadata)
+    val both = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
+      Seq(watermarkedLeft), Seq(rt), Seq(watermarkedLeft), Seq(rt), None,
+      Some(20000), Some(10000), false)
+    assert(both.left.exists {
+      case JoinStateKeyWatermarkPredicate(_, 20000, Some(10000)) => true
+      case _ => false
+    })
+    assert(both.right.isDefined)
+  }
+
+  test("SPARK-58904: range eviction must include newly admitted rows below the previous bound") {
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val lt = AttributeReference("lt", TimestampType, metadata = metadata)()
+    val rt = AttributeReference("rt", TimestampType, metadata = metadata)()
+    Seq(-5, 5).foreach { offset =>
+      val predicates = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
+        Seq(lt), Seq(rt), Nil, Nil, Some(lt > rt + offset),
+        Some(20000), Some(10000), false)
+      val expectedPrevious = if (offset < 0) Some(5000L) else None
+      assert(predicates.left.exists {
+        case JoinStateValueWatermarkPredicate(_, watermark, previous) =>
+          watermark == 20000 + offset * 1000 && previous == expectedPrevious
+        case _ => false
+      })
+    }
+  }
+
+  test("SPARK-58904: a bound on another timestamp does not advance the output watermark") {
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val lt = AttributeReference("lt", TimestampType)()
+    val other = AttributeReference("other", TimestampType, metadata = metadata)()
+    val rt = AttributeReference("rt", TimestampType, metadata = metadata)()
+    val condition = Some(lt > rt - 5)
+    val predicates = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
+      Seq(lt, other), Seq(rt), Nil, Nil, condition, Some(20000), Some(10000), false)
+    assert(predicates.left.exists {
+      case JoinStateValueWatermarkPredicate(expr, 15000, None) => expr.references.contains(lt)
+      case _ => false
+    })
+    assert(StreamingSymmetricHashJoinHelper.getStateWatermark(
+      Seq(lt, other), Seq(rt), Nil, Nil, condition, Some(20000), false) ===
+      (Some(0L), Some(0L)))
+  }
+
+  test("SPARK-58904: legacy V4 watermark index compatibility is directional") {
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val lt = AttributeReference("lt", TimestampType)()
+    val rt = AttributeReference("rt", TimestampType, metadata = metadata)()
+    val other = AttributeReference("other", TimestampType, metadata = metadata)()
+    val watermarkedLeft = lt.withMetadata(metadata)
+    val condition = Some(lt > rt - 5)
+
+    assert(!StreamingSymmetricHashJoinHelper.isLegacyWatermarkIndexCompatible(
+      Seq(lt), Seq(rt), Nil, Nil, condition, false))
+    assert(!StreamingSymmetricHashJoinHelper.isLegacyWatermarkIndexCompatible(
+      Seq(lt, other), Seq(rt), Nil, Nil, condition, false))
+    assert(StreamingSymmetricHashJoinHelper.isLegacyWatermarkIndexCompatible(
+      Seq(watermarkedLeft), Seq(rt), Nil, Nil, Some(watermarkedLeft > rt - 5), false))
+    assert(StreamingSymmetricHashJoinHelper.isLegacyWatermarkIndexCompatible(
+      Seq(lt), Seq(rt), Seq(lt), Seq(rt), None, false))
+    assert(StreamingSymmetricHashJoinHelper.isLegacyWatermarkIndexCompatible(
+      Seq(lt), Seq(lt.newInstance()), Nil, Nil, None, false))
+
+    val leftOther = AttributeReference("leftOther", TimestampType)()
+    val rightOther = AttributeReference("rightOther", TimestampType)()
+    assert(!StreamingSymmetricHashJoinHelper.isLegacyWatermarkIndexCompatible(
+      Seq(watermarkedLeft, leftOther), Seq(rightOther, rt),
+      Seq(watermarkedLeft, leftOther), Seq(rightOther, rt), None, false))
   }
 }
