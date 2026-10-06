@@ -20,6 +20,8 @@ package org.apache.spark.sql.streaming
 import org.apache.hadoop.fs.Path
 import org.scalatest.Tag
 
+import org.apache.spark.SparkUnsupportedOperationException
+import org.apache.spark.sql.Row
 import org.apache.spark.sql.execution.datasources.v2.state.StateSourceOptions
 import org.apache.spark.sql.execution.streaming.checkpointing.CheckpointFileManager
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinExec
@@ -58,6 +60,53 @@ class StreamingInnerJoinV4Suite
   with TestWithV4StateFormat {
 
   import testImplicits._
+
+  Seq(false, true).foreach { leftWatermark =>
+    test(s"SPARK-58904: legacy V4 checkpoint compatibility, left watermark=$leftWatermark") {
+      withTempDir { checkpointDir =>
+        val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
+          "inner", leftWatermark = leftWatermark)
+        testStream(joined)(
+          StartStream(checkpointLocation = checkpointDir.getCanonicalPath),
+          MultiAddData(leftInput, (1, 5))(rightInput, (2, 5)),
+          CheckNewAnswer(),
+          StopStream)
+
+        // Restore the metadata written before the watermark index version was recorded.
+        val statePath = new Path(checkpointDir.getCanonicalPath, "state/0")
+        val metadataPath = OperatorStateMetadataV2.metadataFilePath(statePath, 0)
+        val hadoopConf = spark.sessionState.newHadoopConf()
+        val fm = CheckpointFileManager.create(metadataPath, hadoopConf)
+        val metadata = OperatorStateMetadataUtils.readMetadata(fm.open(metadataPath), 2).get
+          .asInstanceOf[OperatorStateMetadataV2]
+        val legacyMetadata = metadata.copy(
+          operatorPropertiesJson = """{"useVirtualColumnFamilies":true}""")
+        OperatorStateMetadataUtils.writeMetadata(
+          fm.createAtomic(metadataPath, overwriteIfPossible = true), legacyMetadata, metadataPath)
+
+        if (leftWatermark) {
+          // Both inputs were already indexed by the same timestamps in the old layout.
+          testStream(joined)(
+            StartStream(checkpointLocation = checkpointDir.getCanonicalPath),
+            AddData(rightInput, (1, 5)),
+            CheckNewAnswer(Row(1, 1, 5, 5)))
+        } else {
+          // A failed upgrade must not write metadata that permits a subsequent retry.
+          (0 until 2).foreach { _ =>
+            testStream(joined)(
+              StartStream(checkpointLocation = checkpointDir.getCanonicalPath),
+              AddData(rightInput, (1, 5)),
+              ExpectFailure[SparkUnsupportedOperationException] { error =>
+                checkError(
+                  error.asInstanceOf[SparkUnsupportedOperationException],
+                  condition = "STREAMING_JOIN_INCOMPATIBLE_WATERMARK_INDEX",
+                  parameters = Map.empty)
+              })
+          }
+        }
+      }
+    }
+  }
 
   test("SPARK-55628: V4 state format is active in execution plan") {
     val input1 = MemoryStream[Int]
@@ -282,7 +331,7 @@ class StreamingInnerJoinV4Suite
   }
 
   testWithVirtualColumnFamilyJoins(
-    "SPARK-56406: secondary index only populated on watermarked side for time interval join") {
+    "SPARK-56406: secondary index supports one-sided watermark time interval joins") {
     withTempDir { checkpointDir =>
       val leftInput = MemoryStream[(Int, Int)]
       val rightInput = MemoryStream[(Int, Int)]
@@ -294,11 +343,8 @@ class StreamingInnerJoinV4Suite
       val df2 = rightInput.toDF().toDF("rightKey", "time")
         .select($"rightKey", timestamp_seconds($"time") as "rightTime",
           ($"rightKey" * 3) as "rightValue")
-      // Only left side has watermark; watermark is on a value column, not the join key.
-      // joinKeyOrdinalForWatermark is None -> only left has hasEventTime = true.
-      // Neither side can actually evict: the left state watermark is derived from the right
-      // side's watermark via the join condition, which is absent here. The left secondary
-      // index is populated but never used for eviction.
+      // The left watermark and range condition permit right-state eviction. The right
+      // secondary index must be populated even though rightTime has no watermark metadata.
 
       val joined = df1.join(df2,
         expr("leftKey = rightKey AND " +
@@ -322,9 +368,8 @@ class StreamingInnerJoinV4Suite
           // Left has watermark on a value column -> hasEventTime = true, secondary index populated.
           assert(readStateStore(checkpointLoc, "left-tsWithKey") > 0,
             "left secondary index should be populated (watermark on left value column)")
-          // Right has no watermark -> hasEventTime = false, secondary index empty.
-          assert(readStateStore(checkpointLoc, "right-tsWithKey") === 0,
-            "right secondary index should be empty (no watermark on right side)")
+          assert(readStateStore(checkpointLoc, "right-tsWithKey") > 0,
+            "right secondary index should be populated for range eviction")
         },
         StopStream
       )
