@@ -241,7 +241,8 @@ abstract class StreamingJoinSuite
       lowerBound: String = "interval 5 seconds",
       upperBound: String = "interval 5 seconds",
       leftWatermark: Boolean = true,
-      rightWatermark: Boolean = true)
+      rightWatermark: Boolean = true,
+      joinOnTime: Boolean = false)
     : (MemoryStream[(Int, Int)], MemoryStream[(Int, Int)], DataFrame) = {
 
     val leftInput = MemoryStream[(Int, Int)]
@@ -257,11 +258,15 @@ abstract class StreamingJoinSuite
         ($"rightKey" * 3) as "rightValue")
     val df2 = if (rightWatermark) right.withWatermark("rightTime", watermark) else right
 
+    val timeCondition = if (joinOnTime) {
+      "leftTime = rightTime"
+    } else {
+      s"leftTime BETWEEN rightTime - $lowerBound AND rightTime + $upperBound"
+    }
     val joined =
       df1.join(
         df2,
-        expr("leftKey = rightKey AND " +
-          s"leftTime BETWEEN rightTime - $lowerBound AND rightTime + $upperBound"),
+        expr(s"leftKey = rightKey AND $timeCondition"),
         joinType)
 
     val select = if (joinType == "left_semi") {
@@ -1257,33 +1262,117 @@ abstract class StreamingInnerJoinSuite extends StreamingInnerJoinBase {
 abstract class StreamingOuterJoinBase extends StreamingJoinSuite {
 
   import testImplicits._
+  import org.apache.spark.sql.functions._
 
-  Seq(
-    ("left_outer", false, true, Row(1, null, 5, null)),
-    ("right_outer", true, false, Row(null, 1, null, 5))
-  ).foreach { case (joinType, leftWatermark, rightWatermark, expected) =>
-    test(s"SPARK-58904: $joinType range join with one watermark evicts outer state") {
+  for {
+    (joinType, leftWatermark, rightWatermark, expected) <- Seq(
+      ("left_outer", false, true, Row(1, null, 5, null)),
+      ("right_outer", true, false, Row(null, 1, null, 5)))
+    joinOnTime <- Seq(false, true)
+  } {
+    test(s"SPARK-58904: $joinType with one watermark, equality=$joinOnTime") {
       val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
-        joinType, leftWatermark = leftWatermark, rightWatermark = rightWatermark)
+        joinType, leftWatermark = leftWatermark, rightWatermark = rightWatermark,
+        joinOnTime = joinOnTime)
       val stateInput = if (joinType == "left_outer") leftInput else rightInput
       val watermarkInput = if (joinType == "left_outer") rightInput else leftInput
+      val laterUnmatched = if (joinType == "left_outer") {
+        Row(3, null, 5, null)
+      } else {
+        Row(null, 3, null, 5)
+      }
 
+      withTempDir { checkpoint =>
+        withSQLConf(SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+          testStream(joined)(
+            StartStream(checkpointLocation = checkpoint.getCanonicalPath),
+            AddData(stateInput, (1, 5)),
+            CheckNewAnswer(),
+            AddData(watermarkInput, (2, 30)),
+            CheckNewAnswer(),
+            AddData(watermarkInput, (2, 40)),
+            CheckNewAnswer(expected),
+            assertNumStateRows(total = Seq(2), updated = Seq(3),
+              droppedByWatermark = Seq(0), removed = Some(Seq(1))),
+            StopStream,
+            StartStream(checkpointLocation = checkpoint.getCanonicalPath),
+            // The unwatermarked input can introduce rows below an earlier eviction cutoff.
+            AddData(stateInput, (3, 5)),
+            CheckNewAnswer(laterUnmatched),
+            AddData(watermarkInput, (3, 5)),
+            CheckNewAnswer(),
+            AddData(watermarkInput, (4, 50)),
+            CheckNewAnswer(),
+            // Watermarked-side state must survive for future unwatermarked input.
+            AddData(stateInput, (2, 30)),
+            CheckNewAnswer(Row(2, 2, 30, 30)),
+            assertNumStateRows(total = Seq(3),
+              updated = Seq(if (joinType == "left_outer") 3 else 2),
+              droppedByWatermark = Seq(1),
+              removed = Some(Seq(if (joinType == "left_outer") 2 else 1)))
+          )
+        }
+      }
+    }
+  }
+
+  Seq("left_outer", "right_outer").foreach { joinType =>
+    test(s"SPARK-58904: $joinType preserves boundary matches with one watermark") {
+      val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
+        joinType, leftWatermark = joinType == "right_outer",
+        rightWatermark = joinType == "left_outer")
+      val stateInput = if (joinType == "left_outer") leftInput else rightInput
+      val watermarkInput = if (joinType == "left_outer") rightInput else leftInput
+      val matches = if (joinType == "left_outer") {
+        Seq(Row(1, 1, 20, 15), Row(1, 1, 20, 25))
+      } else {
+        Seq(Row(1, 1, 15, 20), Row(1, 1, 25, 20))
+      }
+      val unmatched = if (joinType == "left_outer") {
+        Row(2, null, 20, null)
+      } else {
+        Row(null, 2, null, 20)
+      }
       withSQLConf(SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
         testStream(joined)(
-          AddData(stateInput, (1, 5)),
+          AddData(stateInput, (1, 20), (2, 20)),
           CheckNewAnswer(),
-          AddData(watermarkInput, (2, 30)),
-          CheckNewAnswer(),
-          AddData(watermarkInput, (2, 40)),
-          CheckNewAnswer(expected),
-          assertNumStateRows(total = Seq(2), updated = Seq(3),
-            droppedByWatermark = Seq(0), removed = Some(Seq(1)))
+          AddData(watermarkInput, (1, 15), (1, 25), (3, 50)),
+          CheckNewAnswer(matches: _*),
+          AddData(watermarkInput, (3, 60)),
+          CheckNewAnswer(unmatched),
+          assertNumStateRows(total = Seq(4), updated = Seq(6),
+            droppedByWatermark = Seq(0), removed = Some(Seq(2)))
         )
       }
     }
   }
-  import org.apache.spark.sql.functions._
 
+  test("SPARK-58904: range eviction uses the bound's timestamp, not an unrelated watermark") {
+    val leftInput = MemoryStream[(Int, Int, Int)]
+    val rightInput = MemoryStream[(Int, Int)]
+    val left = leftInput.toDF().toDF("leftKey", "time", "other")
+      .select($"leftKey", timestamp_seconds($"time").as("leftTime"),
+        timestamp_seconds($"other").as("otherTime"))
+      .withWatermark("otherTime", "10 seconds")
+    val right = rightInput.toDF().toDF("rightKey", "time")
+      .select($"rightKey", timestamp_seconds($"time").as("rightTime"))
+      .withWatermark("rightTime", "10 seconds")
+    val joined = left.join(right, expr("leftKey = rightKey AND " +
+      "leftTime BETWEEN rightTime - interval 5 seconds AND rightTime + interval 5 seconds"),
+      "left_outer").select($"leftKey", $"rightKey", $"leftTime".cast("int"),
+      $"otherTime".cast("int"), $"rightTime".cast("int"))
+    withSQLConf(SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+      testStream(joined)(
+        AddData(leftInput, (1, 5, 100)),
+        CheckNewAnswer(),
+        AddData(rightInput, (2, 30)),
+        CheckNewAnswer(),
+        AddData(rightInput, (2, 40)),
+        CheckNewAnswer(Row(1, null, 5, 100, null))
+      )
+    }
+  }
   Seq("left_outer", "right_outer").foreach { joinType =>
     test(s"stream-stream $joinType join does not support Update mode") {
       val input1 = MemoryStream[Int]
@@ -2017,29 +2106,50 @@ abstract class StreamingFullOuterJoinBase extends StreamingJoinSuite {
 
   import testImplicits._
 
-  Seq(
-    (false, true, Row(1, null, 5, null)),
-    (true, false, Row(null, 1, null, 5))
-  ).foreach { case (leftWatermark, rightWatermark, expected) =>
+  Seq((false, true), (true, false)).foreach { case (leftWatermark, rightWatermark) =>
     val watermarkSide = if (leftWatermark) "left" else "right"
-    test(s"SPARK-58904: full outer range join with $watermarkSide watermark evicts other state") {
+    test(s"SPARK-58904: full outer range join rejects only $watermarkSide watermark") {
       val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
         "full_outer", leftWatermark = leftWatermark, rightWatermark = rightWatermark)
-      val stateInput = if (leftWatermark) rightInput else leftInput
-      val watermarkInput = if (leftWatermark) leftInput else rightInput
-
-      withSQLConf(SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+      val error = intercept[AnalysisException] {
         testStream(joined)(
-          AddData(stateInput, (1, 5)),
-          CheckNewAnswer(),
-          AddData(watermarkInput, (2, 30)),
-          CheckNewAnswer(),
-          AddData(watermarkInput, (2, 40)),
-          CheckNewAnswer(expected),
-          assertNumStateRows(total = Seq(2), updated = Seq(3),
-            droppedByWatermark = Seq(0), removed = Some(Seq(1)))
+          MultiAddData(leftInput, (1, 5))(rightInput, (2, 30)),
+          CheckNewAnswer()
         )
       }
+      assert(error.getMessage.contains("watermarks on both inputs"))
+    }
+  }
+
+  test("SPARK-58904: full outer equality join uses different watermark key ordinals") {
+    val leftInput = MemoryStream[(Int, Int)]
+    val rightInput = MemoryStream[(Int, Int)]
+    val left = leftInput.toDF().toDF("a", "b")
+      .select(timestamp_seconds($"a").as("la"), timestamp_seconds($"b").as("lb"))
+      .withWatermark("la", "10 seconds")
+    val right = rightInput.toDF().toDF("a", "b")
+      .select(timestamp_seconds($"a").as("ra"), timestamp_seconds($"b").as("rb"))
+      .withWatermark("rb", "10 seconds")
+    val joined = left.join(right, expr("la = ra AND lb = rb"), "full_outer")
+      .select($"la".cast("int"), $"lb".cast("int"), $"ra".cast("int"), $"rb".cast("int"))
+    withSQLConf(SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+      testStream(joined)(
+        MultiAddData(leftInput, (5, 50))(rightInput, (80, 50)),
+        CheckNewAnswer(),
+        MultiAddData(leftInput, (60, 100))(rightInput, (70, 50)),
+        CheckNewAnswer(),
+        AddData(leftInput, (70, 100)),
+        CheckNewAnswer(),
+        AddData(rightInput, (5, 50)),
+        CheckNewAnswer(Row(5, 50, 5, 50)),
+        AddData(leftInput, (90, 10)),
+        CheckNewAnswer(Row(90, 10, null, null)),
+        MultiAddData(leftInput, (200, 200))(rightInput, (200, 200)),
+        CheckNewAnswer(Row(200, 200, 200, 200)),
+        MultiAddData(leftInput, (210, 210))(rightInput, (210, 210)),
+        CheckNewAnswer(Row(210, 210, 210, 210), Row(60, 100, null, null),
+          Row(70, 100, null, null), Row(null, null, 80, 50), Row(null, null, 70, 50))
+      )
     }
   }
 
@@ -2282,21 +2392,29 @@ abstract class StreamingLeftSemiJoinBase extends StreamingJoinSuite {
 
   import testImplicits._
 
-  test("SPARK-58904: left semi range join with right watermark evicts left state") {
-    val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
-      "left_semi", leftWatermark = false)
+  Seq(false, true).foreach { joinOnTime =>
+    test(s"SPARK-58904: left semi with right watermark, equality=$joinOnTime") {
+      val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
+        "left_semi", leftWatermark = false, joinOnTime = joinOnTime)
 
-    withSQLConf(SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
-      testStream(joined)(
-        AddData(leftInput, (1, 5)),
-        CheckNewAnswer(),
-        AddData(rightInput, (2, 30)),
-        CheckNewAnswer(),
-        AddData(rightInput, (2, 40)),
-        CheckNewAnswer(),
-        assertNumStateRows(total = Seq(2), updated = Seq(3),
-          droppedByWatermark = Seq(0), removed = Some(Seq(1)))
-      )
+      withSQLConf(SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+        testStream(joined)(
+          AddData(leftInput, (1, 5)),
+          CheckNewAnswer(),
+          AddData(rightInput, (2, 30)),
+          CheckNewAnswer(),
+          AddData(rightInput, (2, 40)),
+          CheckNewAnswer(),
+          assertNumStateRows(total = Seq(2), updated = Seq(3),
+            droppedByWatermark = Seq(0), removed = Some(Seq(1))),
+          AddData(leftInput, (3, 5)),
+          CheckNewAnswer(),
+          AddData(leftInput, (2, 30)),
+          CheckNewAnswer(Row(2, 30)),
+          assertNumStateRows(total = Seq(2), updated = Seq(1),
+            droppedByWatermark = Seq(0), removed = Some(Seq(1)))
+        )
+      }
     }
   }
 

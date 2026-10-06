@@ -1297,6 +1297,11 @@ joined <- join(
 Outer joins have the same guarantees as [inner joins](#semantic-guarantees-of-stream-stream-inner-joins-with-watermarking)
 regarding watermark delays and whether data will be dropped or not.
 
+For time-range joins, a watermark on the right input and a time constraint that bounds matching
+right event times allow Spark to finalize unmatched left rows. The left timestamp does not also
+need a watermark for this. The reverse applies to unmatched right rows. Cleaning up state on both
+sides requires suitable watermarks and time constraints in both directions.
+
 ###### Caveats
 There are a few important characteristics to note regarding how the outer results are generated.
 
@@ -1412,8 +1417,8 @@ regarding watermark delays and whether data will be dropped or not.
   <tr>
     <td style="vertical-align: middle;">Full Outer</td>
     <td style="vertical-align: middle;">
-      Conditionally supported, must specify watermark on one side + time constraints for correct
-      results, optionally specify watermark on the other side for all state cleanup
+      Conditionally supported, requires watermarks on both inputs and time constraints that allow
+      unmatched rows from both sides to be finalized.
     </td>
   </tr>
   <tr>

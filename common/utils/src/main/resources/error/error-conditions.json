@@ -7918,6 +7918,12 @@
     ],
     "sqlState" : "42K03"
   },
+  "STREAMING_JOIN_INCOMPATIBLE_WATERMARK_INDEX" : {
+    "message" : [
+      "This stream-stream join uses a V4 checkpoint whose timestamp index is incompatible with the corrected watermark handling. Restart the query with a new checkpoint directory and replay the input data."
+    ],
+    "sqlState" : "42K06"
+  },
   "STREAMING_OUTPUT_MODE" : {
     "message" : [
       "Invalid streaming output mode: <outputMode>."
