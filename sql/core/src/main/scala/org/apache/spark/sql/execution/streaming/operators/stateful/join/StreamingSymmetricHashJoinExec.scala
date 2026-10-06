@@ -668,6 +668,11 @@ case class StreamingSymmetricHashJoinExec(
     val preJoinFilter =
       Predicate.create(preJoinFilterExpr.getOrElse(Literal(true)), inputAttributes).eval _
 
+    private val eventTimeAttribute =
+      StreamingSymmetricHashJoinHelper.findEventTimeColumnForJoinSide(
+        inputAttributes, joinKeys, condition.full, !allowMultipleStatefulOperators)
+    private val eventTimeColumnOrdinal = eventTimeAttribute.map(inputAttributes.indexOf)
+
     private val joinStateManager = SymmetricHashJoinStateManager(
       joinSide = joinSide,
       inputValueAttributes = inputAttributes,
@@ -681,7 +686,8 @@ case class StreamingSymmetricHashJoinExec(
       stateFormatVersion = stateFormatVersion,
       skippedNullValueCount = skippedNullValueCount,
       joinStoreGenerator = joinStateManagerStoreGenerator,
-      joinKeyOrdinalForWatermark = joinKeyOrdinalForWatermark)
+      joinKeyOrdinalForWatermark = joinKeyOrdinalForWatermark,
+      eventTimeColumnOrdinal = eventTimeColumnOrdinal)
 
     private[this] val keyGenerator = UnsafeProjection.create(joinKeys, inputAttributes)
 
@@ -703,9 +709,6 @@ case class StreamingSymmetricHashJoinExec(
 
     private[this] var updatedStateRowsCount = 0
     private[this] var numRemovedFromOtherSideDuringJoinCount = 0
-    private[this] val allowMultipleStatefulOperators: Boolean =
-      conf.getConf(SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE)
-
     // V4 range scan for time-interval joins (SPARK-55147). Extracts constant interval
     // offsets from the join condition using getStateValueWatermark(eventWatermark=0).
     // The -1 eviction adjustment widens range by ~1ms/side; postJoinFilter handles exact bounds.
@@ -718,15 +721,20 @@ case class StreamingSymmetricHashJoinExec(
       if (!isV4TimeIntervalJoin) {
         None
       } else {
-        val (thisSideAttrs, otherSideAttrs) = joinSide match {
-          case LeftSide => (left.output, right.output)
-          case RightSide => (right.output, left.output)
+        val (otherSideAttrs, otherSideKeys) = joinSide match {
+          case LeftSide => (right.output, rightKeys)
+          case RightSide => (left.output, leftKeys)
         }
+        val otherSideEventTime =
+          StreamingSymmetricHashJoinHelper.findEventTimeColumnForJoinSide(
+            otherSideAttrs, otherSideKeys, condition.full, !allowMultipleStatefulOperators)
 
         val lowerBoundMs = StreamingJoinHelper.getStateValueWatermark(
-          AttributeSet(otherSideAttrs), AttributeSet(thisSideAttrs), condition.full, Some(0L))
+          AttributeSet(otherSideEventTime.toSeq), AttributeSet(eventTimeAttribute.toSeq),
+          condition.full, Some(0L))
         val upperBoundMs = StreamingJoinHelper.getStateValueWatermark(
-          AttributeSet(thisSideAttrs), AttributeSet(otherSideAttrs), condition.full, Some(0L))
+          AttributeSet(eventTimeAttribute.toSeq), AttributeSet(otherSideEventTime.toSeq),
+          condition.full, Some(0L))
 
         (lowerBoundMs, upperBoundMs) match {
           case (Some(lower), Some(upper)) =>
@@ -736,10 +744,8 @@ case class StreamingSymmetricHashJoinExec(
       }
     }
 
-    private[this] val eventTimeIdxForRangeScan: Int = scanRangeOffsets.map { _ =>
-      WatermarkSupport.findEventTimeColumnIndex(
-        inputAttributes, !allowMultipleStatefulOperators).getOrElse(-1)
-    }.getOrElse(-1)
+    private[this] val eventTimeIdxForRangeScan: Int =
+      scanRangeOffsets.flatMap(_ => eventTimeColumnOrdinal).getOrElse(-1)
 
     private def computeTimestampRange(thisRow: UnsafeRow): Option[(Long, Long)] = {
       scanRangeOffsets match {
@@ -762,11 +768,9 @@ case class StreamingSymmetricHashJoinExec(
         generateJoinedRow: (InternalRow, InternalRow) => JoinedRow)
       : Iterator[InternalRow] = {
 
-      val watermarkAttribute = WatermarkSupport.findEventTimeColumn(inputAttributes,
-        allowMultipleEventTimeColumns = !allowMultipleStatefulOperators)
       val nonLateRows =
         WatermarkSupport.watermarkExpression(
-          watermarkAttribute, eventTimeWatermarkForLateEvents) match {
+          eventTimeAttribute, eventTimeWatermarkForLateEvents) match {
           case Some(watermarkExpr) =>
             val predicate = Predicate.create(watermarkExpr, inputAttributes)
             applyRemovingRowsOlderThanWatermark(inputIter, predicate)

@@ -59,7 +59,7 @@ object EvictionIterator {
       evictionTimestamp: Option[Long]): EvictionIterator = {
 
     val evictionPredicate = WatermarkSupport.watermarkExpression(
-      WatermarkSupport.findEventTimeColumn(keyExpressions, allowMultipleEventTimeColumns),
+      WatermarkSupport.findEventTimeColumnForStatefulOperator(keyExpressions, keyExpressions),
       evictionTimestamp).map { expr =>
       Predicate.create(expr, keyExpressions)
     }
