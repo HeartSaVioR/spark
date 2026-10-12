@@ -32,6 +32,7 @@ import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.scheduler.ExecutorCacheTaskLocation
 import org.apache.spark.sql.{AnalysisException, DataFrame, Row, SparkSession}
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression}
+import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.execution.datasources.v2.state.StateSourceOptions
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
@@ -687,12 +688,20 @@ abstract class StreamingInnerJoinBase extends StreamingJoinSuite {
           case _: StreamingSymmetricHashJoinExec => true
           case _ => false
         }.isDefined).get
+        val leftInputEventTimeColumns = downstreamJoin.left.output
+          .filter(_.metadata.contains(EventTimeWatermark.delayKey))
+          .map(_.name)
+        val rightInputEventTimeColumns = downstreamJoin.right.output
+          .filter(_.metadata.contains(EventTimeWatermark.delayKey))
+          .map(_.name)
         val leftEventTimeColumns = downstreamJoin.stateWatermarkPredicates.left.toSeq
           .flatMap(_.expr.references)
           .map(_.name)
         val rightEventTimeColumns = downstreamJoin.stateWatermarkPredicates.right.toSeq
           .flatMap(_.expr.references)
           .map(_.name)
+        assert(leftInputEventTimeColumns === Seq("ts2"))
+        assert(rightInputEventTimeColumns === Seq("ts3"))
         assert(leftEventTimeColumns === Seq("ts2"))
         assert(rightEventTimeColumns === Seq("ts3"))
       }

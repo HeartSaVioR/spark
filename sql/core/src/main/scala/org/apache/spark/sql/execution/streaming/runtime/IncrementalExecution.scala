@@ -28,7 +28,8 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{BATCH_TIMESTAMP, ERROR}
 import org.apache.spark.sql.catalyst.QueryPlanningTracker
 import org.apache.spark.sql.catalyst.analysis.WidenStatefulOperatorAttributeNullability
-import org.apache.spark.sql.catalyst.expressions.{CurrentBatchTimestamp, ExpressionWithRandomSeed}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, CurrentBatchTimestamp, Expression, ExpressionWithRandomSeed}
+import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern._
@@ -50,6 +51,7 @@ import org.apache.spark.sql.execution.streaming.sources.WriteToMicroBatchDataSou
 import org.apache.spark.sql.execution.streaming.state.{OperatorStateMetadata, OperatorStateMetadataReader, OperatorStateMetadataV1, OperatorStateMetadataV2, OperatorStateMetadataWriter, StateSchemaBroadcast, StateSchemaMetadata}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.OutputMode
+import org.apache.spark.sql.types.MetadataBuilder
 import org.apache.spark.util.{SerializableConfiguration, Utils}
 
 /**
@@ -150,7 +152,111 @@ class IncrementalExecution(
         ts.toLiteral
       case e: ExpressionWithRandomSeed => e.withNewSeed(Utils.random.nextLong())
     }
-    WidenStatefulOperatorAttributeNullability(optimized)
+    WidenStatefulOperatorAttributeNullability(
+      SelectEventTimeWatermarkForStatefulOperators(optimized))
+  }
+
+  /**
+   * Keep one event-time column on each stateful operator input. Watermark propagation provides
+   * one scalar watermark per stateful operator, so the operator must not interpret that value
+   * against multiple event-time columns with different lineages.
+   */
+  private object SelectEventTimeWatermarkForStatefulOperators extends Rule[LogicalPlan] {
+    private def preferredExpressions(
+        operator: LogicalPlan,
+        childIndex: Int): Seq[Expression] = operator match {
+      case join: Join =>
+        ExtractEquiJoinKeys.unapply(join) match {
+          case Some((_, leftKeys, rightKeys, otherCondition, _, _, _, _)) =>
+            (if (childIndex == 0) leftKeys else rightKeys) ++ otherCondition
+          case None =>
+            join.condition.toSeq
+        }
+      case aggregate: Aggregate => aggregate.groupingExpressions
+      case deduplicate: Deduplicate => deduplicate.keys
+      case deduplicate: DeduplicateWithinWatermark => deduplicate.keys
+      case groups: FlatMapGroupsWithState =>
+        if (childIndex == 0) groups.groupingAttributes else groups.initialStateGroupAttrs
+      case groups: FlatMapGroupsInPandasWithState => groups.groupingAttributes
+      case transform: TransformWithState =>
+        if (childIndex == 0) {
+          transform.groupingAttributes
+        } else {
+          transform.initialStateGroupingAttrs
+        }
+      case transform: TransformWithStateInPySpark =>
+        if (childIndex == 0) transform.leftAttributes else transform.rightAttributes
+      case _ => operator.expressions
+    }
+
+    private def projectSelectedEventTimeColumn(
+        child: LogicalPlan,
+        preferred: Seq[Expression]): LogicalPlan = {
+      val eventTimeAttributes = child.output.filter(
+        _.metadata.contains(EventTimeWatermark.delayKey))
+      if (eventTimeAttributes.map(_.exprId).distinct.size <= 1) {
+        child
+      } else {
+        val selectedExprId = preferred.iterator
+          .flatMap(_.collect { case attr: Attribute => attr.exprId })
+          .find(id => eventTimeAttributes.exists(_.exprId == id))
+          .getOrElse(eventTimeAttributes.head.exprId)
+        val projectList = child.output.map { attr =>
+          if (attr.exprId != selectedExprId &&
+              attr.metadata.contains(EventTimeWatermark.delayKey)) {
+            attr.withMetadata(new MetadataBuilder()
+              .withMetadata(attr.metadata)
+              .remove(EventTimeWatermark.delayKey)
+              .build())
+          } else {
+            attr
+          }
+        }
+        Project(projectList, child)
+      }
+    }
+
+    private def eventTimeDelay(attribute: Attribute): Option[Long] = {
+      if (attribute.metadata.contains(EventTimeWatermark.delayKey)) {
+        Some(attribute.metadata.getLong(EventTimeWatermark.delayKey))
+      } else {
+        None
+      }
+    }
+
+    private def propagateChildEventTimeMetadata(operator: LogicalPlan): LogicalPlan = {
+      val childAttributes = operator.children.flatMap(_.output)
+        .map(attr => attr.exprId -> attr).toMap
+      operator.transformExpressions {
+        case attr: AttributeReference
+            if childAttributes.get(attr.exprId).exists(eventTimeDelay(_) != eventTimeDelay(attr)) =>
+          val metadataBuilder = new MetadataBuilder().withMetadata(attr.metadata)
+          eventTimeDelay(childAttributes(attr.exprId)) match {
+            case Some(delayMs) =>
+              metadataBuilder.putLong(EventTimeWatermark.delayKey, delayMs)
+            case None =>
+              metadataBuilder.remove(EventTimeWatermark.delayKey)
+          }
+          attr.withMetadata(metadataBuilder.build())
+      }
+    }
+
+    override def apply(plan: LogicalPlan): LogicalPlan = plan.transformUp {
+      case operator =>
+        val updatedOperator = if (operator.isStateful) {
+          val newChildren = operator.children.zipWithIndex.map { case (child, index) =>
+            if (child.isStreaming) {
+              projectSelectedEventTimeColumn(child, preferredExpressions(operator, index))
+            } else {
+              child
+            }
+          }
+          operator.withNewChildren(newChildren)
+        } else {
+          operator
+        }
+        propagateChildEventTimeMetadata(updatedOperator)
+    }
   }
 
   // Use `this` for explain so the already-open transaction and executedPlan are reused.

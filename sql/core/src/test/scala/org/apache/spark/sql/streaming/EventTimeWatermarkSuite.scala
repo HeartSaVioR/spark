@@ -29,7 +29,7 @@ import org.scalatest.matchers.should.Matchers._
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.{AnalysisException, DataFrame, Dataset}
-import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
+import org.apache.spark.sql.catalyst.plans.logical.{Deduplicate, EventTimeWatermark}
 import org.apache.spark.sql.catalyst.util.DateTimeConstants._
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.UTC
 import org.apache.spark.sql.execution.streaming.operators.stateful.{EventTimeStats, StateStoreSaveExec, StreamingDeduplicateExec}
@@ -686,6 +686,15 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
   }
 
   private def assertDedupEventTimeColumn(expected: String): AssertOnQuery = Execute { query =>
+    val logicalDedup = query.lastExecution.optimizedPlan.collectFirst {
+      case d: Deduplicate => d
+    }.get
+    val logicalEventTimeColumns = logicalDedup.child.output
+      .filter(_.metadata.contains(EventTimeWatermark.delayKey))
+      .map(_.name)
+      .toSet
+    assert(logicalEventTimeColumns === Set(expected))
+
     val dedup = query.lastExecution.executedPlan.collectFirst {
       case d: StreamingDeduplicateExec => d
     }.get
