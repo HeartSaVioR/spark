@@ -32,6 +32,7 @@ import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.scheduler.ExecutorCacheTaskLocation
 import org.apache.spark.sql.{AnalysisException, DataFrame, Row, SparkSession}
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression}
+import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.execution.datasources.v2.state.StateSourceOptions
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
@@ -648,6 +649,63 @@ abstract class StreamingInnerJoinBase extends StreamingJoinSuite {
       AddData(input2, 1, 5, 10),
       AddData(input3, 5, 10),
       CheckNewAnswer((5, 10, 5, 15, 5, 25)))
+  }
+
+  test("chained stream-stream join picks event time columns from its range condition") {
+    val input1 = MemoryStream[(String, Long)]
+    val input2 = MemoryStream[(String, Long)]
+    val input3 = MemoryStream[(String, Long)]
+
+    val df1 = input1.toDF()
+      .select($"_1" as "id1", timestamp_seconds($"_2") as "ts1")
+      .withWatermark("ts1", "10 seconds")
+    val df2 = input2.toDF()
+      .select($"_1" as "id2", timestamp_seconds($"_2") as "ts2")
+      .withWatermark("ts2", "10 seconds")
+    val df3 = input3.toDF()
+      .select($"_1" as "id3", timestamp_seconds($"_2") as "ts3")
+      .withWatermark("ts3", "10 seconds")
+
+    val firstJoin = df1.join(df2, expr(
+      "id1 = id2 AND ts1 >= ts2 - INTERVAL 5 SECONDS " +
+        "AND ts1 <= ts2 + INTERVAL 5 SECONDS"))
+    val joined = firstJoin.join(df3, expr(
+      "id1 = id3 AND ts2 >= ts3 - INTERVAL 5 SECONDS " +
+        "AND ts2 <= ts3 + INTERVAL 5 SECONDS"))
+      .selectExpr("id1", "CAST(ts1 AS LONG)", "CAST(ts2 AS LONG)", "CAST(ts3 AS LONG)")
+
+    testStream(joined)(
+      MultiAddData(
+        (input1, Seq(("A", 100L))),
+        (input2, Seq(("A", 100L))),
+        (input3, Seq(("A", 100L)))),
+      CheckAnswer(("A", 100L, 100L, 100L)),
+      Execute { query =>
+        val joins = query.lastExecution.executedPlan.collect {
+          case join: StreamingSymmetricHashJoinExec => join
+        }
+        val downstreamJoin = joins.find(_.left.find {
+          case _: StreamingSymmetricHashJoinExec => true
+          case _ => false
+        }.isDefined).get
+        val leftInputEventTimeColumns = downstreamJoin.left.output
+          .filter(_.metadata.contains(EventTimeWatermark.delayKey))
+          .map(_.name)
+        val rightInputEventTimeColumns = downstreamJoin.right.output
+          .filter(_.metadata.contains(EventTimeWatermark.delayKey))
+          .map(_.name)
+        val leftEventTimeColumns = downstreamJoin.stateWatermarkPredicates.left.toSeq
+          .flatMap(_.expr.references)
+          .map(_.name)
+        val rightEventTimeColumns = downstreamJoin.stateWatermarkPredicates.right.toSeq
+          .flatMap(_.expr.references)
+          .map(_.name)
+        assert(leftInputEventTimeColumns === Seq("ts2"))
+        assert(rightInputEventTimeColumns === Seq("ts3"))
+        assert(leftEventTimeColumns === Seq("ts2"))
+        assert(rightEventTimeColumns === Seq("ts3"))
+      }
+    )
   }
 
   test("streaming join should require StatefulOpClusteredDistribution from children") {
