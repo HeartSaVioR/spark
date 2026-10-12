@@ -92,7 +92,9 @@ class StreamingInnerJoinV4Suite
             CheckNewAnswer(Row(1, 1, 5, 5)))
         } else {
           // A failed upgrade must not write metadata that permits a subsequent retry.
-          (0 until 2).foreach { _ =>
+          // Missing legacy metadata must also fail with the targeted upgrade error.
+          (0 until 3).foreach { attempt =>
+            if (attempt == 2) fm.delete(metadataPath)
             testStream(joined)(
               StartStream(checkpointLocation = checkpointDir.getCanonicalPath),
               AddData(rightInput, (1, 5)),

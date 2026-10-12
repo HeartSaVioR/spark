@@ -35,6 +35,7 @@ import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.execution.{BinaryExecNode, SparkPlan}
+import org.apache.spark.sql.execution.datasources.v2.state.StateDataSourceReadOperatorMetadataFailure
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.execution.streaming.operators.stateful.{SchemaValidationUtils, StatefulOperatorCustomMetric, StatefulOperatorCustomSumMetric, StatefulOperatorStateInfo, StatefulOperatorsUtils, StatefulOpStateStoreCheckpointInfo, StateStoreWriter, WatermarkSupport}
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper._
@@ -336,9 +337,13 @@ case class StreamingSymmetricHashJoinExec(
           condition.full, !allowMultipleStatefulOperators)) {
       // Check before writing any metadata, including on retries of a failed upgrade.
       val info = getStateInfo
-      val metadata = OperatorStateMetadataReader.createReader(
-        new Path(info.checkpointLocation, info.operatorId.toString), hadoopConf,
-        operatorStateMetadataVersion, batchId - 1).read()
+      val metadata = try {
+        OperatorStateMetadataReader.createReader(
+          new Path(info.checkpointLocation, info.operatorId.toString), hadoopConf,
+          operatorStateMetadataVersion, batchId - 1).read()
+      } catch {
+        case _: StateDataSourceReadOperatorMetadataFailure => None
+      }
       val compatible = metadata.exists {
         case m: OperatorStateMetadataV2 =>
           (parse(m.operatorPropertiesJson) \ "watermarkIndexVersion") == JInt(2)
@@ -755,8 +760,8 @@ case class StreamingSymmetricHashJoinExec(
     private[this] val allowMultipleStatefulOperators: Boolean =
       conf.getConf(SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE)
 
-    // V4 range scan for time-interval joins (SPARK-55147). Extracts constant interval
-    // offsets from the join condition using getStateValueWatermark(eventWatermark=0).
+    // V4 range scan for time-interval joins (SPARK-55147). Use it only when both sides are
+    // indexed by their own event time, as the offsets must apply to the indexed timestamps.
     // The -1 eviction adjustment widens range by ~1ms/side; postJoinFilter handles exact bounds.
     private[this] val scanRangeOffsets: Option[(Long, Long)] = {
       def usesEventTime(

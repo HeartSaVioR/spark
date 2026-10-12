@@ -32,7 +32,10 @@ Please refer [Migration Guide: SQL, Datasets and DataFrame](../sql-migration-gui
   Valid one-sided left/right outer and left semi range joins remain supported.
   Affected V4 checkpoints whose timestamp index changes cannot be reused; restart with a new
   checkpoint and replay the input data. V2/V3 checkpoints and compatible V4 checkpoints are
-  unaffected by this index restriction.
+  unaffected by this index restriction. One-sided inner joins may now retain more state and
+  produce matches previously lost to incorrect eviction. A join whose buffered event-time rows
+  cannot be bounded may also stop advancing the watermark for downstream append-mode operators.
+  Replay input from a new checkpoint to recover matches already lost by an older query.
 
 - Since Spark 4.4, streaming queries using `EXCEPT` with a streaming left input are rejected
   because their optimizer rewrites introduce streaming aggregations after the initial
