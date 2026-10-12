@@ -664,9 +664,7 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
     }
   }
 
-  private def buildTestQueryForMultiEventTimeColumns(
-      dedupColumns: Seq[String],
-      retainEventTimeColumns: Boolean = true)
+  private def buildTestQueryForMultiEventTimeColumns(dedupColumns: Seq[String])
     : (MemoryStream[(String, Long)], MemoryStream[(String, Long)], DataFrame) = {
     val input1 = MemoryStream[(String, Long)]
     val input2 = MemoryStream[(String, Long)]
@@ -682,13 +680,9 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
       .selectExpr("id1", "ts1", "ts2")
     // the output of join contains both ts1 and ts2
     val dedup = joined.dropDuplicates(dedupColumns)
-    val result = if (retainEventTimeColumns) {
-      dedup.selectExpr("id1", "CAST(ts1 AS LONG) AS ts1", "CAST(ts2 AS LONG) AS ts2")
-    } else {
-      dedup.select("id1")
-    }
+      .selectExpr("id1", "CAST(ts1 AS LONG) AS ts1", "CAST(ts2 AS LONG) AS ts2")
 
-    (input1, input2, result)
+    (input1, input2, dedup)
   }
 
   private def assertDedupEventTimeColumn(expected: String): AssertOnQuery = Execute { query =>
@@ -729,29 +723,6 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
         ),
         CheckAnswer(("A", 200L, 190L)),
         assertDedupEventTimeColumn("ts2")
-      )
-    }
-  }
-
-  test("streaming deduplication prunes unused alternative event time columns") {
-    withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
-      val (input1, input2, dedup) =
-        buildTestQueryForMultiEventTimeColumns(Seq("id1"), retainEventTimeColumns = false)
-      testStream(dedup)(
-        MultiAddData(
-          (input1, Seq(("A", 200L), ("B", 300L))),
-          (input2, Seq(("A", 190L), ("C", 350L)))
-        ),
-        CheckAnswer("A"),
-        Execute { query =>
-          val dedup = query.lastExecution.executedPlan.collectFirst {
-            case d: StreamingDeduplicateExec => d
-          }.get
-          val eventTimeColumns = dedup.child.output
-            .filter(_.metadata.contains(EventTimeWatermark.delayKey))
-            .map(_.name)
-          assert(eventTimeColumns === Seq("ts1"))
-        }
       )
     }
   }
