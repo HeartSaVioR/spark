@@ -1117,22 +1117,23 @@ abstract class StreamingInnerJoinSuite extends StreamingInnerJoinBase {
       StartStream(),
 
       AddData(input1, 25),
-      CheckNewAnswer(),   // watermark = 15, no-data-batch should remove 2 rows having window=[0,10]
-      assertNumStateRows(total = 1, updated = 1),
+      CheckNewAnswer(),
+      assertNumStateRows(total = 2, updated = 1),
 
       AddData(input2, 25),
       CheckNewAnswer((25, 30, 50, 75)),
-      assertNumStateRows(total = 2, updated = 1),
+      assertNumStateRows(total = 3, updated = 1),
       StopStream,
       StartStream(),
 
+      // The unwatermarked right input can still match left state without entering right state.
       AddData(input2, 1),
-      CheckNewAnswer(),                             // Should not join as < 15 removed
-      assertNumStateRows(total = 2, updated = 0),   // row not add as 1 < state key watermark = 15
+      CheckNewAnswer((1, 10, 2, 3)),
+      assertNumStateRows(total = 3, updated = 0),
 
       AddData(input1, 5),
-      CheckNewAnswer(),                             // Same reason as above
-      assertNumStateRows(total = 2, updated = 0, droppedByWatermark = 1)
+      CheckNewAnswer(),
+      assertNumStateRows(total = 3, updated = 0, droppedByWatermark = 1)
     )
   }
 
@@ -1178,14 +1179,14 @@ abstract class StreamingInnerJoinSuite extends StreamingInnerJoinBase {
         total = Seq(2), updated = Seq(1), droppedByWatermark = Seq(0), removed = Some(Seq(0))),
 
       AddData(input1, 25),
-      CheckNewAnswer(),   // watermark = 15, no-data-batch should remove 2 rows having window=[0,10]
+      CheckNewAnswer(),
       assertNumStateRows(
-        total = Seq(1), updated = Seq(1), droppedByWatermark = Seq(0), removed = Some(Seq(2))),
+        total = Seq(2), updated = Seq(1), droppedByWatermark = Seq(0), removed = Some(Seq(1))),
 
       AddData(input2, 25),
       CheckNewAnswer((25, 30, 50, 75)),
       assertNumStateRows(
-        total = Seq(2), updated = Seq(1), droppedByWatermark = Seq(0), removed = Some(Seq(0)))
+        total = Seq(3), updated = Seq(1), droppedByWatermark = Seq(0), removed = Some(Seq(0)))
     )
   }
 
