@@ -189,6 +189,24 @@ class StreamingSymmetricHashJoinHelperSuite extends StreamTest {
       (Some(0L), Some(0L)))
   }
 
+  test("SPARK-58904: a fixed bound can mask a legacy difference at an earlier watermark") {
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val lt = AttributeReference("lt", TimestampType, metadata = metadata)()
+    val li = AttributeReference("li", IntegerType)()
+    val rt = AttributeReference("rt", TimestampType, metadata = metadata)()
+    val condition = Some(lt > rt && li > Literal(10))
+
+    def leftWatermark(watermark: Long, legacy: Boolean): Long = {
+      val predicates = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
+        Seq(lt, li), Seq(rt), Nil, Nil, condition, Some(watermark), None, false, legacy)
+      predicates.left.get.asInstanceOf[JoinStateValueWatermarkPredicate].stateWatermark
+    }
+
+    assert(leftWatermark(0L, legacy = true) == leftWatermark(0L, legacy = false))
+    assert(leftWatermark(20000L, legacy = true) == 10000L)
+    assert(leftWatermark(20000L, legacy = false) == 20000L)
+  }
+
   test("SPARK-58904: legacy V4 keeps its watermark predicates") {
     val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
     val lt = AttributeReference("lt", TimestampType)()

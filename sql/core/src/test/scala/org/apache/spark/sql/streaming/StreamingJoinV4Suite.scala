@@ -104,16 +104,22 @@ class StreamingInnerJoinV4Suite
         removeLatestPinnedIndexConf(checkpointDir)
         assert(latestPinnedIndexConf(checkpointDir).isEmpty)
 
-        testStream(joined)(
-          StartStream(checkpointLocation = checkpointDir.getCanonicalPath),
-          AddData(rightInput, (1, 5)),
-          CheckNewAnswer(Row(1, 1, 5, 5)),
-          Execute { query =>
-            val join = query.lastExecution.executedPlan.collect {
-              case j: StreamingSymmetricHashJoinExec => j
-            }.head
-            assert(join.useLegacyV4WatermarkIndex)
-          })
+        val warning = new LogAppender("legacy V4 join watermark warning", maxEvents = 10000)
+        withLogAppender(warning) {
+          testStream(joined)(
+            StartStream(checkpointLocation = checkpointDir.getCanonicalPath),
+            AddData(rightInput, (1, 5)),
+            CheckNewAnswer(Row(1, 1, 5, 5)),
+            Execute { query =>
+              val join = query.lastExecution.executedPlan.collect {
+                case j: StreamingSymmetricHashJoinExec => j
+              }.head
+              assert(join.useLegacyV4WatermarkIndex)
+            })
+        }
+        assert(warning.loggingEvents.count(_.getMessage.getFormattedMessage.contains(
+          "SPARK-58904: This restarted stream-stream join")) ==
+          (if (leftWatermark) 0 else 1))
         assert(latestPinnedIndexConf(checkpointDir).contains("false"))
       }
     }
@@ -627,6 +633,47 @@ class StreamingOuterJoinV4Suite
   with TestWithV4StateFormat {
 
   import testImplicits._
+
+  test("SPARK-58904: restart warns when a fixed bound masks legacy eviction") {
+    val leftInput = MemoryStream[(Int, Int, Int)]
+    val rightInput = MemoryStream[(Int, Int)]
+    val left = leftInput.toDF().toDF("leftKey", "time", "leftValue")
+      .select($"leftKey", timestamp_seconds($"time").as("leftTime"), $"leftValue")
+      .withWatermark("leftTime", "0 seconds")
+    val right = rightInput.toDF().toDF("rightKey", "time")
+      .select($"rightKey", timestamp_seconds($"time").as("rightTime"))
+      .withWatermark("rightTime", "0 seconds")
+    val joined = left.join(right,
+      expr("leftKey = rightKey AND leftTime > rightTime AND leftValue > 10"),
+      "left_outer")
+
+    withTempDir { checkpointDir =>
+      val checkpoint = checkpointDir.getCanonicalPath
+      withSQLConf(SQLConf.STREAMING_JOIN_V4_CORRECTED_WATERMARK_INDEX_ENABLED.key -> "false") {
+        testStream(joined)(
+          StartStream(checkpointLocation = checkpoint),
+          AddData(leftInput, (1, 1, 11)),
+          ProcessAllAvailable(),
+          StopStream)
+      }
+
+      val warning = new LogAppender("legacy V4 fixed-bound warning", maxEvents = 10000)
+      withLogAppender(warning) {
+        testStream(joined)(
+          StartStream(checkpointLocation = checkpoint),
+          AddData(rightInput, (2, 2)),
+          ProcessAllAvailable(),
+          Execute { query =>
+            val join = query.lastExecution.executedPlan.collect {
+              case j: StreamingSymmetricHashJoinExec => j
+            }.head
+            assert(join.useLegacyV4WatermarkIndex)
+          })
+      }
+      assert(warning.loggingEvents.count(_.getMessage.getFormattedMessage.contains(
+        "SPARK-58904: This restarted stream-stream join")) == 1)
+    }
+  }
 
   test("SPARK-58904: legacy V4 range join keeps its prior eviction behavior") {
     val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(

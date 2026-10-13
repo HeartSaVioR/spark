@@ -1138,20 +1138,25 @@ abstract class StreamingInnerJoinSuite extends StreamingInnerJoinBase {
       assert(path.getFileSystem(spark.sessionState.newHadoopConf()).delete(path, false))
       assert(offsetLog.add(batchId, updated))
 
-      withSQLConf(SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
-        testStream(result, OutputMode.Update())(
-          StartStream(checkpointLocation = checkpoint),
-          AddData(rightInput, 50),
-          CheckNewAnswer(),
-          Execute { query =>
-            val plan = query.lastExecution.executedPlan
-            val join = plan.collect { case j: StreamingSymmetricHashJoinExec => j }.head
-            val aggregation = plan.collect { case s: StateStoreSaveExec => s }.head
-            assert(join.useLegacyWatermarkSemantics)
-            assert(aggregation.eventTimeWatermarkForEviction ===
-              downstreamWatermarkBeforeRestart)
-          })
+      val warning = new LogAppender("legacy join watermark warning", maxEvents = 10000)
+      withLogAppender(warning) {
+        withSQLConf(SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+          testStream(result, OutputMode.Update())(
+            StartStream(checkpointLocation = checkpoint),
+            AddData(rightInput, 50),
+            CheckNewAnswer(),
+            Execute { query =>
+              val plan = query.lastExecution.executedPlan
+              val join = plan.collect { case j: StreamingSymmetricHashJoinExec => j }.head
+              val aggregation = plan.collect { case s: StateStoreSaveExec => s }.head
+              assert(join.useLegacyWatermarkSemantics)
+              assert(aggregation.eventTimeWatermarkForEviction ===
+                downstreamWatermarkBeforeRestart)
+            })
+        }
       }
+      assert(warning.loggingEvents.count(_.getMessage.getFormattedMessage.contains(
+        "SPARK-58904: This restarted stream-stream join")) == 1)
       assert(offsetLog.getLatest().flatMap(_._2.metadataOpt)
         .flatMap(_.conf.get(correctedKey)).contains("false"))
     }

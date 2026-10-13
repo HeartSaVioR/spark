@@ -45,6 +45,7 @@ import org.apache.spark.sql.execution.streaming.checkpointing.{CheckpointFileMan
 import org.apache.spark.sql.execution.streaming.operators.stateful.{SessionWindowStateStoreRestoreExec, SessionWindowStateStoreSaveExec, StatefulOperator, StatefulOperatorStateInfo, StateStoreRestoreExec, StateStoreSaveExec, StateStoreWriter, StreamingDeduplicateExec, StreamingDeduplicateWithinWatermarkExec, StreamingGlobalLimitExec, StreamingLocalLimitExec, UpdateEventTimeColumnExec}
 import org.apache.spark.sql.execution.streaming.operators.stateful.flatmapgroupswithstate.FlatMapGroupsWithStateExec
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.{StreamingSymmetricHashJoinExec, StreamingSymmetricHashJoinHelper}
+import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper.{JoinStateKeyWatermarkPredicate, JoinStateValueWatermarkPredicate, JoinStateWatermarkPredicate}
 import org.apache.spark.sql.execution.streaming.operators.stateful.transformwithstate.TransformWithStateExec
 import org.apache.spark.sql.execution.streaming.sources.WriteToMicroBatchDataSourceV1
 import org.apache.spark.sql.execution.streaming.state.{OperatorStateMetadata, OperatorStateMetadataReader, OperatorStateMetadataV1, OperatorStateMetadataV2, OperatorStateMetadataWriter, StateSchemaBroadcast, StateSchemaMetadata}
@@ -613,6 +614,41 @@ class IncrementalExecution(
   }
 
   val state = new Rule[SparkPlan] {
+    private def joinWatermarkBehaviorChanged(j: StreamingSymmetricHashJoinExec): Boolean = {
+      def samePredicate(
+          left: Option[JoinStateWatermarkPredicate],
+          right: Option[JoinStateWatermarkPredicate]): Boolean = (left, right) match {
+        case (None, None) => true
+        case (Some(JoinStateKeyWatermarkPredicate(l, lw, _)),
+            Some(JoinStateKeyWatermarkPredicate(r, rw, _))) =>
+          lw == rw && l.semanticEquals(r)
+        case (Some(JoinStateValueWatermarkPredicate(l, lw, _)),
+            Some(JoinStateValueWatermarkPredicate(r, rw, _))) =>
+          lw == rw && l.semanticEquals(r)
+        case _ => false
+      }
+
+      // A fixed bound can hide a difference at the checkpoint watermark but not later.
+      // The second probe is the end of year 9999.
+      Seq(offsetSeqMetadata.batchWatermarkMs, 253402300799999L).exists { probe =>
+        val watermark = Some(probe)
+        def predicates(legacy: Boolean) =
+          StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
+            j.left.output, j.right.output, j.leftKeys, j.rightKeys, j.condition.full,
+            watermark, None, !allowMultipleStatefulOperators, legacy)
+        def outputWatermark(legacy: Boolean) =
+          StreamingSymmetricHashJoinHelper.getStateWatermark(
+            j.left.output, j.right.output, j.leftKeys, j.rightKeys, j.condition.full,
+            watermark, !allowMultipleStatefulOperators, legacy)
+
+        val legacyPredicates = predicates(legacy = true)
+        val correctedPredicates = predicates(legacy = false)
+        !samePredicate(legacyPredicates.left, correctedPredicates.left) ||
+          !samePredicate(legacyPredicates.right, correctedPredicates.right) ||
+          outputWatermark(legacy = true) != outputWatermark(legacy = false)
+      }
+    }
+
     private def simulateWatermarkPropagation(plan: SparkPlan): Unit = {
       val watermarkForPrevBatch = prevOffsetSeqMetadata.map(_.batchWatermarkMs).getOrElse(0L)
       val watermarkForCurrBatch = offsetSeqMetadata.batchWatermarkMs
@@ -718,6 +754,15 @@ class IncrementalExecution(
       // Only check when streaming is restarting and is first batch
       if (isFirstBatch && currentBatchId != 0) {
         checkOperatorValidWithMetadata(planWithStateOpId, currentBatchId - 1)
+        if (planWithStateOpId.exists {
+          case j: StreamingSymmetricHashJoinExec if j.useLegacyWatermarkSemantics &&
+              joinWatermarkBehaviorChanged(j) => true
+          case _ => false
+        }) {
+          logWarning(log"SPARK-58904: This restarted stream-stream join uses legacy watermark " +
+            log"behavior that may have affected results or downstream watermarks. " +
+            log"To guarantee corrected results, start with a new checkpoint and replay input.")
+        }
       }
 
       stateStoreWritersWithMetadata = Some(Seq.empty)

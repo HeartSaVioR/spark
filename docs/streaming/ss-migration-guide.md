@@ -38,7 +38,9 @@ Please refer [Migration Guide: SQL, Datasets and DataFrame](../sql-migration-gui
   that can still emit old event times may stop advancing its output watermark for downstream
   append-mode operators. Existing checkpoints keep their prior join-watermark mode; V4 checkpoints
   also keep their previous timestamp indexing. To apply the fix to an existing query, use a new
-  checkpoint and replay its input data.
+  checkpoint and replay its input data. On restart, Spark warns when it detects a difference
+  between the pinned and corrected join watermark behavior. A warning cannot establish whether
+  past results were affected, and its absence does not prove they were safe.
 
 - Since Spark 4.4, streaming queries using `EXCEPT` with a streaming left input are rejected
   because their optimizer rewrites introduce streaming aggregations after the initial
