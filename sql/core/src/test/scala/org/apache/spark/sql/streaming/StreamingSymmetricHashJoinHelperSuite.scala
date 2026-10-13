@@ -189,29 +189,22 @@ class StreamingSymmetricHashJoinHelperSuite extends StreamTest {
       (Some(0L), Some(0L)))
   }
 
-  test("SPARK-58904: legacy V4 watermark index compatibility is directional") {
+  test("SPARK-58904: legacy V4 keeps its watermark predicates") {
     val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
     val lt = AttributeReference("lt", TimestampType)()
     val rt = AttributeReference("rt", TimestampType, metadata = metadata)()
-    val other = AttributeReference("other", TimestampType, metadata = metadata)()
-    val watermarkedLeft = lt.withMetadata(metadata)
     val condition = Some(lt > rt - 5)
+    val legacy = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
+      Seq(lt), Seq(rt), Nil, Nil, condition, Some(20000), None, false,
+      useLegacyWatermarkIndex = true)
+    assert(legacy.left.isEmpty && legacy.right.isEmpty)
+    assert(StreamingSymmetricHashJoinHelper.getStateWatermark(
+      Seq(lt), Seq(rt), Nil, Nil, condition, Some(20000), false,
+      useLegacyWatermarkIndex = true) === (None, None))
 
-    assert(!StreamingSymmetricHashJoinHelper.isLegacyWatermarkIndexCompatible(
-      Seq(lt), Seq(rt), Nil, Nil, condition, false))
-    assert(!StreamingSymmetricHashJoinHelper.isLegacyWatermarkIndexCompatible(
-      Seq(lt, other), Seq(rt), Nil, Nil, condition, false))
-    assert(StreamingSymmetricHashJoinHelper.isLegacyWatermarkIndexCompatible(
-      Seq(watermarkedLeft), Seq(rt), Nil, Nil, Some(watermarkedLeft > rt - 5), false))
-    assert(StreamingSymmetricHashJoinHelper.isLegacyWatermarkIndexCompatible(
-      Seq(lt), Seq(rt), Seq(lt), Seq(rt), None, false))
-    assert(StreamingSymmetricHashJoinHelper.isLegacyWatermarkIndexCompatible(
-      Seq(lt), Seq(lt.newInstance()), Nil, Nil, None, false))
-
-    val leftOther = AttributeReference("leftOther", TimestampType)()
-    val rightOther = AttributeReference("rightOther", TimestampType)()
-    assert(!StreamingSymmetricHashJoinHelper.isLegacyWatermarkIndexCompatible(
-      Seq(watermarkedLeft, leftOther), Seq(rightOther, rt),
-      Seq(watermarkedLeft, leftOther), Seq(rightOther, rt), None, false))
+    val legacyKey = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
+      Seq(lt), Seq(rt), Seq(lt), Seq(rt), None, Some(20000), None, false,
+      useLegacyWatermarkIndex = true)
+    assert(legacyKey.left.isDefined && legacyKey.right.isDefined)
   }
 }

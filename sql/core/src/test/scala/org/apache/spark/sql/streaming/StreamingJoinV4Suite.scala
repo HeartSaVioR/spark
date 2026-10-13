@@ -20,10 +20,10 @@ package org.apache.spark.sql.streaming
 import org.apache.hadoop.fs.Path
 import org.scalatest.Tag
 
-import org.apache.spark.{SparkIllegalArgumentException, SparkUnsupportedOperationException}
+import org.apache.spark.SparkIllegalArgumentException
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.execution.datasources.v2.state.StateSourceOptions
-import org.apache.spark.sql.execution.streaming.checkpointing.CheckpointFileManager
+import org.apache.spark.sql.execution.streaming.checkpointing.{CheckpointFileManager, OffsetMap, OffsetSeq, OffsetSeqLog}
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinExec
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper.{JoinStateKeyWatermarkPredicate, JoinStateValueWatermarkPredicate}
 import org.apache.spark.sql.execution.streaming.runtime.{MemoryStream, StreamExecution}
@@ -61,52 +61,88 @@ class StreamingInnerJoinV4Suite
 
   import testImplicits._
 
+  private val correctedIndexConfKey =
+    SQLConf.STREAMING_JOIN_V4_CORRECTED_WATERMARK_INDEX_ENABLED.key
+
+  private def latestPinnedIndexConf(checkpointDir: java.io.File): Option[String] = {
+    val offsetLog = new OffsetSeqLog(spark, checkpointDir.getCanonicalPath + "/offsets")
+    offsetLog.getLatest().flatMap(_._2.metadataOpt).flatMap(_.conf.get(correctedIndexConfKey))
+  }
+
+  private def removeLatestPinnedIndexConf(checkpointDir: java.io.File): Unit = {
+    val offsetsPath = checkpointDir.getCanonicalPath + "/offsets"
+    val offsetLog = new OffsetSeqLog(spark, offsetsPath)
+    val (batchId, offsets) = offsetLog.getLatest().get
+    val updated = offsets match {
+      case o: OffsetSeq =>
+        o.copy(metadataOpt = o.metadataOpt.map { m =>
+          m.copy(conf = m.conf - correctedIndexConfKey)
+        })
+      case o: OffsetMap =>
+        o.copy(metadata = o.metadata.copy(conf = o.metadata.conf - correctedIndexConfKey))
+    }
+    val path = new Path(offsetsPath, batchId.toString)
+    assert(path.getFileSystem(spark.sessionState.newHadoopConf()).delete(path, false))
+    assert(offsetLog.add(batchId, updated))
+  }
+
   Seq(false, true).foreach { leftWatermark =>
-    test(s"SPARK-58904: legacy V4 checkpoint compatibility, left watermark=$leftWatermark") {
+    test(s"SPARK-58904: legacy V4 index stays pinned, left watermark=$leftWatermark") {
       withTempDir { checkpointDir =>
         val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
           "inner", leftWatermark = leftWatermark)
-        testStream(joined)(
-          StartStream(checkpointLocation = checkpointDir.getCanonicalPath),
-          MultiAddData(leftInput, (1, 5))(rightInput, (2, 5)),
-          CheckNewAnswer(),
-          StopStream)
-
-        // Restore the metadata written before the watermark index version was recorded.
-        val statePath = new Path(checkpointDir.getCanonicalPath, "state/0")
-        val metadataPath = OperatorStateMetadataV2.metadataFilePath(statePath, 0)
-        val hadoopConf = spark.sessionState.newHadoopConf()
-        val fm = CheckpointFileManager.create(metadataPath, hadoopConf)
-        val metadata = OperatorStateMetadataUtils.readMetadata(fm.open(metadataPath), 2).get
-          .asInstanceOf[OperatorStateMetadataV2]
-        val legacyMetadata = metadata.copy(
-          operatorPropertiesJson = """{"useVirtualColumnFamilies":true}""")
-        OperatorStateMetadataUtils.writeMetadata(
-          fm.createAtomic(metadataPath, overwriteIfPossible = true), legacyMetadata, metadataPath)
-
-        if (leftWatermark) {
-          // Both inputs were already indexed by the same timestamps in the old layout.
+        withSQLConf(correctedIndexConfKey -> "false") {
           testStream(joined)(
             StartStream(checkpointLocation = checkpointDir.getCanonicalPath),
-            AddData(rightInput, (1, 5)),
-            CheckNewAnswer(Row(1, 1, 5, 5)))
-        } else {
-          // A failed upgrade must not write metadata that permits a subsequent retry.
-          // Missing legacy metadata must also fail with the targeted upgrade error.
-          (0 until 3).foreach { attempt =>
-            if (attempt == 2) fm.delete(metadataPath)
-            testStream(joined)(
-              StartStream(checkpointLocation = checkpointDir.getCanonicalPath),
-              AddData(rightInput, (1, 5)),
-              ExpectFailure[SparkUnsupportedOperationException] { error =>
-                checkError(
-                  error.asInstanceOf[SparkUnsupportedOperationException],
-                  condition = "STREAMING_JOIN_INCOMPATIBLE_WATERMARK_INDEX",
-                  parameters = Map.empty)
-              })
-          }
+            MultiAddData(leftInput, (1, 5))(rightInput, (2, 5)),
+            CheckNewAnswer(),
+            StopStream)
         }
+        assert(latestPinnedIndexConf(checkpointDir).contains("false"))
+
+        // Simulate a V4 checkpoint written before this setting existed.
+        removeLatestPinnedIndexConf(checkpointDir)
+        assert(latestPinnedIndexConf(checkpointDir).isEmpty)
+
+        testStream(joined)(
+          StartStream(checkpointLocation = checkpointDir.getCanonicalPath),
+          AddData(rightInput, (1, 5)),
+          CheckNewAnswer(Row(1, 1, 5, 5)),
+          Execute { query =>
+            val join = query.lastExecution.executedPlan.collect {
+              case j: StreamingSymmetricHashJoinExec => j
+            }.head
+            assert(join.useLegacyV4WatermarkIndex)
+          })
+        assert(latestPinnedIndexConf(checkpointDir).contains("false"))
       }
+    }
+  }
+
+  test("SPARK-58904: new V4 index stays pinned on restart") {
+    withTempDir { checkpointDir =>
+      val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
+        "inner", leftWatermark = false)
+      testStream(joined)(
+        StartStream(checkpointLocation = checkpointDir.getCanonicalPath),
+        MultiAddData(leftInput, (1, 5))(rightInput, (2, 5)),
+        CheckNewAnswer(),
+        StopStream)
+      assert(latestPinnedIndexConf(checkpointDir).contains("true"))
+
+      withSQLConf(correctedIndexConfKey -> "false") {
+        testStream(joined)(
+          StartStream(checkpointLocation = checkpointDir.getCanonicalPath),
+          AddData(rightInput, (1, 5)),
+          CheckNewAnswer(Row(1, 1, 5, 5)),
+          Execute { query =>
+            val join = query.lastExecution.executedPlan.collect {
+              case j: StreamingSymmetricHashJoinExec => j
+            }.head
+            assert(!join.useLegacyV4WatermarkIndex)
+          })
+      }
+      assert(latestPinnedIndexConf(checkpointDir).contains("true"))
     }
   }
 
@@ -588,7 +624,31 @@ class StreamingInnerJoinV4Suite
 @SlowSQLTest
 class StreamingOuterJoinV4Suite
   extends StreamingOuterJoinBase
-  with TestWithV4StateFormat
+  with TestWithV4StateFormat {
+
+  test("SPARK-58904: legacy V4 range join keeps its prior eviction behavior") {
+    val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
+      "left_outer", leftWatermark = false)
+    withSQLConf(
+        SQLConf.STREAMING_JOIN_V4_CORRECTED_WATERMARK_INDEX_ENABLED.key -> "false",
+        SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+      testStream(joined)(
+        AddData(leftInput, (1, 5)),
+        CheckNewAnswer(),
+        AddData(rightInput, (2, 30)),
+        CheckNewAnswer(),
+        AddData(rightInput, (2, 40)),
+        CheckNewAnswer(),
+        Execute { query =>
+          val join = query.lastExecution.executedPlan.collect {
+            case j: StreamingSymmetricHashJoinExec => j
+          }.head
+          assert(join.useLegacyV4WatermarkIndex)
+          assert(join.stateWatermarkPredicates.left.isEmpty)
+        })
+    }
+  }
+}
 
 @SlowSQLTest
 class StreamingFullOuterJoinV4Suite

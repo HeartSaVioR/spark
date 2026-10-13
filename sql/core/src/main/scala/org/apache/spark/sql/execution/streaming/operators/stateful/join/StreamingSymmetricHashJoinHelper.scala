@@ -162,7 +162,13 @@ object StreamingSymmetricHashJoinHelper extends Logging {
       rightKeys: Seq[Expression],
       condition: Option[Expression],
       eventTimeWatermarkForEviction: Option[Long],
-      allowMultipleEventTimeColumns: Boolean): (Option[Long], Option[Long]) = {
+      allowMultipleEventTimeColumns: Boolean,
+      useLegacyWatermarkIndex: Boolean = false): (Option[Long], Option[Long]) = {
+
+    if (useLegacyWatermarkIndex) {
+      return getLegacyStateWatermark(leftAttributes, rightAttributes, leftKeys, rightKeys,
+        condition, eventTimeWatermarkForEviction, allowMultipleEventTimeColumns)
+    }
 
     val predicates = getStateWatermarkPredicates(leftAttributes, rightAttributes,
       leftKeys, rightKeys, condition, eventTimeWatermarkForEviction, None,
@@ -202,7 +208,14 @@ object StreamingSymmetricHashJoinHelper extends Logging {
       condition: Option[Expression],
       eventTimeWatermarkForEviction: Option[Long],
       eventTimeWatermarkForLateEvents: Option[Long],
-      useFirstEventTimeColumn: Boolean): JoinStateWatermarkPredicates = {
+      useFirstEventTimeColumn: Boolean,
+      useLegacyWatermarkIndex: Boolean = false): JoinStateWatermarkPredicates = {
+
+    if (useLegacyWatermarkIndex) {
+      return getLegacyStateWatermarkPredicates(leftAttributes, rightAttributes, leftKeys,
+        rightKeys, condition, eventTimeWatermarkForEviction, eventTimeWatermarkForLateEvents,
+        useFirstEventTimeColumn)
+    }
 
     // Perform assertions against multiple event time columns in the same DataFrame. This method
     // assumes there is only one event time column per each side (left / right) and it is not very
@@ -275,7 +288,81 @@ object StreamingSymmetricHashJoinHelper extends Logging {
     JoinStateWatermarkPredicates(leftStateWatermarkPredicate, rightStateWatermarkPredicate)
   }
 
-  // Used only to check compatibility with legacy V4 checkpoints.
+  private def getLegacyStateWatermark(
+      leftAttributes: Seq[Attribute],
+      rightAttributes: Seq[Attribute],
+      leftKeys: Seq[Expression],
+      rightKeys: Seq[Expression],
+      condition: Option[Expression],
+      eventTimeWatermarkForEviction: Option[Long],
+      allowMultipleEventTimeColumns: Boolean): (Option[Long], Option[Long]) = {
+    WatermarkSupport.findEventTimeColumn(leftAttributes, allowMultipleEventTimeColumns)
+    WatermarkSupport.findEventTimeColumn(rightAttributes, allowMultipleEventTimeColumns)
+
+    val keyOrdinal = findJoinKeyOrdinalForWatermark(leftKeys, rightKeys)
+    def oneSide(attrs: Seq[Attribute], otherAttrs: Seq[Attribute]): Option[Long] = {
+      if (keyOrdinal.isDefined) {
+        eventTimeWatermarkForEviction
+      } else if (attrs.exists(_.metadata.contains(delayKey))) {
+        StreamingJoinHelper.getStateValueWatermark(
+          AttributeSet(attrs), AttributeSet(otherAttrs), condition,
+          eventTimeWatermarkForEviction)
+      } else {
+        None
+      }
+    }
+
+    (oneSide(leftAttributes, rightAttributes), oneSide(rightAttributes, leftAttributes))
+  }
+
+  private def getLegacyStateWatermarkPredicates(
+      leftAttributes: Seq[Attribute],
+      rightAttributes: Seq[Attribute],
+      leftKeys: Seq[Expression],
+      rightKeys: Seq[Expression],
+      condition: Option[Expression],
+      eventTimeWatermarkForEviction: Option[Long],
+      eventTimeWatermarkForLateEvents: Option[Long],
+      useFirstEventTimeColumn: Boolean): JoinStateWatermarkPredicates = {
+    WatermarkSupport.findEventTimeColumn(leftAttributes, useFirstEventTimeColumn)
+    WatermarkSupport.findEventTimeColumn(rightAttributes, useFirstEventTimeColumn)
+
+    val keyOrdinal = findJoinKeyOrdinalForWatermark(leftKeys, rightKeys)
+    def oneSide(
+        attrs: Seq[Attribute],
+        keys: Seq[Expression],
+        otherAttrs: Seq[Attribute]): Option[JoinStateWatermarkPredicate] = {
+      if (keyOrdinal.isDefined) {
+        val ordinal = keyOrdinal.get
+        val keyExpr = BoundReference(ordinal, keys(ordinal).dataType, keys(ordinal).nullable)
+        watermarkExpression(Some(keyExpr), eventTimeWatermarkForEviction).map { expr =>
+          JoinStateKeyWatermarkPredicate(expr, eventTimeWatermarkForEviction.get,
+            eventTimeWatermarkForLateEvents)
+        }
+      } else if (attrs.exists(_.metadata.contains(delayKey))) {
+        val stateWatermark = StreamingJoinHelper.getStateValueWatermark(
+          AttributeSet(attrs), AttributeSet(otherAttrs), condition,
+          eventTimeWatermarkForEviction)
+        val prevStateWatermark = eventTimeWatermarkForLateEvents.flatMap { _ =>
+          StreamingJoinHelper.getStateValueWatermark(
+            AttributeSet(attrs), AttributeSet(otherAttrs), condition,
+            eventTimeWatermarkForLateEvents)
+        }
+        val eventTime = attrs.find(_.metadata.contains(delayKey))
+        watermarkExpression(eventTime, stateWatermark).map { expr =>
+          JoinStateValueWatermarkPredicate(expr, stateWatermark.get, prevStateWatermark)
+        }
+      } else {
+        None
+      }
+    }
+
+    JoinStateWatermarkPredicates(
+      oneSide(leftAttributes, leftKeys, rightAttributes),
+      oneSide(rightAttributes, rightKeys, leftAttributes))
+  }
+
+  // Legacy V4 uses the same watermarked join-key ordinal for both state sides.
   private[join] def findJoinKeyOrdinalForWatermark(
       leftKeys: Seq[Expression],
       rightKeys: Seq[Expression]): Option[Int] = {
@@ -294,36 +381,6 @@ object StreamingSymmetricHashJoinHelper extends Logging {
     } orElse {
       rightKeys.zipWithIndex.collectFirst {
         case (ne: NamedExpression, index) if ne.metadata.contains(delayKey) => index
-      }
-    }
-  }
-
-  /** Whether V4 would index both inputs by the same timestamps as before SPARK-58904. */
-  def isLegacyWatermarkIndexCompatible(
-      leftAttributes: Seq[Attribute],
-      rightAttributes: Seq[Attribute],
-      leftKeys: Seq[Expression],
-      rightKeys: Seq[Expression],
-      condition: Option[Expression],
-      allowMultipleEventTimeColumns: Boolean): Boolean = {
-    val legacyKeyOrdinal = findJoinKeyOrdinalForWatermark(leftKeys, rightKeys)
-    val predicates = getStateWatermarkPredicates(leftAttributes, rightAttributes,
-      leftKeys, rightKeys, condition, Some(0L), None, allowMultipleEventTimeColumns)
-
-    Seq((leftAttributes, leftKeys, predicates.left),
-      (rightAttributes, rightKeys, predicates.right)).forall { case (attributes, keys, predicate) =>
-      val eventTime = WatermarkSupport.findEventTimeColumn(
-        attributes, allowMultipleEventTimeColumns)
-      val legacyTimestamp = legacyKeyOrdinal.map(keys).orElse(eventTime)
-      val timestamp = predicate.flatMap {
-        case JoinStateKeyWatermarkPredicate(expr, _, _) =>
-          expr.collectFirst { case b: BoundReference => keys(b.ordinal) }
-        case JoinStateValueWatermarkPredicate(expr, _, _) => expr.references.headOption
-      }.orElse(eventTime)
-      (legacyTimestamp, timestamp) match {
-        case (Some(old), Some(current)) => old.semanticEquals(current)
-        case (None, None) => true
-        case _ => false
       }
     }
   }

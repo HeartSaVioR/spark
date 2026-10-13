@@ -20,11 +20,8 @@ package org.apache.spark.sql.execution.streaming.operators.stateful.join
 import java.util.concurrent.TimeUnit.NANOSECONDS
 
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.Path
-import org.json4s.JInt
-import org.json4s.jackson.JsonMethods.parse
 
-import org.apache.spark.{SparkException, SparkUnsupportedOperationException}
+import org.apache.spark.SparkException
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.StreamingJoinHelper
@@ -35,7 +32,6 @@ import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.execution.{BinaryExecNode, SparkPlan}
-import org.apache.spark.sql.execution.datasources.v2.state.StateDataSourceReadOperatorMetadataFailure
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.execution.streaming.operators.stateful.{SchemaValidationUtils, StatefulOperatorCustomMetric, StatefulOperatorCustomSumMetric, StatefulOperatorStateInfo, StatefulOperatorsUtils, StatefulOpStateStoreCheckpointInfo, StateStoreWriter, WatermarkSupport}
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper._
@@ -231,6 +227,8 @@ case class StreamingSymmetricHashJoinExec(
       SessionState.newHadoopConf(sparkContext.hadoopConfiguration, conf))
   private val allowMultipleStatefulOperators =
     conf.getConf(SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE)
+  private[sql] val useLegacyV4WatermarkIndex = stateFormatVersion == 4 &&
+    !conf.getConf(SQLConf.STREAMING_JOIN_V4_CORRECTED_WATERMARK_INDEX_ENABLED)
 
   private val useVirtualColumnFamilies = stateFormatVersion >= 3
 
@@ -291,8 +289,7 @@ case class StreamingSymmetricHashJoinExec(
         case (storeName, schemaPath) =>
           StateStoreMetadataV2(storeName, 0, info.numPartitions, schemaPath)
       }.toArray
-      val properties = StreamingJoinOperatorProperties(useVirtualColumnFamilies,
-        watermarkIndexVersion = if (stateFormatVersion == 4) 2 else 1)
+      val properties = StreamingJoinOperatorProperties(useVirtualColumnFamilies)
       OperatorStateMetadataV2(operatorInfo, stateStoreInfo, properties.json)
     } else {
       val stateStoreInfo =
@@ -332,29 +329,6 @@ case class StreamingSymmetricHashJoinExec(
       hadoopConf: Configuration,
       batchId: Long,
       stateSchemaVersion: Int): List[StateSchemaValidationResult] = {
-    if (stateFormatVersion == 4 && batchId > 0 &&
-        !isLegacyWatermarkIndexCompatible(left.output, right.output, leftKeys, rightKeys,
-          condition.full, !allowMultipleStatefulOperators)) {
-      // Check before writing any metadata, including on retries of a failed upgrade.
-      val info = getStateInfo
-      val metadata = try {
-        OperatorStateMetadataReader.createReader(
-          new Path(info.checkpointLocation, info.operatorId.toString), hadoopConf,
-          operatorStateMetadataVersion, batchId - 1).read()
-      } catch {
-        case _: StateDataSourceReadOperatorMetadataFailure => None
-      }
-      val compatible = metadata.exists {
-        case m: OperatorStateMetadataV2 =>
-          (parse(m.operatorPropertiesJson) \ "watermarkIndexVersion") == JInt(2)
-        case _ => false
-      }
-      if (!compatible) {
-        throw new SparkUnsupportedOperationException(
-          errorClass = "STREAMING_JOIN_INCOMPATIBLE_WATERMARK_INDEX",
-          messageParameters = Map.empty[String, String])
-      }
-    }
     if (useVirtualColumnFamilies) {
       val info = getStateInfo
       val stateSchemaDir = stateSchemaDirPath()
@@ -431,19 +405,29 @@ case class StreamingSymmetricHashJoinExec(
     // Create left and right side hash joiners and store in the joiner manager.
     // Both sides should use the same store generator if we are re-using the same store instance.
     val joinStateManagerStoreGenerator = new JoinStateManagerStoreGenerator()
+    val legacyJoinKeyOrdinal =
+      StreamingSymmetricHashJoinHelper.findJoinKeyOrdinalForWatermark(leftKeys, rightKeys)
     val joinerManager = OneSideHashJoinerManager(
       new OneSideHashJoiner(
         LeftSide, left.output, leftKeys, leftInputIter,
         condition.leftSideOnly, postJoinFilter, stateWatermarkPredicates.left, partitionId,
         checkpointIds.left.keyToNumValues, checkpointIds.left.keyWithIndexToValue,
         skippedNullValueCount, joinStateManagerStoreGenerator,
-        StreamingJoinHelper.getStateKeyWatermarkOrdinal(rightKeys, right.output)),
+        if (useLegacyV4WatermarkIndex) {
+          legacyJoinKeyOrdinal
+        } else {
+          StreamingJoinHelper.getStateKeyWatermarkOrdinal(rightKeys, right.output)
+        }),
       new OneSideHashJoiner(
         RightSide, right.output, rightKeys, rightInputIter,
         condition.rightSideOnly, postJoinFilter, stateWatermarkPredicates.right, partitionId,
         checkpointIds.right.keyToNumValues, checkpointIds.right.keyWithIndexToValue,
         skippedNullValueCount, joinStateManagerStoreGenerator,
-        StreamingJoinHelper.getStateKeyWatermarkOrdinal(leftKeys, left.output)))
+        if (useLegacyV4WatermarkIndex) {
+          legacyJoinKeyOrdinal
+        } else {
+          StreamingJoinHelper.getStateKeyWatermarkOrdinal(leftKeys, left.output)
+        }))
 
     //  Join one side input using the other side's buffered/state rows. Here is how it is done.
     //
@@ -712,7 +696,9 @@ case class StreamingSymmetricHashJoinExec(
     val preJoinFilter =
       Predicate.create(preJoinFilterExpr.getOrElse(Literal(true)), inputAttributes).eval _
 
-    private val stateValueWatermarkOrdinal = stateWatermarkPredicate.flatMap {
+    private val stateValueWatermarkOrdinal = stateWatermarkPredicate.filter { _ =>
+      !useLegacyV4WatermarkIndex
+    }.flatMap {
       case JoinStateValueWatermarkPredicate(expr, _, _) =>
         inputAttributes.indexWhere(expr.references.contains) match {
           case ordinal if ordinal >= 0 => Some(ordinal)
@@ -760,8 +746,8 @@ case class StreamingSymmetricHashJoinExec(
     private[this] val allowMultipleStatefulOperators: Boolean =
       conf.getConf(SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE)
 
-    // V4 range scan for time-interval joins (SPARK-55147). Use it only when both sides are
-    // indexed by their own event time, as the offsets must apply to the indexed timestamps.
+    // V4 range scan for time-interval joins (SPARK-55147). With corrected indexing, use it
+    // only when both sides are indexed by their own event time.
     // The -1 eviction adjustment widens range by ~1ms/side; postJoinFilter handles exact bounds.
     private[this] val scanRangeOffsets: Option[(Long, Long)] = {
       def usesEventTime(
@@ -773,8 +759,12 @@ case class StreamingSymmetricHashJoinExec(
         case _ => false
       }
       val isV4TimeIntervalJoin = stateFormatVersion >= 4 &&
-        usesEventTime(left.output, stateWatermarkPredicates.left) &&
-        usesEventTime(right.output, stateWatermarkPredicates.right)
+        (if (useLegacyV4WatermarkIndex) {
+          stateWatermarkPredicate.exists(_.isInstanceOf[JoinStateValueWatermarkPredicate])
+        } else {
+          usesEventTime(left.output, stateWatermarkPredicates.left) &&
+            usesEventTime(right.output, stateWatermarkPredicates.right)
+        })
 
       if (!isV4TimeIntervalJoin) {
         None
@@ -1169,7 +1159,7 @@ case class StreamingSymmetricHashJoinExec(
     val (leftStateWatermark, rightStateWatermark) =
       StreamingSymmetricHashJoinHelper.getStateWatermark(
         left.output, right.output, leftKeys, rightKeys, condition.full, Some(inputWatermarkMs),
-        !allowMultipleStatefulOperators)
+        !allowMultipleStatefulOperators, useLegacyV4WatermarkIndex)
 
     Some((leftStateWatermark ++ rightStateWatermark ++ Some(inputWatermarkMs)).min)
   }
