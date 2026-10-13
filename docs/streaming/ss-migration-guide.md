@@ -29,11 +29,16 @@ Please refer [Migration Guide: SQL, Datasets and DataFrame](../sql-migration-gui
   conditions that cannot finalize the required unmatched state. Left outer and left semi joins
   require a bound from the right input's watermark; right outer joins require the reverse, and
   full outer joins require both directions. This also applies to equality joins on event time.
-  Valid one-sided left/right outer and left semi range joins remain supported.
-  Existing V4 checkpoints keep their previous timestamp indexing. To apply the fix to one of them
-  and recover missing results, use a new checkpoint and replay its input data. V2/V3 checkpoints
-  are unaffected by the V4 index change. A join that can still emit old event times may stop
-  advancing its output watermark for downstream append-mode operators.
+  This validation also applies when restarting an existing checkpoint. Valid one-sided left/right
+  outer and left semi range joins remain supported.
+
+- Since Spark 4.4, new stream-stream joins evict state using the opposite input's watermark.
+  With a watermark on only one input, inner, outer, and semi joins may retain state on the
+  watermarked side indefinitely and produce matches previously lost to premature eviction. A join
+  that can still emit old event times may stop advancing its output watermark for downstream
+  append-mode operators. Existing checkpoints keep their prior join-watermark mode; V4 checkpoints
+  also keep their previous timestamp indexing. To apply the fix to an existing query, use a new
+  checkpoint and replay its input data.
 
 - Since Spark 4.4, streaming queries using `EXCEPT` with a streaming left input are rejected
   because their optimizer rewrites introduce streaming aggregations after the initial

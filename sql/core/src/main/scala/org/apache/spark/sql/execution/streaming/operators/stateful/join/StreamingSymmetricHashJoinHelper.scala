@@ -163,9 +163,9 @@ object StreamingSymmetricHashJoinHelper extends Logging {
       condition: Option[Expression],
       eventTimeWatermarkForEviction: Option[Long],
       allowMultipleEventTimeColumns: Boolean,
-      useLegacyWatermarkIndex: Boolean = false): (Option[Long], Option[Long]) = {
+      useLegacyWatermarkSemantics: Boolean = false): (Option[Long], Option[Long]) = {
 
-    if (useLegacyWatermarkIndex) {
+    if (useLegacyWatermarkSemantics) {
       return getLegacyStateWatermark(leftAttributes, rightAttributes, leftKeys, rightKeys,
         condition, eventTimeWatermarkForEviction, allowMultipleEventTimeColumns)
     }
@@ -209,9 +209,9 @@ object StreamingSymmetricHashJoinHelper extends Logging {
       eventTimeWatermarkForEviction: Option[Long],
       eventTimeWatermarkForLateEvents: Option[Long],
       useFirstEventTimeColumn: Boolean,
-      useLegacyWatermarkIndex: Boolean = false): JoinStateWatermarkPredicates = {
+      useLegacyWatermarkSemantics: Boolean = false): JoinStateWatermarkPredicates = {
 
-    if (useLegacyWatermarkIndex) {
+    if (useLegacyWatermarkSemantics) {
       return getLegacyStateWatermarkPredicates(leftAttributes, rightAttributes, leftKeys,
         rightKeys, condition, eventTimeWatermarkForEviction, eventTimeWatermarkForLateEvents,
         useFirstEventTimeColumn)
@@ -262,6 +262,7 @@ object StreamingSymmetricHashJoinHelper extends Logging {
           condition,
           eventTimeWatermarkForEviction)
         stateValueWatermark.flatMap { case (stateAttribute, watermark) =>
+          // Rows newer than the late-event watermark can have arrived since the last eviction.
           val prevStateValueWatermark = eventTimeWatermarkForLateEvents.flatMap { _ =>
             StreamingJoinHelper.getStateValueWatermarkWithAttribute(
               attributesToFindStateWatermarkFor = AttributeSet(oneSideInputAttributes),
@@ -270,8 +271,8 @@ object StreamingSymmetricHashJoinHelper extends Logging {
               eventTimeWatermarkForLateEvents).collect {
               case (prevAttribute, prevWatermark)
                   if prevAttribute.semanticEquals(stateAttribute) &&
-                    ownEventTime.exists(_.semanticEquals(stateAttribute)) &&
-                    prevWatermark <= eventTimeWatermarkForLateEvents.get => prevWatermark
+                    ownEventTime.exists(_.semanticEquals(stateAttribute)) =>
+                math.min(prevWatermark, eventTimeWatermarkForLateEvents.get)
             }
           }
           watermarkExpression(Some(stateAttribute), Some(watermark)).map { e =>
@@ -304,7 +305,7 @@ object StreamingSymmetricHashJoinHelper extends Logging {
       if (keyOrdinal.isDefined) {
         eventTimeWatermarkForEviction
       } else if (attrs.exists(_.metadata.contains(delayKey))) {
-        StreamingJoinHelper.getStateValueWatermark(
+        StreamingJoinHelper.getLegacyStateValueWatermark(
           AttributeSet(attrs), AttributeSet(otherAttrs), condition,
           eventTimeWatermarkForEviction)
       } else {
@@ -324,6 +325,8 @@ object StreamingSymmetricHashJoinHelper extends Logging {
       eventTimeWatermarkForEviction: Option[Long],
       eventTimeWatermarkForLateEvents: Option[Long],
       useFirstEventTimeColumn: Boolean): JoinStateWatermarkPredicates = {
+    // Existing checkpoints retain the old predicate and indexed timestamp selection. Only the
+    // scan-start bound below is capped; that does not change either selection.
     WatermarkSupport.findEventTimeColumn(leftAttributes, useFirstEventTimeColumn)
     WatermarkSupport.findEventTimeColumn(rightAttributes, useFirstEventTimeColumn)
 
@@ -340,14 +343,16 @@ object StreamingSymmetricHashJoinHelper extends Logging {
             eventTimeWatermarkForLateEvents)
         }
       } else if (attrs.exists(_.metadata.contains(delayKey))) {
-        val stateWatermark = StreamingJoinHelper.getStateValueWatermark(
+        val stateWatermark = StreamingJoinHelper.getLegacyStateValueWatermark(
           AttributeSet(attrs), AttributeSet(otherAttrs), condition,
           eventTimeWatermarkForEviction)
+        // New rows can arrive down to the late-event watermark after the previous batch.
+        // Do not skip them when scanning the V4 timestamp index for eviction.
         val prevStateWatermark = eventTimeWatermarkForLateEvents.flatMap { _ =>
-          StreamingJoinHelper.getStateValueWatermark(
+          StreamingJoinHelper.getLegacyStateValueWatermark(
             AttributeSet(attrs), AttributeSet(otherAttrs), condition,
             eventTimeWatermarkForLateEvents)
-        }
+        }.map(math.min(_, eventTimeWatermarkForLateEvents.get))
         val eventTime = attrs.find(_.metadata.contains(delayKey))
         watermarkExpression(eventTime, stateWatermark).map { expr =>
           JoinStateValueWatermarkPredicate(expr, stateWatermark.get, prevStateWatermark)

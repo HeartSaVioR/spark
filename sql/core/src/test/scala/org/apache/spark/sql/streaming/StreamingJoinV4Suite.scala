@@ -626,6 +626,8 @@ class StreamingOuterJoinV4Suite
   extends StreamingOuterJoinBase
   with TestWithV4StateFormat {
 
+  import testImplicits._
+
   test("SPARK-58904: legacy V4 range join keeps its prior eviction behavior") {
     val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
       "left_outer", leftWatermark = false)
@@ -646,6 +648,36 @@ class StreamingOuterJoinV4Suite
           assert(join.useLegacyV4WatermarkIndex)
           assert(join.stateWatermarkPredicates.left.isEmpty)
         })
+    }
+  }
+
+  test("SPARK-58904: legacy V4 scan includes newly admitted rows below the old bound") {
+    val leftInput = MemoryStream[(Int, Int)]
+    val rightInput = MemoryStream[(Int, Int)]
+    val left = leftInput.toDF().toDF("leftKey", "time")
+      .select($"leftKey", timestamp_seconds($"time").as("leftTime"))
+      .withWatermark("leftTime", "0 seconds")
+    val right = rightInput.toDF().toDF("rightKey", "time")
+      .select($"rightKey", timestamp_seconds($"time").as("rightTime"))
+      .withWatermark("rightTime", "0 seconds")
+    val joined = left.join(right,
+      expr("leftKey = rightKey AND leftTime > rightTime + INTERVAL 5 SECONDS"),
+      "left_outer")
+      .select($"leftKey", $"rightKey", $"leftTime".cast("long"),
+        $"rightTime".cast("long"))
+
+    withSQLConf(
+        SQLConf.STREAMING_JOIN_V4_CORRECTED_WATERMARK_INDEX_ENABLED.key -> "false",
+        SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+      testStream(joined)(
+        MultiAddData(leftInput, (9, 20))(rightInput, (9, 10)),
+        CheckNewAnswer(Row(9, 9, 20, 10)),
+        AddData(rightInput, (2, 20)),
+        CheckNewAnswer(),
+        // This left row is newer than the late-event watermark but older than the
+        // previous state bound. It must still be scanned and finalized.
+        MultiAddData(leftInput, (1, 12))(rightInput, (2, 30)),
+        CheckNewAnswer(Row(1, null, 12, null)))
     }
   }
 }

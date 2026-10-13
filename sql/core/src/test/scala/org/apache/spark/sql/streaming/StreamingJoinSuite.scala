@@ -35,8 +35,8 @@ import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.execution.datasources.v2.state.StateSourceOptions
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
-import org.apache.spark.sql.execution.streaming.checkpointing.CheckpointFileManager
-import org.apache.spark.sql.execution.streaming.operators.stateful.StatefulOperatorStateInfo
+import org.apache.spark.sql.execution.streaming.checkpointing.{CheckpointFileManager, OffsetMap, OffsetSeq, OffsetSeqLog}
+import org.apache.spark.sql.execution.streaming.operators.stateful.{StatefulOperatorStateInfo, StateStoreSaveExec}
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.{StreamingSymmetricHashJoinExec, StreamingSymmetricHashJoinHelper}
 import org.apache.spark.sql.execution.streaming.runtime.{MemoryStream, StreamExecution}
 import org.apache.spark.sql.execution.streaming.state._
@@ -1086,6 +1086,76 @@ abstract class StreamingInnerJoinBase extends StreamingJoinSuite {
 /** Adds tests that are specific to state format V1-V3 (not compatible with V4). */
 abstract class StreamingInnerJoinSuite extends StreamingInnerJoinBase {
   import testImplicits._
+
+  test("SPARK-58904: V2/V3 checkpoint keeps join and downstream watermark behavior") {
+    val correctedKey = SQLConf.STREAMING_JOIN_V1_TO_V3_CORRECTED_WATERMARK_ENABLED.key
+    val leftInput = MemoryStream[Int]
+    val rightInput = MemoryStream[Int]
+    val left = leftInput.toDF()
+      .select(timestamp_seconds($"value").as("leftTime"))
+      .withWatermark("leftTime", "0 seconds")
+    val right = rightInput.toDF().select(timestamp_seconds($"value").as("rightTime"))
+    val result = left.join(right, $"leftTime" === $"rightTime")
+      .groupBy(window($"leftTime", "10 seconds"))
+      .count()
+      .select($"window.start".cast("long"), $"count")
+    var downstreamWatermarkBeforeRestart = Option.empty[Long]
+
+    withTempDir { checkpointDir =>
+      val checkpoint = checkpointDir.getCanonicalPath
+      withSQLConf(
+          correctedKey -> "false",
+          SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+        testStream(result, OutputMode.Update())(
+          StartStream(checkpointLocation = checkpoint),
+          MultiAddData(leftInput, 5)(rightInput, 5),
+          CheckNewAnswer(Row(0L, 1L)),
+          MultiAddData(leftInput, 30)(rightInput, 30),
+          CheckNewAnswer(Row(30L, 1L)),
+          AddData(rightInput, 40),
+          CheckNewAnswer(),
+          Execute { query =>
+            val aggregation = query.lastExecution.executedPlan.collect {
+              case s: StateStoreSaveExec => s
+            }.head
+            downstreamWatermarkBeforeRestart = aggregation.eventTimeWatermarkForEviction
+            assert(downstreamWatermarkBeforeRestart.exists(_ > 0L))
+          },
+          StopStream)
+      }
+
+      // Simulate a checkpoint written before the corrected-watermark setting existed.
+      val offsetsPath = checkpoint + "/offsets"
+      val offsetLog = new OffsetSeqLog(spark, offsetsPath)
+      val (batchId, offsets) = offsetLog.getLatest().get
+      val updated = offsets match {
+        case o: OffsetSeq =>
+          o.copy(metadataOpt = o.metadataOpt.map(m => m.copy(conf = m.conf - correctedKey)))
+        case o: OffsetMap =>
+          o.copy(metadata = o.metadata.copy(conf = o.metadata.conf - correctedKey))
+      }
+      val path = new Path(offsetsPath, batchId.toString)
+      assert(path.getFileSystem(spark.sessionState.newHadoopConf()).delete(path, false))
+      assert(offsetLog.add(batchId, updated))
+
+      withSQLConf(SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+        testStream(result, OutputMode.Update())(
+          StartStream(checkpointLocation = checkpoint),
+          AddData(rightInput, 50),
+          CheckNewAnswer(),
+          Execute { query =>
+            val plan = query.lastExecution.executedPlan
+            val join = plan.collect { case j: StreamingSymmetricHashJoinExec => j }.head
+            val aggregation = plan.collect { case s: StateStoreSaveExec => s }.head
+            assert(join.useLegacyWatermarkSemantics)
+            assert(aggregation.eventTimeWatermarkForEviction ===
+              downstreamWatermarkBeforeRestart)
+          })
+      }
+      assert(offsetLog.getLatest().flatMap(_._2.metadataOpt)
+        .flatMap(_.conf.get(correctedKey)).contains("false"))
+    }
+  }
 
   testWithAppendAndUpdate("stream stream inner join on windows - with watermark") { outputMode =>
     val input1 = MemoryStream[Int]

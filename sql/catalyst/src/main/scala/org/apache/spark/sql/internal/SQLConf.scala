@@ -4037,6 +4037,15 @@ object SQLConf {
       .booleanConf
       .createWithDefault(true)
 
+  val STREAMING_JOIN_V1_TO_V3_CORRECTED_WATERMARK_ENABLED =
+    buildConf("spark.sql.streaming.join.v1ToV3.correctedWatermark.enabled")
+      .internal()
+      .doc("Use corrected watermark eviction for stream-stream joins with state formats V1-V3. " +
+        "The value is pinned in the offset log for checkpoint compatibility.")
+      .version("4.4.0")
+      .booleanConf
+      .createWithDefault(true)
+
   val STREAMING_SESSION_WINDOW_MERGE_SESSIONS_IN_LOCAL_PARTITION =
     buildConf("spark.sql.streaming.sessionWindow.merge.sessions.in.local.partition")
       .doc("When true, streaming session window sorts and merge sessions in local partition " +

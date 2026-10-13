@@ -163,7 +163,7 @@ class StreamingSymmetricHashJoinHelperSuite extends StreamTest {
       val predicates = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
         Seq(lt), Seq(rt), Nil, Nil, Some(lt > rt + offset),
         Some(20000), Some(10000), false)
-      val expectedPrevious = if (offset < 0) Some(5000L) else None
+      val expectedPrevious = if (offset < 0) Some(5000L) else Some(10000L)
       assert(predicates.left.exists {
         case JoinStateValueWatermarkPredicate(_, watermark, previous) =>
           watermark == 20000 + offset * 1000 && previous == expectedPrevious
@@ -196,15 +196,24 @@ class StreamingSymmetricHashJoinHelperSuite extends StreamTest {
     val condition = Some(lt > rt - 5)
     val legacy = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
       Seq(lt), Seq(rt), Nil, Nil, condition, Some(20000), None, false,
-      useLegacyWatermarkIndex = true)
+      useLegacyWatermarkSemantics = true)
     assert(legacy.left.isEmpty && legacy.right.isEmpty)
     assert(StreamingSymmetricHashJoinHelper.getStateWatermark(
       Seq(lt), Seq(rt), Nil, Nil, condition, Some(20000), false,
-      useLegacyWatermarkIndex = true) === (None, None))
+      useLegacyWatermarkSemantics = true) === (None, None))
 
     val legacyKey = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
       Seq(lt), Seq(rt), Seq(lt), Seq(rt), None, Some(20000), None, false,
-      useLegacyWatermarkIndex = true)
+      useLegacyWatermarkSemantics = true)
     assert(legacyKey.left.isDefined && legacyKey.right.isDefined)
+
+    val watermarkedLeft = lt.withMetadata(metadata)
+    val legacyRange = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
+      Seq(watermarkedLeft), Seq(rt), Nil, Nil, Some(watermarkedLeft > rt + 5),
+      Some(20000), Some(10000), false, useLegacyWatermarkSemantics = true)
+    assert(legacyRange.left.exists {
+      case JoinStateValueWatermarkPredicate(_, 25000, Some(10000)) => true
+      case _ => false
+    })
   }
 }

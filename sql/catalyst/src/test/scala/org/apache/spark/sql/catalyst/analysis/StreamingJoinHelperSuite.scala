@@ -39,6 +39,34 @@ class StreamingJoinHelperSuite extends AnalysisTest {
     }
   }
 
+  test("SPARK-58904: prefer the state side's event time in either conjunct order") {
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val eventTime = AttributeReference("eventTime", TimestampType, metadata = metadata)()
+    val other = AttributeReference("other", TimestampType)()
+    val right = AttributeReference("right", TimestampType, metadata = metadata)()
+    Seq(other > right && eventTime > right,
+      eventTime > right && other > right).foreach { condition =>
+      val result = StreamingJoinHelper.getStateValueWatermarkWithAttribute(
+        AttributeSet(Seq(eventTime, other)), AttributeSet(Seq(right)), Some(condition),
+        Some(20000L))
+      assert(result.exists { case (attr, watermark) =>
+        attr.semanticEquals(eventTime) && watermark == 20000L
+      })
+    }
+  }
+
+  test("SPARK-58904: legacy state bounds keep the prior extraction rules") {
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val stateValue = AttributeReference("stateValue", IntegerType)()
+    val right = AttributeReference("right", TimestampType, metadata = metadata)()
+    val condition = Some(stateValue > right)
+    assert(StreamingJoinHelper.getStateValueWatermark(
+      AttributeSet(Seq(stateValue)), AttributeSet(Seq(right)), condition, Some(20000L)).isEmpty)
+    assert(StreamingJoinHelper.getLegacyStateValueWatermark(
+      AttributeSet(Seq(stateValue)), AttributeSet(Seq(right)), condition,
+      Some(20000L)).contains(20000L))
+  }
+
   test("extract watermark from time condition") {
     val attributesToFindConstraintFor = Seq(
       AttributeReference("leftTime", TimestampType)(),

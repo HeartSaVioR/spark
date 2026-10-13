@@ -229,6 +229,11 @@ case class StreamingSymmetricHashJoinExec(
     conf.getConf(SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE)
   private[sql] val useLegacyV4WatermarkIndex = stateFormatVersion == 4 &&
     !conf.getConf(SQLConf.STREAMING_JOIN_V4_CORRECTED_WATERMARK_INDEX_ENABLED)
+  private[sql] val useLegacyWatermarkSemantics = if (stateFormatVersion == 4) {
+    useLegacyV4WatermarkIndex
+  } else {
+    !conf.getConf(SQLConf.STREAMING_JOIN_V1_TO_V3_CORRECTED_WATERMARK_ENABLED)
+  }
 
   private val useVirtualColumnFamilies = stateFormatVersion >= 3
 
@@ -1159,7 +1164,7 @@ case class StreamingSymmetricHashJoinExec(
     val (leftStateWatermark, rightStateWatermark) =
       StreamingSymmetricHashJoinHelper.getStateWatermark(
         left.output, right.output, leftKeys, rightKeys, condition.full, Some(inputWatermarkMs),
-        !allowMultipleStatefulOperators, useLegacyV4WatermarkIndex)
+        !allowMultipleStatefulOperators, useLegacyWatermarkSemantics)
 
     Some((leftStateWatermark ++ rightStateWatermark ++ Some(inputWatermarkMs)).min)
   }
