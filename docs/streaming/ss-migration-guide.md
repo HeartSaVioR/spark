@@ -29,8 +29,9 @@ Please refer [Migration Guide: SQL, Datasets and DataFrame](../sql-migration-gui
   reject conditions that cannot finalize the required state. Left outer and left semi joins
   require a bound from the right input's watermark; right outer joins require the reverse, and
   full outer joins require both directions. This also applies to equality joins on event time.
-  The check runs when the first micro-batch is planned. Existing checkpoints retain previously
-  accepted join shapes under their pinned legacy behavior; see the replay guidance below.
+  The check runs when the first micro-batch is planned, so an invalid new query may fail after
+  `writeStream.start()` returns. Existing checkpoints retain previously accepted join shapes under
+  their pinned legacy behavior; see the replay guidance below.
 
 - Since Spark 4.4, new stream-stream joins evict state using the opposite input's watermark.
   With a watermark on only one input, inner, outer, and semi joins may retain state on the

@@ -25,7 +25,7 @@ import scala.collection.mutable.{Map => MutableMap}
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.internal.LogKeys.{BATCH_TIMESTAMP, ERROR}
+import org.apache.spark.internal.LogKeys.{BATCH_TIMESTAMP, ERROR, JOIN_TYPE, OP_ID, REASON}
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.QueryPlanningTracker
 import org.apache.spark.sql.catalyst.analysis.WidenStatefulOperatorAttributeNullability
@@ -640,7 +640,8 @@ class IncrementalExecution(
       }
     }
 
-    private def joinWatermarkBehaviorChanged(j: StreamingSymmetricHashJoinExec): Boolean = {
+    private def joinWatermarkBehaviorDifferences(
+        j: StreamingSymmetricHashJoinExec): Seq[String] = {
       def samePredicate(
           left: Option[JoinStateWatermarkPredicate],
           right: Option[JoinStateWatermarkPredicate]): Boolean = (left, right) match {
@@ -656,7 +657,7 @@ class IncrementalExecution(
 
       // A fixed bound can hide a difference at the checkpoint watermark but not later.
       // The second probe is the end of year 9999.
-      Seq(offsetSeqMetadata.batchWatermarkMs, 253402300799999L).exists { probe =>
+      Seq(offsetSeqMetadata.batchWatermarkMs, 253402300799999L).flatMap { probe =>
         val watermark = Some(probe)
         def predicates(legacy: Boolean) =
           StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
@@ -669,10 +670,14 @@ class IncrementalExecution(
 
         val legacyPredicates = predicates(legacy = true)
         val correctedPredicates = predicates(legacy = false)
-        !samePredicate(legacyPredicates.left, correctedPredicates.left) ||
-          !samePredicate(legacyPredicates.right, correctedPredicates.right) ||
-          outputWatermark(legacy = true) != outputWatermark(legacy = false)
-      }
+        Seq(
+          Option.when(!samePredicate(legacyPredicates.left, correctedPredicates.left))(
+            "left-state eviction"),
+          Option.when(!samePredicate(legacyPredicates.right, correctedPredicates.right))(
+            "right-state eviction"),
+          Option.when(outputWatermark(legacy = true) != outputWatermark(legacy = false))(
+            "output watermark")).flatten
+      }.distinct
     }
 
     private def simulateWatermarkPropagation(plan: SparkPlan): Unit = {
@@ -787,14 +792,18 @@ class IncrementalExecution(
       // Only check when streaming is restarting and is first batch
       if (isFirstBatch && currentBatchId != 0) {
         checkOperatorValidWithMetadata(planWithStateOpId, currentBatchId - 1)
-        if (planWithStateOpId.exists {
-          case j: StreamingSymmetricHashJoinExec if j.useLegacyWatermarkSemantics &&
-              joinWatermarkBehaviorChanged(j) => true
-          case _ => false
-        }) {
-          logWarning(log"SPARK-58904: This restarted stream-stream join uses legacy watermark " +
-            log"behavior that may have affected results or downstream watermarks. " +
-            log"To guarantee corrected results, start with a new checkpoint and replay input.")
+        planWithStateOpId.foreach {
+          case j: StreamingSymmetricHashJoinExec if j.useLegacyWatermarkSemantics =>
+            val differences = joinWatermarkBehaviorDifferences(j)
+            if (differences.nonEmpty) {
+              logWarning(log"SPARK-58904: This restarted stream-stream join " +
+                log"(operator ${MDC(OP_ID, j.getStateInfo.operatorId)}, " +
+                log"type ${MDC(JOIN_TYPE, j.joinType)}) uses legacy watermark behavior. " +
+                log"Corrected behavior differs in ${MDC(REASON, differences.mkString(", "))}. " +
+                log"Past results or downstream watermarks may have been affected. " +
+                log"To guarantee corrected results, start with a new checkpoint and replay input.")
+            }
+          case _ =>
         }
       }
 
