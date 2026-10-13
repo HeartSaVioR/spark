@@ -1357,6 +1357,50 @@ abstract class StreamingOuterJoinBase extends StreamingJoinSuite {
   import testImplicits._
   import org.apache.spark.sql.functions._
 
+  test("SPARK-58904: corrected left outer equality join requires a right watermark") {
+    val (leftInput, _, joined) = setupJoinWithRangeCondition(
+      "left_outer", leftWatermark = true, rightWatermark = false, joinOnTime = true)
+    val error = intercept[StreamingQueryException] {
+      testStream(joined)(
+        AddData(leftInput, (1, 5)),
+        CheckNewAnswer())
+    }
+    assert(error.getMessage.contains("a watermark on the right input"))
+  }
+
+  test("SPARK-58904: legacy left outer equality join can restart") {
+    val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
+      "left_outer", leftWatermark = true, rightWatermark = false, joinOnTime = true)
+    withTempDir { checkpointDir =>
+      val checkpoint = checkpointDir.getCanonicalPath
+      withSQLConf(
+          SQLConf.STREAMING_JOIN_V1_TO_V3_CORRECTED_WATERMARK_ENABLED.key -> "false",
+          SQLConf.STREAMING_JOIN_V4_CORRECTED_WATERMARK_INDEX_ENABLED.key -> "false") {
+        testStream(joined)(
+          StartStream(checkpointLocation = checkpoint),
+          AddData(leftInput, (1, 5)),
+          CheckNewAnswer(),
+          StopStream)
+      }
+
+      val warning = new LogAppender("legacy equality join warning", maxEvents = 10000)
+      withLogAppender(warning) {
+        testStream(joined)(
+          StartStream(checkpointLocation = checkpoint),
+          AddData(rightInput, (2, 30)),
+          CheckNewAnswer(),
+          Execute { query =>
+            val join = query.lastExecution.executedPlan.collect {
+              case j: StreamingSymmetricHashJoinExec => j
+            }.head
+            assert(join.useLegacyWatermarkSemantics)
+          })
+      }
+      assert(warning.loggingEvents.count(_.getMessage.getFormattedMessage.contains(
+        "SPARK-58904: This restarted stream-stream join")) == 1)
+    }
+  }
+
   for {
     (joinType, leftWatermark, rightWatermark, expected) <- Seq(
       ("left_outer", false, true, Row(1, null, 5, null)),
@@ -2204,7 +2248,7 @@ abstract class StreamingFullOuterJoinBase extends StreamingJoinSuite {
     test(s"SPARK-58904: full outer range join rejects only $watermarkSide watermark") {
       val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
         "full_outer", leftWatermark = leftWatermark, rightWatermark = rightWatermark)
-      val error = intercept[AnalysisException] {
+      val error = intercept[StreamingQueryException] {
         testStream(joined)(
           MultiAddData(leftInput, (1, 5))(rightInput, (2, 30)),
           CheckNewAnswer()

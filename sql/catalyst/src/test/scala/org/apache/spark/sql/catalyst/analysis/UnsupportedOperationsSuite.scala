@@ -530,17 +530,27 @@ class UnsupportedOperationsSuite extends SparkFunSuite with SQLHelper {
     }
     val leftCanEvict = rightWatermark && conditionType != "right bound"
     val rightCanEvict = leftWatermark && conditionType != "left bound"
-    val supported = joinType match {
+    val correctedSupported = joinType match {
       case LeftOuter | LeftSemi => leftCanEvict
       case RightOuter => rightCanEvict
       case FullOuter => leftCanEvict && rightCanEvict
       case _ => false
     }
+    val legacySupported = if (conditionType == "equality") {
+      leftWatermark || rightWatermark
+    } else {
+      joinType match {
+        case LeftOuter | LeftSemi => leftCanEvict
+        case RightOuter => rightCanEvict
+        case FullOuter => leftCanEvict || rightCanEvict
+        case _ => false
+      }
+    }
     val plan = new TestStreamingRelation(left).join(new TestStreamingRelation(right),
       joinType = joinType, condition = Some(condition))
     val name = s"SPARK-58904: $joinType $conditionType with watermarks " +
       s"left=$leftWatermark right=$rightWatermark"
-    if (supported) {
+    if (correctedSupported || legacySupported) {
       assertSupportedInStreamingPlan(name, plan, OutputMode.Append())
     } else {
       assertNotSupportedInStreamingPlan(name, plan, OutputMode.Append(),
@@ -567,16 +577,19 @@ class UnsupportedOperationsSuite extends SparkFunSuite with SQLHelper {
         assertSupportedInStreamingPlan(s"SPARK-58904: $joinType with $name",
           left.join(right, joinType = joinType, condition = Some(condition)), OutputMode.Append())
       }
+      // These bounds were accepted before SPARK-58904. Corrected-mode execution rejects them
+      // when the checkpoint setting becomes available during planning.
       Seq(
         "constant bound" -> (leftTime > 10),
         "non-advancing bound" -> (leftTime + rightTime > 100),
-        "repeated state attribute" -> (leftTime + leftTime > rightTime),
-        "unrelated right watermark" -> (leftTime > rightOther - 10)
+        "repeated state attribute" -> (leftTime + leftTime > rightTime)
       ).foreach { case (name, condition) =>
-        assertNotSupportedInStreamingPlan(s"SPARK-58904: $joinType with $name",
-          left.join(right, joinType = joinType, condition = Some(condition)), OutputMode.Append(),
-          Seq("requires a watermark on the right input"))
+        assertSupportedInStreamingPlan(s"SPARK-58904: legacy $joinType with $name",
+          left.join(right, joinType = joinType, condition = Some(condition)), OutputMode.Append())
       }
+      assertNotSupportedInStreamingPlan(s"SPARK-58904: $joinType with unrelated right watermark",
+        left.join(right, joinType = joinType, condition = Some(leftTime > rightOther - 10)),
+        OutputMode.Append(), Seq("requires a watermark on the right input"))
     }
 
     assertSupportedInStreamingPlan("SPARK-58904: full outer with different watermark key ordinals",

@@ -26,9 +26,11 @@ import org.apache.hadoop.fs.Path
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{BATCH_TIMESTAMP, ERROR}
+import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.QueryPlanningTracker
 import org.apache.spark.sql.catalyst.analysis.WidenStatefulOperatorAttributeNullability
 import org.apache.spark.sql.catalyst.expressions.{CurrentBatchTimestamp, ExpressionWithRandomSeed}
+import org.apache.spark.sql.catalyst.plans.{FullOuter, LeftOuter, LeftSemi, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern._
@@ -614,6 +616,30 @@ class IncrementalExecution(
   }
 
   val state = new Rule[SparkPlan] {
+    private def checkCorrectedJoinWatermark(j: StreamingSymmetricHashJoinExec): Unit = {
+      val predicates = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
+        j.left.output, j.right.output, j.leftKeys, j.rightKeys, j.condition.full,
+        Some(1000000L), None, !allowMultipleStatefulOperators)
+      val supported = j.joinType match {
+        case LeftOuter | LeftSemi => predicates.left.isDefined
+        case RightOuter => predicates.right.isDefined
+        case FullOuter => predicates.left.isDefined && predicates.right.isDefined
+        case _ => true
+      }
+      if (!supported) {
+        val requirement = j.joinType match {
+          case FullOuter => "watermarks on both inputs and time constraints in both directions"
+          case RightOuter => "a watermark on the left input and a time constraint"
+          case _ => "a watermark on the right input and a time constraint"
+        }
+        val msg = s"Stream-stream ${j.joinType} join requires $requirement " +
+          "to finalize unmatched state."
+        throw new AnalysisException(
+          errorClass = "_LEGACY_ERROR_TEMP_3102",
+          messageParameters = Map("msg" -> msg))
+      }
+    }
+
     private def joinWatermarkBehaviorChanged(j: StreamingSymmetricHashJoinExec): Boolean = {
       def samePredicate(
           left: Option[JoinStateWatermarkPredicate],
@@ -750,6 +776,13 @@ class IncrementalExecution(
 
     override def apply(plan: SparkPlan): SparkPlan = {
       val planWithStateOpId = plan transform composedRule
+      if (isFirstBatch) {
+        planWithStateOpId.foreach {
+          case j: StreamingSymmetricHashJoinExec if !j.useLegacyWatermarkSemantics =>
+            checkCorrectedJoinWatermark(j)
+          case _ =>
+        }
+      }
       // Need to check before write to metadata because we need to detect add operator
       // Only check when streaming is restarting and is first batch
       if (isFirstBatch && currentBatchId != 0) {

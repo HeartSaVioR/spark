@@ -779,9 +779,14 @@ case class StreamingSymmetricHashJoinExec(
           case RightSide => (right.output, left.output)
         }
 
-        val lowerBoundMs = StreamingJoinHelper.getStateValueWatermark(
+        val stateValueWatermark = if (useLegacyV4WatermarkIndex) {
+          StreamingJoinHelper.getLegacyStateValueWatermark _
+        } else {
+          StreamingJoinHelper.getStateValueWatermark _
+        }
+        val lowerBoundMs = stateValueWatermark(
           AttributeSet(otherSideAttrs), AttributeSet(thisSideAttrs), condition.full, Some(0L))
-        val upperBoundMs = StreamingJoinHelper.getStateValueWatermark(
+        val upperBoundMs = stateValueWatermark(
           AttributeSet(thisSideAttrs), AttributeSet(otherSideAttrs), condition.full, Some(0L))
 
         (lowerBoundMs, upperBoundMs) match {

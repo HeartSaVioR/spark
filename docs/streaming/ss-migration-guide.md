@@ -25,12 +25,12 @@ Please refer [Migration Guide: SQL, Datasets and DataFrame](../sql-migration-gui
 
 ## Upgrading from Structured Streaming 4.3 to 4.4
 
-- Since Spark 4.4, stream-stream outer and semi joins reject watermark placements and time
-  conditions that cannot finalize the required unmatched state. Left outer and left semi joins
+- Since Spark 4.4, new stream-stream outer and semi joins using corrected watermark behavior
+  reject conditions that cannot finalize the required state. Left outer and left semi joins
   require a bound from the right input's watermark; right outer joins require the reverse, and
   full outer joins require both directions. This also applies to equality joins on event time.
-  This validation also applies when restarting an existing checkpoint. Valid one-sided left/right
-  outer and left semi range joins remain supported.
+  The check runs when the first micro-batch is planned. Existing checkpoints retain previously
+  accepted join shapes under their pinned legacy behavior; see the replay guidance below.
 
 - Since Spark 4.4, new stream-stream joins evict state using the opposite input's watermark.
   With a watermark on only one input, inner, outer, and semi joins may retain state on the

@@ -55,6 +55,21 @@ class StreamingJoinHelperSuite extends AnalysisTest {
     }
   }
 
+  test("SPARK-58904: legacy range bounds retain the pre-fix minimum") {
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val eventTime = AttributeReference("eventTime", TimestampType, metadata = metadata)()
+    val other = AttributeReference("other", TimestampType)()
+    val right = AttributeReference("right", TimestampType, metadata = metadata)()
+    val condition = Some(eventTime > right + 10 && other > right - 10)
+    val stateAttrs = AttributeSet(Seq(eventTime, other))
+    val otherAttrs = AttributeSet(Seq(right))
+    val legacy = StreamingJoinHelper.getLegacyStateValueWatermark(
+      stateAttrs, otherAttrs, condition, Some(0L))
+    val corrected = StreamingJoinHelper.getStateValueWatermark(
+      stateAttrs, otherAttrs, condition, Some(0L))
+    assert(legacy.isDefined && corrected.isDefined && legacy.get < corrected.get)
+  }
+
   test("SPARK-58904: legacy state bounds keep the prior extraction rules") {
     val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
     val stateValue = AttributeReference("stateValue", IntegerType)()

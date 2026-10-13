@@ -733,7 +733,28 @@ object UnsupportedOperationChecker extends Logging {
           s"Join type ${join.joinType} is not supported with streaming DataFrame/Dataset")(join)
     }
 
-    if (!hasRequiredWatermarks) {
+    // The checkpoint's join-watermark mode is not available during analysis. Preserve the
+    // pre-SPARK-58904 accepted shapes here; corrected-mode queries are checked during planning.
+    val legacyWatermarkInJoinKeys = (leftKeys ++ rightKeys).exists {
+      case a: AttributeReference => a.metadata.contains(EventTimeWatermark.delayKey)
+      case _ => false
+    }
+    lazy val legacyRange = join.joinType match {
+      case LeftOuter | LeftSemi =>
+        StreamingJoinHelper.getLegacyStateValueWatermark(join.left.outputSet,
+          join.right.outputSet, join.condition, Some(1000000L)).isDefined
+      case RightOuter =>
+        StreamingJoinHelper.getLegacyStateValueWatermark(join.right.outputSet,
+          join.left.outputSet, join.condition, Some(1000000L)).isDefined
+      case FullOuter =>
+        StreamingJoinHelper.getLegacyStateValueWatermark(join.left.outputSet,
+          join.right.outputSet, join.condition, Some(1000000L)).isDefined ||
+          StreamingJoinHelper.getLegacyStateValueWatermark(join.right.outputSet,
+            join.left.outputSet, join.condition, Some(1000000L)).isDefined
+      case _ => false
+    }
+
+    if (!hasRequiredWatermarks && !legacyWatermarkInJoinKeys && !legacyRange) {
       val requirement = join.joinType match {
         case FullOuter => "watermarks on both inputs and time constraints in both directions"
         case RightOuter => "a watermark on the left input and a time constraint"
