@@ -2531,6 +2531,72 @@ abstract class StreamingLeftSemiJoinBase extends StreamingJoinSuite {
 
   import testImplicits._
 
+  Seq(false, true).foreach { corrected =>
+    test(s"SPARK-58904: left semi output watermark preserves legacy mode, corrected=$corrected") {
+      val (leftInput, left) = setupStream("left", 2)
+      val (rightInput, right) = setupStream("right", 3)
+      val joined = left.join(right,
+        (left("key") === right("key")) &&
+          expr("leftTime > rightTime - INTERVAL 5 SECONDS AND " +
+            "leftTime < rightTime + INTERVAL 10 SECONDS"), "left_semi")
+        .select("key")
+
+      withSQLConf(
+          SQLConf.STREAMING_JOIN_V1_TO_V3_CORRECTED_WATERMARK_ENABLED.key -> corrected.toString,
+          SQLConf.STREAMING_JOIN_V4_CORRECTED_WATERMARK_INDEX_ENABLED.key -> corrected.toString) {
+        testStream(joined)(
+          MultiAddData(leftInput, 5)(rightInput, 5),
+          CheckNewAnswer(5),
+          Execute { query =>
+            val join = query.lastExecution.executedPlan.collect {
+              case j: StreamingSymmetricHashJoinExec => j
+            }.head
+            assert(join.useLegacyWatermarkSemantics === !corrected)
+            // Legacy mode also includes the right-state bound, which is lower here.
+            val expectedWatermark = if (corrected) 15000L else 10000L
+            assert(join.produceOutputWatermark(20000L) === Some(expectedWatermark))
+          }
+        )
+      }
+    }
+  }
+
+  test("SPARK-58904: left semi output watermark ignores unbounded right state") {
+    val leftInput = MemoryStream[(Int, Int)]
+    val rightInput = MemoryStream[(Int, Int)]
+    val left = leftInput.toDF()
+      .select($"_1".as("leftKey"), timestamp_seconds($"_2").as("leftTime"))
+      .withWatermark("leftTime", "0 seconds")
+    val right = rightInput.toDF()
+      .select($"_1".as("rightKey"), timestamp_seconds($"_2").as("rightTime"))
+      .withWatermark("rightTime", "0 seconds")
+    val result = left.join(right,
+      expr("leftKey = rightKey AND leftTime > rightTime - INTERVAL 5 SECONDS"), "left_semi")
+      .groupBy(window($"leftTime", "10 seconds"))
+      .count()
+      .select($"window.start".cast("long"), $"count")
+
+    testStream(result)(
+      MultiAddData(leftInput, (1, 5))(rightInput, (1, 5)),
+      CheckNewAnswer(),
+      MultiAddData(leftInput, (2, 20))(rightInput, (2, 20)),
+      // Left state is bounded at 15 seconds. Retained right timestamps are not output.
+      CheckNewAnswer(Row(0L, 1L)),
+      Execute { query =>
+        val plan = query.lastExecution.executedPlan
+        val join = plan.collect { case j: StreamingSymmetricHashJoinExec => j }.head
+        val aggregation = plan.collect { case s: StateStoreSaveExec => s }.head
+        assert(join.produceOutputWatermark(20000L) === Some(15000L))
+        assert(aggregation.eventTimeWatermarkForEviction === Some(15000L))
+      },
+      // A fresh left row can still match old right state without emitting its old timestamp.
+      AddData(leftInput, (1, 25)),
+      CheckNewAnswer(),
+      MultiAddData(leftInput, (3, 40))(rightInput, (3, 40)),
+      CheckNewAnswer(Row(20L, 2L))
+    )
+  }
+
   Seq(false, true).foreach { joinOnTime =>
     test(s"SPARK-58904: left semi with right watermark, equality=$joinOnTime") {
       val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
