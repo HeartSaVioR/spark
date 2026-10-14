@@ -117,9 +117,13 @@ class StreamingInnerJoinV4Suite
               assert(join.useLegacyV4WatermarkIndex)
             })
         }
-        assert(warning.loggingEvents.count(_.getMessage.getFormattedMessage.contains(
-          "SPARK-58904: This restarted stream-stream join")) ==
-          (if (leftWatermark) 0 else 1))
+        val warnings = warning.loggingEvents.map(_.getMessage.getFormattedMessage)
+          .filter(_.contains("SPARK-58904: This restarted stream-stream join"))
+        assert(warnings.size == (if (leftWatermark) 0 else 1))
+        if (!leftWatermark) {
+          assert(warnings.head.contains("can retain state"))
+          assert(!warnings.head.contains("unmatched"))
+        }
         assert(latestPinnedIndexConf(checkpointDir).contains("false"))
       }
     }
@@ -634,7 +638,34 @@ class StreamingOuterJoinV4Suite
 
   import testImplicits._
 
-  test("SPARK-58904: restart warns when a fixed bound masks legacy eviction") {
+  test("SPARK-58904: restart warns when legacy outer range state cannot be finalized") {
+    val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
+      "left_outer", leftWatermark = false)
+    withTempDir { checkpointDir =>
+      val checkpoint = checkpointDir.getCanonicalPath
+      withSQLConf(SQLConf.STREAMING_JOIN_V4_CORRECTED_WATERMARK_INDEX_ENABLED.key -> "false") {
+        testStream(joined)(
+          StartStream(checkpointLocation = checkpoint),
+          AddData(leftInput, (1, 5)),
+          ProcessAllAvailable(),
+          StopStream)
+      }
+
+      val warning = new LogAppender("legacy V4 outer range warning", maxEvents = 10000)
+      withLogAppender(warning) {
+        testStream(joined)(
+          StartStream(checkpointLocation = checkpoint),
+          AddData(rightInput, (2, 30)),
+          ProcessAllAvailable())
+      }
+      val warnings = warning.loggingEvents.map(_.getMessage.getFormattedMessage)
+        .filter(_.contains("SPARK-58904: This restarted stream-stream join"))
+      assert(warnings.size == 1)
+      assert(warnings.head.contains("may delay or prematurely emit unmatched left rows"))
+    }
+  }
+
+  test("SPARK-58904: restart warns when a fixed bound delays unmatched output") {
     val leftInput = MemoryStream[(Int, Int, Int)]
     val rightInput = MemoryStream[(Int, Int)]
     val left = leftInput.toDF().toDF("leftKey", "time", "leftValue")

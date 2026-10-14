@@ -38,10 +38,12 @@ Please refer [Migration Guide: SQL, Datasets and DataFrame](../sql-migration-gui
   watermarked side indefinitely and produce matches previously lost to premature eviction. A join
   that can still emit old event times may stop advancing its output watermark for downstream
   append-mode operators. Existing checkpoints keep their prior join-watermark mode; V4 checkpoints
-  also keep their previous timestamp indexing. To apply the fix to an existing query, use a new
-  checkpoint and replay its input data. On restart, Spark warns when it detects a difference
-  between the pinned and corrected join watermark behavior. A warning cannot establish whether
-  past results were affected, and its absence does not prove they were safe.
+  also keep their previous timestamp indexing. On restart, Spark warns for join shapes whose old
+  cleanup may retain extra state or affect results. This matters for inner and semi joins too;
+  outer joins may also delay unmatched rows. A warning does not mean that past results are wrong
+  or that the checkpoint must be discarded. To adopt corrected behavior, start with a new
+  checkpoint and replay input. Outer and semi joins must first meet the watermark requirements
+  above. The absence of a warning does not prove that earlier results were safe.
 
 - Since Spark 4.4, streaming queries using `EXCEPT` with a streaming left input are rejected
   because their optimizer rewrites introduce streaming aggregations after the initial

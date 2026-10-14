@@ -34,7 +34,7 @@ import org.apache.spark.sql.execution.streaming.state.{StateStoreCheckpointInfo,
 /**
  * Helper object for [[StreamingSymmetricHashJoinExec]]. See that object for more details.
  */
-object StreamingSymmetricHashJoinHelper extends Logging {
+object StreamingSymmetricHashJoinHelper extends Logging with PredicateHelper {
 
   sealed trait JoinSide
   case object LeftSide extends JoinSide { override def toString(): String = "left" }
@@ -365,6 +365,65 @@ object StreamingSymmetricHashJoinHelper extends Logging {
     JoinStateWatermarkPredicates(
       oneSide(leftAttributes, leftKeys, rightAttributes),
       oneSide(rightAttributes, rightKeys, leftAttributes))
+  }
+
+  /** Join shapes whose state cleanup can change under the corrected watermark rules. */
+  private[sql] def legacyWatermarkChangeSides(
+      leftAttributes: Seq[Attribute],
+      rightAttributes: Seq[Attribute],
+      leftKeys: Seq[Expression],
+      rightKeys: Seq[Expression],
+      condition: Option[Expression]): Seq[String] = {
+    val leftWatermarked = leftAttributes.filter(_.metadata.contains(delayKey))
+    val rightWatermarked = rightAttributes.filter(_.metadata.contains(delayKey))
+    if (leftWatermarked.map(_.exprId).distinct.size > 1 ||
+        rightWatermarked.map(_.exprId).distinct.size > 1) {
+      return Nil
+    }
+
+    val legacyKeyOrdinal = findJoinKeyOrdinalForWatermark(leftKeys, rightKeys)
+    val leftKeyOrdinal = StreamingJoinHelper.getStateKeyWatermarkOrdinal(
+      rightKeys, rightAttributes)
+    val rightKeyOrdinal = StreamingJoinHelper.getStateKeyWatermarkOrdinal(
+      leftKeys, leftAttributes)
+    val conjuncts = condition.toSeq.flatMap(splitConjunctivePredicates)
+
+    def differs(
+        stateAttributes: Seq[Attribute],
+        otherAttributes: Seq[Attribute],
+        correctedKeyOrdinal: Option[Int]): Boolean = {
+      val ownTime = stateAttributes.find(_.metadata.contains(delayKey))
+      val otherTime = otherAttributes.find(_.metadata.contains(delayKey))
+      val stateSet = AttributeSet(stateAttributes)
+      if (legacyKeyOrdinal != correctedKeyOrdinal) {
+        true
+      } else if (legacyKeyOrdinal.isDefined || otherTime.isEmpty) {
+        false
+      } else if (ownTime.isEmpty) {
+        // Legacy requires a watermark on the state side even when the opposite input's
+        // watermark and the range condition provide a cleanup bound.
+        StreamingJoinHelper.getStateValueWatermarkWithAttribute(
+          stateSet, AttributeSet(Seq(otherTime.get)), condition, Some(0L)).isDefined
+      } else {
+        // Legacy applies a bound on another state column to the event-time column. This can
+        // differ even without a separate event-time bound in the join condition.
+        val hasOtherColumnBound = conjuncts.filter { conjunct =>
+          !conjunct.references.contains(ownTime.get) &&
+            conjunct.references.exists(stateSet.contains)
+        }.exists { conjunct =>
+          StreamingJoinHelper.getLegacyStateValueWatermark(
+            stateSet, AttributeSet(otherAttributes), Some(conjunct), Some(0L)).isDefined
+        }
+        hasOtherColumnBound
+      }
+    }
+
+    Seq(
+      Option.when(differs(leftAttributes, rightAttributes, leftKeyOrdinal))(
+        "left-state cleanup"),
+      Option.when(differs(rightAttributes, leftAttributes, rightKeyOrdinal))(
+        "right-state cleanup")
+    ).flatten
   }
 
   // Legacy V4 uses the same watermarked join-key ordinal for both state sides.

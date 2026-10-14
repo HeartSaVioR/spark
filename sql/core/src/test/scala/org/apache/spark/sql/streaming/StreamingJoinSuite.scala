@@ -1399,8 +1399,7 @@ abstract class StreamingOuterJoinBase extends StreamingJoinSuite {
       val warnings = warning.loggingEvents.map(_.getMessage.getFormattedMessage)
         .filter(_.contains("SPARK-58904: This restarted stream-stream join"))
       assert(warnings.size == 1)
-      assert(warnings.head.contains("operator 0, type LeftOuter"))
-      assert(warnings.head.contains("left-state eviction"))
+      assert(warnings.head.contains("replaying it unchanged would fail"))
     }
   }
 
