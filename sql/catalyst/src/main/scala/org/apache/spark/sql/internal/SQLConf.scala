@@ -4034,6 +4034,7 @@ object SQLConf {
       .doc("Use corrected watermark-based state indexing for V4 stream-stream joins. " +
         "The value is pinned in the offset log so existing V4 checkpoints keep their index.")
       .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
       .createWithDefault(true)
 
@@ -4043,6 +4044,7 @@ object SQLConf {
       .doc("Use corrected watermark eviction for stream-stream joins with state formats V1-V3. " +
         "The value is pinned in the offset log for checkpoint compatibility.")
       .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
       .createWithDefault(true)
 
