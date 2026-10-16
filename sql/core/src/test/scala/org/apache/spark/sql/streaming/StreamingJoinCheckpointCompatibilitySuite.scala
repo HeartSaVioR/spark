@@ -83,10 +83,11 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
     val leftInput = MemoryStream[(Int, Int)]
     val rightInput = MemoryStream[(Int, Int)]
     val leftData = leftInput.toDF().toDF("leftKey", "time")
-      .select($"leftKey", timestamp_seconds($"time").as("leftTime"))
+      .select($"leftKey", timestamp_seconds($"time").as("leftTime"),
+        timestamp_seconds($"time" + 10).as("expiry"))
     val rightData = rightInput.toDF().toDF("rightKey", "time")
       .select($"rightKey", timestamp_seconds($"time").as("rightTime"))
-    val left = if (shape == "equality") {
+    val left = if (Seq("equality", "expiry", "pruned expiry").contains(shape)) {
       leftData.withWatermark("leftTime", "100 seconds")
     } else {
       leftData
@@ -96,10 +97,11 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
     } else {
       rightData
     }
-    val condition = if (shape == "range") {
-      "leftKey = rightKey AND leftTime > rightTime - INTERVAL 5 SECONDS"
-    } else {
-      "leftKey = rightKey AND leftTime = rightTime"
+    val condition = shape match {
+      case "range" => "leftKey = rightKey AND leftTime > rightTime - INTERVAL 5 SECONDS"
+      case "expiry" => "leftKey = rightKey AND rightTime BETWEEN leftTime AND expiry"
+      case "pruned expiry" => "leftKey = rightKey AND rightTime <= expiry"
+      case _ => "leftKey = rightKey AND leftTime = rightTime"
     }
     (leftInput, rightInput, left.join(right, expr(condition)).select($"leftKey", $"rightKey"))
   }
@@ -108,10 +110,11 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
     version <- Seq(1, 2, 3, 4)
     logVersion <- Seq(1, 2)
     oldVersion <- Seq(None, Some("1"))
+    shape <- Seq("range", "expiry", "pruned expiry")
   } {
-    test(s"SPARK-58904: reject old range checkpoint, V$version log=$logVersion old=$oldVersion") {
+    test(s"SPARK-58904: reject old $shape checkpoint, V$version log=$logVersion old=$oldVersion") {
       withJoinConf(version, logVersion) {
-        val (leftInput, rightInput, joined) = joinInputs("range")
+        val (leftInput, rightInput, joined) = joinInputs(shape)
         withTempDir { checkpointDir =>
           val checkpoint = checkpointDir.getCanonicalPath
           testStream(joined)(
@@ -150,7 +153,7 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
   for {
     version <- Seq(1, 2, 3, 4)
     logVersion <- Seq(1, 2)
-    shape <- Seq("equality", "no watermark", "range")
+    shape <- Seq("equality", "no watermark", "range", "expiry", "pruned expiry")
   } {
     test(s"SPARK-58904: resume compatible $shape checkpoint, V$version log=$logVersion") {
       withJoinConf(version, logVersion) {
@@ -163,8 +166,9 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
             CheckNewAnswer(),
             StopStream)
           assert(pinnedVersion(checkpoint).contains("2"))
-          val expectedVersion = if (shape == "range") "2" else "1"
-          if (shape != "range") setWatermarkVersion(checkpoint, None)
+          val oldCompatible = Seq("equality", "no watermark").contains(shape)
+          val expectedVersion = if (oldCompatible) "1" else "2"
+          if (oldCompatible) setWatermarkVersion(checkpoint, None)
           withSQLConf(watermarkVersionKey -> "1",
               SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key -> "2") {
             testStream(joined)(
