@@ -22,7 +22,7 @@ import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference,
 import org.apache.spark.sql.catalyst.optimizer.SimpleTestOptimizer
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.plans.logical.{EventTimeWatermark, Filter, LeafNode, Statistics}
-import org.apache.spark.sql.types.{IntegerType, MetadataBuilder, TimestampType}
+import org.apache.spark.sql.types.{DoubleType, IntegerType, MetadataBuilder, TimestampType}
 
 class StreamingJoinHelperSuite extends AnalysisTest {
 
@@ -82,7 +82,31 @@ class StreamingJoinHelperSuite extends AnalysisTest {
       Some(20000L)).contains(20000L))
   }
 
-  test("extract watermark from time condition") {
+  test("SPARK-58904: legacy extraction preserves deduplication of unoptimized terms") {
+    val left = AttributeReference("left", TimestampType)()
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val right = AttributeReference("right", TimestampType, metadata = metadata)()
+    Seq((left > right + 2 + 2, 12000L), (left > right - 2 - 2, 8000L)).foreach {
+      case (condition, expected) =>
+        assert(StreamingJoinHelper.getLegacyStateValueWatermark(
+          AttributeSet(Seq(left)), AttributeSet(Seq(right)), Some(condition), Some(10000L))
+          .contains(expected))
+    }
+  }
+
+  test("SPARK-58904: legacy extraction deduplicates terms after watermark substitution") {
+    val stateValue = AttributeReference("stateValue", DoubleType)()
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val right = AttributeReference("right", DoubleType, metadata = metadata)()
+    // The old extractor accepted numeric attributes carrying watermark metadata. At this
+    // watermark, substituting right makes its term semantically equal to the literal term.
+    val result = StreamingJoinHelper.getLegacyStateValueWatermark(
+      AttributeSet(Seq(stateValue)), AttributeSet(Seq(right)),
+      Some(stateValue > right + 1000.0), Some(1000000L))
+    assert(result.contains(1000000L))
+  }
+
+  gridTest("extract watermark from time condition")(Seq(false, true)) { legacy =>
     val attributesToFindConstraintFor = Seq(
       AttributeReference("leftTime", TimestampType)(),
       AttributeReference("leftOther", IntegerType)())
@@ -111,7 +135,12 @@ class StreamingJoinHelperSuite extends AnalysisTest {
         val optimized = SimpleTestOptimizer.execute(SimpleAnalyzer.execute(plan))
         optimized.asInstanceOf[Filter].condition
       }
-      StreamingJoinHelper.getStateValueWatermark(
+      val extract = if (legacy) {
+        StreamingJoinHelper.getLegacyStateValueWatermark _
+      } else {
+        StreamingJoinHelper.getStateValueWatermark _
+      }
+      extract(
         AttributeSet(attributesToFindConstraintFor), AttributeSet(attributesWithWatermark),
         conditionExpr, rightWatermark)
     }
@@ -201,25 +230,45 @@ class StreamingJoinHelperSuite extends AnalysisTest {
     assert(watermarkFrom("cast(rightTime AS DOUBLE) < rightOther") === None)  // non-time attributes
     assert(watermarkFrom("leftTime > rightTime + interval 1 month") === None) // month not allowed
 
-    // A state bound must advance with the opposite input's watermark.
-    assert(watermarkFrom("cast(leftTime AS LONG) > 10") === None)
-    assert(watermarkFrom("cast(leftTime AS LONG) + cast(rightTime AS LONG) > 100") === None)
-    assert(watermarkFrom(
-      "cast(leftTime AS LONG) + cast(leftTime AS LONG) > cast(rightTime AS LONG)") === None)
-    assert(watermarkFrom(
-      "cast(leftTime AS LONG) > cast(rightTime AS LONG) + cast(rightTime AS LONG)") === None)
-    assert(watermarkFrom("leftOther > cast(rightTime AS LONG)") === None)
-    assert(watermarkFrom("leftTime > rightTime AND cast(leftTime AS LONG) > 10") === Some(10000))
-    assert(watermarkFrom(
-      "leftTime > rightTime AND cast(leftTime AS LONG) + cast(rightTime AS LONG) > 100") ===
-      Some(10000))
-    assert(watermarkFrom("leftTime > rightTime OR cast(leftTime AS LONG) > 10") === None)
+    if (legacy) {
+      // Preserve the original extractor's acceptance and ExpressionSet arithmetic, even
+      // for shapes that corrected extraction deliberately rejects.
+      assert(watermarkFrom("cast(leftTime AS LONG) > 10") === Some(10000))
+      assert(watermarkFrom("cast(leftTime AS LONG) + cast(rightTime AS LONG) > 100") ===
+        Some(90000))
+      assert(watermarkFrom(
+        "cast(leftTime AS LONG) + cast(leftTime AS LONG) > cast(rightTime AS LONG)") ===
+        Some(10000))
+      assert(watermarkFrom(
+        "cast(leftTime AS LONG) > cast(rightTime AS LONG) + cast(rightTime AS LONG)") ===
+        Some(10000))
+      assert(watermarkFrom("leftOther > cast(rightTime AS LONG)") === Some(10000))
+      // Keep the historical results after SQL optimization as well as for raw terms above.
+      assert(watermarkFrom("cast(leftTime AS LONG) > cast(rightTime AS LONG) + 2 + 2") ===
+        Some(14000))
+      assert(watermarkFrom("cast(leftTime AS LONG) > cast(rightTime AS LONG) - 2 - 2") ===
+        Some(8000))
+    } else {
+      // A state bound must advance with the opposite input's watermark.
+      assert(watermarkFrom("cast(leftTime AS LONG) > 10") === None)
+      assert(watermarkFrom("cast(leftTime AS LONG) + cast(rightTime AS LONG) > 100") === None)
+      assert(watermarkFrom(
+        "cast(leftTime AS LONG) + cast(leftTime AS LONG) > cast(rightTime AS LONG)") === None)
+      assert(watermarkFrom(
+        "cast(leftTime AS LONG) > cast(rightTime AS LONG) + cast(rightTime AS LONG)") === None)
+      assert(watermarkFrom("leftOther > cast(rightTime AS LONG)") === None)
+      assert(watermarkFrom("leftTime > rightTime AND cast(leftTime AS LONG) > 10") === Some(10000))
+      assert(watermarkFrom(
+        "leftTime > rightTime AND cast(leftTime AS LONG) + cast(rightTime AS LONG) > 100") ===
+        Some(10000))
+      assert(watermarkFrom("leftTime > rightTime OR cast(leftTime AS LONG) > 10") === None)
 
-    // Equal literal terms must not be deduplicated during canonicalization.
-    assert(watermarkFrom("cast(leftTime AS LONG) > cast(rightTime AS LONG) + 2 + 2") ===
-      Some(14000))
-    assert(watermarkFrom("cast(leftTime AS LONG) > cast(rightTime AS LONG) - 2 - 2") ===
-      Some(6000))
+      // Equal literal terms must not be deduplicated during canonicalization.
+      assert(watermarkFrom("cast(leftTime AS LONG) > cast(rightTime AS LONG) + 2 + 2") ===
+        Some(14000))
+      assert(watermarkFrom("cast(leftTime AS LONG) > cast(rightTime AS LONG) - 2 - 2") ===
+        Some(6000))
+    }
 
     // Test non-positive results
     assert(watermarkFrom("CAST(leftTime AS LONG) > CAST(rightTime AS LONG) - 10") === Some(0))
