@@ -409,16 +409,15 @@ object StreamingSymmetricHashJoinHelper extends Logging with PredicateHelper {
         StreamingJoinHelper.getStateValueWatermarkWithAttribute(
           stateSet, AttributeSet(Seq(otherTime.get)), condition, Some(0L)).isDefined
       } else {
-        // Legacy applies a bound on another state column to the event-time column. This can
-        // differ even without a separate event-time bound in the join condition.
-        val hasOtherColumnBound = conjuncts.filter { conjunct =>
-          !conjunct.references.contains(ownTime.get) &&
-            conjunct.references.exists(stateSet.contains)
-        }.exists { conjunct =>
-          StreamingJoinHelper.getLegacyStateValueWatermark(
-            stateSet, AttributeSet(otherAttributes), Some(conjunct), Some(0L)).isDefined
+        // Legacy can apply another column's bound to event time, or use an event-time bound
+        // that corrected extraction rejects or computes differently (for example, a constant).
+        conjuncts.exists { conjunct =>
+          val legacyBound = StreamingJoinHelper.getLegacyStateValueWatermark(
+            stateSet, AttributeSet(otherAttributes), Some(conjunct), Some(0L))
+          legacyBound.isDefined && (!conjunct.references.contains(ownTime.get) ||
+            legacyBound != StreamingJoinHelper.getStateValueWatermark(
+              stateSet, AttributeSet(Seq(otherTime.get)), Some(conjunct), Some(0L)))
         }
-        hasOtherColumnBound
       }
     }
 

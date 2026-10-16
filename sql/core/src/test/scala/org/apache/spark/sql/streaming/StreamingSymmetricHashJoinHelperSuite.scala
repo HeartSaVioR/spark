@@ -251,6 +251,17 @@ class StreamingSymmetricHashJoinHelperSuite extends StreamTest {
       Seq(lt), Seq(rt), Nil, Nil, Some(lt > rt)).isEmpty)
   }
 
+  test("SPARK-58904: legacy warning identifies changed event-time bounds") {
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val lt = AttributeReference("lt", TimestampType, metadata = metadata)()
+    val rt = AttributeReference("rt", TimestampType, metadata = metadata)()
+
+    Seq(lt > Literal(10L), lt + rt > Literal(100L), lt > rt + 2 + 2).foreach { condition =>
+      assert(StreamingSymmetricHashJoinHelper.legacyWatermarkChangeSides(
+        Seq(lt), Seq(rt), Nil, Nil, Some(condition)).contains("left-state cleanup"))
+    }
+  }
+
   test("SPARK-58904: legacy V4 keeps its watermark predicates") {
     val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
     val lt = AttributeReference("lt", TimestampType)()
