@@ -227,6 +227,10 @@ case class StreamingSymmetricHashJoinExec(
       SessionState.newHadoopConf(sparkContext.hadoopConfiguration, conf))
   private val allowMultipleStatefulOperators =
     conf.getConf(SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE)
+  // SPARK-58904: Legacy modes preserve checkpoint-pinned eviction and output-watermark behavior.
+  // V4 also pins timestamp selection; advancing watermarks does not rewrite existing state keys.
+  // Remove legacy paths only when legacy checkpoint support ends or a safe migration exists;
+  // review legacy helpers, offset-log settings and analysis/restart compatibility together.
   private[sql] val useLegacyV4WatermarkIndex = stateFormatVersion == 4 &&
     !conf.getConf(SQLConf.STREAMING_JOIN_V4_CORRECTED_WATERMARK_INDEX_ENABLED)
   private[sql] val useLegacyWatermarkSemantics = if (stateFormatVersion == 4) {
