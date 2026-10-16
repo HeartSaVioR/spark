@@ -34,7 +34,7 @@ import org.apache.spark.sql.execution.streaming.state.{StateStoreCheckpointInfo,
 /**
  * Helper object for [[StreamingSymmetricHashJoinExec]]. See that object for more details.
  */
-object StreamingSymmetricHashJoinHelper extends Logging with PredicateHelper {
+object StreamingSymmetricHashJoinHelper extends Logging {
 
   sealed trait JoinSide
   case object LeftSide extends JoinSide { override def toString(): String = "left" }
@@ -204,15 +204,6 @@ object StreamingSymmetricHashJoinHelper extends Logging with PredicateHelper {
       eventTimeWatermarkForLateEvents: Option[Long],
       useFirstEventTimeColumn: Boolean): JoinStateWatermarkPredicates = {
 
-    // Perform assertions against multiple event time columns in the same DataFrame. This method
-    // assumes there is only one event time column per each side (left / right) and it is not very
-    // clear to reason about the correctness if there are multiple event time columns. Disallow to
-    // be conservative.
-    WatermarkSupport.findEventTimeColumn(leftAttributes,
-      allowMultipleEventTimeColumns = useFirstEventTimeColumn)
-    WatermarkSupport.findEventTimeColumn(rightAttributes,
-      allowMultipleEventTimeColumns = useFirstEventTimeColumn)
-
     def getOneSideStateWatermarkPredicate(
         oneSideInputAttributes: Seq[Attribute],
         oneSideJoinKeys: Seq[Expression],
@@ -220,13 +211,13 @@ object StreamingSymmetricHashJoinHelper extends Logging with PredicateHelper {
         otherSideJoinKeys: Seq[Expression]): Option[JoinStateWatermarkPredicate] = {
       val joinKeyOrdinalForWatermark = StreamingJoinHelper.getStateKeyWatermarkOrdinal(
         otherSideJoinKeys, otherSideInputAttributes)
-      val isWatermarkDefinedOnJoinKey = joinKeyOrdinalForWatermark.isDefined
+      // Validate multiple event-time columns and use the same column as late-event filtering.
       val ownEventTime = WatermarkSupport.findEventTimeColumn(
         oneSideInputAttributes, useFirstEventTimeColumn)
       val otherEventTime = WatermarkSupport.findEventTimeColumn(
         otherSideInputAttributes, useFirstEventTimeColumn)
 
-      if (isWatermarkDefinedOnJoinKey) { // case 1 and 3 in the StreamingSymmetricHashJoinExec docs
+      if (joinKeyOrdinalForWatermark.isDefined) { // cases 1 and 3 in the join exec docs
         val keyExprWithWatermark = BoundReference(
           joinKeyOrdinalForWatermark.get,
           oneSideJoinKeys(joinKeyOrdinalForWatermark.get).dataType,
@@ -243,23 +234,23 @@ object StreamingSymmetricHashJoinHelper extends Logging with PredicateHelper {
             })
         }
       } else { // case 2 in the StreamingSymmetricHashJoinExec docs
-        val stateValueWatermark = StreamingJoinHelper.getStateValueWatermarkWithAttribute(
+        val stateValueWatermark = StreamingJoinHelper.getStateValueWatermark(
           attributesToFindStateWatermarkFor = AttributeSet(oneSideInputAttributes),
           attributesWithEventWatermark = AttributeSet(otherEventTime.toSeq),
           condition,
           eventTimeWatermarkForEviction)
         stateValueWatermark.flatMap { case (stateAttribute, watermark) =>
           // Rows newer than the late-event watermark can have arrived since the last eviction.
-          val prevStateValueWatermark = eventTimeWatermarkForLateEvents.flatMap { _ =>
-            StreamingJoinHelper.getStateValueWatermarkWithAttribute(
+          val prevStateValueWatermark = eventTimeWatermarkForLateEvents.flatMap { lateWatermark =>
+            StreamingJoinHelper.getStateValueWatermark(
               attributesToFindStateWatermarkFor = AttributeSet(oneSideInputAttributes),
               attributesWithEventWatermark = AttributeSet(otherEventTime.toSeq),
               condition,
-              eventTimeWatermarkForLateEvents).collect {
+              Some(lateWatermark)).collect {
               case (prevAttribute, prevWatermark)
                   if prevAttribute.semanticEquals(stateAttribute) &&
                     ownEventTime.exists(_.semanticEquals(stateAttribute)) =>
-                math.min(prevWatermark, eventTimeWatermarkForLateEvents.get)
+                math.min(prevWatermark, lateWatermark)
             }
           }
           watermarkExpression(Some(stateAttribute), Some(watermark)).map { e =>

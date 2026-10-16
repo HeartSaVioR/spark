@@ -64,24 +64,9 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
    * @param attributesWithEventWatermark  attributes of the other side which has a watermark column
    * @param joinCondition                 join condition
    * @param eventWatermark                watermark defined on the input event data
-   * @return state value watermark in milliseconds, is possible.
+   * @return the state attribute and its watermark in milliseconds, if possible.
    */
   def getStateValueWatermark(
-      attributesToFindStateWatermarkFor: AttributeSet,
-      attributesWithEventWatermark: AttributeSet,
-      joinCondition: Option[Expression],
-      eventWatermark: Option[Long]): Option[Long] = {
-    getStateValueWatermarkWithAttribute(
-      attributesToFindStateWatermarkFor,
-      attributesWithEventWatermark,
-      joinCondition,
-      eventWatermark).map(_._2)
-  }
-
-  /**
-   * Get the state value watermark together with the state attribute it applies to.
-   */
-  def getStateValueWatermarkWithAttribute(
       attributesToFindStateWatermarkFor: AttributeSet,
       attributesWithEventWatermark: AttributeSet,
       joinCondition: Option[Expression],

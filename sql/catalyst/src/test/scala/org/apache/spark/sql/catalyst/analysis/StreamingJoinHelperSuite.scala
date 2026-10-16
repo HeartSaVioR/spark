@@ -33,7 +33,7 @@ class StreamingJoinHelperSuite extends AnalysisTest {
     val right = AttributeReference("right", TimestampType, metadata = metadata)()
     val condition = Some(first > right - 0.0001 && second > right + 0.0001)
     Seq(0L, 1L, 10000L).foreach { watermark =>
-      val result = StreamingJoinHelper.getStateValueWatermarkWithAttribute(
+      val result = StreamingJoinHelper.getStateValueWatermark(
         AttributeSet(Seq(first, second)), AttributeSet(Seq(right)), condition, Some(watermark))
       assert(result.exists(_._1.semanticEquals(first)))
     }
@@ -46,7 +46,7 @@ class StreamingJoinHelperSuite extends AnalysisTest {
     val right = AttributeReference("right", TimestampType, metadata = metadata)()
     Seq(other > right && eventTime > right,
       eventTime > right && other > right).foreach { condition =>
-      val result = StreamingJoinHelper.getStateValueWatermarkWithAttribute(
+      val result = StreamingJoinHelper.getStateValueWatermark(
         AttributeSet(Seq(eventTime, other)), AttributeSet(Seq(right)), Some(condition),
         Some(20000L))
       assert(result.exists { case (attr, watermark) =>
@@ -86,7 +86,7 @@ class StreamingJoinHelperSuite extends AnalysisTest {
       }
       StreamingJoinHelper.getStateValueWatermark(
         AttributeSet(attributesToFindConstraintFor), AttributeSet(attributesWithWatermark),
-        conditionExpr, rightWatermark)
+        conditionExpr, rightWatermark).map(_._2)
     }
 
     // Test comparison directionality. E.g. if leftTime < rightTime and rightTime > watermark,

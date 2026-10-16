@@ -30,7 +30,6 @@ import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.QueryPlanningTracker
 import org.apache.spark.sql.catalyst.analysis.WidenStatefulOperatorAttributeNullability
 import org.apache.spark.sql.catalyst.expressions.{CurrentBatchTimestamp, ExpressionWithRandomSeed}
-import org.apache.spark.sql.catalyst.plans.{FullOuter, LeftOuter, LeftSemi, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern._
@@ -614,33 +613,6 @@ class IncrementalExecution(
   }
 
   val state = new Rule[SparkPlan] {
-    private def correctedJoinWatermarkSupported(j: StreamingSymmetricHashJoinExec): Boolean = {
-      val predicates = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
-        j.left.output, j.right.output, j.leftKeys, j.rightKeys, j.condition.full,
-        Some(1000000L), None, !allowMultipleStatefulOperators)
-      j.joinType match {
-        case LeftOuter | LeftSemi => predicates.left.isDefined
-        case RightOuter => predicates.right.isDefined
-        case FullOuter => predicates.left.isDefined && predicates.right.isDefined
-        case _ => true
-      }
-    }
-
-    private def checkCorrectedJoinWatermark(j: StreamingSymmetricHashJoinExec): Unit = {
-      if (!correctedJoinWatermarkSupported(j)) {
-        val requirement = j.joinType match {
-          case FullOuter => "watermarks on both inputs and time constraints in both directions"
-          case RightOuter => "a watermark on the left input and a time constraint"
-          case _ => "a watermark on the right input and a time constraint"
-        }
-        val msg = s"Stream-stream ${j.joinType} join requires $requirement " +
-          "to finalize unmatched state."
-        throw new AnalysisException(
-          errorClass = "_LEGACY_ERROR_TEMP_3102",
-          messageParameters = Map("msg" -> msg))
-      }
-    }
-
     private def simulateWatermarkPropagation(plan: SparkPlan): Unit = {
       val watermarkForPrevBatch = prevOffsetSeqMetadata.map(_.batchWatermarkMs).getOrElse(0L)
       val watermarkForCurrBatch = offsetSeqMetadata.batchWatermarkMs
@@ -744,23 +716,21 @@ class IncrementalExecution(
       val planWithStateOpId = plan transform composedRule
       // Offset metadata has restored the checkpoint version by this point. Validate before
       // writing operator metadata or opening state, including retries of an incomplete batch 0.
-      if (isFirstBatch) {
+      if (isFirstBatch && conf.getConf(SQLConf.STREAMING_JOIN_WATERMARK_VERSION) == 1) {
         planWithStateOpId.foreach {
-          case j: StreamingSymmetricHashJoinExec =>
-            if (conf.getConf(SQLConf.STREAMING_JOIN_WATERMARK_VERSION) == 1 &&
-                !StreamingSymmetricHashJoinHelper.isWatermarkCheckpointCompatible(
-                  j.left.output, j.right.output, j.leftKeys, j.rightKeys)) {
-              throw new AnalysisException(
-                errorClass = "STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE",
-                messageParameters = Map(
-                  "operatorId" -> j.getStateInfo.operatorId.toString,
-                  "stateFormatVersion" -> j.stateFormatVersion.toString))
-            }
-            checkCorrectedJoinWatermark(j)
+          case j: StreamingSymmetricHashJoinExec
+              if !StreamingSymmetricHashJoinHelper.isWatermarkCheckpointCompatible(
+                j.left.output, j.right.output, j.leftKeys, j.rightKeys) =>
+            throw new AnalysisException(
+              errorClass = "STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE",
+              messageParameters = Map(
+                "operatorId" -> j.getStateInfo.operatorId.toString,
+                "stateFormatVersion" -> j.stateFormatVersion.toString))
           case _ =>
         }
       }
-      // Need to check before writing metadata to detect changes to stateful operators.
+      // Need to check before write to metadata because we need to detect add operator
+      // Only check when streaming is restarting and is first batch
       if (isFirstBatch && currentBatchId != 0) {
         checkOperatorValidWithMetadata(planWithStateOpId, currentBatchId - 1)
       }

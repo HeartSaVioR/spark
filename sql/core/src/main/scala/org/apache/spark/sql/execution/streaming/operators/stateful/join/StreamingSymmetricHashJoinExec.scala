@@ -227,6 +227,7 @@ case class StreamingSymmetricHashJoinExec(
       SessionState.newHadoopConf(sparkContext.hadoopConfiguration, conf))
   private val allowMultipleStatefulOperators =
     conf.getConf(SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE)
+
   private val useVirtualColumnFamilies = stateFormatVersion >= 3
 
   // Determine the store names and metadata version based on format version
@@ -762,7 +763,7 @@ case class StreamingSymmetricHashJoinExec(
           AttributeSet(thisSideAttrs), AttributeSet(otherSideAttrs), condition.full, Some(0L))
 
         (lowerBoundMs, upperBoundMs) match {
-          case (Some(lower), Some(upper)) =>
+          case (Some((_, lower)), Some((_, upper))) =>
             Some((lower * 1000L, -upper * 1000L)) // ms -> us
           case _ => None
         }
