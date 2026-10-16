@@ -25,6 +25,26 @@ Please refer [Migration Guide: SQL, Datasets and DataFrame](../sql-migration-gui
 
 ## Upgrading from Structured Streaming 4.3 to 4.4
 
+- Since Spark 4.4, new stream-stream outer and semi joins using corrected watermark behavior
+  reject conditions that cannot finalize the required state. Left outer and left semi joins
+  require a bound from the right input's watermark; right outer joins require the reverse, and
+  full outer joins require both directions. This also applies to equality joins on event time.
+  The check runs when the first micro-batch is planned, so an invalid new query may fail after
+  `writeStream.start()` returns. Existing checkpoints retain previously accepted join shapes under
+  their pinned legacy behavior; see the replay guidance below.
+
+- Since Spark 4.4, new stream-stream joins evict state using the opposite input's watermark.
+  With a watermark on only one input, inner, outer, and semi joins may retain state on the
+  watermarked side indefinitely and produce matches previously lost to premature eviction. A join
+  that can still emit old event times may stop advancing its output watermark for downstream
+  append-mode operators. Existing checkpoints keep their prior join-watermark mode; V4 checkpoints
+  also keep their previous timestamp indexing. On restart, Spark warns for join shapes whose old
+  cleanup may retain extra state or affect results. This matters for inner and semi joins too;
+  outer joins may also delay unmatched rows. A warning does not mean that past results are wrong
+  or that the checkpoint must be discarded. To adopt corrected behavior, start with a new
+  checkpoint and replay input. Outer and semi joins must first meet the watermark requirements
+  above. The absence of a warning does not prove that earlier results were safe.
+
 - Since Spark 4.4, streaming queries using `EXCEPT` with a streaming left input are rejected
   because their optimizer rewrites introduce streaming aggregations after the initial
   unsupported-operation checks. Existing queries can still restart from their persistent

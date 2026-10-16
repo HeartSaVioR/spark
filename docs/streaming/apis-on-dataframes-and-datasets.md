@@ -1211,12 +1211,10 @@ A watermark delay of "2 hours" guarantees that the engine will never drop any da
  2 hours delayed. But data delayed by more than 2 hours may or may not get processed.
 
 ##### Outer Joins with Watermarking
-While the watermark + event-time constraints is optional for inner joins, for outer joins
-they must be specified. This is because for generating the NULL results in outer join, the
-engine must know when an input row is not going to match with anything in the future. Hence, the
-watermark + event-time constraints must be specified for generating correct results. Therefore,
-a query with outer-join will look quite like the ad-monetization example earlier, except that
-there will be an additional parameter specifying it to be an outer-join.
+Inner joins can run without watermarks or event-time constraints. Outer joins need to know when
+an unmatched row can no longer find a match. A left outer join needs a watermark on the right
+input and a time constraint that bounds matching right event times. A right outer join needs
+the reverse, and a full outer join needs both. The example below uses both watermarks.
 
 <div class="codetabs">
 
@@ -1296,6 +1294,15 @@ joined <- join(
 ###### Semantic Guarantees of Stream-stream Outer Joins with Watermarking
 Outer joins have the same guarantees as [inner joins](#semantic-guarantees-of-stream-stream-inner-joins-with-watermarking)
 regarding watermark delays and whether data will be dropped or not.
+
+In the left outer join above, a click can match an impression only during the following hour.
+Once the `clickTime` watermark passes the end of that hour, Spark knows no future click can
+match that impression. If it is unmatched, Spark outputs it with NULL click values. Spark also
+stops keeping that impression for future matches, whether or not it found a match. For an
+unmatched impression, output and removal use the same cutoff; no watermark on `impressionTime`
+is needed for either. The `impressionTime` watermark and the time range let Spark stop keeping
+old clicks as well. Right outer joins reverse the roles, while full outer joins need both
+watermarks to output unmatched rows from both sides.
 
 ###### Caveats
 There are a few important characteristics to note regarding how the outer results are generated.
@@ -1398,29 +1405,32 @@ regarding watermark delays and whether data will be dropped or not.
   <tr>
     <td style="vertical-align: middle;">Left Outer</td>
     <td style="vertical-align: middle;">
-      Conditionally supported, must specify watermark on right + time constraints for correct
-      results, optionally specify watermark on left for all state cleanup
+      Conditionally supported, requires a right watermark and a bound on matching right event
+      times to output unmatched left rows and stop keeping them. To stop keeping right rows too,
+      also specify a left watermark and a bound on matching left event times.
     </td>
   </tr>
   <tr>
     <td style="vertical-align: middle;">Right Outer</td>
     <td style="vertical-align: middle;">
-      Conditionally supported, must specify watermark on left + time constraints for correct
-      results, optionally specify watermark on right for all state cleanup
+      Conditionally supported, requires a left watermark and a bound on matching left event
+      times to output unmatched right rows and stop keeping them. To stop keeping left rows too,
+      also specify a right watermark and a bound on matching right event times.
     </td>
   </tr>
   <tr>
     <td style="vertical-align: middle;">Full Outer</td>
     <td style="vertical-align: middle;">
-      Conditionally supported, must specify watermark on one side + time constraints for correct
-      results, optionally specify watermark on the other side for all state cleanup
+      Conditionally supported, requires watermarks on both inputs and bounds on matching event
+      times in both directions to output unmatched rows and stop keeping rows on both sides.
     </td>
   </tr>
   <tr>
     <td style="vertical-align: middle;">Left Semi</td>
     <td style="vertical-align: middle;">
-      Conditionally supported, must specify watermark on right + time constraints for correct
-      results, optionally specify watermark on left for all state cleanup
+      Conditionally supported, requires a right watermark and a bound on matching right event
+      times to stop keeping unmatched left rows. To stop keeping right rows too, also specify
+      a left watermark and a bound on matching left event times.
     </td>
   </tr>
   <tr>

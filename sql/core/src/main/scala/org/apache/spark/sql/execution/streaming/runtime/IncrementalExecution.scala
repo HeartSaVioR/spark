@@ -25,10 +25,12 @@ import scala.collection.mutable.{Map => MutableMap}
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.internal.LogKeys.{BATCH_TIMESTAMP, ERROR}
+import org.apache.spark.internal.LogKeys.{BATCH_TIMESTAMP, ERROR, JOIN_TYPE, OP_ID, REASON}
+import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.QueryPlanningTracker
 import org.apache.spark.sql.catalyst.analysis.WidenStatefulOperatorAttributeNullability
 import org.apache.spark.sql.catalyst.expressions.{CurrentBatchTimestamp, ExpressionWithRandomSeed}
+import org.apache.spark.sql.catalyst.plans.{FullOuter, LeftOuter, LeftSemi, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern._
@@ -606,12 +608,40 @@ class IncrementalExecution(
           stateWatermarkPredicates =
             StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
               j.left.output, j.right.output, j.leftKeys, j.rightKeys, j.condition.full,
-              iwEviction, prevBatchLateEventsWm, !allowMultipleStatefulOperators)
+              iwEviction, prevBatchLateEventsWm, !allowMultipleStatefulOperators,
+              j.useLegacyWatermarkSemantics)
         )
     }
   }
 
   val state = new Rule[SparkPlan] {
+    private def correctedJoinWatermarkSupported(j: StreamingSymmetricHashJoinExec): Boolean = {
+      val predicates = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
+        j.left.output, j.right.output, j.leftKeys, j.rightKeys, j.condition.full,
+        Some(1000000L), None, !allowMultipleStatefulOperators)
+      j.joinType match {
+        case LeftOuter | LeftSemi => predicates.left.isDefined
+        case RightOuter => predicates.right.isDefined
+        case FullOuter => predicates.left.isDefined && predicates.right.isDefined
+        case _ => true
+      }
+    }
+
+    private def checkCorrectedJoinWatermark(j: StreamingSymmetricHashJoinExec): Unit = {
+      if (!correctedJoinWatermarkSupported(j)) {
+        val requirement = j.joinType match {
+          case FullOuter => "watermarks on both inputs and time constraints in both directions"
+          case RightOuter => "a watermark on the left input and a time constraint"
+          case _ => "a watermark on the right input and a time constraint"
+        }
+        val msg = s"Stream-stream ${j.joinType} join requires $requirement " +
+          "to finalize unmatched state."
+        throw new AnalysisException(
+          errorClass = "_LEGACY_ERROR_TEMP_3102",
+          messageParameters = Map("msg" -> msg))
+      }
+    }
+
     private def simulateWatermarkPropagation(plan: SparkPlan): Unit = {
       val watermarkForPrevBatch = prevOffsetSeqMetadata.map(_.batchWatermarkMs).getOrElse(0L)
       val watermarkForCurrBatch = offsetSeqMetadata.batchWatermarkMs
@@ -713,10 +743,56 @@ class IncrementalExecution(
 
     override def apply(plan: SparkPlan): SparkPlan = {
       val planWithStateOpId = plan transform composedRule
+      // Validate once checkpoint settings are known. Legacy queries keep previously accepted
+      // join shapes; the restart checks below report watermark differences as warnings.
+      if (isFirstBatch) {
+        planWithStateOpId.foreach {
+          case j: StreamingSymmetricHashJoinExec if !j.useLegacyWatermarkSemantics =>
+            checkCorrectedJoinWatermark(j)
+          case _ =>
+        }
+      }
       // Need to check before write to metadata because we need to detect add operator
       // Only check when streaming is restarting and is first batch
       if (isFirstBatch && currentBatchId != 0) {
         checkOperatorValidWithMetadata(planWithStateOpId, currentBatchId - 1)
+        planWithStateOpId.foreach {
+          case j: StreamingSymmetricHashJoinExec if j.useLegacyWatermarkSemantics =>
+            val changes = StreamingSymmetricHashJoinHelper.legacyWatermarkChangeSides(
+              j.left.output, j.right.output, j.leftKeys, j.rightKeys, j.condition.full)
+            if (changes.nonEmpty) {
+              val supported = try {
+                correctedJoinWatermarkSupported(j)
+              } catch {
+                // The comparison must not prevent a checkpoint from resuming in legacy mode.
+                case _: AnalysisException => false
+              }
+              val reasons = if (supported) changes else changes :+ "new-query watermark requirement"
+              val guidance = if (supported) {
+                "Review the streaming migration guide before changing this checkpoint."
+              } else {
+                "A new query with this join shape needs additional watermarks or time " +
+                  "constraints; replaying it unchanged would fail."
+              }
+              val unmatchedSide = j.joinType match {
+                case LeftOuter if changes.contains("left-state cleanup") => Some("left")
+                case RightOuter if changes.contains("right-state cleanup") => Some("right")
+                case FullOuter if changes.size == 2 => Some("left and right")
+                case FullOuter if changes.nonEmpty =>
+                  Some(if (changes.head == "left-state cleanup") "left" else "right")
+                case _ => None
+              }
+              val effect = "can retain state or change match results" +
+                unmatchedSide.map(side =>
+                  s", and may delay or prematurely emit unmatched $side rows").getOrElse("")
+              val detail = s"${reasons.mkString(", ")}: $effect. $guidance"
+              logWarning(log"SPARK-58904: This restarted stream-stream join " +
+                log"(operator ${MDC(OP_ID, j.getStateInfo.operatorId)}, " +
+                log"type ${MDC(JOIN_TYPE, j.joinType)}) uses legacy watermark behavior. " +
+                log"This shape has potential consequences: ${MDC(REASON, detail)}")
+            }
+          case _ =>
+        }
       }
 
       stateStoreWritersWithMetadata = Some(Seq.empty)

@@ -227,6 +227,17 @@ case class StreamingSymmetricHashJoinExec(
       SessionState.newHadoopConf(sparkContext.hadoopConfiguration, conf))
   private val allowMultipleStatefulOperators =
     conf.getConf(SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE)
+  // SPARK-58904: Legacy modes preserve checkpoint-pinned eviction and output-watermark behavior.
+  // V4 also pins timestamp selection; advancing watermarks does not rewrite existing state keys.
+  // Remove legacy paths only when legacy checkpoint support ends or a safe migration exists;
+  // review legacy helpers, offset-log settings and analysis/restart compatibility together.
+  private[sql] val useLegacyV4WatermarkIndex = stateFormatVersion == 4 &&
+    !conf.getConf(SQLConf.STREAMING_JOIN_V4_CORRECTED_WATERMARK_INDEX_ENABLED)
+  private[sql] val useLegacyWatermarkSemantics = if (stateFormatVersion == 4) {
+    useLegacyV4WatermarkIndex
+  } else {
+    !conf.getConf(SQLConf.STREAMING_JOIN_V1_TO_V3_CORRECTED_WATERMARK_ENABLED)
+  }
 
   private val useVirtualColumnFamilies = stateFormatVersion >= 3
 
@@ -403,19 +414,31 @@ case class StreamingSymmetricHashJoinExec(
     // Create left and right side hash joiners and store in the joiner manager.
     // Both sides should use the same store generator if we are re-using the same store instance.
     val joinStateManagerStoreGenerator = new JoinStateManagerStoreGenerator()
-    val joinKeyOrdinalForWatermark =
+    // For equality eviction, legacy V4 shares one key ordinal. Corrected indexing uses the
+    // opposite input's ordinal on each side, matching the watermark that permits its eviction.
+    val legacyJoinKeyOrdinal =
       StreamingSymmetricHashJoinHelper.findJoinKeyOrdinalForWatermark(leftKeys, rightKeys)
     val joinerManager = OneSideHashJoinerManager(
       new OneSideHashJoiner(
         LeftSide, left.output, leftKeys, leftInputIter,
         condition.leftSideOnly, postJoinFilter, stateWatermarkPredicates.left, partitionId,
         checkpointIds.left.keyToNumValues, checkpointIds.left.keyWithIndexToValue,
-        skippedNullValueCount, joinStateManagerStoreGenerator, joinKeyOrdinalForWatermark),
+        skippedNullValueCount, joinStateManagerStoreGenerator,
+        if (useLegacyV4WatermarkIndex) {
+          legacyJoinKeyOrdinal
+        } else {
+          StreamingJoinHelper.getStateKeyWatermarkOrdinal(rightKeys, right.output)
+        }),
       new OneSideHashJoiner(
         RightSide, right.output, rightKeys, rightInputIter,
         condition.rightSideOnly, postJoinFilter, stateWatermarkPredicates.right, partitionId,
         checkpointIds.right.keyToNumValues, checkpointIds.right.keyWithIndexToValue,
-        skippedNullValueCount, joinStateManagerStoreGenerator, joinKeyOrdinalForWatermark))
+        skippedNullValueCount, joinStateManagerStoreGenerator,
+        if (useLegacyV4WatermarkIndex) {
+          legacyJoinKeyOrdinal
+        } else {
+          StreamingJoinHelper.getStateKeyWatermarkOrdinal(leftKeys, left.output)
+        }))
 
     //  Join one side input using the other side's buffered/state rows. Here is how it is done.
     //
@@ -684,6 +707,19 @@ case class StreamingSymmetricHashJoinExec(
     val preJoinFilter =
       Predicate.create(preJoinFilterExpr.getOrElse(Literal(true)), inputAttributes).eval _
 
+    // Legacy V4 keeps the state manager's event-time fallback so existing keys remain readable.
+    // Corrected V4 indexes the timestamp actually bounded by the eviction predicate.
+    private val stateValueWatermarkOrdinal = stateWatermarkPredicate.filter { _ =>
+      !useLegacyV4WatermarkIndex
+    }.flatMap {
+      case JoinStateValueWatermarkPredicate(expr, _, _) =>
+        inputAttributes.indexWhere(expr.references.contains) match {
+          case ordinal if ordinal >= 0 => Some(ordinal)
+          case _ => None
+        }
+      case _ => None
+    }
+
     private val joinStateManager = SymmetricHashJoinStateManager(
       joinSide = joinSide,
       inputValueAttributes = inputAttributes,
@@ -697,7 +733,8 @@ case class StreamingSymmetricHashJoinExec(
       stateFormatVersion = stateFormatVersion,
       skippedNullValueCount = skippedNullValueCount,
       joinStoreGenerator = joinStateManagerStoreGenerator,
-      joinKeyOrdinalForWatermark = joinKeyOrdinalForWatermark)
+      joinKeyOrdinalForWatermark = joinKeyOrdinalForWatermark,
+      stateValueWatermarkOrdinal = stateValueWatermarkOrdinal)
 
     private[this] val keyGenerator = UnsafeProjection.create(joinKeys, inputAttributes)
 
@@ -722,14 +759,26 @@ case class StreamingSymmetricHashJoinExec(
     private[this] val allowMultipleStatefulOperators: Boolean =
       conf.getConf(SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE)
 
-    // V4 range scan for time-interval joins (SPARK-55147). Extracts constant interval
-    // offsets from the join condition using getStateValueWatermark(eventWatermark=0).
+    // V4 range scan for time-interval joins (SPARK-55147). Probes use each input's event
+    // time, but corrected indexing may use another timestamp. Require both indexes to use their
+    // own event time; legacy V4 keeps its original eligibility test for its event-time indexes.
     // The -1 eviction adjustment widens range by ~1ms/side; postJoinFilter handles exact bounds.
     private[this] val scanRangeOffsets: Option[(Long, Long)] = {
-      val isV4TimeIntervalJoin = stateFormatVersion >= 4 && (stateWatermarkPredicate match {
-        case Some(_: JoinStateValueWatermarkPredicate) => true
+      def usesEventTime(
+          attrs: Seq[Attribute],
+          predicate: Option[JoinStateWatermarkPredicate]): Boolean = predicate match {
+        case Some(JoinStateValueWatermarkPredicate(expr, _, _)) =>
+          WatermarkSupport.findEventTimeColumn(attrs, !allowMultipleStatefulOperators)
+            .exists(expr.references.contains)
         case _ => false
-      })
+      }
+      val isV4TimeIntervalJoin = stateFormatVersion >= 4 &&
+        (if (useLegacyV4WatermarkIndex) {
+          stateWatermarkPredicate.exists(_.isInstanceOf[JoinStateValueWatermarkPredicate])
+        } else {
+          usesEventTime(left.output, stateWatermarkPredicates.left) &&
+            usesEventTime(right.output, stateWatermarkPredicates.right)
+        })
 
       if (!isV4TimeIntervalJoin) {
         None
@@ -739,9 +788,15 @@ case class StreamingSymmetricHashJoinExec(
           case RightSide => (right.output, left.output)
         }
 
-        val lowerBoundMs = StreamingJoinHelper.getStateValueWatermark(
+        // Probe bounds must use the same extraction rules as eviction in the checkpoint's mode.
+        val stateValueWatermark = if (useLegacyV4WatermarkIndex) {
+          StreamingJoinHelper.getLegacyStateValueWatermark _
+        } else {
+          StreamingJoinHelper.getStateValueWatermark _
+        }
+        val lowerBoundMs = stateValueWatermark(
           AttributeSet(otherSideAttrs), AttributeSet(thisSideAttrs), condition.full, Some(0L))
-        val upperBoundMs = StreamingJoinHelper.getStateValueWatermark(
+        val upperBoundMs = stateValueWatermark(
           AttributeSet(thisSideAttrs), AttributeSet(otherSideAttrs), condition.full, Some(0L))
 
         (lowerBoundMs, upperBoundMs) match {
@@ -967,7 +1022,8 @@ case class StreamingSymmetricHashJoinExec(
      * processing the rows for outer join.
      */
     def removeAndReturnOldState(): Iterator[KeyToValuePair] = {
-      stateWatermarkPredicate match {
+      val numRemovedStateRows = longMetric("numRemovedStateRows")
+      val removedRowIter = stateWatermarkPredicate match {
         case Some(JoinStateKeyWatermarkPredicate(_, stateWatermark, prevStateWatermark)) =>
           joinStateManager match {
             case s: SupportsEvictByCondition =>
@@ -989,6 +1045,10 @@ case class StreamingSymmetricHashJoinExec(
                 prevStateWatermark.map(watermarkMsToStateTimestamp))
           }
         case _ => Iterator.empty
+      }
+      removedRowIter.map { row =>
+        numRemovedStateRows += 1
+        row
       }
     }
 
@@ -1110,17 +1170,20 @@ case class StreamingSymmetricHashJoinExec(
       Nil
     }
 
-  // This operator will evict based on the state watermark on both side of inputs; we would like
-  // to let users leverage both sides of event time column for output of join, so the watermark
-  // must be lower bound of both sides of event time column. The lower bound of event time column
-  // for each side is determined by state watermark, hence we take a minimum of (left state
-  // watermark, right state watermark, input watermark) to decide the output watermark.
+  // The output watermark must bound event times in emitted rows. Joins that emit both inputs
+  // take the minimum of both state watermarks and the input watermark. Corrected left semi joins
+  // only emit left columns, so retained right-side timestamps do not constrain their output.
+  // Legacy checkpoints keep the prior calculation.
   override def produceOutputWatermark(inputWatermarkMs: Long): Option[Long] = {
     val (leftStateWatermark, rightStateWatermark) =
       StreamingSymmetricHashJoinHelper.getStateWatermark(
         left.output, right.output, leftKeys, rightKeys, condition.full, Some(inputWatermarkMs),
-        !allowMultipleStatefulOperators)
+        !allowMultipleStatefulOperators, useLegacyWatermarkSemantics)
 
-    Some((leftStateWatermark ++ rightStateWatermark ++ Some(inputWatermarkMs)).min)
+    if (joinType == LeftSemi && !useLegacyWatermarkSemantics) {
+      Some((leftStateWatermark ++ Some(inputWatermarkMs)).min)
+    } else {
+      Some((leftStateWatermark ++ rightStateWatermark ++ Some(inputWatermarkMs)).min)
+    }
   }
 }

@@ -22,8 +22,6 @@ import scala.util.control.NonFatal
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys._
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
-import org.apache.spark.sql.catalyst.plans.logical.{EventTimeWatermark, LogicalPlan}
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark._
 import org.apache.spark.sql.catalyst.util.DateTimeConstants.MICROS_PER_DAY
 import org.apache.spark.sql.types._
@@ -35,19 +33,19 @@ import org.apache.spark.unsafe.types.CalendarInterval
 object StreamingJoinHelper extends PredicateHelper with Logging {
 
   /**
-   * Check the provided logical plan to see if its join keys contain a watermark attribute.
-   *
-   * Will return false if the plan is not an equijoin.
-   * @param plan the logical plan to check
+   * Find the equality key filtered by this input's watermark. Its ordinal can be used to
+   * evict the opposite input's state, whose equality keys have the same ordering.
    */
-  def isWatermarkInJoinKeys(plan: LogicalPlan): Boolean = {
-    plan match {
-      case ExtractEquiJoinKeys(_, leftKeys, rightKeys, _, _, _, _, _) =>
-        (leftKeys ++ rightKeys).exists {
-          case a: AttributeReference => a.metadata.contains(EventTimeWatermark.delayKey)
-          case _ => false
-        }
-      case _ => false
+  def getStateKeyWatermarkOrdinal(
+      keys: Seq[Expression],
+      inputAttributes: Seq[Attribute]): Option[Int] = {
+    // Late filtering uses the first event-time column in legacy mode. In the default mode,
+    // execution rejects multiple distinct event-time columns.
+    inputAttributes.find(_.metadata.contains(delayKey)).flatMap { eventTime =>
+      keys.indexWhere(_.semanticEquals(eventTime)) match {
+        case ordinal if ordinal >= 0 => Some(ordinal)
+        case _ => None
+      }
     }
   }
 
@@ -73,6 +71,20 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
       attributesWithEventWatermark: AttributeSet,
       joinCondition: Option[Expression],
       eventWatermark: Option[Long]): Option[Long] = {
+    getStateValueWatermarkWithAttribute(
+      attributesToFindStateWatermarkFor,
+      attributesWithEventWatermark,
+      joinCondition,
+      eventWatermark).map(_._2)
+  }
+
+  // Keep the pre-SPARK-58904 extractor separate so changes to corrected arithmetic cannot
+  // alter checkpoint-pinned bounds. In particular, preserve ExpressionSet operations throughout.
+  private[sql] def getLegacyStateValueWatermark(
+      attributesToFindStateWatermarkFor: AttributeSet,
+      attributesWithEventWatermark: AttributeSet,
+      joinCondition: Option[Expression],
+      eventWatermark: Option[Long]): Option[Long] = {
 
     // If condition or event time watermark is not provided, then cannot calculate state watermark
     if (joinCondition.isEmpty || eventWatermark.isEmpty) return None
@@ -82,7 +94,7 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
 
     def getStateWatermarkSafely(l: Expression, r: Expression): Option[Long] = {
       try {
-        getStateWatermarkFromLessThenPredicate(
+        getLegacyStateWatermarkFromLessThenPredicate(
           l, r, attributesToFindStateWatermarkFor, attributesWithEventWatermark, eventWatermark)
       } catch {
         case NonFatal(e) =>
@@ -118,6 +130,73 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
   }
 
   /**
+   * Get the state value watermark together with the state attribute it applies to.
+   */
+  def getStateValueWatermarkWithAttribute(
+      attributesToFindStateWatermarkFor: AttributeSet,
+      attributesWithEventWatermark: AttributeSet,
+      joinCondition: Option[Expression],
+      eventWatermark: Option[Long]): Option[(Attribute, Long)] = {
+
+    // If condition or event time watermark is not provided, then cannot calculate state watermark
+    if (joinCondition.isEmpty || eventWatermark.isEmpty) return None
+
+    // If there is not watermark attribute, then cannot define state watermark
+    if (!attributesWithEventWatermark.exists(_.metadata.contains(delayKey))) return None
+
+    def getStateWatermarkSafely(l: Expression, r: Expression): Option[(Attribute, Long)] = {
+      try {
+        getStateWatermarkFromLessThenPredicate(
+          l, r, attributesToFindStateWatermarkFor, attributesWithEventWatermark, eventWatermark)
+      } catch {
+        case NonFatal(e) =>
+          logWarning(log"Error trying to extract state constraint from condition " +
+            log"${MDC(JOIN_CONDITION, joinCondition)}", e)
+          None
+      }
+    }
+
+    val allStateWatermarks = splitConjunctivePredicates(joinCondition.get).flatMap { predicate =>
+
+      // The generated the state watermark cleanup expression is inclusive of the state watermark.
+      // If state watermark is W, all state where timestamp <= W will be cleaned up.
+      // Now when the canonicalized join condition solves to leftTime >= W, we don't want to clean
+      // up leftTime <= W. Rather we should clean up leftTime <= W - 1. Hence the -1 below.
+      val stateWatermark = predicate match {
+        case LessThan(l, r) => getStateWatermarkSafely(l, r)
+        case LessThanOrEqual(l, r) =>
+          getStateWatermarkSafely(l, r).map { case (attr, value) => attr -> (value - 1) }
+        case GreaterThan(l, r) => getStateWatermarkSafely(r, l)
+        case GreaterThanOrEqual(l, r) =>
+          getStateWatermarkSafely(r, l).map { case (attr, value) => attr -> (value - 1) }
+        case Between(input, lower, upper, _) =>
+          getStateWatermarkSafely(lower, input)
+            .map { case (attr, value) => attr -> (value - 1) }
+            .orElse(getStateWatermarkSafely(input, upper)
+              .map { case (attr, value) => attr -> (value - 1) })
+        case _ => None
+      }
+      if (stateWatermark.nonEmpty) {
+        logInfo(log"Condition ${MDC(JOIN_CONDITION, joinCondition)} generated " +
+          log"watermark constraint = ${MDC(WATERMARK_CONSTRAINT, stateWatermark.get)}")
+      }
+      stateWatermark
+    }
+    // Prefer the input's event time, then keep the indexed attribute stable as the watermark
+    // advances. The order of conjuncts must not determine whether event-time state can be evicted.
+    val eventTime = attributesToFindStateWatermarkFor.find(_.metadata.contains(delayKey))
+    allStateWatermarks.reduceOption { (x, y) =>
+      if (x._1.semanticEquals(y._1)) {
+        if (x._2 < y._2) x else y
+      } else if (eventTime.exists(_.semanticEquals(y._1))) {
+        y
+      } else {
+        x
+      }
+    }
+  }
+
+  /**
    * Extract the state value watermark (milliseconds) from the condition
    * `LessThan(leftExpr, rightExpr)` where . For example: if we want to find the constraint for
    * leftTime using the watermark on the rightTime. Example:
@@ -128,6 +207,103 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
    * With watermark value:  watermark-value + c1 + (-c2) < leftTime
    */
   private def getStateWatermarkFromLessThenPredicate(
+      leftExpr: Expression,
+      rightExpr: Expression,
+      attributesToFindStateWatermarkFor: AttributeSet,
+      attributesWithEventWatermark: AttributeSet,
+      eventWatermark: Option[Long]): Option[(Attribute, Long)] = {
+
+    val attributesInCondition = AttributeSet(
+      leftExpr.collect { case a: AttributeReference => a } ++
+      rightExpr.collect { case a: AttributeReference => a }
+    )
+    if (attributesInCondition.count(attributesToFindStateWatermarkFor.contains) > 1 ||
+        attributesInCondition.count(attributesWithEventWatermark.contains) > 1) {
+      // If more than attributes present in condition from one side, then it cannot be solved
+      return None
+    }
+
+    def containsAttributeToFindStateConstraintFor(e: Expression): Boolean = {
+      e.collectLeaves().collectFirst {
+        case a @ AttributeReference(_, _, _, _)
+          if attributesToFindStateWatermarkFor.contains(a) => a
+      }.nonEmpty
+    }
+
+    // Canonicalization step 1: convert to (rightTime-with-watermark + c1) - (leftTime + c2) < 0
+    val allOnLeftExpr = Subtract(leftExpr, rightExpr)
+    logDebug(s"All on Left:\n${allOnLeftExpr.treeString(true)}\n${allOnLeftExpr.asCode}")
+
+    // Canonicalization step 2: extract commutative terms
+    //    rightTime-with-watermark, c1, -leftTime, -c2
+    // Preserve repeated terms such as +2 +2, which contribute twice to the cutoff.
+    val terms = collectTerms(allOnLeftExpr)
+    logDebug("Terms extracted from join condition:\n\t" + terms.mkString("\n\t"))
+
+    // Find the term that has leftTime (i.e. the one present in attributesToFindConstraintFor
+    val constraintTerms = terms.filter(containsAttributeToFindStateConstraintFor)
+
+    // Verify there is only one correct constraint term and of the correct type
+    if (constraintTerms.size > 1) {
+      logWarning(
+        log"Failed to extract state constraint terms: multiple time terms in condition\n\t" +
+          log"${MDC(EXPR_TERMS, terms.mkString("\n\t"))}")
+      return None
+    }
+    if (constraintTerms.isEmpty) {
+      logDebug("Failed to extract state constraint terms: no time terms in condition\n\t" +
+        terms.mkString("\n\t"))
+      return None
+    }
+    val constraintTerm = constraintTerms.head
+    if (!constraintTerm.exists(_.isInstanceOf[UnaryMinus])) {
+      // Incorrect condition. We want the constraint term in canonical form to be `-leftTime`
+      // so that resolve for it as `-leftTime + watermark + c < 0` ==> `watermark + c < leftTime`.
+      // Now, if the original conditions is `rightTime-with-watermark > leftTime` and watermark
+      // condition is `rightTime-with-watermark > watermarkValue`, then no constraint about
+      // `leftTime` can be inferred. In this case, after canonicalization and collection of terms,
+      // the constraintTerm would be `leftTime` and not `-leftTime`. Hence, we return None.
+      return None
+    }
+    val stateAttribute = constraintTerm.collectFirst {
+      case a: AttributeReference if attributesToFindStateWatermarkFor.contains(a) => a
+    }.get
+    // Eviction applies the bound to this attribute itself, so it must be a timestamp.
+    if (stateAttribute.dataType != TimestampType) return None
+
+    // Substituting a lower bound for the other input is sound only for a positive, single
+    // occurrence of its watermarked attribute. Constants do not provide an advancing bound.
+    val watermarkTerms = terms.filter(_.references.exists(attributesWithEventWatermark.contains))
+    if (watermarkTerms.size != 1 ||
+        watermarkTerms.head.isInstanceOf[UnaryMinus] ||
+        !watermarkTerms.head.references.forall(_.metadata.contains(delayKey))) {
+      return None
+    }
+
+    // Replace watermark attribute with watermark value, and generate the resolved expression
+    // from the other terms. That is,
+    // rightTime-with-watermark, c1, -c2  =>  watermark, c1, -c2  =>  watermark + c1 + (-c2)
+    logDebug(s"Constraint term from join condition:\t$constraintTerm")
+    // Remove only the selected occurrence, consistent with preserving term multiplicity above.
+    val remainingTerms = terms.filterNot(_ eq constraintTerm)
+    val exprWithWatermarkSubstituted = remainingTerms.map { term =>
+      term.transform {
+        case a @ AttributeReference(_, _, _, metadata)
+          if attributesWithEventWatermark.contains(a) && metadata.contains(delayKey) =>
+          Multiply(Literal(eventWatermark.get.toDouble), Literal(1000.0))
+      }
+    }.reduceLeft(Add(_, _))
+
+    // Calculate the constraint value
+    logInfo(log"Final expression to evaluate " +
+      log"constraint:\t${MDC(WATERMARK_CONSTRAINT, exprWithWatermarkSubstituted)}")
+    val constraintValue = exprWithWatermarkSubstituted.eval().asInstanceOf[java.lang.Double]
+    Some(stateAttribute -> (Double2double(constraintValue) / 1000.0).toLong)
+  }
+
+  // Preserve the original constraint selection, subtraction and post-substitution deduplication.
+  // The corrected extractor above intentionally uses different acceptance and arithmetic rules.
+  private def getLegacyStateWatermarkFromLessThenPredicate(
       leftExpr: Expression,
       rightExpr: Expression,
       attributesToFindStateWatermarkFor: AttributeSet,
