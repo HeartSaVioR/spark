@@ -39,8 +39,8 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
   def getStateKeyWatermarkOrdinal(
       keys: Seq[Expression],
       inputAttributes: Seq[Attribute]): Option[Int] = {
-    // Late filtering uses the first event-time column in legacy mode. In the default mode,
-    // execution rejects multiple distinct event-time columns.
+    // When multiple stateful operators are disabled, late filtering uses the first event-time
+    // column. Otherwise, execution rejects multiple distinct event-time columns.
     inputAttributes.find(_.metadata.contains(delayKey)).flatMap { eventTime =>
       keys.indexWhere(_.semanticEquals(eventTime)) match {
         case ordinal if ordinal >= 0 => Some(ordinal)

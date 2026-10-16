@@ -32,6 +32,7 @@ import org.apache.spark.sql.execution.streaming.runtime.MemoryStream
 import org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.util.Utils
 
 class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
   import testImplicits._
@@ -216,4 +217,37 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
       }
     }
   }
+  Seq("2.4.0" -> "1", "3.5.1" -> "2").foreach { case (sparkVersion, stateVersion) =>
+    test(s"SPARK-58904: reject the historical Spark $sparkVersion range checkpoint") {
+      val input = MemoryStream[(Int, Long)]
+      val data = input.toDF().select($"_1".as("value"), timestamp_seconds($"_2").as("timestamp"))
+      val left = data.select($"value".as("leftId"), $"timestamp".as("leftTime"))
+        .withWatermark("leftTime", "5 seconds")
+      val right = data.where($"value" % 2 === 0)
+        .select($"value".as("rightId"), $"timestamp".as("rightTime"))
+        .withWatermark("rightTime", "5 seconds")
+      val joined = left.join(right, expr(
+        "rightId = leftId AND rightTime >= leftTime AND " +
+          "rightTime <= leftTime + INTERVAL 5 SECONDS"))
+      withTempDir { checkpointDir =>
+        val resource = getClass.getResource(
+          s"/structured-streaming/checkpoint-version-$sparkVersion-streaming-join/").toURI
+        Utils.copyDirectory(new File(resource), checkpointDir)
+        val before = snapshot(new File(checkpointDir, "state"))
+        val commitsBefore = snapshot(new File(checkpointDir, "commits"))
+        input.addData((1, 1L), (2, 2L), (3, 3L), (4, 4L), (5, 5L))
+        testStream(joined)(
+          StartStream(checkpointLocation = checkpointDir.getCanonicalPath),
+          AddData(input, (6, 6L), (7, 7L), (8, 8L), (9, 9L), (10, 10L)),
+          ExpectFailure[AnalysisException](assertFailure = error => {
+            checkError(error.asInstanceOf[AnalysisException],
+              condition = "STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE",
+              parameters = Map("operatorId" -> "0", "stateFormatVersion" -> stateVersion))
+          }))
+        assert(snapshot(new File(checkpointDir, "state")) == before)
+        assert(snapshot(new File(checkpointDir, "commits")) == commitsBefore)
+      }
+    }
+  }
+
 }

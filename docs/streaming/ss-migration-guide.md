@@ -43,7 +43,9 @@ Please refer [Migration Guide: SQL, Datasets and DataFrame](../sql-migration-gui
   key position. Other shapes, including range-only joins, fail with
   `STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE`. This conservative check can reject queries whose old
   behavior was correct; it does not diagnose historical output corruption. Incompatible outer or
-  semi join conditions may instead fail the analysis check described above.
+  semi join conditions may instead fail the analysis check described above. The compatibility
+  check assumes the same query is restarted; it does not make arbitrary changes to a stateful
+  query safe.
 
   To migrate a rejected query, preserve the original checkpoint, use a new checkpoint, and replay
   sufficient source history to rebuild state and any affected output. Confirm that the required
@@ -55,9 +57,10 @@ Please refer [Migration Guide: SQL, Datasets and DataFrame](../sql-migration-gui
   The internal `spark.sql.streaming.join.watermarkVersion` is pinned in offset metadata. Missing
   values identify old checkpoints (version 1); new checkpoints use version 2. It is a compatibility
   marker, not a legacy execution switch. Do not edit checkpoint metadata to bypass validation.
-  A rejected restart may append an offset-log entry, but does not change join state or commit the
-  batch. Downgrading a version 2 checkpoint to older Spark code is unsupported: older code may
-  ignore this marker and interpret its state with incompatible watermark semantics.
+  A rejected restart may append an offset-log entry and perform normal checkpoint housekeeping,
+  but does not change join state or commit the batch. Downgrading a version 2 checkpoint to older
+  Spark code is unsupported: older code may ignore this marker and interpret its state with
+  incompatible watermark semantics.
 
 - Since Spark 4.4, streaming queries using `EXCEPT` with a streaming left input are rejected
   because their optimizer rewrites introduce streaming aggregations after the initial
