@@ -23,7 +23,7 @@ import org.scalatest.Tag
 import org.apache.spark.SparkIllegalArgumentException
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.execution.datasources.v2.state.StateSourceOptions
-import org.apache.spark.sql.execution.streaming.checkpointing.{CheckpointFileManager, OffsetMap, OffsetSeq, OffsetSeqLog}
+import org.apache.spark.sql.execution.streaming.checkpointing.CheckpointFileManager
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinExec
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper.{JoinStateKeyWatermarkPredicate, JoinStateValueWatermarkPredicate}
 import org.apache.spark.sql.execution.streaming.runtime.{MemoryStream, StreamExecution}
@@ -60,101 +60,6 @@ class StreamingInnerJoinV4Suite
   with TestWithV4StateFormat {
 
   import testImplicits._
-
-  private val correctedIndexConfKey =
-    SQLConf.STREAMING_JOIN_V4_CORRECTED_WATERMARK_INDEX_ENABLED.key
-
-  private def latestPinnedIndexConf(checkpointDir: java.io.File): Option[String] = {
-    val offsetLog = new OffsetSeqLog(spark, checkpointDir.getCanonicalPath + "/offsets")
-    offsetLog.getLatest().flatMap(_._2.metadataOpt).flatMap(_.conf.get(correctedIndexConfKey))
-  }
-
-  private def removeLatestPinnedIndexConf(checkpointDir: java.io.File): Unit = {
-    val offsetsPath = checkpointDir.getCanonicalPath + "/offsets"
-    val offsetLog = new OffsetSeqLog(spark, offsetsPath)
-    val (batchId, offsets) = offsetLog.getLatest().get
-    val updated = offsets match {
-      case o: OffsetSeq =>
-        o.copy(metadataOpt = o.metadataOpt.map { m =>
-          m.copy(conf = m.conf - correctedIndexConfKey)
-        })
-      case o: OffsetMap =>
-        o.copy(metadata = o.metadata.copy(conf = o.metadata.conf - correctedIndexConfKey))
-    }
-    val path = new Path(offsetsPath, batchId.toString)
-    assert(path.getFileSystem(spark.sessionState.newHadoopConf()).delete(path, false))
-    assert(offsetLog.add(batchId, updated))
-  }
-
-  Seq(false, true).foreach { leftWatermark =>
-    test(s"SPARK-58904: legacy V4 index stays pinned, left watermark=$leftWatermark") {
-      withTempDir { checkpointDir =>
-        val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
-          "inner", leftWatermark = leftWatermark)
-        withSQLConf(correctedIndexConfKey -> "false") {
-          testStream(joined)(
-            StartStream(checkpointLocation = checkpointDir.getCanonicalPath),
-            MultiAddData(leftInput, (1, 5))(rightInput, (2, 5)),
-            CheckNewAnswer(),
-            StopStream)
-        }
-        assert(latestPinnedIndexConf(checkpointDir).contains("false"))
-
-        // Simulate a V4 checkpoint written before this setting existed.
-        removeLatestPinnedIndexConf(checkpointDir)
-        assert(latestPinnedIndexConf(checkpointDir).isEmpty)
-
-        val warning = new LogAppender("legacy V4 join watermark warning", maxEvents = 10000)
-        withLogAppender(warning) {
-          testStream(joined)(
-            StartStream(checkpointLocation = checkpointDir.getCanonicalPath),
-            AddData(rightInput, (1, 5)),
-            CheckNewAnswer(Row(1, 1, 5, 5)),
-            Execute { query =>
-              val join = query.lastExecution.executedPlan.collect {
-                case j: StreamingSymmetricHashJoinExec => j
-              }.head
-              assert(join.useLegacyV4WatermarkIndex)
-            })
-        }
-        val warnings = warning.loggingEvents.map(_.getMessage.getFormattedMessage)
-          .filter(_.contains("SPARK-58904: This restarted stream-stream join"))
-        assert(warnings.size == (if (leftWatermark) 0 else 1))
-        if (!leftWatermark) {
-          assert(warnings.head.contains("can retain state"))
-          assert(!warnings.head.contains("unmatched"))
-        }
-        assert(latestPinnedIndexConf(checkpointDir).contains("false"))
-      }
-    }
-  }
-
-  test("SPARK-58904: new V4 index stays pinned on restart") {
-    withTempDir { checkpointDir =>
-      val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
-        "inner", leftWatermark = false)
-      testStream(joined)(
-        StartStream(checkpointLocation = checkpointDir.getCanonicalPath),
-        MultiAddData(leftInput, (1, 5))(rightInput, (2, 5)),
-        CheckNewAnswer(),
-        StopStream)
-      assert(latestPinnedIndexConf(checkpointDir).contains("true"))
-
-      withSQLConf(correctedIndexConfKey -> "false") {
-        testStream(joined)(
-          StartStream(checkpointLocation = checkpointDir.getCanonicalPath),
-          AddData(rightInput, (1, 5)),
-          CheckNewAnswer(Row(1, 1, 5, 5)),
-          Execute { query =>
-            val join = query.lastExecution.executedPlan.collect {
-              case j: StreamingSymmetricHashJoinExec => j
-            }.head
-            assert(!join.useLegacyV4WatermarkIndex)
-          })
-      }
-      assert(latestPinnedIndexConf(checkpointDir).contains("true"))
-    }
-  }
 
   test("SPARK-55628: V4 state format is active in execution plan") {
     val input1 = MemoryStream[Int]
@@ -638,98 +543,7 @@ class StreamingOuterJoinV4Suite
 
   import testImplicits._
 
-  test("SPARK-58904: restart warns when legacy outer range state cannot be finalized") {
-    val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
-      "left_outer", leftWatermark = false)
-    withTempDir { checkpointDir =>
-      val checkpoint = checkpointDir.getCanonicalPath
-      withSQLConf(SQLConf.STREAMING_JOIN_V4_CORRECTED_WATERMARK_INDEX_ENABLED.key -> "false") {
-        testStream(joined)(
-          StartStream(checkpointLocation = checkpoint),
-          AddData(leftInput, (1, 5)),
-          ProcessAllAvailable(),
-          StopStream)
-      }
-
-      val warning = new LogAppender("legacy V4 outer range warning", maxEvents = 10000)
-      withLogAppender(warning) {
-        testStream(joined)(
-          StartStream(checkpointLocation = checkpoint),
-          AddData(rightInput, (2, 30)),
-          ProcessAllAvailable())
-      }
-      val warnings = warning.loggingEvents.map(_.getMessage.getFormattedMessage)
-        .filter(_.contains("SPARK-58904: This restarted stream-stream join"))
-      assert(warnings.size == 1)
-      assert(warnings.head.contains("may delay or prematurely emit unmatched left rows"))
-    }
-  }
-
-  test("SPARK-58904: restart warns when a fixed bound delays unmatched output") {
-    val leftInput = MemoryStream[(Int, Int, Int)]
-    val rightInput = MemoryStream[(Int, Int)]
-    val left = leftInput.toDF().toDF("leftKey", "time", "leftValue")
-      .select($"leftKey", timestamp_seconds($"time").as("leftTime"), $"leftValue")
-      .withWatermark("leftTime", "0 seconds")
-    val right = rightInput.toDF().toDF("rightKey", "time")
-      .select($"rightKey", timestamp_seconds($"time").as("rightTime"))
-      .withWatermark("rightTime", "0 seconds")
-    val joined = left.join(right,
-      expr("leftKey = rightKey AND leftTime > rightTime AND leftValue > 10"),
-      "left_outer")
-
-    withTempDir { checkpointDir =>
-      val checkpoint = checkpointDir.getCanonicalPath
-      withSQLConf(SQLConf.STREAMING_JOIN_V4_CORRECTED_WATERMARK_INDEX_ENABLED.key -> "false") {
-        testStream(joined)(
-          StartStream(checkpointLocation = checkpoint),
-          AddData(leftInput, (1, 1, 11)),
-          ProcessAllAvailable(),
-          StopStream)
-      }
-
-      val warning = new LogAppender("legacy V4 fixed-bound warning", maxEvents = 10000)
-      withLogAppender(warning) {
-        testStream(joined)(
-          StartStream(checkpointLocation = checkpoint),
-          AddData(rightInput, (2, 2)),
-          ProcessAllAvailable(),
-          Execute { query =>
-            val join = query.lastExecution.executedPlan.collect {
-              case j: StreamingSymmetricHashJoinExec => j
-            }.head
-            assert(join.useLegacyV4WatermarkIndex)
-          })
-      }
-      assert(warning.loggingEvents.count(_.getMessage.getFormattedMessage.contains(
-        "SPARK-58904: This restarted stream-stream join")) == 1)
-    }
-  }
-
-  test("SPARK-58904: legacy V4 range join keeps its prior eviction behavior") {
-    val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
-      "left_outer", leftWatermark = false)
-    withSQLConf(
-        SQLConf.STREAMING_JOIN_V4_CORRECTED_WATERMARK_INDEX_ENABLED.key -> "false",
-        SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
-      testStream(joined)(
-        AddData(leftInput, (1, 5)),
-        CheckNewAnswer(),
-        AddData(rightInput, (2, 30)),
-        CheckNewAnswer(),
-        AddData(rightInput, (2, 40)),
-        CheckNewAnswer(),
-        Execute { query =>
-          val join = query.lastExecution.executedPlan.collect {
-            case j: StreamingSymmetricHashJoinExec => j
-          }.head
-          assert(join.useLegacyV4WatermarkIndex)
-          assert(join.stateWatermarkPredicates.left.isEmpty)
-        })
-    }
-  }
-
-  test("SPARK-58904: legacy V4 scan includes newly admitted rows below the old bound") {
+  test("SPARK-58904: V4 scan includes newly admitted rows below the old bound") {
     val leftInput = MemoryStream[(Int, Int)]
     val rightInput = MemoryStream[(Int, Int)]
     val left = leftInput.toDF().toDF("leftKey", "time")
@@ -745,7 +559,6 @@ class StreamingOuterJoinV4Suite
         $"rightTime".cast("long"))
 
     withSQLConf(
-        SQLConf.STREAMING_JOIN_V4_CORRECTED_WATERMARK_INDEX_ENABLED.key -> "false",
         SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
       testStream(joined)(
         MultiAddData(leftInput, (9, 20))(rightInput, (9, 10)),

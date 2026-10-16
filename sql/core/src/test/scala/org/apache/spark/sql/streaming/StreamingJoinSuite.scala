@@ -35,7 +35,7 @@ import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.execution.datasources.v2.state.StateSourceOptions
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
-import org.apache.spark.sql.execution.streaming.checkpointing.{CheckpointFileManager, OffsetMap, OffsetSeq, OffsetSeqLog}
+import org.apache.spark.sql.execution.streaming.checkpointing.CheckpointFileManager
 import org.apache.spark.sql.execution.streaming.operators.stateful.{StatefulOperatorStateInfo, StateStoreSaveExec}
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.{StreamingSymmetricHashJoinExec, StreamingSymmetricHashJoinHelper}
 import org.apache.spark.sql.execution.streaming.runtime.{MemoryStream, StreamExecution}
@@ -1087,81 +1087,6 @@ abstract class StreamingInnerJoinBase extends StreamingJoinSuite {
 abstract class StreamingInnerJoinSuite extends StreamingInnerJoinBase {
   import testImplicits._
 
-  test("SPARK-58904: V2/V3 checkpoint keeps join and downstream watermark behavior") {
-    val correctedKey = SQLConf.STREAMING_JOIN_V1_TO_V3_CORRECTED_WATERMARK_ENABLED.key
-    val leftInput = MemoryStream[Int]
-    val rightInput = MemoryStream[Int]
-    val left = leftInput.toDF()
-      .select(timestamp_seconds($"value").as("leftTime"))
-      .withWatermark("leftTime", "0 seconds")
-    val right = rightInput.toDF().select(timestamp_seconds($"value").as("rightTime"))
-    val result = left.join(right, $"leftTime" === $"rightTime")
-      .groupBy(window($"leftTime", "10 seconds"))
-      .count()
-      .select($"window.start".cast("long"), $"count")
-    var downstreamWatermarkBeforeRestart = Option.empty[Long]
-
-    withTempDir { checkpointDir =>
-      val checkpoint = checkpointDir.getCanonicalPath
-      withSQLConf(
-          correctedKey -> "false",
-          SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
-        testStream(result, OutputMode.Update())(
-          StartStream(checkpointLocation = checkpoint),
-          MultiAddData(leftInput, 5)(rightInput, 5),
-          CheckNewAnswer(Row(0L, 1L)),
-          MultiAddData(leftInput, 30)(rightInput, 30),
-          CheckNewAnswer(Row(30L, 1L)),
-          AddData(rightInput, 40),
-          CheckNewAnswer(),
-          Execute { query =>
-            val aggregation = query.lastExecution.executedPlan.collect {
-              case s: StateStoreSaveExec => s
-            }.head
-            downstreamWatermarkBeforeRestart = aggregation.eventTimeWatermarkForEviction
-            assert(downstreamWatermarkBeforeRestart.exists(_ > 0L))
-          },
-          StopStream)
-      }
-
-      // Simulate a checkpoint written before the corrected-watermark setting existed.
-      val offsetsPath = checkpoint + "/offsets"
-      val offsetLog = new OffsetSeqLog(spark, offsetsPath)
-      val (batchId, offsets) = offsetLog.getLatest().get
-      val updated = offsets match {
-        case o: OffsetSeq =>
-          o.copy(metadataOpt = o.metadataOpt.map(m => m.copy(conf = m.conf - correctedKey)))
-        case o: OffsetMap =>
-          o.copy(metadata = o.metadata.copy(conf = o.metadata.conf - correctedKey))
-      }
-      val path = new Path(offsetsPath, batchId.toString)
-      assert(path.getFileSystem(spark.sessionState.newHadoopConf()).delete(path, false))
-      assert(offsetLog.add(batchId, updated))
-
-      val warning = new LogAppender("legacy join watermark warning", maxEvents = 10000)
-      withLogAppender(warning) {
-        withSQLConf(SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
-          testStream(result, OutputMode.Update())(
-            StartStream(checkpointLocation = checkpoint),
-            AddData(rightInput, 50),
-            CheckNewAnswer(),
-            Execute { query =>
-              val plan = query.lastExecution.executedPlan
-              val join = plan.collect { case j: StreamingSymmetricHashJoinExec => j }.head
-              val aggregation = plan.collect { case s: StateStoreSaveExec => s }.head
-              assert(join.useLegacyWatermarkSemantics)
-              assert(aggregation.eventTimeWatermarkForEviction ===
-                downstreamWatermarkBeforeRestart)
-            })
-        }
-      }
-      assert(warning.loggingEvents.count(_.getMessage.getFormattedMessage.contains(
-        "SPARK-58904: This restarted stream-stream join")) == 1)
-      assert(offsetLog.getLatest().flatMap(_._2.metadataOpt)
-        .flatMap(_.conf.get(correctedKey)).contains("false"))
-    }
-  }
-
   testWithAppendAndUpdate("stream stream inner join on windows - with watermark") { outputMode =>
     val input1 = MemoryStream[Int]
     val input2 = MemoryStream[Int]
@@ -1360,47 +1285,12 @@ abstract class StreamingOuterJoinBase extends StreamingJoinSuite {
   test("SPARK-58904: corrected left outer equality join requires a right watermark") {
     val (leftInput, _, joined) = setupJoinWithRangeCondition(
       "left_outer", leftWatermark = true, rightWatermark = false, joinOnTime = true)
-    val error = intercept[StreamingQueryException] {
+    val error = intercept[AnalysisException] {
       testStream(joined)(
         AddData(leftInput, (1, 5)),
         CheckNewAnswer())
     }
     assert(error.getMessage.contains("a watermark on the right input"))
-  }
-
-  test("SPARK-58904: legacy left outer equality join can restart") {
-    val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
-      "left_outer", leftWatermark = true, rightWatermark = false, joinOnTime = true)
-    withTempDir { checkpointDir =>
-      val checkpoint = checkpointDir.getCanonicalPath
-      withSQLConf(
-          SQLConf.STREAMING_JOIN_V1_TO_V3_CORRECTED_WATERMARK_ENABLED.key -> "false",
-          SQLConf.STREAMING_JOIN_V4_CORRECTED_WATERMARK_INDEX_ENABLED.key -> "false") {
-        testStream(joined)(
-          StartStream(checkpointLocation = checkpoint),
-          AddData(leftInput, (1, 5)),
-          CheckNewAnswer(),
-          StopStream)
-      }
-
-      val warning = new LogAppender("legacy equality join warning", maxEvents = 10000)
-      withLogAppender(warning) {
-        testStream(joined)(
-          StartStream(checkpointLocation = checkpoint),
-          AddData(rightInput, (2, 30)),
-          CheckNewAnswer(),
-          Execute { query =>
-            val join = query.lastExecution.executedPlan.collect {
-              case j: StreamingSymmetricHashJoinExec => j
-            }.head
-            assert(join.useLegacyWatermarkSemantics)
-          })
-      }
-      val warnings = warning.loggingEvents.map(_.getMessage.getFormattedMessage)
-        .filter(_.contains("SPARK-58904: This restarted stream-stream join"))
-      assert(warnings.size == 1)
-      assert(warnings.head.contains("replaying it unchanged would fail"))
-    }
   }
 
   for {
@@ -2531,34 +2421,24 @@ abstract class StreamingLeftSemiJoinBase extends StreamingJoinSuite {
 
   import testImplicits._
 
-  Seq(false, true).foreach { corrected =>
-    test(s"SPARK-58904: left semi output watermark preserves legacy mode, corrected=$corrected") {
-      val (leftInput, left) = setupStream("left", 2)
-      val (rightInput, right) = setupStream("right", 3)
-      val joined = left.join(right,
-        (left("key") === right("key")) &&
-          expr("leftTime > rightTime - INTERVAL 5 SECONDS AND " +
-            "leftTime < rightTime + INTERVAL 10 SECONDS"), "left_semi")
-        .select("key")
+  test("SPARK-58904: left semi output watermark uses only left output columns") {
+    val (leftInput, left) = setupStream("left", 2)
+    val (rightInput, right) = setupStream("right", 3)
+    val joined = left.join(right,
+      (left("key") === right("key")) &&
+        expr("leftTime > rightTime - INTERVAL 5 SECONDS AND " +
+          "leftTime < rightTime + INTERVAL 10 SECONDS"), "left_semi")
+      .select("key")
 
-      withSQLConf(
-          SQLConf.STREAMING_JOIN_V1_TO_V3_CORRECTED_WATERMARK_ENABLED.key -> corrected.toString,
-          SQLConf.STREAMING_JOIN_V4_CORRECTED_WATERMARK_INDEX_ENABLED.key -> corrected.toString) {
-        testStream(joined)(
-          MultiAddData(leftInput, 5)(rightInput, 5),
-          CheckNewAnswer(5),
-          Execute { query =>
-            val join = query.lastExecution.executedPlan.collect {
-              case j: StreamingSymmetricHashJoinExec => j
-            }.head
-            assert(join.useLegacyWatermarkSemantics === !corrected)
-            // Legacy mode also includes the right-state bound, which is lower here.
-            val expectedWatermark = if (corrected) 15000L else 10000L
-            assert(join.produceOutputWatermark(20000L) === Some(expectedWatermark))
-          }
-        )
-      }
-    }
+    testStream(joined)(
+      MultiAddData(leftInput, 5)(rightInput, 5),
+      CheckNewAnswer(5),
+      Execute { query =>
+        val join = query.lastExecution.executedPlan.collect {
+          case j: StreamingSymmetricHashJoinExec => j
+        }.head
+        assert(join.produceOutputWatermark(20000L) === Some(15000L))
+      })
   }
 
   test("SPARK-58904: left semi output watermark ignores unbounded right state") {

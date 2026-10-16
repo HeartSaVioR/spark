@@ -18,7 +18,7 @@
 package org.apache.spark.sql.streaming
 
 import org.apache.spark.sql.catalyst.dsl.expressions._
-import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression, Literal}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, Expression, Literal}
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
 import org.apache.spark.sql.execution.LocalTableScanExec
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper
@@ -189,104 +189,32 @@ class StreamingSymmetricHashJoinHelperSuite extends StreamTest {
       (Some(0L), Some(0L)))
   }
 
-  test("SPARK-58904: a fixed bound can mask a legacy difference at an earlier watermark") {
-    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
-    val lt = AttributeReference("lt", TimestampType, metadata = metadata)()
-    val li = AttributeReference("li", IntegerType)()
-    val rt = AttributeReference("rt", TimestampType, metadata = metadata)()
-    val condition = Some(lt > rt && li > Literal(10))
-
-    def leftWatermark(watermark: Long, legacy: Boolean): Long = {
-      val predicates = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
-        Seq(lt, li), Seq(rt), Nil, Nil, condition, Some(watermark), None, false, legacy)
-      predicates.left.get.asInstanceOf[JoinStateValueWatermarkPredicate].stateWatermark
-    }
-
-    assert(leftWatermark(0L, legacy = true) == leftWatermark(0L, legacy = false))
-    assert(leftWatermark(20000L, legacy = true) == 10000L)
-    assert(leftWatermark(20000L, legacy = false) == 20000L)
-  }
-
-  test("SPARK-58904: legacy warning identifies one-sided watermark shapes") {
-    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
-    val lt = AttributeReference("lt", TimestampType)()
-    val rt = AttributeReference("rt", TimestampType, metadata = metadata)()
-    val range = Some(lt > rt - 5)
-
-    def changes(
-        leftKeys: Seq[AttributeReference] = Nil,
-        rightKeys: Seq[AttributeReference] = Nil,
-        condition: Option[Expression] = range): Seq[String] = {
-      StreamingSymmetricHashJoinHelper.legacyWatermarkChangeSides(
-        Seq(lt), Seq(rt), leftKeys, rightKeys, condition)
-    }
-
-    assert(changes() == Seq("left-state cleanup"))
-    assert(changes(Seq(lt), Seq(rt), None) == Seq("right-state cleanup"))
-    val watermarkedLeft = lt.withMetadata(metadata)
-    assert(StreamingSymmetricHashJoinHelper.legacyWatermarkChangeSides(
-      Seq(watermarkedLeft), Seq(rt), Seq(watermarkedLeft), Seq(rt), None).isEmpty)
-    assert(StreamingSymmetricHashJoinHelper.legacyWatermarkChangeSides(
-      Seq(watermarkedLeft), Seq(lt), Seq(watermarkedLeft), Seq(lt), None) ==
-      Seq("left-state cleanup"))
-  }
-
-  test("SPARK-58904: legacy warning identifies an additional state-column bound") {
-    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
-    val lt = AttributeReference("lt", TimestampType, metadata = metadata)()
-    val li = AttributeReference("li", LongType)()
-    val rt = AttributeReference("rt", TimestampType, metadata = metadata)()
-
-    def changes(bound: Long): Seq[String] = {
-      StreamingSymmetricHashJoinHelper.legacyWatermarkChangeSides(
-        Seq(lt, li), Seq(rt), Nil, Nil, Some(lt > rt && li > Literal(bound)))
-    }
-
-    assert(changes(300000000000L) == Seq("left-state cleanup"))
-    assert(changes(10000000000000L) == Seq("left-state cleanup"))
-    assert(StreamingSymmetricHashJoinHelper.legacyWatermarkChangeSides(
-      Seq(lt, li), Seq(rt), Nil, Nil, Some(li > Literal(10L))) ==
-      Seq("left-state cleanup"))
-    assert(StreamingSymmetricHashJoinHelper.legacyWatermarkChangeSides(
-      Seq(lt), Seq(rt), Nil, Nil, Some(lt > rt)).isEmpty)
-  }
-
-  test("SPARK-58904: legacy warning identifies changed event-time bounds") {
+  test("SPARK-58904: checkpoint compatibility requires unambiguous event-time equality") {
     val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
     val lt = AttributeReference("lt", TimestampType, metadata = metadata)()
     val rt = AttributeReference("rt", TimestampType, metadata = metadata)()
-
-    Seq(lt > Literal(10L), lt + rt > Literal(100L), lt > rt + 2 + 2).foreach { condition =>
-      assert(StreamingSymmetricHashJoinHelper.legacyWatermarkChangeSides(
-        Seq(lt), Seq(rt), Nil, Nil, Some(condition)).contains("left-state cleanup"))
+    val other = AttributeReference("other", TimestampType)()
+    def compatible(
+        left: Seq[Attribute],
+        right: Seq[Attribute],
+        leftKeys: Seq[Expression],
+        rightKeys: Seq[Expression]): Boolean = {
+      StreamingSymmetricHashJoinHelper.isWatermarkCheckpointCompatible(
+        left, right, leftKeys, rightKeys)
     }
-  }
 
-  test("SPARK-58904: legacy V4 keeps its watermark predicates") {
-    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
-    val lt = AttributeReference("lt", TimestampType)()
-    val rt = AttributeReference("rt", TimestampType, metadata = metadata)()
-    val condition = Some(lt > rt - 5)
-    val legacy = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
-      Seq(lt), Seq(rt), Nil, Nil, condition, Some(20000), None, false,
-      useLegacyWatermarkSemantics = true)
-    assert(legacy.left.isEmpty && legacy.right.isEmpty)
-    assert(StreamingSymmetricHashJoinHelper.getStateWatermark(
-      Seq(lt), Seq(rt), Nil, Nil, condition, Some(20000), false,
-      useLegacyWatermarkSemantics = true) === (None, None))
-
-    val legacyKey = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
-      Seq(lt), Seq(rt), Seq(lt), Seq(rt), None, Some(20000), None, false,
-      useLegacyWatermarkSemantics = true)
-    assert(legacyKey.left.isDefined && legacyKey.right.isDefined)
-
-    val watermarkedLeft = lt.withMetadata(metadata)
-    val legacyRange = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
-      Seq(watermarkedLeft), Seq(rt), Nil, Nil, Some(watermarkedLeft > rt + 5),
-      Some(20000), Some(10000), false, useLegacyWatermarkSemantics = true)
-    assert(legacyRange.left.exists {
-      case JoinStateValueWatermarkPredicate(_, 25000, Some(10000)) => true
-      case _ => false
-    })
+    assert(compatible(Seq(lt), Seq(rt), Seq(lt), Seq(rt)))
+    assert(compatible(Seq(other), Seq(other), Seq(other), Seq(other)))
+    assert(!compatible(Seq(lt), Seq(rt), Nil, Nil)) // Range-only keys.
+    assert(!compatible(Seq(other), Seq(rt), Seq(other), Seq(rt)))
+    assert(!compatible(Seq(lt), Seq(other), Seq(lt), Seq(other)))
+    assert(!compatible(Seq(lt, other), Seq(rt, other), Seq(lt, other), Seq(other, rt)))
+    assert(!compatible(Seq(lt, rt), Seq(rt), Seq(lt), Seq(rt)))
+    assert(!compatible(Seq(lt), Seq(rt, lt), Seq(lt), Seq(rt)))
+    assert(!compatible(Seq(lt), Seq(rt), Seq(lt, lt), Seq(rt, rt)))
+    // Metadata alone must not select an earlier key or conceal a watermark on a computed key.
+    val computed = Alias(lt, "computed")()
+    assert(!compatible(Seq(lt), Seq(rt), Seq(computed, lt), Seq(rt, rt)))
+    assert(!compatible(Seq(other), Seq(other), Seq(computed), Seq(other)))
   }
 }

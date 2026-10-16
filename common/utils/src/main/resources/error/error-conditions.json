@@ -7924,6 +7924,13 @@
     ],
     "sqlState" : "42K03"
   },
+  "STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE" : {
+    "message" : [
+      "Cannot establish watermark compatibility for stream-stream join operator <operatorId> with checkpoint state format <stateFormatVersion>.",
+      "This checkpoint predates the corrected join watermark semantics. Start the query with a new checkpoint and replay the required input, reconciling previously written sink output. Preserve the original checkpoint; do not change its version metadata to bypass this check."
+    ],
+    "sqlState" : "0A000"
+  },
   "STREAMING_OUTPUT_MODE" : {
     "message" : [
       "Invalid streaming output mode: <outputMode>."

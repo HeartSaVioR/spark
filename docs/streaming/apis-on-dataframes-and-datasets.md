@@ -1304,6 +1304,10 @@ is needed for either. The `impressionTime` watermark and the time range let Spar
 old clicks as well. Right outer joins reverse the roles, while full outer joins need both
 watermarks to output unmatched rows from both sides.
 
+When upgrading a query created before Spark 4.4, some existing join checkpoints cannot be
+resumed with these watermark semantics. Review the [streaming migration guide](ss-migration-guide.html)
+before upgrading, including input replay and sink reconciliation requirements.
+
 ###### Caveats
 There are a few important characteristics to note regarding how the outer results are generated.
 
