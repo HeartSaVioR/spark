@@ -743,6 +743,8 @@ class IncrementalExecution(
 
     override def apply(plan: SparkPlan): SparkPlan = {
       val planWithStateOpId = plan transform composedRule
+      // Validate once checkpoint settings are known. Legacy queries keep previously accepted
+      // join shapes; the restart checks below report watermark differences as warnings.
       if (isFirstBatch) {
         planWithStateOpId.foreach {
           case j: StreamingSymmetricHashJoinExec if !j.useLegacyWatermarkSemantics =>

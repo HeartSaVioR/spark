@@ -157,6 +157,8 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
     val eventTime = attributesToFindStateWatermarkFor.find(_.metadata.contains(delayKey))
     allStateWatermarks.reduceOption { (x, y) =>
       if (legacy) {
+        // Legacy callers use only the cutoff, so keep the old minimum across all attributes.
+        // Corrected selection below keeps the indexed attribute stable as the watermark advances.
         if (x._2 < y._2) x else y
       } else if (x._1.semanticEquals(y._1)) {
         if (x._2 < y._2) x else y
@@ -209,6 +211,8 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
 
     // Canonicalization step 2: extract commutative terms
     //    rightTime-with-watermark, c1, -leftTime, -c2
+    // Legacy extraction deduplicates equal terms. Corrected arithmetic must preserve repeated
+    // terms such as +2 +2, which contribute twice to the cutoff.
     val terms = if (legacy) {
       ExpressionSet(collectTerms(allOnLeftExpr)).toSeq
     } else {
@@ -244,10 +248,13 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
     val stateAttribute = constraintTerm.collectFirst {
       case a: AttributeReference if attributesToFindStateWatermarkFor.contains(a) => a
     }.get
+    // Legacy extraction accepted bounds on other data types and applied them to event time.
+    // Corrected eviction applies the bound to this attribute itself, so it must be a timestamp.
     if (!legacy && stateAttribute.dataType != TimestampType) return None
 
     // Substituting a lower bound for the other input is sound only for a positive, single
     // occurrence of its watermarked attribute. Constants do not provide an advancing bound.
+    // Legacy mode retains its prior acceptance rules to preserve checkpoint behavior.
     val watermarkTerms = terms.filter(_.references.exists(attributesWithEventWatermark.contains))
     if (!legacy && (watermarkTerms.size != 1 ||
         watermarkTerms.head.isInstanceOf[UnaryMinus] ||
@@ -262,6 +269,7 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
     val remainingTerms = if (legacy) {
       terms.filterNot(_.semanticEquals(constraintTerm))
     } else {
+      // Remove only the selected occurrence, consistent with preserving term multiplicity above.
       terms.filterNot(_ eq constraintTerm)
     }
     val exprWithWatermarkSubstituted = remainingTerms.map { term =>

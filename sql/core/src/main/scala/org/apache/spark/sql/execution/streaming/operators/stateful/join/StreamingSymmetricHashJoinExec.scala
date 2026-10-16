@@ -414,6 +414,8 @@ case class StreamingSymmetricHashJoinExec(
     // Create left and right side hash joiners and store in the joiner manager.
     // Both sides should use the same store generator if we are re-using the same store instance.
     val joinStateManagerStoreGenerator = new JoinStateManagerStoreGenerator()
+    // For equality eviction, legacy V4 shares one key ordinal. Corrected indexing uses the
+    // opposite input's ordinal on each side, matching the watermark that permits its eviction.
     val legacyJoinKeyOrdinal =
       StreamingSymmetricHashJoinHelper.findJoinKeyOrdinalForWatermark(leftKeys, rightKeys)
     val joinerManager = OneSideHashJoinerManager(
@@ -705,6 +707,8 @@ case class StreamingSymmetricHashJoinExec(
     val preJoinFilter =
       Predicate.create(preJoinFilterExpr.getOrElse(Literal(true)), inputAttributes).eval _
 
+    // Legacy V4 keeps the state manager's event-time fallback so existing keys remain readable.
+    // Corrected V4 indexes the timestamp actually bounded by the eviction predicate.
     private val stateValueWatermarkOrdinal = stateWatermarkPredicate.filter { _ =>
       !useLegacyV4WatermarkIndex
     }.flatMap {
@@ -755,8 +759,9 @@ case class StreamingSymmetricHashJoinExec(
     private[this] val allowMultipleStatefulOperators: Boolean =
       conf.getConf(SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE)
 
-    // V4 range scan for time-interval joins (SPARK-55147). With corrected indexing, use it
-    // only when both sides are indexed by their own event time.
+    // V4 range scan for time-interval joins (SPARK-55147). Probes use each input's event
+    // time, but corrected indexing may use another timestamp. Require both indexes to use their
+    // own event time; legacy V4 keeps its original eligibility test for its event-time indexes.
     // The -1 eviction adjustment widens range by ~1ms/side; postJoinFilter handles exact bounds.
     private[this] val scanRangeOffsets: Option[(Long, Long)] = {
       def usesEventTime(
@@ -783,6 +788,7 @@ case class StreamingSymmetricHashJoinExec(
           case RightSide => (right.output, left.output)
         }
 
+        // Probe bounds must use the same extraction rules as eviction in the checkpoint's mode.
         val stateValueWatermark = if (useLegacyV4WatermarkIndex) {
           StreamingJoinHelper.getLegacyStateValueWatermark _
         } else {

@@ -166,6 +166,8 @@ object StreamingSymmetricHashJoinHelper extends Logging with PredicateHelper {
       useLegacyWatermarkSemantics: Boolean = false): (Option[Long], Option[Long]) = {
 
     if (useLegacyWatermarkSemantics) {
+      // Legacy output bounds can omit retained state or use a bound on another timestamp.
+      // Preserve that calculation so restart does not change downstream watermark behavior.
       return getLegacyStateWatermark(leftAttributes, rightAttributes, leftKeys, rightKeys,
         condition, eventTimeWatermarkForEviction, allowMultipleEventTimeColumns)
     }
@@ -212,6 +214,8 @@ object StreamingSymmetricHashJoinHelper extends Logging with PredicateHelper {
       useLegacyWatermarkSemantics: Boolean = false): JoinStateWatermarkPredicates = {
 
     if (useLegacyWatermarkSemantics) {
+      // Legacy eviction shares one equality-key ordinal and requires a watermark on the stored
+      // side for range cleanup. Corrected eviction below follows the opposite input's watermark.
       return getLegacyStateWatermarkPredicates(leftAttributes, rightAttributes, leftKeys,
         rightKeys, condition, eventTimeWatermarkForEviction, eventTimeWatermarkForLateEvents,
         useFirstEventTimeColumn)
