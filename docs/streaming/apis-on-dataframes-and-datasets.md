@@ -1297,6 +1297,15 @@ joined <- join(
 Outer joins have the same guarantees as [inner joins](#semantic-guarantees-of-stream-stream-inner-joins-with-watermarking)
 regarding watermark delays and whether data will be dropped or not.
 
+Unmatched output and state removal use the same cutoff, derived from the opposite input's
+watermark and the time constraint. In the example above, the `clickTime` watermark finalizes
+impressions; no watermark on `impressionTime` is needed for this. Full outer joins require
+watermarks and time constraints in both directions to finalize both sides.
+
+When upgrading a query created before Spark 4.4, some existing join checkpoints cannot be
+resumed with these watermark semantics. Review the [streaming migration guide](ss-migration-guide.html)
+before upgrading, including input replay and sink reconciliation requirements.
+
 ###### Caveats
 There are a few important characteristics to note regarding how the outer results are generated.
 
@@ -1412,8 +1421,8 @@ regarding watermark delays and whether data will be dropped or not.
   <tr>
     <td style="vertical-align: middle;">Full Outer</td>
     <td style="vertical-align: middle;">
-      Conditionally supported, must specify watermark on one side + time constraints for correct
-      results, optionally specify watermark on the other side for all state cleanup
+      Conditionally supported, requires watermarks on both inputs and bounds on matching event
+      times in both directions to output unmatched rows and stop keeping rows on both sides.
     </td>
   </tr>
   <tr>

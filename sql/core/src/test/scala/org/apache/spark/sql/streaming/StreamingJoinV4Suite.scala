@@ -21,6 +21,7 @@ import org.apache.hadoop.fs.Path
 import org.scalatest.Tag
 
 import org.apache.spark.SparkIllegalArgumentException
+import org.apache.spark.sql.Row
 import org.apache.spark.sql.execution.datasources.v2.state.StateSourceOptions
 import org.apache.spark.sql.execution.streaming.checkpointing.CheckpointFileManager
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinExec
@@ -359,7 +360,7 @@ class StreamingInnerJoinV4Suite
   }
 
   testWithVirtualColumnFamilyJoins(
-    "SPARK-56406: secondary index only populated on watermarked side for time interval join") {
+    "SPARK-56406: secondary index supports one-sided watermark time interval joins") {
     withTempDir { checkpointDir =>
       val leftInput = MemoryStream[(Int, Int)]
       val rightInput = MemoryStream[(Int, Int)]
@@ -371,11 +372,8 @@ class StreamingInnerJoinV4Suite
       val df2 = rightInput.toDF().toDF("rightKey", "time")
         .select($"rightKey", timestamp_seconds($"time") as "rightTime",
           ($"rightKey" * 3) as "rightValue")
-      // Only left side has watermark; watermark is on a value column, not the join key.
-      // joinKeyOrdinalForWatermark is None -> only left has hasEventTime = true.
-      // Neither side can actually evict: the left state watermark is derived from the right
-      // side's watermark via the join condition, which is absent here. The left secondary
-      // index is populated but never used for eviction.
+      // The left watermark and range condition permit right-state eviction. The right
+      // secondary index must be populated even though rightTime has no watermark metadata.
 
       val joined = df1.join(df2,
         expr("leftKey = rightKey AND " +
@@ -399,9 +397,8 @@ class StreamingInnerJoinV4Suite
           // Left has watermark on a value column -> hasEventTime = true, secondary index populated.
           assert(readStateStore(checkpointLoc, "left-tsWithKey") > 0,
             "left secondary index should be populated (watermark on left value column)")
-          // Right has no watermark -> hasEventTime = false, secondary index empty.
-          assert(readStateStore(checkpointLoc, "right-tsWithKey") === 0,
-            "right secondary index should be empty (no watermark on right side)")
+          assert(readStateStore(checkpointLoc, "right-tsWithKey") > 0,
+            "right secondary index should be populated for range eviction")
         },
         StopStream
       )
@@ -542,7 +539,39 @@ class StreamingInnerJoinV4Suite
 @SlowSQLTest
 class StreamingOuterJoinV4Suite
   extends StreamingOuterJoinBase
-  with TestWithV4StateFormat
+  with TestWithV4StateFormat {
+
+  import testImplicits._
+
+  test("SPARK-58904: V4 scan includes newly admitted rows below the old bound") {
+    val leftInput = MemoryStream[(Int, Int)]
+    val rightInput = MemoryStream[(Int, Int)]
+    val left = leftInput.toDF().toDF("leftKey", "time")
+      .select($"leftKey", timestamp_seconds($"time").as("leftTime"))
+      .withWatermark("leftTime", "0 seconds")
+    val right = rightInput.toDF().toDF("rightKey", "time")
+      .select($"rightKey", timestamp_seconds($"time").as("rightTime"))
+      .withWatermark("rightTime", "0 seconds")
+    val joined = left.join(right,
+      expr("leftKey = rightKey AND leftTime > rightTime + INTERVAL 5 SECONDS"),
+      "left_outer")
+      .select($"leftKey", $"rightKey", $"leftTime".cast("long"),
+        $"rightTime".cast("long"))
+
+    withSQLConf(
+        SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+      testStream(joined)(
+        MultiAddData(leftInput, (9, 20))(rightInput, (9, 10)),
+        CheckNewAnswer(Row(9, 9, 20, 10)),
+        AddData(rightInput, (2, 20)),
+        CheckNewAnswer(),
+        // This left row is newer than the late-event watermark but older than the
+        // previous state bound. It must still be scanned and finalized.
+        MultiAddData(leftInput, (1, 12))(rightInput, (2, 30)),
+        CheckNewAnswer(Row(1, null, 12, null)))
+    }
+  }
+}
 
 @SlowSQLTest
 class StreamingFullOuterJoinV4Suite

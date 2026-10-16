@@ -26,6 +26,7 @@ import org.apache.hadoop.fs.Path
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{BATCH_TIMESTAMP, ERROR}
+import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.QueryPlanningTracker
 import org.apache.spark.sql.catalyst.analysis.WidenStatefulOperatorAttributeNullability
 import org.apache.spark.sql.catalyst.expressions.{CurrentBatchTimestamp, ExpressionWithRandomSeed}
@@ -713,6 +714,21 @@ class IncrementalExecution(
 
     override def apply(plan: SparkPlan): SparkPlan = {
       val planWithStateOpId = plan transform composedRule
+      // Offset metadata has restored the checkpoint version by this point. Validate before
+      // writing operator metadata or opening state, including retries of an incomplete batch 0.
+      if (isFirstBatch && conf.getConf(SQLConf.STREAMING_JOIN_WATERMARK_VERSION) == 1) {
+        planWithStateOpId.foreach {
+          case j: StreamingSymmetricHashJoinExec
+              if !StreamingSymmetricHashJoinHelper.isWatermarkCheckpointCompatible(
+                j.left.output, j.right.output, j.leftKeys, j.rightKeys) =>
+            throw new AnalysisException(
+              errorClass = "STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE",
+              messageParameters = Map(
+                "operatorId" -> j.getStateInfo.operatorId.toString,
+                "stateFormatVersion" -> j.stateFormatVersion.toString))
+          case _ =>
+        }
+      }
       // Need to check before write to metadata because we need to detect add operator
       // Only check when streaming is restarting and is first batch
       if (isFirstBatch && currentBatchId != 0) {

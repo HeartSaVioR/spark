@@ -25,6 +25,43 @@ Please refer [Migration Guide: SQL, Datasets and DataFrame](../sql-migration-gui
 
 ## Upgrading from Structured Streaming 4.3 to 4.4
 
+- Since Spark 4.4, stream-stream outer and semi joins reject conditions that cannot finalize
+  the required state. Left outer and left semi joins require a bound from the right input's
+  watermark; right outer joins require the reverse, and full outer joins require both directions.
+  This also applies to equality joins on event time. Previously accepted queries that do not meet
+  these requirements must correct their watermarks or time constraints before restarting.
+
+- Since Spark 4.4, stream-stream joins evict state using the opposite input's watermark.
+  With a watermark on only one input, inner, outer, and semi joins may retain state on the
+  watermarked side indefinitely and produce matches previously lost to premature eviction. A join
+  that can still emit old event times may stop advancing its output watermark for downstream
+  append-mode operators.
+
+- Old stream-stream join checkpoints are validated before state access. Spark permits restart
+  only when neither input nor any named equality key has watermark metadata, or when each input
+  has exactly one event-time column and both are the unique watermarked equality keys at the same
+  key position. Other shapes, including range-only joins, fail with
+  `STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE`. This conservative check can reject queries whose old
+  behavior was correct; it does not diagnose historical output corruption. Incompatible outer or
+  semi join conditions may instead fail the analysis check described above. The compatibility
+  check assumes the same query is restarted; it does not make arbitrary changes to a stateful
+  query safe.
+
+  To migrate a rejected query, preserve the original checkpoint, use a new checkpoint, and replay
+  sufficient source history to rebuild state and any affected output. Confirm that the required
+  input is still available under the source's retention policy and reconcile previously written
+  sink output to avoid duplicates and apply corrections. Merely starting at the latest offsets
+  does not repair past results. If replay is unavailable, this change does not provide an in-place
+  migration. Plan migration before upgrading production queries.
+
+  The internal `spark.sql.streaming.join.watermarkVersion` is pinned in offset metadata. Missing
+  values identify old checkpoints (version 1); new checkpoints use version 2. It is a compatibility
+  marker, not a legacy execution switch. Do not edit checkpoint metadata to bypass validation.
+  A rejected restart may append an offset-log entry and perform normal checkpoint housekeeping,
+  but does not change join state or commit the batch. Downgrading a version 2 checkpoint to older
+  Spark code is unsupported: older code may ignore this marker and interpret its state with
+  incompatible watermark semantics.
+
 - Since Spark 4.4, streaming queries using `EXCEPT` with a streaming left input are rejected
   because their optimizer rewrites introduce streaming aggregations after the initial
   unsupported-operation checks. Existing queries can still restart from their persistent
