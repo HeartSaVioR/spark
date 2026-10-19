@@ -21,6 +21,7 @@ import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.sql.{AnalysisException, SQLContext}
 import org.apache.spark.sql.catalyst.analysis.{AnalysisTest, NamedRelation}
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, EqualTo, Literal}
+import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.streaming.StreamingRelationV2
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
@@ -34,7 +35,7 @@ import org.apache.spark.sql.execution.streaming.{Offset, Source}
 import org.apache.spark.sql.execution.streaming.runtime.StreamingRelation
 import org.apache.spark.sql.sources.StreamSourceProvider
 import org.apache.spark.sql.test.SharedSparkSession
-import org.apache.spark.sql.types.{LongType, StringType, StructType}
+import org.apache.spark.sql.types.{IntegerType, LongType, StringType, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
 class TableCapabilityCheckSuite extends AnalysisTest with SharedSparkSession {
@@ -83,6 +84,23 @@ class TableCapabilityCheckSuite extends AnalysisTest with SharedSparkSession {
       CapabilityTable(BATCH_READ), None, None, emptyMap))
     val e = intercept[AnalysisException] {
       TableCapabilityCheck.apply(invalidLookupRelation)
+    }
+    assert(e.message.contains("does not support batch scan"))
+  }
+
+  test("external lookup join: lookup-only relation is checked only as a lookup side") {
+    val left = LocalRelation(AttributeReference("id", IntegerType)())
+    val lookupOnly = DataSourceV2Relation.create(
+      CapabilityTable(EXTERNAL_LOOKUP), None, None, emptyMap)
+    TableCapabilityCheck.apply(ExternalLookupJoin(
+      left, lookupOnly, Inner, Some(Literal(true)),
+      ExternalLookupCacheOptions(enabled = false, 1, 0, 1), lookupOnly.output))
+
+    val noCapability = DataSourceV2Relation.create(CapabilityTable(), None, None, emptyMap)
+    val e = intercept[AnalysisException] {
+      TableCapabilityCheck.apply(ExternalLookupJoin(
+        left, noCapability, Inner, Some(Literal(true)),
+        ExternalLookupCacheOptions(enabled = false, 1, 0, 1), noCapability.output))
     }
     assert(e.message.contains("does not support batch scan"))
   }

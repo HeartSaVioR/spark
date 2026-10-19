@@ -29,9 +29,11 @@ import org.apache.spark.{SparkException, SparkIllegalArgumentException}
 import org.apache.spark.sql.{AnalysisException, Column, DataFrame, Row}
 import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
 import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupCacheOptions,
   PreparedExternalLookupJoin}
-import org.apache.spark.sql.connector.catalog.{SupportsRead, Table, TableCapability, TableProvider}
+import org.apache.spark.sql.connector.catalog.{Identifier, SupportsRead, Table, TableCapability,
+  TableCatalog, TableChange, TableProvider}
 import org.apache.spark.sql.connector.catalog.TableCapability.{BATCH_READ, EXTERNAL_LOOKUP}
 import org.apache.spark.sql.connector.expressions.{NamedReference, Transform}
 import org.apache.spark.sql.connector.expressions.filter.Predicate
@@ -55,6 +57,8 @@ import org.apache.spark.util.ThreadUtils
 class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
 
   import testImplicits._
+
+  private val ExternalLookupCatalogName = "external_lookup_cat"
 
   test("external lookup capability produces a unary external lookup join") {
     val lookup = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
@@ -434,6 +438,63 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
         parameters = Map(
           "tableName" -> "`SimpleExternalLookupTable`",
           "operation" -> "batch scan"))
+    }
+  }
+
+  test("catalog-resolved tables follow the same lookup selection") {
+    withSQLConf(
+        s"spark.sql.catalog.$ExternalLookupCatalogName" ->
+          classOf[ExternalLookupTestCatalog].getName) {
+      withTempView("external_lookup_left") {
+        Seq(1, 3).toDF("id").createOrReplaceTempView("external_lookup_left")
+        def query(table: String, hint: String = ""): DataFrame = sql(
+          s"""
+            |SELECT $hint l.id, r.department
+            |FROM external_lookup_left l
+            |LEFT JOIN $ExternalLookupCatalogName.ns.$table r ON l.id = r.id
+            |""".stripMargin)
+        val expected = Seq(Row(1, "engineering"), Row(1, "research"), Row(3, null))
+        def usesLookup(df: DataFrame): Boolean =
+          df.queryExecution.optimizedPlan.exists(_.isInstanceOf[PreparedExternalLookupJoin])
+
+        SimpleExternalLookupDataSource.resetCounters()
+        val lookupOnly = query("lookup")
+        assert(usesLookup(lookupOnly))
+        checkAnswer(lookupOnly, expected)
+        assert(SimpleExternalLookupDataSource.requestCount.get() > 0)
+
+        SimpleExternalLookupDataSource.resetCounters()
+        val dual = query("dual")
+        assert(!usesLookup(dual))
+        checkAnswer(dual, expected)
+        assert(SimpleExternalLookupDataSource.readerCount.get() === 0)
+
+        val hintedDual = query("dual", "/*+ EXTERNAL_LOOKUP(r) */")
+        assert(usesLookup(hintedDual))
+        checkAnswer(hintedDual, expected)
+      }
+    }
+  }
+
+  test("a catalog-resolved external lookup-only table cannot be read outside a lookup join") {
+    withSQLConf(
+        s"spark.sql.catalog.$ExternalLookupCatalogName" ->
+          classOf[ExternalLookupTestCatalog].getName) {
+      val table = s"$ExternalLookupCatalogName.ns.lookup"
+      val left = Seq(1).toDF("id")
+      Seq[() => DataFrame](
+        () => spark.table(table),
+        () => sql(s"SELECT * FROM $table WHERE id = 1"),
+        () => left.crossJoin(spark.read.table(table)),
+        () => sql(s"SELECT * FROM $table r FULL OUTER JOIN $table s ON r.id = s.id")).foreach {
+        df =>
+          checkError(
+            exception = intercept[AnalysisException] { df().queryExecution.optimizedPlan },
+            condition = "UNSUPPORTED_FEATURE.TABLE_OPERATION",
+            parameters = Map(
+              "tableName" -> "`SimpleExternalLookupTable`",
+              "operation" -> "batch scan"))
+      }
     }
   }
 
@@ -1127,6 +1188,27 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       spark.catalog.dropTempView(queryName)
     }
   }
+}
+
+/** A catalog serving `ns.lookup` (lookup-only) and `ns.dual` (dual-capability). */
+class ExternalLookupTestCatalog extends TableCatalog {
+  private var catalogName: String = _
+
+  override def initialize(name: String, options: CaseInsensitiveStringMap): Unit =
+    catalogName = name
+  override def name(): String = catalogName
+  override def listTables(namespace: Array[String]): Array[Identifier] =
+    Array("lookup", "dual").map(Identifier.of(Array("ns"), _))
+  override def loadTable(ident: Identifier): Table = (ident.namespace().toSeq, ident.name()) match {
+    case (Seq("ns"), "lookup") => SimpleExternalLookupTable
+    case (Seq("ns"), "dual") => DualCapabilityExternalLookupTable
+    case _ => throw new NoSuchTableException(ident.namespace().mkString("."), ident.name())
+  }
+  override def alterTable(ident: Identifier, changes: TableChange*): Table =
+    throw new UnsupportedOperationException()
+  override def dropTable(ident: Identifier): Boolean = throw new UnsupportedOperationException()
+  override def renameTable(oldIdent: Identifier, newIdent: Identifier): Unit =
+    throw new UnsupportedOperationException()
 }
 
 class ExternalLookupJoinRealTimeModeSuite extends StreamRealTimeModeE2ESuiteBase {

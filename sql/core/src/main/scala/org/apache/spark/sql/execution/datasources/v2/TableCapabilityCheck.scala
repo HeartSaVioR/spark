@@ -17,8 +17,10 @@
 
 package org.apache.spark.sql.execution.datasources.v2
 
+import java.util.{Collections, IdentityHashMap}
+
 import org.apache.spark.sql.catalyst.expressions.Literal
-import org.apache.spark.sql.catalyst.plans.logical.{AppendData, InsertOnlyMerge, LogicalPlan, OverwriteByExpression, OverwritePartitionsDynamic}
+import org.apache.spark.sql.catalyst.plans.logical.{AppendData, ExternalLookupJoin, InsertOnlyMerge, LogicalPlan, OverwriteByExpression, OverwritePartitionsDynamic}
 import org.apache.spark.sql.catalyst.streaming.StreamingRelationV2
 import org.apache.spark.sql.connector.catalog.Table
 import org.apache.spark.sql.connector.catalog.TableCapability._
@@ -37,8 +39,22 @@ object TableCapabilityCheck extends (LogicalPlan => Unit) {
   }
 
   override def apply(plan: LogicalPlan): Unit = {
+    // A relation on the lookup side of an external lookup join is read through lookups rather
+    // than a batch scan. PrepareExternalLookupJoin rejects lookup sides it cannot serve.
+    val lookupSources =
+      Collections.newSetFromMap(new IdentityHashMap[LogicalPlan, java.lang.Boolean])
+    plan.foreach {
+      case join: ExternalLookupJoin =>
+        join.right.foreach {
+          case r: DataSourceV2Relation if r.table.supports(EXTERNAL_LOOKUP) => lookupSources.add(r)
+          case _ =>
+        }
+      case _ =>
+    }
+
     plan foreach {
-      case r: DataSourceV2Relation if !r.table.supports(BATCH_READ) =>
+      case r: DataSourceV2Relation
+          if !r.table.supports(BATCH_READ) && !lookupSources.contains(r) =>
         throw QueryCompilationErrors.unsupportedBatchReadError(r.table)
 
       case r: ExternalLookupRelation if !r.table.supports(EXTERNAL_LOOKUP) =>
