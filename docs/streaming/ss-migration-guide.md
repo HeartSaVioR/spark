@@ -25,6 +25,31 @@ Please refer [Migration Guide: SQL, Datasets and DataFrame](../sql-migration-gui
 
 ## Upgrading from Structured Streaming 4.3 to 4.4
 
+- Since Spark 4.4, left outer and left semi stream-stream joins require a watermark on the
+  right input and a time condition that limits how late a matching right row can arrive.
+  Right outer joins require the corresponding settings on the left; full outer joins require
+  them on both sides. Some previously accepted queries now fail if these requirements are not
+  met. Update their watermarks and join conditions using the
+  [join support table](apis-on-dataframes-and-datasets.html#support-matrix-for-joins-in-streaming-queries).
+
+- Spark 4.4 corrects cases where stream-stream joins could discard rows before their matches
+  arrived or output unmatched rows too early. Queries with a watermark on only one input may
+  now keep more rows in memory or on disk. If a join can still output rows with old timestamps,
+  later aggregations in the query may take longer to produce results or stop making progress.
+
+- When restarting a stream-stream join from an older Spark version, Spark may reject the
+  existing checkpoint with `STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE`. This includes joins that
+  match rows within a time range. Spark cannot always verify that the saved rows can be reused
+  safely after the correction, even if the query did not previously produce incorrect results.
+
+  Before upgrading, check that the input history needed to rebuild the join is still available.
+  If the checkpoint is rejected, start with a new checkpoint and replay that input. Account for
+  results already written to the destination so that replay does not create duplicates and any
+  incorrect results are corrected. Starting only with new input does not recover past results.
+  If the required history is no longer available, a new checkpoint cannot recover those results.
+  Do not edit the rejected checkpoint to bypass the error or use a checkpoint created by the
+  new version with an older Spark version.
+
 - Since Spark 4.4, streaming queries using `EXCEPT` with a streaming left input are rejected
   because their optimizer rewrites introduce streaming aggregations after the initial
   unsupported-operation checks. Existing queries can still restart from their persistent

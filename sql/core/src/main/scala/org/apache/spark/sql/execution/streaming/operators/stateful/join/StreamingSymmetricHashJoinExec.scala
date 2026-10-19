@@ -403,19 +403,19 @@ case class StreamingSymmetricHashJoinExec(
     // Create left and right side hash joiners and store in the joiner manager.
     // Both sides should use the same store generator if we are re-using the same store instance.
     val joinStateManagerStoreGenerator = new JoinStateManagerStoreGenerator()
-    val joinKeyOrdinalForWatermark =
-      StreamingSymmetricHashJoinHelper.findJoinKeyOrdinalForWatermark(leftKeys, rightKeys)
     val joinerManager = OneSideHashJoinerManager(
       new OneSideHashJoiner(
         LeftSide, left.output, leftKeys, leftInputIter,
         condition.leftSideOnly, postJoinFilter, stateWatermarkPredicates.left, partitionId,
         checkpointIds.left.keyToNumValues, checkpointIds.left.keyWithIndexToValue,
-        skippedNullValueCount, joinStateManagerStoreGenerator, joinKeyOrdinalForWatermark),
+        skippedNullValueCount, joinStateManagerStoreGenerator,
+        StreamingJoinHelper.getStateKeyWatermarkOrdinal(rightKeys, right.output)),
       new OneSideHashJoiner(
         RightSide, right.output, rightKeys, rightInputIter,
         condition.rightSideOnly, postJoinFilter, stateWatermarkPredicates.right, partitionId,
         checkpointIds.right.keyToNumValues, checkpointIds.right.keyWithIndexToValue,
-        skippedNullValueCount, joinStateManagerStoreGenerator, joinKeyOrdinalForWatermark))
+        skippedNullValueCount, joinStateManagerStoreGenerator,
+        StreamingJoinHelper.getStateKeyWatermarkOrdinal(leftKeys, left.output)))
 
     //  Join one side input using the other side's buffered/state rows. Here is how it is done.
     //
@@ -684,6 +684,16 @@ case class StreamingSymmetricHashJoinExec(
     val preJoinFilter =
       Predicate.create(preJoinFilterExpr.getOrElse(Literal(true)), inputAttributes).eval _
 
+    // Index the timestamp actually bounded by the eviction predicate.
+    private val stateValueWatermarkOrdinal = stateWatermarkPredicate.flatMap {
+      case JoinStateValueWatermarkPredicate(expr, _, _) =>
+        inputAttributes.indexWhere(expr.references.contains) match {
+          case ordinal if ordinal >= 0 => Some(ordinal)
+          case _ => None
+        }
+      case _ => None
+    }
+
     private val joinStateManager = SymmetricHashJoinStateManager(
       joinSide = joinSide,
       inputValueAttributes = inputAttributes,
@@ -697,7 +707,8 @@ case class StreamingSymmetricHashJoinExec(
       stateFormatVersion = stateFormatVersion,
       skippedNullValueCount = skippedNullValueCount,
       joinStoreGenerator = joinStateManagerStoreGenerator,
-      joinKeyOrdinalForWatermark = joinKeyOrdinalForWatermark)
+      joinKeyOrdinalForWatermark = joinKeyOrdinalForWatermark,
+      stateValueWatermarkOrdinal = stateValueWatermarkOrdinal)
 
     private[this] val keyGenerator = UnsafeProjection.create(joinKeys, inputAttributes)
 
@@ -739,7 +750,7 @@ case class StreamingSymmetricHashJoinExec(
           case RightSide => (right.output, left.output)
         }
 
-        // Probes and indexes use event time. A bound on another column, such as expiry,
+        // Range probes use event time. A bound on another column, such as expiry,
         // cannot limit this scan; fall back to scanning the key when either bound is absent.
         val thisEventTime = WatermarkSupport.findEventTimeColumn(
           thisSideAttrs, !allowMultipleStatefulOperators).toSeq
@@ -751,7 +762,7 @@ case class StreamingSymmetricHashJoinExec(
           AttributeSet(thisEventTime), AttributeSet(otherEventTime), condition.full, Some(0L))
 
         (lowerBoundMs, upperBoundMs) match {
-          case (Some(lower), Some(upper)) =>
+          case (Some((_, lower)), Some((_, upper))) =>
             Some((lower * 1000L, -upper * 1000L)) // ms -> us
           case _ => None
         }

@@ -22,8 +22,6 @@ import scala.util.control.NonFatal
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys._
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
-import org.apache.spark.sql.catalyst.plans.logical.{EventTimeWatermark, LogicalPlan}
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark._
 import org.apache.spark.sql.catalyst.util.DateTimeConstants.MICROS_PER_DAY
 import org.apache.spark.sql.types._
@@ -35,19 +33,21 @@ import org.apache.spark.unsafe.types.CalendarInterval
 object StreamingJoinHelper extends PredicateHelper with Logging {
 
   /**
-   * Check the provided logical plan to see if its join keys contain a watermark attribute.
-   *
-   * Will return false if the plan is not an equijoin.
-   * @param plan the logical plan to check
+   * Find the equality key filtered by this input's watermark. Its ordinal can be used to
+   * evict the opposite input's state, whose equality keys have the same ordering.
+   * For leftTime = rightTime, a watermark on rightTime bounds leftTime even when leftTime
+   * has no watermark. It does not bound right-side state without a watermark on leftTime.
    */
-  def isWatermarkInJoinKeys(plan: LogicalPlan): Boolean = {
-    plan match {
-      case ExtractEquiJoinKeys(_, leftKeys, rightKeys, _, _, _, _, _) =>
-        (leftKeys ++ rightKeys).exists {
-          case a: AttributeReference => a.metadata.contains(EventTimeWatermark.delayKey)
-          case _ => false
-        }
-      case _ => false
+  def getStateKeyWatermarkOrdinal(
+      keys: Seq[Expression],
+      inputAttributes: Seq[Attribute]): Option[Int] = {
+    // When multiple stateful operators are disabled, late filtering uses the first event-time
+    // column. Otherwise, execution rejects multiple distinct event-time columns.
+    inputAttributes.find(_.metadata.contains(delayKey)).flatMap { eventTime =>
+      keys.indexWhere(_.semanticEquals(eventTime)) match {
+        case ordinal if ordinal >= 0 => Some(ordinal)
+        case _ => None
+      }
     }
   }
 
@@ -66,13 +66,13 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
    * @param attributesWithEventWatermark  attributes of the other side which has a watermark column
    * @param joinCondition                 join condition
    * @param eventWatermark                watermark defined on the input event data
-   * @return state value watermark in milliseconds, is possible.
+   * @return the state attribute and its watermark in milliseconds, if possible.
    */
   def getStateValueWatermark(
       attributesToFindStateWatermarkFor: AttributeSet,
       attributesWithEventWatermark: AttributeSet,
       joinCondition: Option[Expression],
-      eventWatermark: Option[Long]): Option[Long] = {
+      eventWatermark: Option[Long]): Option[(Attribute, Long)] = {
 
     // If condition or event time watermark is not provided, then cannot calculate state watermark
     if (joinCondition.isEmpty || eventWatermark.isEmpty) return None
@@ -80,7 +80,7 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
     // If there is not watermark attribute, then cannot define state watermark
     if (!attributesWithEventWatermark.exists(_.metadata.contains(delayKey))) return None
 
-    def getStateWatermarkSafely(l: Expression, r: Expression): Option[Long] = {
+    def getStateWatermarkSafely(l: Expression, r: Expression): Option[(Attribute, Long)] = {
       try {
         getStateWatermarkFromLessThenPredicate(
           l, r, attributesToFindStateWatermarkFor, attributesWithEventWatermark, eventWatermark)
@@ -100,12 +100,16 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
       // up leftTime <= W. Rather we should clean up leftTime <= W - 1. Hence the -1 below.
       val stateWatermark = predicate match {
         case LessThan(l, r) => getStateWatermarkSafely(l, r)
-        case LessThanOrEqual(l, r) => getStateWatermarkSafely(l, r).map(_ - 1)
+        case LessThanOrEqual(l, r) =>
+          getStateWatermarkSafely(l, r).map { case (attr, value) => attr -> (value - 1) }
         case GreaterThan(l, r) => getStateWatermarkSafely(r, l)
-        case GreaterThanOrEqual(l, r) => getStateWatermarkSafely(r, l).map(_ - 1)
+        case GreaterThanOrEqual(l, r) =>
+          getStateWatermarkSafely(r, l).map { case (attr, value) => attr -> (value - 1) }
         case Between(input, lower, upper, _) =>
-          getStateWatermarkSafely(lower, input).map(_ - 1)
-            .orElse(getStateWatermarkSafely(input, upper).map(_ - 1))
+          getStateWatermarkSafely(lower, input)
+            .map { case (attr, value) => attr -> (value - 1) }
+            .orElse(getStateWatermarkSafely(input, upper)
+              .map { case (attr, value) => attr -> (value - 1) })
         case _ => None
       }
       if (stateWatermark.nonEmpty) {
@@ -114,7 +118,24 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
       }
       stateWatermark
     }
-    allStateWatermarks.reduceOption((x, y) => Math.min(x, y))
+    // Each conjunct provides a bound on one state column, e.g. expiry >= otherTime - 5s
+    // gives expiry <= watermark - 5s - 1ms for eviction. Bounds on different columns cannot
+    // be combined by taking their minimum: the resulting cutoff must keep its column identity.
+    // Choose one column for the predicate and V4 index. Prefer this input's event time so its
+    // bound can also advance the output watermark; otherwise keep the first bounded column.
+    // This choice must stay stable across batches as the watermark advances. Within that column,
+    // keep the minimum cutoff, a conservative bound that may retain rows longer than necessary.
+    // Compute the other side independently, using this side's watermarked input column.
+    val eventTime = attributesToFindStateWatermarkFor.find(_.metadata.contains(delayKey))
+    allStateWatermarks.reduceOption { (x, y) =>
+      if (x._1.semanticEquals(y._1)) {
+        if (x._2 < y._2) x else y
+      } else if (eventTime.exists(_.semanticEquals(y._1))) {
+        y
+      } else {
+        x
+      }
+    }
   }
 
   /**
@@ -132,15 +153,15 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
       rightExpr: Expression,
       attributesToFindStateWatermarkFor: AttributeSet,
       attributesWithEventWatermark: AttributeSet,
-      eventWatermark: Option[Long]): Option[Long] = {
+      eventWatermark: Option[Long]): Option[(Attribute, Long)] = {
 
-    val attributesInCondition = AttributeSet(
+    // Count occurrences before canonicalization so repeated attributes cannot appear unit-scaled.
+    val attributesInCondition =
       leftExpr.collect { case a: AttributeReference => a } ++
       rightExpr.collect { case a: AttributeReference => a }
-    )
     if (attributesInCondition.count(attributesToFindStateWatermarkFor.contains) > 1 ||
         attributesInCondition.count(attributesWithEventWatermark.contains) > 1) {
-      // If more than attributes present in condition from one side, then it cannot be solved
+      // Multiple attribute occurrences on either side require coefficient handling.
       return None
     }
 
@@ -185,6 +206,24 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
       // the constraintTerm would be `leftTime` and not `-leftTime`. Hence, we return None.
       return None
     }
+    val stateAttribute = constraintTerm.collectFirst {
+      case a: AttributeReference if attributesToFindStateWatermarkFor.contains(a) => a
+    }.get
+    // Eviction now applies the bound to this column, not to an unrelated event-time column.
+    // The cutoff is in timestamp units; a numeric column cast from seconds is not a timestamp.
+    if (stateAttribute.dataType != TimestampType) return None
+
+    // Substituting a lower bound for the other input is sound only for a positive, single
+    // occurrence of its watermarked attribute. For stateTime + otherTime > c, future larger
+    // otherTime can still match old stateTime, so substituting its watermark is unsafe.
+    // Repeated attributes need coefficient handling this solver does not implement. A constant
+    // alone is not a watermark-driven bound; an unwatermarked attribute has no known lower bound.
+    val watermarkTerms = terms.filter(_.references.exists(attributesWithEventWatermark.contains))
+    if (watermarkTerms.size != 1 ||
+        watermarkTerms.head.isInstanceOf[UnaryMinus] ||
+        !watermarkTerms.head.references.forall(_.metadata.contains(delayKey))) {
+      return None
+    }
 
     // Replace watermark attribute with watermark value, and generate the resolved expression
     // from the other terms. That is,
@@ -202,7 +241,7 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
     logInfo(log"Final expression to evaluate " +
       log"constraint:\t${MDC(WATERMARK_CONSTRAINT, exprWithWatermarkSubstituted)}")
     val constraintValue = exprWithWatermarkSubstituted.eval().asInstanceOf[java.lang.Double]
-    Some((Double2double(constraintValue) / 1000.0).toLong)
+    Some(stateAttribute -> (Double2double(constraintValue) / 1000.0).toLong)
   }
 
   /**

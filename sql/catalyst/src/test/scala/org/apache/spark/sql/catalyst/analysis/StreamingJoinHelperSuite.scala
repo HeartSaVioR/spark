@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
+import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, AttributeSet}
 import org.apache.spark.sql.catalyst.optimizer.SimpleTestOptimizer
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
@@ -24,6 +25,56 @@ import org.apache.spark.sql.catalyst.plans.logical.{EventTimeWatermark, Filter, 
 import org.apache.spark.sql.types.{IntegerType, MetadataBuilder, TimestampType}
 
 class StreamingJoinHelperSuite extends AnalysisTest {
+
+  test("SPARK-58904: state timestamp selection is stable as the watermark advances") {
+    val first = AttributeReference("first", TimestampType)()
+    val second = AttributeReference("second", TimestampType)()
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val right = AttributeReference("right", TimestampType, metadata = metadata)()
+    val condition = Some(first > right - 0.0001 && second > right + 0.0001)
+    Seq(0L, 1L, 10000L).foreach { watermark =>
+      val result = StreamingJoinHelper.getStateValueWatermark(
+        AttributeSet(Seq(first, second)), AttributeSet(Seq(right)), condition, Some(watermark))
+      assert(result.exists(_._1.semanticEquals(first)))
+    }
+  }
+
+  test("SPARK-58904: prefer the state side's event time in either conjunct order") {
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val eventTime = AttributeReference("eventTime", TimestampType, metadata = metadata)()
+    val other = AttributeReference("other", TimestampType)()
+    val right = AttributeReference("right", TimestampType, metadata = metadata)()
+    Seq(other > right && eventTime > right,
+      eventTime > right && other > right).foreach { condition =>
+      val result = StreamingJoinHelper.getStateValueWatermark(
+        AttributeSet(Seq(eventTime, other)), AttributeSet(Seq(right)), Some(condition),
+        Some(20000L))
+      assert(result.exists { case (attr, watermark) =>
+        attr.semanticEquals(eventTime) && watermark == 20000L
+      })
+    }
+  }
+
+  test("SPARK-58904: crossed intervals bound a different timestamp on each side") {
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val leftTime = AttributeReference("leftTime", TimestampType, metadata = metadata)()
+    val leftOther = AttributeReference("leftOther", TimestampType)()
+    val rightTime = AttributeReference("rightTime", TimestampType, metadata = metadata)()
+    val rightOther = AttributeReference("rightOther", TimestampType)()
+    val left = AttributeSet(Seq(leftTime, leftOther))
+    val right = AttributeSet(Seq(rightTime, rightOther))
+    val leftInterval = leftOther > rightTime - 5 && leftOther < rightTime + 10
+    val rightInterval = rightOther > leftTime - 7 && rightOther < leftTime + 12
+
+    Seq(leftInterval && rightInterval, rightInterval && leftInterval).foreach { condition =>
+      val leftBound = StreamingJoinHelper.getStateValueWatermark(
+        left, right, Some(condition), Some(20000L)).get
+      val rightBound = StreamingJoinHelper.getStateValueWatermark(
+        right, left, Some(condition), Some(20000L)).get
+      assert(leftBound._1.semanticEquals(leftOther) && leftBound._2 == 15000L)
+      assert(rightBound._1.semanticEquals(rightOther) && rightBound._2 == 13000L)
+    }
+  }
 
   test("extract watermark from time condition") {
     val attributesToFindConstraintFor = Seq(
@@ -56,7 +107,7 @@ class StreamingJoinHelperSuite extends AnalysisTest {
       }
       StreamingJoinHelper.getStateValueWatermark(
         AttributeSet(attributesToFindConstraintFor), AttributeSet(attributesWithWatermark),
-        conditionExpr, rightWatermark)
+        conditionExpr, rightWatermark).map(_._2)
     }
 
     // Test comparison directionality. E.g. if leftTime < rightTime and rightTime > watermark,
@@ -144,8 +195,19 @@ class StreamingJoinHelperSuite extends AnalysisTest {
     assert(watermarkFrom("cast(rightTime AS DOUBLE) < rightOther") === None)  // non-time attributes
     assert(watermarkFrom("leftTime > rightTime + interval 1 month") === None) // month not allowed
 
-    // Test static comparisons
-    assert(watermarkFrom("cast(leftTime AS LONG) > 10") === Some(10000))
+    // A state bound must advance with the opposite input's watermark.
+    assert(watermarkFrom("cast(leftTime AS LONG) > 10") === None)
+    assert(watermarkFrom("cast(leftTime AS LONG) + cast(rightTime AS LONG) > 100") === None)
+    assert(watermarkFrom(
+      "cast(leftTime AS LONG) + cast(leftTime AS LONG) > cast(rightTime AS LONG)") === None)
+    assert(watermarkFrom(
+      "cast(leftTime AS LONG) > cast(rightTime AS LONG) + cast(rightTime AS LONG)") === None)
+    assert(watermarkFrom("leftOther > cast(rightTime AS LONG)") === None)
+    assert(watermarkFrom("leftTime > rightTime AND cast(leftTime AS LONG) > 10") === Some(10000))
+    assert(watermarkFrom(
+      "leftTime > rightTime AND cast(leftTime AS LONG) + cast(rightTime AS LONG) > 100") ===
+      Some(10000))
+    assert(watermarkFrom("leftTime > rightTime OR cast(leftTime AS LONG) > 10") === None)
 
     // Test non-positive results
     assert(watermarkFrom("CAST(leftTime AS LONG) > CAST(rightTime AS LONG) - 10") === Some(0))

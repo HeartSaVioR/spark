@@ -240,6 +240,7 @@ class SymmetricHashJoinStateManagerV4(
     snapshotOptions: Option[SnapshotOptions] = None,
     joinStoreGenerator: JoinStateManagerStoreGenerator,
     joinKeyOrdinalForWatermark: Option[Int] = None,
+    stateValueWatermarkOrdinal: Option[Int] = None,
     readOnly: Boolean = false)
   extends SymmetricHashJoinStateManager with SupportsEvictByTimestamp with Logging {
 
@@ -251,12 +252,17 @@ class SymmetricHashJoinStateManagerV4(
   protected val keySchema = StructType(
     joinKeys.zipWithIndex.map { case (k, i) => StructField(s"field$i", k.dataType, k.nullable) })
   protected val keyAttributes = toAttributes(keySchema)
-  private val eventTimeColIdxOpt = WatermarkSupport.findEventTimeColumnIndex(
-    inputValueAttributes,
-    // NOTE: This does not accept multiple event time columns. This is not the same with the
-    // operator which we offer the backward compatibility, but it involves too many layers to
-    // pass the information. The information is in SQLConf.
-    allowMultipleEventTimeColumns = false)
+  // A value predicate supplies its bounded column. Otherwise, key eviction gets its timestamp
+  // from the join key, or no predicate means no eviction. Falling back to our event time only
+  // chooses the storage timestamp; it does not enable eviction or timestamp range scans.
+  private val eventTimeColIdxOpt = stateValueWatermarkOrdinal.orElse {
+    WatermarkSupport.findEventTimeColumnIndex(
+      inputValueAttributes,
+      // NOTE: This does not accept multiple event time columns. This is not the same with the
+      // operator which we offer the backward compatibility, but it involves too many layers to
+      // pass the information. The information is in SQLConf.
+      allowMultipleEventTimeColumns = false)
+  }
 
   // When there is no event time column in the value and no watermark ordinal in the key,
   // the secondary index (TsWithKey) will never be used for eviction. Skip writing to it
@@ -2179,13 +2185,14 @@ object SymmetricHashJoinStateManager {
       snapshotOptions: Option[SnapshotOptions] = None,
       joinStoreGenerator: JoinStateManagerStoreGenerator,
       joinKeyOrdinalForWatermark: Option[Int] = None,
+      stateValueWatermarkOrdinal: Option[Int] = None,
       readOnly: Boolean = false): SymmetricHashJoinStateManager = {
     if (stateFormatVersion == 4) {
       new SymmetricHashJoinStateManagerV4(
         joinSide, inputValueAttributes, joinKeys, stateInfo, storeConf, hadoopConf,
         partitionId, keyToNumValuesStateStoreCkptId, keyWithIndexToValueStateStoreCkptId,
         stateFormatVersion, skippedNullValueCount, useStateStoreCoordinator, snapshotOptions,
-        joinStoreGenerator, joinKeyOrdinalForWatermark, readOnly
+        joinStoreGenerator, joinKeyOrdinalForWatermark, stateValueWatermarkOrdinal, readOnly
       )
     } else if (stateFormatVersion == 3) {
       new SymmetricHashJoinStateManagerV2(
