@@ -1546,10 +1546,12 @@ class PythonDataSourceSuite extends PythonDataSourceSuiteBase {
         Row(2, 0, 10, "c", 5, "c")))
   }
 
-  test("SQLite-backed Python data source implements external lookup") {
+  gridTest("SQLite-backed Python data source implements external lookup")(
+      Seq(1, 2)) { maxRecordsPerBatch =>
     assume(shouldTestPandasUDFs)
 
     withTempDir { directory =>
+      // Planning-time seeding and the driver-local path are test fixtures, not connector patterns.
       val database = new File(directory, "lookup.db")
       val requests = new File(directory, "requests")
       val dataSourceScript =
@@ -1574,14 +1576,16 @@ class PythonDataSourceSuite extends PythonDataSourceSuiteBase {
            |
            |    def lookup(self, batches):
            |        conn = sqlite3.connect(self.options["path"])
+           |        request_size = 0
+           |        batch_count = 0
            |        try:
            |            for batch in batches:
            |                data = batch.to_pydict()
            |                parameters = list(zip(
            |                    data["input_ordinal"], data["parameter_0"], data["parameter_1"]
            |                ))
-           |                with open(self.options["requests"], "a") as output:
-           |                    output.write(str(len(parameters)) + "\\n")
+           |                request_size += len(parameters)
+           |                batch_count += 1
            |                placeholders = ", ".join(["(?, ?, ?)"] * len(parameters))
            |                columns = ", ".join(f'e."{field}"' for field in self.output_fields)
            |                query = (
@@ -1595,6 +1599,8 @@ class PythonDataSourceSuite extends PythonDataSourceSuiteBase {
            |                yield from conn.execute(query, values)
            |        finally:
            |            conn.close()
+           |            with open(self.options["requests"], "a") as output:
+           |                output.write(f"{request_size},{batch_count}\\n")
            |
            |class $dataSourceName(DataSource):
            |    def schema(self):
@@ -1655,26 +1661,33 @@ class PythonDataSourceSuite extends PythonDataSourceSuiteBase {
         Row(3, 0, "missing", null), Row(2, 0, "two", null), Row(1, 20, "missing", null),
         Row(null, 0, "missing", null), Row(1, null, "missing", null))
 
-      Seq("inner", "left_outer").foreach { joinType =>
-        val joined = left.join(lookup, condition, joinType)
-          .select(col("left.id"), col("left.lower_bound"), col("left.rejected"),
-            col("lookup.label"))
-        checkAnswer(joined, matched ++ (if (joinType == "left_outer") unmatched else Nil))
+      withSQLConf(SQLConf.ARROW_EXECUTION_MAX_RECORDS_PER_BATCH.key ->
+          maxRecordsPerBatch.toString) {
+        Seq("inner", "left_outer").foreach { joinType =>
+          val joined = left.join(lookup, condition, joinType)
+            .select(col("left.id"), col("left.lower_bound"), col("left.rejected"),
+              col("lookup.label"))
+          checkAnswer(joined, matched ++ (if (joinType == "left_outer") unmatched else Nil))
 
-        val lookupJoin = collectFirst(joined.queryExecution.executedPlan) {
-          case exec: ExternalLookupJoinExec => exec
-        }.getOrElse(
-          fail(s"ExternalLookupJoinExec not found:\n${joined.queryExecution.executedPlan}"))
-        assert(lookupJoin.maxParameterRowsPerRequest == 2)
-        assert(lookupJoin.lookupOutput.map(_.name) == Seq("label"))
-        assert(lookupJoin.residualCondition.nonEmpty)
-        assert(!lookupJoin.cacheOptions.enabled)
+          val lookupJoin = collectFirst(joined.queryExecution.executedPlan) {
+            case exec: ExternalLookupJoinExec => exec
+          }.getOrElse(
+            fail(s"ExternalLookupJoinExec not found:\n${joined.queryExecution.executedPlan}"))
+          assert(lookupJoin.maxParameterRowsPerRequest == 2)
+          assert(lookupJoin.lookupOutput.map(_.name) == Seq("label"))
+          assert(lookupJoin.residualCondition.nonEmpty)
+          assert(!lookupJoin.cacheOptions.enabled)
+        }
       }
 
-      val batchSizes = java.nio.file.Files.readAllLines(requests.toPath)
-      assert(batchSizes.size() > 2)
-      batchSizes.forEach(size => assert(size.toInt > 0 && size.toInt <= 2))
-      assert(batchSizes.contains("2"))
+      val requestStats = java.nio.file.Files.readAllLines(requests.toPath)
+      assert(requestStats.size() > 2)
+      requestStats.forEach { entry =>
+        val Array(rowCount, batchCount) = entry.split(",").map(_.toInt)
+        assert(rowCount > 0 && rowCount <= 2)
+        assert(batchCount == (rowCount + maxRecordsPerBatch - 1) / maxRecordsPerBatch)
+      }
+      assert(requestStats.contains(if (maxRecordsPerBatch == 1) "2,2" else "2,1"))
     }
   }
 
