@@ -394,6 +394,8 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
   // Authentication helper used when serving method calls via socket from Python side.
   private lazy val authHelper = new SocketAuthHelper(conf)
 
+  protected def onWorkerCreated(cancelWorker: () => Unit): Unit = {}
+
   def compute(
       inputIterator: Iterator[IN],
       partitionIndex: Int,
@@ -487,6 +489,13 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
         }
       }
     }
+
+    onWorkerCreated(() => {
+      if (releasedOrClosed.compareAndSet(false, true)) {
+        env.destroyPythonWorker(
+          pythonExec, workerModule, daemonModule, envVars.asScala.toMap, worker)
+      }
+    })
 
     if (reuseWorker) {
       val key = (worker, context.taskAttemptId())

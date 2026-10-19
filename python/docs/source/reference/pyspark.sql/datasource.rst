@@ -26,10 +26,16 @@ Python Data Source
     :toctree: api/
 
     DataSource.name
+    DataSource.externalLookup
     DataSource.reader
     DataSource.schema
     DataSource.streamReader
     DataSource.writer
+    ExternalLookup
+    ExternalLookup.selectedPredicateIndexes
+    ExternalLookup.maxParameterRowsPerRequest
+    ExternalLookup.lookup
+    LookupParameter
     DataSourceReader.partitions
     DataSourceReader.pushFilters
     DataSourceReader.pushLimit

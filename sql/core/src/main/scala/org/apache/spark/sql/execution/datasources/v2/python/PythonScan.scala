@@ -18,6 +18,7 @@ package org.apache.spark.sql.execution.datasources.v2.python
 
 import org.apache.spark.JobArtifactSet
 import org.apache.spark.sql.classic.SparkSession
+import org.apache.spark.sql.connector.expressions.filter.Predicate
 import org.apache.spark.sql.connector.metric.CustomMetric
 import org.apache.spark.sql.connector.read._
 import org.apache.spark.sql.connector.read.streaming.MicroBatchStream
@@ -35,9 +36,35 @@ class PythonScan(
     pushedLimit: Option[Int] = None,
     // Read info computed during filter/limit pushdown, if any. Scoped to this scan so it does not
     // leak across scans that share the same `PythonDataSourceV2` (see `PythonScanBuilder`).
-    readInfo: Option[PythonDataSourceReadInfo] = None
+    readInfo: Option[PythonDataSourceReadInfo] = None,
+    lookupPredicates: Array[Predicate] = Array.empty,
+    selectedLookupPredicateIndexes: Array[Int] = Array.emptyIntArray
 ) extends Scan with SupportsMetadata {
   override def toBatch: Batch = new PythonBatch(ds, shortName, outputSchema, options, readInfo)
+
+  override def toExternalLookup(): ExternalLookup = {
+    require(selectedLookupPredicateIndexes.nonEmpty,
+      "External lookup predicates were not selected")
+    val creationResult = ds.getOrCreateDataSourceInPython(shortName, options, Some(outputSchema))
+    val lookupInfo = ds.source.createLookupInfoInPython(
+      creationResult, outputSchema, lookupPredicates).getOrElse {
+      throw new IllegalStateException("Python data source did not return an external lookup")
+    }
+    require(lookupInfo.selectedPredicateIndexes.sameElements(selectedLookupPredicateIndexes),
+      "Python data source returned different external lookup predicates after pruning")
+    val jobArtifactUUID = JobArtifactSet.getCurrentJobArtifactState.map(_.uuid)
+    val sessionUUID = SparkSession.getActiveSession.collect {
+      case session if session.sessionState.conf.pythonWorkerLoggingEnabled => session.sessionUUID
+    }
+    PythonExternalLookup(
+      ds.source,
+      lookupInfo.func,
+      selectedLookupPredicateIndexes.map(lookupPredicates.apply).toIndexedSeq,
+      outputSchema,
+      lookupInfo.maxParameterRowsPerRequest,
+      jobArtifactUUID,
+      sessionUUID)
+  }
 
   override def toMicroBatchStream(checkpointLocation: String): MicroBatchStream = {
     val runner = PythonMicroBatchStream.createPythonStreamingSourceRunner(

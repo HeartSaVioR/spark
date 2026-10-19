@@ -41,7 +41,8 @@ class MapInBatchEvaluatorFactory(
     pythonRunnerConf: Map[String, String],
     val pythonMetrics: Map[String, SQLMetric],
     jobArtifactUUID: Option[String],
-    sessionUUID: Option[String])
+    sessionUUID: Option[String],
+    onPythonWorkerCreated: (() => Unit) => Unit = _ => ())
   extends PartitionEvaluatorFactory[InternalRow, InternalRow] {
 
   override def createEvaluator(): PartitionEvaluator[InternalRow, InternalRow] =
@@ -73,7 +74,11 @@ class MapInBatchEvaluatorFactory(
         pythonRunnerConf,
         pythonMetrics,
         jobArtifactUUID,
-        sessionUUID) with BatchedPythonArrowInput
+        sessionUUID) with BatchedPythonArrowInput {
+        override protected def onWorkerCreated(cancelWorker: () => Unit): Unit = {
+          onPythonWorkerCreated(cancelWorker)
+        }
+      }
       val columnarBatchIter = pyRunner.compute(batchIter, context.partitionId(), context)
 
       val unsafeProj = UnsafeProjection.create(output, output)

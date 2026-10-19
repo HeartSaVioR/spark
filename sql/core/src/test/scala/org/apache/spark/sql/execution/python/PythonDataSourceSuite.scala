@@ -18,18 +18,26 @@
 package org.apache.spark.sql.execution.python
 
 import java.io.{File, FileWriter}
+import java.util.{Arrays => JArrays}
 
 import org.apache.spark.api.python.PythonException
 import org.apache.spark.api.python.PythonUtils
 import org.apache.spark.sql.{AnalysisException, IntegratedUDFTestUtils, Row}
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.connector.catalog.SupportsRead
+import org.apache.spark.sql.connector.expressions.{Expression => V2Expression, FieldReference}
+import org.apache.spark.sql.connector.expressions.filter.{Predicate => V2Predicate}
+import org.apache.spark.sql.connector.read.LookupParameter
 import org.apache.spark.sql.execution.{FilterExec, LimitExec}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.datasources.DataSourceManager
-import org.apache.spark.sql.execution.datasources.v2.{BatchScanExec, DataSourceV2ScanRelation}
-import org.apache.spark.sql.execution.datasources.v2.python.PythonScan
+import org.apache.spark.sql.execution.datasources.v2.{BatchScanExec, DataSourceV2ScanRelation, ExternalLookupRelation}
+import org.apache.spark.sql.execution.datasources.v2.python.{PythonScan, PythonScanBuilder}
+import org.apache.spark.sql.execution.joins.ExternalLookupJoinExec
+import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types.{IntegerType, StructType}
 import org.apache.spark.util.Utils
 
 abstract class PythonDataSourceSuiteBase
@@ -580,6 +588,581 @@ class PythonDataSourceSuite extends PythonDataSourceSuiteBase {
       checkAnswer(df.filter("id = 1"), Seq(Row(1)))
       checkAnswer(df, (0 until 10).map(Row(_)))
     }
+  }
+
+  private def pythonLookupScript(dualCapability: Boolean = false): String = {
+    val readerMethod = if (dualCapability) {
+      """
+        |    def reader(self, schema):
+        |        return Reader()
+        |""".stripMargin
+    } else {
+      ""
+    }
+    s"""
+       |import json
+       |from pyspark.sql.datasource import DataSource, DataSourceReader, ExternalLookup
+       |
+       |class Reader(DataSourceReader):
+       |    def read(self, partition):
+       |        yield (1, "scan-1")
+       |        yield (2, "scan-2")
+       |
+       |class Lookup(ExternalLookup):
+       |    def __init__(self, schema, options):
+       |        self.fields = schema.fieldNames()
+       |        self.options = options
+       |
+       |    def selectedPredicateIndexes(self):
+       |        if self.options.get("change_after_pruning") and len(self.fields) == 1:
+       |            return []
+       |        return json.loads(self.options.get("selected", "[0]"))
+       |
+       |    def maxParameterRowsPerRequest(self):
+       |        return int(self.options.get("max_rows", "2"))
+       |
+       |    def lookup(self, batches):
+       |        try:
+       |            yield from self.lookup_rows(batches)
+       |        finally:
+       |            path = self.options.get("close_path")
+       |            if path:
+       |                with open(path, "a") as output:
+       |                    output.write("closed\\n")
+       |
+       |    def lookup_rows(self, batches):
+       |        if self.options.get("failure"):
+       |            raise RuntimeError("external lookup execution failed")
+       |        for batch in batches:
+       |            assert batch.num_rows <= 2
+       |            assert batch.schema.names[0] == "input_ordinal"
+       |            data = batch.to_pydict()
+       |            if self.options.get("request_path"):
+       |                import os
+       |                with open(self.options["request_path"], "a") as output:
+       |                    output.write("%s\\n" % os.getpid())
+       |            if self.options.get("block_after_first") and data["parameter_0"][0] > 2:
+       |                import time
+       |                while True:
+       |                    time.sleep(1)
+       |            rows = list(zip(data["input_ordinal"], data["parameter_0"]))
+       |            for ordinal, value in reversed(rows):
+       |                mode = self.options.get("ordinal")
+       |                if mode == "null":
+       |                    ordinal = None
+       |                elif mode == "negative":
+       |                    ordinal = -1
+       |                elif mode == "too_large":
+       |                    ordinal = batch.num_rows
+       |                values = {"id": value, "label": "lookup-%s" % value}
+       |                result = tuple([ordinal] + [values[field] for field in self.fields])
+       |                yield result
+       |                if self.options.get("unbounded"):
+       |                    while True:
+       |                        yield result
+       |
+       |class $dataSourceName(DataSource):
+       |    def externalLookup(self, schema, predicates):
+       |        if self.options.get("none_after_pruning") and len(schema) == 1:
+       |            return None
+       |        return Lookup(schema, self.options)
+       |$readerMethod
+       |""".stripMargin
+  }
+
+  test("external lookup Python dual-capability source requires a hint") {
+    assume(shouldTestPandasUDFs)
+    val source = createUserDefinedPythonDataSource(dataSourceName, pythonLookupScript(true))
+    spark.dataSource.registerPython(dataSourceName, source)
+    val left = spark.range(1, 3).selectExpr("cast(id as int) as id").as("left")
+    val lookup = spark.read.format(dataSourceName)
+      .schema("id INT, label STRING").load().as("lookup")
+
+    val ordinary = left.join(lookup, col("left.id") === col("lookup.id"))
+      .select(col("lookup.label"))
+    checkAnswer(ordinary, Seq(Row("scan-1"), Row("scan-2")))
+    assert(collectFirst(ordinary.queryExecution.executedPlan) {
+      case exec: ExternalLookupJoinExec => exec
+    }.isEmpty)
+
+    val hinted = left.join(lookup.hint("EXTERNAL_LOOKUP"),
+      col("left.id") === col("lookup.id")).select(col("lookup.label"))
+    checkAnswer(hinted, Seq(Row("lookup-1"), Row("lookup-2")))
+    assert(collectFirst(hinted.queryExecution.executedPlan) {
+      case exec: ExternalLookupJoinExec => exec
+    }.isDefined)
+  }
+
+  test("external lookup Python literal filters remain residual with read pushdown enabled") {
+    assume(shouldTestPandasUDFs)
+    val source = createUserDefinedPythonDataSource(dataSourceName, pythonLookupScript())
+    spark.dataSource.registerPython(dataSourceName, source)
+    withSQLConf(SQLConf.PYTHON_FILTER_PUSHDOWN_ENABLED.key -> "true",
+        SQLConf.PYTHON_LIMIT_PUSHDOWN_ENABLED.key -> "true") {
+      val left = spark.range(1, 8).selectExpr("cast(id as int) as id").as("left")
+      val lookup = spark.read.format(dataSourceName).schema("id INT, label STRING")
+        .load().filter("label = 'lookup-1'").as("lookup")
+      val joined = left.join(lookup, col("left.id") === col("lookup.id"))
+        .select(col("lookup.label"))
+      checkAnswer(joined, Seq(Row("lookup-1")))
+      assert(collectFirst(joined.queryExecution.executedPlan) {
+        case exec: ExternalLookupJoinExec => exec
+      }.isDefined)
+    }
+  }
+
+  test("external lookup Python negotiation returns original predicate occurrences in order") {
+    assume(shouldTestPandasUDFs)
+    val source = createUserDefinedPythonDataSource(dataSourceName, pythonLookupScript())
+    spark.dataSource.registerPython(dataSourceName, source)
+    val frame = spark.read.format(dataSourceName).option("selected", "[2,0]")
+      .schema("id INT, label STRING").load()
+    val relation = frame.queryExecution.analyzed.collectFirst {
+      case relation: ExternalLookupRelation => relation.relation
+    }.get
+    val builder = relation.table.asInstanceOf[SupportsRead]
+      .newScanBuilder(relation.options).asInstanceOf[PythonScanBuilder]
+    val candidates = Array.fill(3) {
+      new V2Predicate("=", Array[V2Expression](
+        FieldReference.column("id"), new LookupParameter(IntegerType)))
+    }
+    val selected = builder.selectLookupPredicates(candidates)
+    assert(selected.length == 2)
+    assert(selected(0) eq candidates(2))
+    assert(selected(1) eq candidates(0))
+    builder.pruneColumns(StructType.fromDDL("label STRING"))
+    val scan = builder.build()
+    assert(scan.readSchema().fieldNames.toSeq == Seq("label"))
+    assert(scan.toExternalLookup().maxParameterRowsPerRequest() == 2)
+  }
+
+  test("external lookup Python cleans up each batched request") {
+    assume(shouldTestPandasUDFs)
+    val source = createUserDefinedPythonDataSource(dataSourceName, pythonLookupScript())
+    spark.dataSource.registerPython(dataSourceName, source)
+    withSQLConf(SQLConf.ARROW_EXECUTION_MAX_RECORDS_PER_BATCH.key -> "1") {
+      withTempDir { directory =>
+        val marker = new File(directory, "closed")
+        val left = spark.range(1, 8).selectExpr("cast(id as int) as id").coalesce(1).as("left")
+        val lookup = spark.read.format(dataSourceName).option("close_path", marker.toString)
+          .schema("id INT, label STRING").load().as("lookup")
+        val joined = left.join(lookup, col("left.id") === col("lookup.id"))
+          .select(col("lookup.label"))
+        assert(joined.collect().toSeq.sortBy(_.getString(0)) ==
+          (1 to 7).map(value => Row(s"lookup-$value")))
+        assert(java.nio.file.Files.readAllLines(marker.toPath).size() == 4)
+      }
+    }
+  }
+
+  test("external lookup Python cancellation stops a blocked second request on a reused worker") {
+    import scala.concurrent.{ExecutionContext, Future}
+    import scala.concurrent.duration._
+
+    assume(shouldTestPandasUDFs)
+    val source = createUserDefinedPythonDataSource(dataSourceName, pythonLookupScript())
+    spark.dataSource.registerPython(dataSourceName, source)
+    withTempDir { directory =>
+      val marker = new File(directory, "requests")
+      val group = java.util.UUID.randomUUID().toString
+      val left = spark.range(1, 8).selectExpr("cast(id as int) as id").coalesce(1).as("left")
+      val lookup = spark.read.format(dataSourceName)
+        .option("block_after_first", "true").option("request_path", marker.toString)
+        .schema("id INT, label STRING").load().as("lookup")
+      val joined = left.join(lookup, col("left.id") === col("lookup.id"))
+        .select(col("lookup.label"))
+      val result = Future {
+        spark.sparkContext.setJobGroup(group, "cancel Python external lookup",
+          interruptOnCancel = false)
+        try {
+          joined.collect()
+        } finally {
+          spark.sparkContext.clearJobGroup()
+        }
+      }(ExecutionContext.global)
+      var worker: Option[ProcessHandle] = None
+      try {
+        eventually(timeout(30.seconds), interval(100.milliseconds)) {
+          assert(marker.exists())
+          val requests = java.nio.file.Files.readAllLines(marker.toPath)
+          assert(requests.size() >= 2)
+          assert(requests.get(0) == requests.get(1))
+          worker = Some(ProcessHandle.of(requests.get(1).toLong).orElseThrow())
+        }
+        spark.sparkContext.cancelJobGroup(group)
+        intercept[Exception] {
+          org.apache.spark.util.ThreadUtils.awaitResult(result, 15.seconds)
+        }
+        eventually(timeout(15.seconds), interval(100.milliseconds)) {
+          assert(!worker.get.isAlive)
+        }
+      } finally {
+        spark.sparkContext.cancelJobGroup(group)
+        worker.filter(_.isAlive).foreach(_.destroyForcibly())
+      }
+    }
+  }
+
+  test("external lookup Python early cursor close stops an unbounded worker") {
+    import scala.concurrent.duration._
+
+    assume(shouldTestPandasUDFs)
+    val source = createUserDefinedPythonDataSource(dataSourceName, pythonLookupScript())
+    spark.dataSource.registerPython(dataSourceName, source)
+    withSQLConf(SQLConf.ARROW_EXECUTION_MAX_RECORDS_PER_BATCH.key -> "1") {
+      withTempDir { directory =>
+        val marker = new File(directory, "requests")
+        val left = spark.range(1, 2).selectExpr("cast(id as int) as id").as("left")
+        val lookup = spark.read.format(dataSourceName)
+          .option("unbounded", "true").option("request_path", marker.toString)
+          .schema("id INT, label STRING").load().as("lookup")
+        val joined = left.join(lookup, col("left.id") === col("lookup.id"))
+          .select(col("lookup.label"))
+        val factory = collectFirst(joined.queryExecution.executedPlan) {
+          case exec: ExternalLookupJoinExec => exec.readerFactory
+        }.get
+        org.apache.spark.sql.execution.SQLExecution.withSQLConfPropagated(spark) {
+          val result = spark.sparkContext.parallelize(Seq(1), 1).mapPartitions { _ =>
+            val reader = factory.createReader()
+            try {
+              val cursor = reader.lookupBatch(Array(InternalRow(1)))
+              assert(cursor.next())
+              cursor.close()
+              cursor.close()
+              reader.close()
+              Iterator.single(1)
+            } finally {
+              reader.close()
+            }
+          }.collect()
+          assert(result.toSeq == Seq(1))
+        }
+        val processId = java.nio.file.Files.readAllLines(marker.toPath).get(0).toLong
+        eventually(timeout(15.seconds), interval(100.milliseconds)) {
+          val process = ProcessHandle.of(processId)
+          assert(process.isEmpty || !process.get().isAlive)
+        }
+      }
+    }
+  }
+
+  test("external lookup Python rejects invalid selections without read fallback") {
+    assume(shouldTestPandasUDFs)
+    val source = createUserDefinedPythonDataSource(dataSourceName, pythonLookupScript(true))
+    spark.dataSource.registerPython(dataSourceName, source)
+    val left = spark.range(1, 3).selectExpr("cast(id as int) as id").as("left")
+    Seq("null", "[0,0]", "[-1]", "[1]", "[null]", "[true]").foreach { selected =>
+      val lookup = spark.read.format(dataSourceName).option("selected", selected)
+        .schema("id INT, label STRING").load().hint("EXTERNAL_LOOKUP").as("lookup")
+      val joined = left.join(lookup, col("left.id") === col("lookup.id"))
+      val error = intercept[Exception] { joined.queryExecution.optimizedPlan }
+      assert(error.getMessage.contains("DATA_SOURCE_TYPE_MISMATCH"), error.getMessage)
+    }
+  }
+
+  test("external lookup Python rejects access path changes after pruning") {
+    assume(shouldTestPandasUDFs)
+    val source = createUserDefinedPythonDataSource(dataSourceName, pythonLookupScript())
+    spark.dataSource.registerPython(dataSourceName, source)
+    val left = spark.range(1, 3).selectExpr("cast(id as int) as id").as("left")
+    Seq("change_after_pruning", "none_after_pruning").foreach { option =>
+      val lookup = spark.read.format(dataSourceName).option(option, "true")
+        .schema("id INT, label STRING").load().as("lookup")
+      val joined = left.join(lookup, col("left.id") === col("lookup.id"))
+        .select(col("lookup.label"))
+      val error = intercept[Exception] { joined.queryExecution.executedPlan }
+      assert(error.getMessage.contains("Python data source"), error.getMessage)
+    }
+  }
+
+  test("external lookup Python rejects invalid result ordinals and propagates execution errors") {
+    assume(shouldTestPandasUDFs)
+    val source = createUserDefinedPythonDataSource(dataSourceName, pythonLookupScript())
+    spark.dataSource.registerPython(dataSourceName, source)
+    val left = spark.range(1, 3).selectExpr("cast(id as int) as id").as("left")
+    Seq("negative", "too_large", "null", "failure").foreach { mode =>
+      val option = if (mode == "failure") "failure" else "ordinal"
+      val lookup = spark.read.format(dataSourceName).option(option, mode)
+        .schema("id INT, label STRING").load().as("lookup")
+      val joined = left.join(lookup, col("left.id") === col("lookup.id"))
+        .select(col("lookup.label"))
+      val error = intercept[Exception] { joined.collect() }
+      val message = Option(error.getCause).map(_.getMessage).getOrElse(error.getMessage)
+      assert(message.contains("ordinal") || message.contains("external lookup execution failed"),
+        message)
+    }
+  }
+
+  test("external lookup with Python data source") {
+    assume(shouldTestPandasUDFs)
+
+    val dataSourceScript =
+      s"""
+         |from pyspark.sql.datasource import DataSource, EqualTo, ExternalLookup, LookupParameter
+         |
+         |class CompositeLookup(ExternalLookup):
+         |    def __init__(self, schema, selected):
+         |        self.output_fields = schema.fieldNames()
+         |        self.selected = selected
+         |        self.values = {
+         |            ("a", 1): ["one", "uno"],
+         |            ("b", 2): ["two"],
+         |        }
+         |
+         |    def selectedPredicateIndexes(self):
+         |        return self.selected
+         |
+         |    def maxParameterRowsPerRequest(self):
+         |        return 2
+         |
+         |    def lookup(self, batches):
+         |        for batch in batches:
+         |            data = batch.to_pydict()
+         |            rows = zip(
+         |                data["input_ordinal"], data["parameter_0"], data["parameter_1"]
+         |            )
+         |            for input_ordinal, group, item_id in rows:
+         |                for label in self.values.get((group, item_id), []):
+         |                    row = [input_ordinal]
+         |                    for field in self.output_fields:
+         |                        if field == "id":
+         |                            row.append(item_id)
+         |                        elif field == "label":
+         |                            row.append(label)
+         |                        elif field == "group":
+         |                            row.append(group)
+         |                    yield tuple(row)
+         |
+         |class $dataSourceName(DataSource):
+         |    def externalLookup(self, schema, predicates):
+         |        fields = [
+         |            predicate.attribute
+         |            if isinstance(predicate, EqualTo)
+         |            and isinstance(predicate.value, LookupParameter)
+         |            else None
+         |            for predicate in predicates
+         |        ]
+         |        if ("id",) in fields and ("group",) in fields:
+         |            return CompositeLookup(
+         |                schema,
+         |                [fields.index(("group",)), fields.index(("id",))]
+         |            )
+         |        return None
+         |""".stripMargin
+    val schema = StructType.fromDDL("id INT, label STRING, group STRING")
+    val dataSource = createUserDefinedPythonDataSource(dataSourceName, dataSourceScript)
+    spark.dataSource.registerPython(dataSourceName, dataSource)
+
+    val leftSchema = StructType.fromDDL("id INT, `group` STRING")
+    val left = spark.createDataFrame(
+      JArrays.asList(Row(1, "a"), Row(2, "b"), Row(3, "c"), Row(1, "a")),
+      leftSchema).as("left")
+    val lookup = spark.read.format(dataSourceName).schema(schema).load().as("lookup")
+    val joined = left.join(
+      lookup,
+      col("left.id") === col("lookup.id") && col("left.group") === col("lookup.group"),
+      "left_outer")
+      .select(col("left.id"), col("left.group"), col("lookup.label"))
+
+    checkAnswer(
+      joined,
+      Seq(Row(1, "a", "one"), Row(1, "a", "uno"), Row(2, "b", "two"),
+        Row(3, "c", null), Row(1, "a", "one"), Row(1, "a", "uno")))
+    assert(joined.count() == 6)
+
+    val lookupJoin = collectFirst(joined.queryExecution.executedPlan) {
+      case exec: ExternalLookupJoinExec => exec
+    }.getOrElse(fail(s"ExternalLookupJoinExec not found:\n${joined.queryExecution.executedPlan}"))
+    assert(lookupJoin.maxParameterRowsPerRequest == 2)
+    assert(lookupJoin.lookupOutput.map(_.name) == Seq("label"))
+
+    val unsupported = left.join(
+      lookup, col("left.id") === col("lookup.id"), "inner")
+    val error = intercept[AnalysisException] {
+      unsupported.queryExecution.optimizedPlan
+    }
+    assert(error.getCondition == "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.NO_LOOKUP_PREDICATE")
+  }
+
+  test("external lookup with Python data source supports null-safe keys") {
+    assume(shouldTestPandasUDFs)
+
+    val dataSourceScript =
+      s"""
+         |from pyspark.sql.datasource import (
+         |    DataSource, EqualNullSafe, ExternalLookup, LookupParameter
+         |)
+         |
+         |class NullSafeLookup(ExternalLookup):
+         |    def __init__(self, schema, selected):
+         |        self.output_fields = schema.fieldNames()
+         |        self.selected = selected
+         |
+         |    def selectedPredicateIndexes(self):
+         |        return self.selected
+         |
+         |    def lookup(self, batches):
+         |        for batch in batches:
+         |            data = batch.to_pydict()
+         |            for input_ordinal, item_id in zip(
+         |                data["input_ordinal"], data["parameter_0"]
+         |            ):
+         |                if item_id is None:
+         |                    label = "null-key"
+         |                elif item_id == 1:
+         |                    label = "one"
+         |                else:
+         |                    continue
+         |                row = [input_ordinal]
+         |                for field in self.output_fields:
+         |                    if field == "id":
+         |                        row.append(item_id)
+         |                    elif field == "label":
+         |                        row.append(label)
+         |                yield tuple(row)
+         |
+         |class $dataSourceName(DataSource):
+         |    def externalLookup(self, schema, predicates):
+         |        if len(predicates) == 1:
+         |            predicate = predicates[0]
+         |            if (
+         |                isinstance(predicate, EqualNullSafe)
+         |                and predicate.attribute == ("id",)
+         |                and isinstance(predicate.value, LookupParameter)
+         |            ):
+         |                return NullSafeLookup(schema, [0])
+         |        return None
+         |""".stripMargin
+    val schema = StructType.fromDDL("id INT, label STRING")
+    val dataSource = createUserDefinedPythonDataSource(dataSourceName, dataSourceScript)
+    spark.dataSource.registerPython(dataSourceName, dataSource)
+
+    val left = spark.createDataFrame(
+      JArrays.asList(Row(null), Row(1), Row(2)),
+      StructType.fromDDL("id INT")).as("left")
+    val lookup = spark.read.format(dataSourceName).schema(schema).load().as("lookup")
+    val joined = left.join(
+      lookup,
+      col("left.id") <=> col("lookup.id"),
+      "inner")
+      .select(col("left.id"), col("lookup.label"))
+
+    checkAnswer(joined, Seq(Row(null, "null-key"), Row(1, "one")))
+
+    val unsupported = left.join(
+      lookup, col("left.id") === col("lookup.id"), "inner")
+    val error = intercept[AnalysisException] {
+      unsupported.queryExecution.optimizedPlan
+    }
+    assert(error.getCondition == "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.NO_LOOKUP_PREDICATE")
+  }
+
+  test("external lookup with Python data source supports mixed lookup predicates") {
+    assume(shouldTestPandasUDFs)
+
+    val dataSourceScript =
+      s"""
+         |from pyspark.sql.datasource import (
+         |    DataSource,
+         |    EqualTo,
+         |    ExternalLookup,
+         |    GreaterThanOrEqual,
+         |    LessThan,
+         |    LookupParameter,
+         |)
+         |
+         |class TemporalLookup(ExternalLookup):
+         |    def __init__(self, schema, selected):
+         |        self.output_fields = schema.fieldNames()
+         |        self.selected = selected
+         |        self.values = [
+         |            (1, 12, "a"),
+         |            (1, 18, "b"),
+         |            (1, 22, "b"),
+         |            (2, 5, "c"),
+         |        ]
+         |
+         |    def selectedPredicateIndexes(self):
+         |        return self.selected
+         |
+         |    def lookup(self, batches):
+         |        for batch in batches:
+         |            data = batch.to_pydict()
+         |            rows = zip(
+         |                data["input_ordinal"],
+         |                data["parameter_0"],
+         |                data["parameter_1"],
+         |                data["parameter_2"],
+         |            )
+         |            for input_ordinal, tenant, start, end in rows:
+         |                for value_tenant, event_time, label in self.values:
+         |                    if value_tenant != tenant or not start <= event_time < end:
+         |                        continue
+         |                    row = [input_ordinal]
+         |                    for field in self.output_fields:
+         |                        if field == "tenant":
+         |                            row.append(value_tenant)
+         |                        elif field == "event_time":
+         |                            row.append(event_time)
+         |                        elif field == "label":
+         |                            row.append(label)
+         |                    yield tuple(row)
+         |
+         |class $dataSourceName(DataSource):
+         |    def externalLookup(self, schema, predicates):
+         |        expected = [
+         |            (EqualTo, ("tenant",)),
+         |            (GreaterThanOrEqual, ("event_time",)),
+         |            (LessThan, ("event_time",)),
+         |        ]
+         |        selected = []
+         |        for predicate_type, field in expected:
+         |            matches = [
+         |                index
+         |                for index, predicate in enumerate(predicates)
+         |                if isinstance(predicate, predicate_type)
+         |                and predicate.attribute == field
+         |                and isinstance(predicate.value, LookupParameter)
+         |            ]
+         |            if len(matches) != 1:
+         |                return None
+         |            selected.append(matches[0])
+         |        return TemporalLookup(schema, selected)
+         |""".stripMargin
+    val schema = StructType.fromDDL("tenant INT, event_time INT, label STRING")
+    val dataSource = createUserDefinedPythonDataSource(dataSourceName, dataSourceScript)
+    spark.dataSource.registerPython(dataSourceName, dataSource)
+
+    val leftSchema = StructType.fromDDL(
+      "tenant INT, start INT, end INT, expected STRING")
+    val left = spark.createDataFrame(
+      JArrays.asList(
+        Row(1, 10, 20, "a"),
+        Row(1, 15, 25, "b"),
+        Row(2, 0, 10, "c"),
+        Row(1, 10, 20, "missing")),
+      leftSchema).as("left")
+    val lookup = spark.read.format(dataSourceName).schema(schema).load().as("lookup")
+    val condition = col("left.tenant") === col("lookup.tenant") &&
+      col("lookup.event_time") >= col("left.start") &&
+      col("lookup.event_time") < col("left.end") &&
+      col("left.expected") === col("lookup.label")
+    val joined = left.join(lookup, condition, "inner")
+      .select(
+        col("left.tenant"),
+        col("left.start"),
+        col("left.end"),
+        col("left.expected"),
+        col("lookup.event_time"),
+        col("lookup.label"))
+
+    checkAnswer(
+      joined,
+      Seq(
+        Row(1, 10, 20, "a", 12, "a"),
+        Row(1, 15, 25, "b", 18, "b"),
+        Row(1, 15, 25, "b", 22, "b"),
+        Row(2, 0, 10, "c", 5, "c")))
   }
 
   test("register data source") {

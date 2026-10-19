@@ -34,7 +34,7 @@ from typing import (
 from pyspark.errors import PySparkNotImplementedError
 from pyspark.sql import Row
 from pyspark.sql.streaming.datasource import ReadAllAvailable, ReadLimit
-from pyspark.sql.types import StructType
+from pyspark.sql.types import DataType, StructType
 
 if TYPE_CHECKING:
     from pyarrow import RecordBatch
@@ -52,6 +52,8 @@ __all__ = [
     "SimpleDataSourceStreamReader",
     "DataSourceRegistration",
     "InputPartition",
+    "LookupParameter",
+    "ExternalLookup",
     "WriterCommitMessage",
     "Filter",
     "EqualTo",
@@ -170,6 +172,46 @@ class DataSource(ABC):
             messageParameters={"feature": "reader"},
         )
 
+    def externalLookup(
+        self, schema: StructType, predicates: List["Filter"]
+    ) -> Optional["ExternalLookup"]:
+        """Returns a parameterized lookup implementation for one complete access path.
+
+        .. versionadded:: 4.4.0
+
+        Parameters
+        ----------
+        schema : :class:`StructType`
+            Requested lookup output schema. It may omit selected predicate fields after
+            column pruning, or contain no fields.
+        predicates : list of :class:`Filter`
+            Offered comparisons with a lookup-side column as ``attribute`` and a typed
+            :class:`LookupParameter` as ``value``. Initially supported comparison classes
+            are :class:`EqualTo`, :class:`EqualNullSafe`, :class:`LessThan`,
+            :class:`LessThanOrEqual`, :class:`GreaterThan` and :class:`GreaterThanOrEqual`.
+
+        Returns
+        -------
+        :class:`ExternalLookup` or None
+            A lookup selecting a complete access path, or ``None`` if none is supported.
+
+        Notes
+        -----
+        Implementations must reject unsupported predicate types and semantics. Selected
+        predicates are trusted: Spark does not re-evaluate them on returned rows. Unselected
+        predicates and literal filters remain Spark residual filters.
+
+        Spark may call this method again with a pruned schema. Predicate selection and
+        parameter order must remain the same. Planning runs on the driver; the returned
+        object must be serializable and should open external resources inside ``lookup``.
+
+        A source implementing this method but not :meth:`reader` is lookup-only and is
+        selected automatically for eligible joins. A source implementing both uses an
+        ordinary join by default; apply the ``EXTERNAL_LOOKUP`` hint to opt into lookup.
+        No access path or a connector failure is an error, not an ordinary-read fallback.
+        """
+        return None
+
     def writer(self, schema: StructType, overwrite: bool) -> "DataSourceWriter":
         """
         Returns a :class:`DataSourceWriter` instance for writing data.
@@ -274,9 +316,103 @@ For example, `("a", "b", "c")` represents the column `a.b.c`.
 
 
 @dataclass(frozen=True)
+class LookupParameter:
+    """
+    A runtime-bound value in a predicate offered for external lookup planning.
+
+    Its value is supplied in each parameter row passed to :meth:`ExternalLookup.lookup`.
+
+    .. versionadded:: 4.4.0
+
+    Parameters
+    ----------
+    dataType : :class:`DataType`
+        The Spark SQL type of the runtime-bound value.
+    """
+
+    dataType: DataType
+
+
+class ExternalLookup(ABC):
+    """
+    A base class for parameterized external lookup implementations.
+
+    Spark calls :meth:`selectedPredicateIndexes` during planning to choose one complete
+    access path from the predicates passed to :meth:`DataSource.externalLookup`.
+    During execution, Spark calls :meth:`lookup` with Arrow batches containing an
+    ``input_ordinal`` column followed by ``parameter_0``, ``parameter_1``, and so on.
+    Parameters follow selected-predicate order. The method must return rows with
+    ``input_ordinal`` followed by the requested output columns.
+
+    A lookup may return rows in any order, return multiple rows for one ordinal,
+    or omit an ordinal to represent a miss.
+
+    .. versionadded:: 4.4.0
+    """
+
+    @abstractmethod
+    def selectedPredicateIndexes(self) -> Sequence[int]:
+        """
+        Returns predicate indexes in the order expected by lookup requests.
+
+        The returned indexes refer to the original predicate list passed to
+        :meth:`DataSource.externalLookup`. Each occurrence is distinct even when two
+        predicates have the same column and comparison type. Return distinct integer
+        indexes within that list; an empty sequence means no supported access path.
+
+        .. versionadded:: 4.4.0
+        """
+        ...
+
+    def maxParameterRowsPerRequest(self) -> int:
+        """
+        Returns the maximum number of parameter rows Spark should send in one request.
+
+        Return an integer between 1 and 2147483647. Spark may use smaller requests and
+        split a request into multiple Arrow batches.
+
+        .. versionadded:: 4.4.0
+        """
+        return 1000
+
+    @abstractmethod
+    def lookup(
+        self, parameters: Iterator["RecordBatch"]
+    ) -> Union[Iterator[Tuple], Iterator["RecordBatch"]]:
+        """
+        Looks up rows for input Arrow batches.
+
+        Each input row contains ``input_ordinal`` followed by the selected parameters.
+        Each output row must contain ``input_ordinal`` followed by one lookup value
+        row. A zero-column lookup value still returns a single-field row containing
+        only ``input_ordinal``.
+
+        Ordinals are non-null integers local to one request, starting at zero. They
+        correlate results with parameter rows, not original join-side rows: Spark may
+        deduplicate identical parameters and reuse results within its task-scoped cache.
+        Disable caching with the ``EXTERNAL_LOOKUP`` hint's ``cache_enabled=false`` option
+        when results should not be reused across requests. This does not provide snapshot
+        isolation across requests.
+
+        Yield tuples in schema order or Arrow batches matching the output schema,
+        including a non-nullable integer ``input_ordinal`` field. Use ``try/finally``
+        inside the iterator to release connections or other request resources. Failures
+        propagate to Spark and normal Spark task retries may repeat requests.
+        Cancellation or early cursor closure can terminate the worker without running
+        Python cleanup code.
+
+        .. versionadded:: 4.4.0
+        """
+        ...
+
+
+@dataclass(frozen=True)
 class Filter(ABC):
     """
-    The base class for filters used for filter pushdown.
+    The base class for predicates used by data sources.
+
+    Predicates may contain literal values for filter pushdown or a
+    :class:`LookupParameter` for external lookup planning.
 
     .. versionadded:: 4.1.0
 
