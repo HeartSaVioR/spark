@@ -16,6 +16,7 @@
 #
 
 import json
+import sys
 from collections.abc import Iterator as IteratorABC
 from collections.abc import Sequence as SequenceABC
 from typing import IO, Iterable, List
@@ -46,6 +47,7 @@ from pyspark.sql.pandas.types import to_arrow_schema
 from pyspark.sql.types import (
     DataType,
     IntegerType,
+    Row,
     StructField,
     StructType,
     _parse_datatype_json_string,
@@ -200,9 +202,8 @@ def _main(infile: IO, outfile: IO) -> None:
     predicates = [deserialize_lookup_predicate(predicate) for predicate in predicate_dicts]
 
     max_arrow_batch_size = read_int(infile)
-    assert max_arrow_batch_size > 0, (
-        f"The maximum arrow batch size should be greater than 0, but got '{max_arrow_batch_size}'"
-    )
+    if max_arrow_batch_size <= 0:
+        max_arrow_batch_size = sys.maxsize
     read_bool(infile)
 
     with capture_outputs():
@@ -235,9 +236,33 @@ def _main(infile: IO, outfile: IO) -> None:
                         "supported_types": "iterator",
                     },
                 )
+
+            def validated_output_rows():
+                for row in output_iter:
+                    named_row = isinstance(row, Row) and hasattr(row, "__fields__")
+                    if (
+                        isinstance(row, (tuple, list))
+                        and len(row) == len(return_type)
+                        and (not named_row or INPUT_ORDINAL_COLUMN_NAME in row.__fields__)
+                    ):
+                        ordinal = row[INPUT_ORDINAL_COLUMN_NAME] if named_row else row[0]
+                        if (
+                            not isinstance(ordinal, int)
+                            or isinstance(ordinal, bool)
+                            or not 0 <= ordinal <= 2**31 - 1
+                        ):
+                            raise PySparkRuntimeError(
+                                errorClass="DATA_SOURCE_TYPE_MISMATCH",
+                                messageParameters={
+                                    "expected": "input_ordinal integer in range [0, 2147483647]",
+                                    "actual": repr(ordinal),
+                                },
+                            )
+                    yield row
+
             try:
                 for batch in records_to_arrow_batches(
-                    output_iter, max_arrow_batch_size, return_type, data_source
+                    validated_output_rows(), max_arrow_batch_size, return_type, data_source
                 ):
                     if not arrow_schema.equals(batch.schema):
                         raise PySparkRuntimeError(

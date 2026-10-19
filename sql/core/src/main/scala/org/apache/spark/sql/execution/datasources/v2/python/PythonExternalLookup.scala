@@ -72,6 +72,7 @@ private case class PythonExternalLookupReaderFactory(
 
     private def registerWorkerCancellation(cancel: () => Unit): Unit = {
       cancelWorker.set(Some(cancel))
+      TaskContext.get().addTaskCompletionListener[Unit] { _ => cancel() }
       if (closed.get() || TaskContext.get().isInterrupted()) {
         cancelActiveWorker()
       }

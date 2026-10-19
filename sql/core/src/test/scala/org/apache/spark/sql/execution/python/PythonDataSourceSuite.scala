@@ -654,9 +654,21 @@ class PythonDataSourceSuite extends PythonDataSourceSuiteBase {
        |                    ordinal = -1
        |                elif mode == "too_large":
        |                    ordinal = batch.num_rows
+       |                elif mode == "fractional":
+       |                    ordinal = 0.5
+       |                elif mode == "negative_fractional":
+       |                    ordinal = -0.5
        |                values = {"id": value, "label": "lookup-%s" % value}
+       |                if self.options.get("block_after_output"):
+       |                    values["label"] *= 16384
        |                result = tuple([ordinal] + [values[field] for field in self.fields])
        |                yield result
+       |                if self.options.get("block_after_output"):
+       |                    import time
+       |                    with open(self.options["block_path"], "w") as output:
+       |                        output.write("blocked")
+       |                    while True:
+       |                        time.sleep(1)
        |                if self.options.get("unbounded"):
        |                    while True:
        |                        yield result
@@ -803,6 +815,80 @@ class PythonDataSourceSuite extends PythonDataSourceSuiteBase {
     }
   }
 
+  test("external lookup Python successful limit stops a blocked worker") {
+    import scala.concurrent.{ExecutionContext, Future}
+    import scala.concurrent.duration._
+
+    assume(shouldTestPandasUDFs)
+    assert(spark.sparkContext.getConf.getBoolean("spark.python.worker.reuse", true))
+    val source = createUserDefinedPythonDataSource(dataSourceName, pythonLookupScript())
+    spark.dataSource.registerPython(dataSourceName, source)
+    withSQLConf(SQLConf.ARROW_EXECUTION_MAX_RECORDS_PER_BATCH.key -> "1") {
+      withTempDir { directory =>
+        val marker = new File(directory, "requests")
+        val blocked = new File(directory, "blocked")
+        val group = java.util.UUID.randomUUID().toString
+        val left = spark.range(1, 2).selectExpr("cast(id as int) as id").coalesce(1).as("left")
+        val lookup = spark.read.format(dataSourceName)
+          .option("block_after_output", "true").option("request_path", marker.toString)
+          .option("block_path", blocked.toString)
+          .schema("id INT, label STRING").load().as("lookup")
+        val joined = left.join(lookup, col("left.id") === col("lookup.id"))
+          .select(col("lookup.label"))
+        val result = Future {
+          spark.sparkContext.setJobGroup(group, "limit Python external lookup",
+            interruptOnCancel = false)
+          try {
+            joined.limit(1).rdd.mapPartitions { rows =>
+              val first = rows.next()
+              val deadline = 30.seconds.fromNow
+              while (!blocked.exists() && deadline.hasTimeLeft()) {
+                Thread.sleep(10)
+              }
+              require(blocked.exists(), "Python lookup did not block after flushing its result")
+              Iterator.single(first)
+            }.collect()
+          } finally {
+            spark.sparkContext.clearJobGroup()
+          }
+        }(ExecutionContext.global)
+        var worker: Option[ProcessHandle] = None
+        try {
+          eventually(timeout(30.seconds), interval(100.milliseconds)) {
+            assert(marker.exists())
+            val processId = java.nio.file.Files.readAllLines(marker.toPath).get(0).toLong
+            worker = Option(ProcessHandle.of(processId).orElse(null))
+            assert(blocked.exists())
+          }
+          assert(org.apache.spark.util.ThreadUtils.awaitResult(result, 30.seconds).toSeq ==
+            Seq(Row("lookup-1" * 16384)))
+          eventually(timeout(15.seconds), interval(100.milliseconds)) {
+            assert(worker.forall(process => !process.isAlive))
+          }
+        } finally {
+          spark.sparkContext.cancelJobGroup(group)
+          worker.filter(_.isAlive).foreach(_.destroyForcibly())
+        }
+      }
+    }
+  }
+
+  test("external lookup Python honors unlimited Arrow batch sizes") {
+    assume(shouldTestPandasUDFs)
+    val source = createUserDefinedPythonDataSource(dataSourceName, pythonLookupScript())
+    spark.dataSource.registerPython(dataSourceName, source)
+    Seq("0", "-1").foreach { batchSize =>
+      withSQLConf(SQLConf.ARROW_EXECUTION_MAX_RECORDS_PER_BATCH.key -> batchSize) {
+        val left = spark.range(1, 8).selectExpr("cast(id as int) as id").coalesce(1).as("left")
+        val lookup = spark.read.format(dataSourceName)
+          .schema("id INT, label STRING").load().as("lookup")
+        val joined = left.join(lookup, col("left.id") === col("lookup.id"))
+          .select(col("lookup.label"))
+        checkAnswer(joined, (1 to 7).map(value => Row(s"lookup-$value")))
+      }
+    }
+  }
+
   test("external lookup Python early cursor close stops an unbounded worker") {
     import scala.concurrent.duration._
 
@@ -880,7 +966,8 @@ class PythonDataSourceSuite extends PythonDataSourceSuiteBase {
     val source = createUserDefinedPythonDataSource(dataSourceName, pythonLookupScript())
     spark.dataSource.registerPython(dataSourceName, source)
     val left = spark.range(1, 3).selectExpr("cast(id as int) as id").as("left")
-    Seq("negative", "too_large", "null", "failure").foreach { mode =>
+    val modes = Seq("negative", "too_large", "null", "fractional", "negative_fractional", "failure")
+    modes.foreach { mode =>
       val option = if (mode == "failure") "failure" else "ordinal"
       val lookup = spark.read.format(dataSourceName).option(option, mode)
         .schema("id INT, label STRING").load().as("lookup")
