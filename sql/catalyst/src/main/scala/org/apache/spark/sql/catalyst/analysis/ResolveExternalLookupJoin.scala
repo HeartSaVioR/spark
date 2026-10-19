@@ -26,8 +26,8 @@ import org.apache.spark.sql.catalyst.expressions.{Expression, Literal, StringLit
 import org.apache.spark.sql.catalyst.optimizer.EliminateResolvedHint
 import org.apache.spark.sql.catalyst.plans.{Inner, LeftAnti, LeftOuter, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupCacheOptions,
-  ExternalLookupHint, ExternalLookupJoin, Join, JoinHint, LogicalPlan, SubqueryAlias,
-  UnresolvedHint, UnresolvedWith, View}
+  ExternalLookupHint, ExternalLookupJoin, Filter, Join, JoinHint, LogicalPlan, Project,
+  ResolvedHint, SubqueryAlias, UnresolvedHint, UnresolvedWith, View}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.connector.catalog.Table
 import org.apache.spark.sql.connector.catalog.TableCapability.{BATCH_READ, EXTERNAL_LOOKUP}
@@ -71,63 +71,82 @@ object ResolveExternalLookupJoin extends Rule[LogicalPlan] with QueryErrorsBase 
     }
 
   override def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsUp {
-    case Join(left, _, _, _, _) if containsLookupHint(left) =>
+    case join: Join if lookupHints(join.left).nonEmpty =>
       throw QueryCompilationErrors.invalidExternalLookupHintError("NOT_ON_LOOKUP_SIDE")
 
-    case join @ Join(left, right, joinType, condition, hint)
-        if left.resolved && right.resolved && shouldConsiderLookup(right) =>
-      val markers = right.collect { case marker: ExternalLookupHint => marker }
-      if (markers.length > 1) {
-        throw QueryCompilationErrors.invalidExternalLookupHintError("MULTIPLE_HINTS")
-      }
-      val hasLookupOptions = markers.nonEmpty
-      val lookupPlan = right.transformDown {
-        case marker: ExternalLookupHint => marker.child
-      }
-      if (hasJoinStrategyHint(hint, left, right)) {
-        join.copy(right = lookupPlan)
-      } else if (condition.isEmpty) {
-        if (hasLookupOptions) {
-          throw QueryCompilationErrors.unsupportedExternalLookupJoinError(
-            "MISSING_JOIN_CONDITION")
-        }
-        join
-      } else if (!SupportedJoinTypes.contains(joinType)) {
-        if (hasLookupOptions) {
-          throw QueryCompilationErrors.unsupportedExternalLookupJoinError(
-            "JOIN_TYPE",
-            Map(
-              "joinType" -> toSQLStmt(joinType.sql),
-              "supportedJoinTypes" -> SupportedJoinTypes.map(t => toSQLStmt(t.sql)).mkString(", ")))
-        }
-        join.copy(right = lookupPlan)
-      } else if (right.isStreaming) {
-        if (hasLookupOptions) {
-          throw QueryCompilationErrors.unsupportedExternalLookupJoinError("STREAMING_LOOKUP_SIDE")
-        }
-        join.copy(right = lookupPlan)
-      } else {
-        val cacheOptions = markers.headOption.map(_.cacheOptions)
-          .getOrElse(defaultCacheOptions)
-        ExternalLookupJoin(
-          left,
-          lookupPlan,
-          joinType,
-          condition,
-          cacheOptions,
-          lookupPlan.output)
-      }
+    case join: Join if join.left.resolved && join.right.resolved => resolveLookupJoin(join)
   }
 
-  private def containsLookupHint(plan: LogicalPlan): Boolean =
-    plan.exists(_.isInstanceOf[ExternalLookupHint])
-
-  private def shouldConsiderLookup(plan: LogicalPlan): Boolean =
-    containsLookupHint(plan) || plan.exists {
+  private def resolveLookupJoin(join: Join): LogicalPlan = {
+    val Join(left, right, joinType, condition, hint) = join
+    val markers = lookupHints(right)
+    val lookupOnly = accessPath(right).last match {
       case relation: DataSourceV2Relation => isLookupOnly(relation.table)
       case relation: ExternalLookupRelation => isLookupOnly(relation.table)
       case _ => false
     }
+    if (markers.isEmpty && !lookupOnly) return join
+    if (markers.length > 1) {
+      throw QueryCompilationErrors.invalidExternalLookupHintError("MULTIPLE_HINTS")
+    }
+    val hasLookupOptions = markers.nonEmpty
+    val lookupPlan = removeLookupHints(right)
+    // A lookup-only table has no batch scan, so a physical strategy hint cannot apply to it.
+    if (!lookupOnly && hasJoinStrategyHint(hint, left, right)) {
+      join.copy(right = lookupPlan)
+    } else if (condition.isEmpty) {
+      if (hasLookupOptions) {
+        throw QueryCompilationErrors.unsupportedExternalLookupJoinError("MISSING_JOIN_CONDITION")
+      }
+      join.copy(right = lookupPlan)
+    } else if (!SupportedJoinTypes.contains(joinType)) {
+      if (hasLookupOptions) {
+        throw QueryCompilationErrors.unsupportedExternalLookupJoinError(
+          "JOIN_TYPE",
+          Map(
+            "joinType" -> toSQLStmt(joinType.sql),
+            "supportedJoinTypes" -> SupportedJoinTypes.map(t => toSQLStmt(t.sql)).mkString(", ")))
+      }
+      join.copy(right = lookupPlan)
+    } else if (right.isStreaming) {
+      if (hasLookupOptions) {
+        throw QueryCompilationErrors.unsupportedExternalLookupJoinError("STREAMING_LOOKUP_SIDE")
+      }
+      join.copy(right = lookupPlan)
+    } else {
+      val cacheOptions = markers.headOption.map(_.cacheOptions)
+        .getOrElse(defaultCacheOptions)
+      ExternalLookupJoin(
+        left,
+        lookupPlan,
+        joinType,
+        condition,
+        cacheOptions,
+        lookupPlan.output)
+    }
+  }
+
+  /**
+   * The operators from a join input down to the relation that a lookup would read. The path stops
+   * at the first operator that cannot be part of a lookup side, such as another join, so a table
+   * read by a nested, already-formed join does not make the outer join a lookup candidate.
+   */
+  private def accessPath(plan: LogicalPlan): Seq[LogicalPlan] = plan match {
+    case node @ (_: ExternalLookupHint | _: ResolvedHint | _: SubqueryAlias | _: View |
+        _: Project | _: Filter) =>
+      node +: accessPath(node.children.head)
+    case other => Seq(other)
+  }
+
+  private def lookupHints(plan: LogicalPlan): Seq[ExternalLookupHint] =
+    accessPath(plan).collect { case marker: ExternalLookupHint => marker }
+
+  private def removeLookupHints(plan: LogicalPlan): LogicalPlan = plan match {
+    case marker: ExternalLookupHint => removeLookupHints(marker.child)
+    case node @ (_: ResolvedHint | _: SubqueryAlias | _: View | _: Project | _: Filter) =>
+      node.withNewChildren(Seq(removeLookupHints(node.children.head)))
+    case other => other
+  }
 
   private def isLookupOnly(table: Table): Boolean = {
     val capabilities = table.capabilities()

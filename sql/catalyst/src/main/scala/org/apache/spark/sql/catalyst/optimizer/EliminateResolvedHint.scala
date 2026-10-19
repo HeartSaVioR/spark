@@ -51,6 +51,11 @@ object EliminateResolvedHint extends Rule[LogicalPlan] {
       case h: ResolvedHint =>
         hintErrorHandler.joinNotFoundForJoinHint(h.hints)
         h.child
+      // Analysis consumes every EXTERNAL_LOOKUP hint on the lookup side of a join; one that is
+      // left is not attached to any join.
+      case h: ExternalLookupHint =>
+        logWarning("An EXTERNAL_LOOKUP hint is not attached to a join and is ignored.")
+        h.child
     }
   }
 

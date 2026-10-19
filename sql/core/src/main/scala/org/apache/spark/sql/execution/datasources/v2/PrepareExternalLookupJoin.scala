@@ -44,7 +44,12 @@ object PrepareExternalLookupJoin extends Rule[LogicalPlan] with PredicateHelper
   override def apply(plan: LogicalPlan): LogicalPlan = plan.transformUp {
     case join: ExternalLookupJoin => prepare(join)
   }.transformUp {
+    // Prepared lookup joins no longer contain their lookup relation, so any lookup-only relation
+    // left here would have to be scanned.
     case relation: ExternalLookupRelation =>
+      throw QueryCompilationErrors.unsupportedBatchReadError(relation.table)
+    case relation: DataSourceV2Relation
+        if !relation.table.capabilities().contains(TableCapability.BATCH_READ) =>
       throw QueryCompilationErrors.unsupportedBatchReadError(relation.table)
   }
 

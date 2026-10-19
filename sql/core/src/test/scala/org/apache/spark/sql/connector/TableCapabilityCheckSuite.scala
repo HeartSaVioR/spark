@@ -30,7 +30,7 @@ import org.apache.spark.sql.connector.catalog.{Table, TableCapability}
 import org.apache.spark.sql.connector.catalog.TableCapability._
 import org.apache.spark.sql.execution.datasources.DataSource
 import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, ExternalLookupRelation,
-  TableCapabilityCheck}
+  PrepareExternalLookupJoin, TableCapabilityCheck}
 import org.apache.spark.sql.execution.streaming.{Offset, Source}
 import org.apache.spark.sql.execution.streaming.runtime.StreamingRelation
 import org.apache.spark.sql.sources.StreamSourceProvider
@@ -66,11 +66,12 @@ class TableCapabilityCheckSuite extends AnalysisTest with SharedSparkSession {
     assert(e.message.contains("does not support batch scan"))
   }
 
-  test("batch scan: external lookup capability does not satisfy batch read") {
+  test("batch scan: external lookup capability defers the batch read check to planning") {
     val relation = DataSourceV2Relation.create(
       CapabilityTable(EXTERNAL_LOOKUP), None, None, emptyMap)
+    TableCapabilityCheck.apply(relation)
     val e = intercept[AnalysisException] {
-      TableCapabilityCheck.apply(relation)
+      PrepareExternalLookupJoin(relation)
     }
     assert(e.message.contains("does not support batch scan"))
   }
@@ -88,7 +89,7 @@ class TableCapabilityCheckSuite extends AnalysisTest with SharedSparkSession {
     assert(e.message.contains("does not support batch scan"))
   }
 
-  test("external lookup join: lookup-only relation is checked only as a lookup side") {
+  test("external lookup join: the lookup side still requires a read capability") {
     val left = LocalRelation(AttributeReference("id", IntegerType)())
     val lookupOnly = DataSourceV2Relation.create(
       CapabilityTable(EXTERNAL_LOOKUP), None, None, emptyMap)
