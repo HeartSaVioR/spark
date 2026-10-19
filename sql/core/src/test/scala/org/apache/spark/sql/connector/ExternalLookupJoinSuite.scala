@@ -25,7 +25,8 @@ import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
 
-import org.apache.spark.{SparkException, SparkIllegalArgumentException}
+import org.apache.spark.{SparkException, SparkIllegalArgumentException,
+  SparkUnsupportedOperationException}
 import org.apache.spark.sql.{AnalysisException, Column, DataFrame, Row}
 import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.catalyst.InternalRow
@@ -226,6 +227,40 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       left.join(lookup, left("id") === lookup("id")).collect()
     }
     assert(error.getMessage.contains("External lookup returned a null result cursor"))
+
+    def misconfigured(kind: String): DataFrame = spark.read
+      .format(classOf[MisconfiguredExternalLookupDataSource].getName)
+      .option("kind", kind)
+      .load()
+    val table = Map("table" -> "`MisconfiguredExternalLookupTable`")
+    Seq(
+      ("unknownField", "UNKNOWN_SCAN_FIELD", Map("field" -> "`unknown`")),
+      ("duplicateField", "DUPLICATE_SCAN_FIELD", Map("field" -> "`id`"))).foreach {
+      case (kind, subClass, parameters) =>
+        val lookup = misconfigured(kind)
+        checkError(
+          exception = intercept[AnalysisException] {
+            left.join(lookup, left("id") === lookup("id")).queryExecution.optimizedPlan
+          },
+          condition = s"DATA_SOURCE_INVALID_EXTERNAL_LOOKUP.$subClass",
+          parameters = table ++ parameters)
+    }
+
+    val noExternalLookup = misconfigured("noExternalLookup")
+    checkError(
+      exception = intercept[SparkUnsupportedOperationException] {
+        left.join(noExternalLookup, left("id") === noExternalLookup("id"))
+          .queryExecution.optimizedPlan
+      },
+      condition = "DATA_SOURCE_EXTERNAL_LOOKUP_NOT_SUPPORTED",
+      parameters = Map("description" -> "NoExternalLookupScan"))
+
+    val invalidOrdinal = misconfigured("invalidOrdinal")
+    val ordinalError = intercept[SparkException] {
+      left.join(invalidOrdinal, left("id") === invalidOrdinal("id")).collect()
+    }
+    assert(ordinalError.getMessage.contains(
+      "External lookup returned invalid input ordinal 5 for 1 requested parameter rows"))
   }
 
   test("an external lookup hinted DataFrame can be reused by multiple joins") {
@@ -503,6 +538,48 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
         val hintedDual = query("dual", "/*+ EXTERNAL_LOOKUP(r) */")
         assert(usesLookup(hintedDual))
         checkAnswer(hintedDual, expected)
+      }
+    }
+  }
+
+  test("a named external lookup hint targets unaliased, multipart, and aliased relations") {
+    withSQLConf(
+        s"spark.sql.catalog.$ExternalLookupCatalogName" ->
+          classOf[ExternalLookupTestCatalog].getName) {
+      withTempView("external_lookup_left", "external_lookup_right") {
+        Seq(1, 3).toDF("id").createOrReplaceTempView("external_lookup_left")
+        spark.read.format(classOf[DualCapabilityExternalLookupDataSource].getName).load()
+          .createOrReplaceTempView("external_lookup_right")
+        val expected = Seq(Row(1, "engineering"), Row(1, "research"), Row(3, null))
+        def query(hintTarget: String, right: String, rightName: String): DataFrame = sql(
+          s"""
+            |SELECT /*+ EXTERNAL_LOOKUP($hintTarget) */ l.id, $rightName.department
+            |FROM external_lookup_left l LEFT JOIN $right ON l.id = $rightName.id
+            |""".stripMargin)
+
+        val catalogTable = s"$ExternalLookupCatalogName.ns.dual"
+        Seq(
+          ("external_lookup_right", "external_lookup_right", "external_lookup_right"),
+          ("dual", catalogTable, "dual"),
+          ("ns.dual", catalogTable, "dual"),
+          (catalogTable, catalogTable, "dual"),
+          ("r", s"$catalogTable r", "r"),
+          ("s", "(SELECT * FROM external_lookup_right) s", "s")).foreach {
+          case (hintTarget, right, rightName) =>
+            val df = query(hintTarget, right, rightName)
+            assert(df.queryExecution.optimizedPlan.exists(
+              _.isInstanceOf[PreparedExternalLookupJoin]), hintTarget)
+            checkAnswer(df, expected)
+        }
+
+        // Like join strategy hints, a target name does not reach into an aliased subquery.
+        checkError(
+          exception = intercept[AnalysisException] {
+            query("external_lookup_right", "(SELECT * FROM external_lookup_right) s", "s")
+              .queryExecution.analyzed
+          },
+          condition = "INVALID_EXTERNAL_LOOKUP_HINT.RELATION_NOT_FOUND",
+          parameters = Map("relations" -> "`external_lookup_right`"))
       }
     }
   }
@@ -1795,12 +1872,42 @@ case class MisconfiguredExternalLookupTable(kind: String) extends Table with Sup
   override def schema(): StructType = SimpleExternalLookupDataSource.outputSchema
   override def capabilities(): java.util.Set[TableCapability] = kind match {
     case "batchOnly" => java.util.EnumSet.of(BATCH_READ)
-    case "noLookupBuilder" => java.util.EnumSet.of(EXTERNAL_LOOKUP)
+    case _ => java.util.EnumSet.of(EXTERNAL_LOOKUP)
   }
 
-  override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = () =>
-    SimpleExternalLookupScan(100, 0, failRequests = false, mutateAfterRequest = false,
-      nullCursor = false, schema(), excludeResearch = false, Seq("="))
+  override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = kind match {
+    case "batchOnly" | "noLookupBuilder" => () =>
+      SimpleExternalLookupScan(100, 0, failRequests = false, mutateAfterRequest = false,
+        nullCursor = false, schema(), excludeResearch = false, Seq("="))
+    case _ => new SupportsExternalLookup {
+      override def selectLookupPredicates(candidates: Array[Predicate]): Array[Predicate] =
+        candidates.take(1)
+      override def build(): Scan = kind match {
+        case "unknownField" => NoExternalLookupScan(new StructType().add("unknown", "int"))
+        case "duplicateField" =>
+          NoExternalLookupScan(new StructType().add("id", "int").add("id", "int"))
+        case "noExternalLookup" => NoExternalLookupScan(schema())
+        case "invalidOrdinal" => new Scan {
+          override def readSchema(): StructType = schema()
+          override def toExternalLookup(): ExternalLookup =
+            TestExternalLookup(10, InvalidOrdinalExternalLookupReaderFactory)
+        }
+      }
+    }
+  }
+}
+
+case class NoExternalLookupScan(readSchema: StructType) extends Scan {
+  override def description(): String = "NoExternalLookupScan"
+}
+
+object InvalidOrdinalExternalLookupReaderFactory extends ExternalLookupReaderFactory {
+  override def createReader(): ExternalLookupReader = new ExternalLookupReader {
+    override def lookupBatch(keys: Array[InternalRow]): ExternalLookupResultCursor =
+      new TestExternalLookupResultCursor(
+        Iterator(5 -> InternalRow(1, UTF8String.fromString("value"))))
+    override def close(): Unit = {}
+  }
 }
 
 case class TestExternalLookup(

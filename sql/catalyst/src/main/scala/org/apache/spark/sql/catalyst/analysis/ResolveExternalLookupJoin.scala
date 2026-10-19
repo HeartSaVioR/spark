@@ -27,7 +27,7 @@ import org.apache.spark.sql.catalyst.optimizer.EliminateResolvedHint
 import org.apache.spark.sql.catalyst.plans.{Inner, LeftAnti, LeftOuter, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupCacheOptions,
   ExternalLookupHint, ExternalLookupJoin, Join, JoinHint, LogicalPlan, SubqueryAlias,
-  UnresolvedHint}
+  UnresolvedHint, UnresolvedWith, View}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.connector.catalog.Table
 import org.apache.spark.sql.connector.catalog.TableCapability.{BATCH_READ, EXTERNAL_LOOKUP}
@@ -177,19 +177,23 @@ object ResolveExternalLookupJoin extends Rule[LogicalPlan] with QueryErrorsBase 
       if (wrappedJoin) rewritten else ExternalLookupHint(child, cacheOptions)
     } else {
       val matched = mutable.HashSet.empty[Seq[String]]
-      val rewritten = child.resolveOperatorsDown {
-        case alias: SubqueryAlias =>
-          val identifier = alias.identifier.qualifier :+ alias.identifier.name
-          relationNames.find { name =>
-            !matched.contains(name) &&
-              ResolveHints.matchedIdentifier(name, identifier, SQLConf.get.resolver)
-          } match {
-            case Some(name) =>
-              matched += name
-              ExternalLookupHint(alias, cacheOptions)
-            case None => alias
-          }
+      def matches(identifier: Seq[String]): Boolean = relationNames.find { name =>
+        !matched.contains(name) &&
+          ResolveHints.matchedIdentifier(name, identifier, SQLConf.get.resolver)
+      }.map(matched.add).nonEmpty
+      // Mirrors the target scoping of ResolveHints.ResolveJoinStrategyHints: a name matches an
+      // unaliased (possibly multipart) table or an alias, and does not reach into a view,
+      // a WITH clause, or an aliased subquery.
+      def applyHint(plan: LogicalPlan): LogicalPlan = plan match {
+        case relation: UnresolvedRelation if matches(relation.multipartIdentifier) =>
+          ExternalLookupHint(relation, cacheOptions)
+        case alias: SubqueryAlias
+            if matches(alias.identifier.qualifier :+ alias.identifier.name) =>
+          ExternalLookupHint(alias, cacheOptions)
+        case _: View | _: UnresolvedWith | _: SubqueryAlias => plan
+        case _ => plan.mapChildren(applyHint)
       }
+      val rewritten = applyHint(child)
       val missing = relationNames.filterNot(matched.contains)
       if (missing.nonEmpty) {
         throw QueryCompilationErrors.invalidExternalLookupHintError(
