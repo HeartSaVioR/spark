@@ -1250,8 +1250,7 @@ abstract class StreamingOuterJoinBase extends StreamingJoinSuite {
             CheckNewAnswer(),
             AddData(watermarkInput, (2, 40)),
             CheckNewAnswer(expected),
-            assertNumStateRows(total = Seq(2), updated = Seq(3),
-              droppedByWatermark = Seq(0), removed = Some(Seq(1))),
+            assertNumStateRows(total = 2, updated = 3),
             StopStream,
             StartStream(checkpointLocation = checkpoint.getCanonicalPath),
             // The unwatermarked input can introduce rows below an earlier eviction cutoff.
@@ -1264,10 +1263,9 @@ abstract class StreamingOuterJoinBase extends StreamingJoinSuite {
             // Watermarked-side state must survive for future unwatermarked input.
             AddData(stateInput, (2, 30)),
             CheckNewAnswer(Row(2, 2, 30, 30)),
-            assertNumStateRows(total = Seq(3),
-              updated = Seq(if (joinType == "left_outer") 3 else 2),
-              droppedByWatermark = Seq(1),
-              removed = Some(Seq(if (joinType == "left_outer") 2 else 1)))
+            assertNumStateRows(total = 3,
+              updated = if (joinType == "left_outer") 3 else 2,
+              droppedByWatermark = 1)
           )
         }
       }
@@ -1299,8 +1297,7 @@ abstract class StreamingOuterJoinBase extends StreamingJoinSuite {
           CheckNewAnswer(matches: _*),
           AddData(watermarkInput, (3, 60)),
           CheckNewAnswer(unmatched),
-          assertNumStateRows(total = Seq(4), updated = Seq(6),
-            droppedByWatermark = Seq(0), removed = Some(Seq(2)))
+          assertNumStateRows(total = 4, updated = 6)
         )
       }
     }

@@ -985,8 +985,7 @@ case class StreamingSymmetricHashJoinExec(
      * processing the rows for outer join.
      */
     def removeAndReturnOldState(): Iterator[KeyToValuePair] = {
-      val numRemovedStateRows = longMetric("numRemovedStateRows")
-      val removedRowIter = stateWatermarkPredicate match {
+      stateWatermarkPredicate match {
         case Some(JoinStateKeyWatermarkPredicate(_, stateWatermark, prevStateWatermark)) =>
           joinStateManager match {
             case s: SupportsEvictByCondition =>
@@ -1008,10 +1007,6 @@ case class StreamingSymmetricHashJoinExec(
                 prevStateWatermark.map(watermarkMsToStateTimestamp))
           }
         case _ => Iterator.empty
-      }
-      removedRowIter.map { row =>
-        numRemovedStateRows += 1
-        row
       }
     }
 
