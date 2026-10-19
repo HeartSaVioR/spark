@@ -212,8 +212,12 @@ case class ExternalLookupJoinExec(
 
         val misses = mutable.LinkedHashMap.empty[UnsafeRow, UnsafeRow]
         val cachedValues = mutable.HashMap.empty[UnsafeRow, Array[InternalRow]]
+        // Classify each distinct key once per batch: every path fans out to all rows sharing the
+        // key, so a key must not be both a cache hit and a miss (e.g. across a TTL boundary).
         rows.foreach { case (_, requestParameters, semanticParameters) =>
-          if (!hasUnmatchableNull(requestParameters)) {
+          if (!hasUnmatchableNull(requestParameters) &&
+              !cachedValues.contains(semanticParameters) &&
+              !misses.contains(semanticParameters)) {
             val cached = if (useCache) getCached(semanticParameters) else null
             if (cached != null) {
               cachedValues.put(semanticParameters, cached.values)

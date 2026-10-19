@@ -124,6 +124,30 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       parameters = Map("table" -> "`DualCapabilityExternalLookupTable`"))
   }
 
+  test("a strategy hint on a nested join does not disable an outer lookup join") {
+    val left = Seq((1, 10), (2, 20)).toDF("id", "k")
+    val other = Seq((10, "a"), (20, "b")).toDF("k", "v")
+    val nested = left.join(other.hint("merge"), "k")
+    def usesLookup(df: DataFrame): Boolean =
+      df.queryExecution.optimizedPlan.exists(_.isInstanceOf[PreparedExternalLookupJoin])
+
+    val dual = spark.read.format(classOf[DualCapabilityExternalLookupDataSource].getName).load()
+      .hint("external_lookup")
+    val dualJoin = nested.join(dual, nested("id") === dual("id"))
+    assert(usesLookup(dualJoin))
+    checkAnswer(dualJoin, Seq(
+      Row(10, 1, "a", 1, "engineering"), Row(10, 1, "a", 1, "research"),
+      Row(20, 2, "b", 2, "sales")))
+
+    // Falling back to an ordinary join would fail: a lookup-only table cannot be scanned.
+    val lookupOnly = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
+    val lookupOnlyJoin = nested.join(lookupOnly, nested("id") === lookupOnly("id"))
+    assert(usesLookup(lookupOnlyJoin))
+    checkAnswer(lookupOnlyJoin, Seq(
+      Row(10, 1, "a", 1, "engineering"), Row(10, 1, "a", 1, "research"),
+      Row(20, 2, "b", 2, "sales")))
+  }
+
   test("an explicit external lookup option marker rejects unsupported join shapes") {
     val lookup = spark.read.format(classOf[DualCapabilityExternalLookupDataSource].getName).load()
     val left = Seq(1).toDF("id")
@@ -139,6 +163,13 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       parameters = Map(
         "joinType" -> "RIGHT OUTER",
         "supportedJoinTypes" -> "INNER, LEFT OUTER, LEFT SEMI, LEFT ANTI"))
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        left.crossJoin(lookup.hint("external_lookup")).queryExecution.analyzed
+      },
+      condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.MISSING_JOIN_CONDITION",
+      parameters = Map.empty)
 
     SimpleExternalLookupDataSource.resetCounters()
     val optedOut = left.join(
@@ -903,6 +934,28 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       assert(left.join(lookup, left("id") === lookup("id"), "left_outer").count() === 2)
     }
     assert(SimpleExternalLookupDataSource.requestedKeys.asScala.toSeq === Seq(2, 2))
+  }
+
+  test("a cache entry expiring between duplicate keys in one batch is looked up once") {
+    SimpleExternalLookupDataSource.resetCounters()
+    val calls = new AtomicInteger(0)
+    val expired = TimeUnit.MILLISECONDS.toNanos(2)
+    val lookup = spark.read
+      .format(classOf[SimpleExternalLookupDataSource].getName)
+      .option("maxBatchSize", "2")
+      .load()
+      .hint("external_lookup", "cache_ttl=1ms")
+    // Batches [2, 1] and [2, 2]. The clock is read when the first batch writes the cache and on
+    // each cache probe; it expires the entry for key 2 between the two rows of the second batch.
+    val left = Seq(2, 1, 2, 2).toDF("id").coalesce(1)
+
+    val rows = ExternalLookupJoinExec.withCacheTimeNanos { () =>
+      if (calls.incrementAndGet() <= 2) 0L else expired
+    } {
+      left.join(lookup, left("id") === lookup("id"), "inner").collect().toSeq
+    }
+    assert(rows.map(_.getInt(0)).sorted === Seq(1, 1, 2, 2, 2))
+    assert(SimpleExternalLookupDataSource.requestedKeys.asScala.toSeq === Seq(2, 1))
   }
 
   test("external lookup reports cache metrics") {

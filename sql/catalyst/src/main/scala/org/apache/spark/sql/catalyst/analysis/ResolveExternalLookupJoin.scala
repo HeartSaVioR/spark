@@ -23,10 +23,11 @@ import scala.collection.mutable
 import scala.util.control.NonFatal
 
 import org.apache.spark.sql.catalyst.expressions.{Expression, Literal, StringLiteral}
+import org.apache.spark.sql.catalyst.optimizer.EliminateResolvedHint
 import org.apache.spark.sql.catalyst.plans.{Inner, LeftAnti, LeftOuter, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupCacheOptions,
-  ExternalLookupHint, ExternalLookupJoin, Join, JoinHint, LogicalPlan, ResolvedHint,
-  SubqueryAlias, UnresolvedHint}
+  ExternalLookupHint, ExternalLookupJoin, Join, JoinHint, LogicalPlan, SubqueryAlias,
+  UnresolvedHint}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.connector.catalog.Table
 import org.apache.spark.sql.connector.catalog.TableCapability.{BATCH_READ, EXTERNAL_LOOKUP}
@@ -86,6 +87,10 @@ object ResolveExternalLookupJoin extends Rule[LogicalPlan] with QueryErrorsBase 
       if (hasJoinStrategyHint(hint, left, right)) {
         join.copy(right = lookupPlan)
       } else if (condition.isEmpty) {
+        if (hasLookupOptions) {
+          throw QueryCompilationErrors.unsupportedExternalLookupJoinError(
+            "MISSING_JOIN_CONDITION")
+        }
         join
       } else if (!SupportedJoinTypes.contains(joinType)) {
         if (hasLookupOptions) {
@@ -133,12 +138,13 @@ object ResolveExternalLookupJoin extends Rule[LogicalPlan] with QueryErrorsBase 
       hint: JoinHint,
       left: LogicalPlan,
       right: LogicalPlan): Boolean = {
+    // Only the hints that EliminateResolvedHint will attach to this join count; a strategy hint
+    // on a nested join belongs to that join.
     hint.leftHint.exists(_.strategy.isDefined) ||
       hint.rightHint.exists(_.strategy.isDefined) ||
-      Seq(left, right).exists(_.exists {
-        case ResolvedHint(_, hintInfo) => hintInfo.strategy.isDefined
-        case _ => false
-      })
+      Seq(left, right).exists { side =>
+        EliminateResolvedHint.extractHintsFromPlan(side)._2.exists(_.strategy.isDefined)
+      }
   }
 
   private def resolveHint(parameters: Seq[Expression], child: LogicalPlan): LogicalPlan = {

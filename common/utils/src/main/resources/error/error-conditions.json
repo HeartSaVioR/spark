@@ -2838,6 +2838,11 @@
           "The lookup side must be a DSv2 table, optionally followed by projections and filters."
         ]
       },
+      "MISSING_JOIN_CONDITION" : {
+        "message" : [
+          "The join has no join condition."
+        ]
+      },
       "NO_LOOKUP_PREDICATE" : {
         "message" : [
           "The data source of table <table> did not select any lookup predicate from the join condition."
