@@ -68,6 +68,486 @@ from pyspark.testing.utils import (
 from pyspark.util import is_remote_only
 
 
+@unittest.skipIf(not have_pyarrow, pyarrow_requirement_message)
+class PythonExternalLookupPlanningTests(unittest.TestCase):
+    def plan_lookup(self, data_source, schema, max_arrow_batch_size=2):
+        from pyspark.serializers import read_int, write_int, write_with_length
+        from pyspark.sql.worker.plan_data_source_lookup import _main
+        from pyspark.worker_util import pickleSer
+
+        infile, outfile = io.BytesIO(), io.BytesIO()
+        pickleSer._write_with_length(data_source, infile)
+        write_with_length(schema.json().encode("utf-8"), infile)
+        predicates = [{"name": "=", "field": ["id"], "parameterDataType": IntegerType().json()}]
+        write_with_length(json.dumps(predicates).encode("utf-8"), infile)
+        write_int(max_arrow_batch_size, infile)
+        infile.write(b"\x00")
+        infile.seek(0)
+        _main(infile, outfile)
+        outfile.seek(0)
+        command = pickleSer._read_with_length(outfile)
+        max_rows = read_int(outfile)
+        selected = [read_int(outfile) for _ in range(read_int(outfile))]
+        return command, max_rows, selected
+
+    def make_lookup(self, selected, max_rows=2):
+        from pyspark.sql.datasource import ExternalLookup
+
+        class Lookup(ExternalLookup):
+            def selectedPredicateIndexes(self):
+                return selected
+
+            def maxParameterRowsPerRequest(self):
+                return max_rows
+
+            def lookup(self, parameters):
+                yield from ()
+
+        return Lookup()
+
+    def test_lookup_predicate_deserialization(self):
+        from pyspark.sql.datasource import LookupParameter
+        from pyspark.sql.worker.plan_data_source_lookup import deserialize_lookup_predicate
+
+        for operator, predicate_type in [
+            ("=", EqualTo),
+            ("<=>", EqualNullSafe),
+            (">", GreaterThan),
+            (">=", GreaterThanOrEqual),
+            ("<", LessThan),
+            ("<=", LessThanOrEqual),
+        ]:
+            with self.subTest(operator=operator):
+                predicate = deserialize_lookup_predicate(
+                    {
+                        "name": operator,
+                        "field": ["nested", "value"],
+                        "parameterDataType": DecimalType(10, 2).json(),
+                    }
+                )
+                self.assertIsInstance(predicate, predicate_type)
+                self.assertEqual(predicate.attribute, ("nested", "value"))
+                self.assertEqual(predicate.value, LookupParameter(DecimalType(10, 2)))
+
+        with self.assertRaisesRegex(Exception, "supported external lookup predicate"):
+            deserialize_lookup_predicate(
+                {"name": "IN", "field": ["id"], "parameterDataType": IntegerType().json()}
+            )
+
+    def test_selected_predicate_indexes_preserve_occurrences_and_order(self):
+        from pyspark.sql.datasource import LookupParameter
+        from pyspark.sql.worker.plan_data_source_lookup import validate_selected_predicate_indexes
+
+        predicates = [EqualTo(("id",), LookupParameter(IntegerType())) for _ in range(3)]
+        self.assertEqual(
+            validate_selected_predicate_indexes(self.make_lookup((2, 0)), predicates), [2, 0]
+        )
+        self.assertEqual(validate_selected_predicate_indexes(self.make_lookup([]), predicates), [])
+
+    def test_invalid_selected_predicate_indexes(self):
+        from pyspark.sql.worker.plan_data_source_lookup import validate_selected_predicate_indexes
+
+        predicates = [EqualTo(("id",), 1), EqualTo(("id",), 2)]
+        for selected in [None, "0", b"0", {0}, [None], [True], [0.0], [-1], [2], [0, 0]]:
+            with self.subTest(selected=selected):
+                with self.assertRaisesRegex(Exception, "DATA_SOURCE_TYPE_MISMATCH"):
+                    validate_selected_predicate_indexes(self.make_lookup(selected), predicates)
+
+    def test_max_parameter_rows_per_request(self):
+        from pyspark.sql.worker.plan_data_source_lookup import (
+            validate_max_parameter_rows_per_request,
+        )
+
+        self.assertEqual(validate_max_parameter_rows_per_request(self.make_lookup([0], 1)), 1)
+        for max_rows in [None, True, 1.5, "2", 0, -1, 2**31]:
+            with self.subTest(max_rows=max_rows):
+                with self.assertRaisesRegex(Exception, "DATA_SOURCE_TYPE_MISMATCH"):
+                    validate_max_parameter_rows_per_request(self.make_lookup([0], max_rows))
+
+    def test_lookup_output_schema(self):
+        from pyspark.sql.worker.plan_data_source_lookup import lookup_output_schema
+
+        schema = StructType([StructField("id", IntegerType(), True)])
+        self.assertEqual(
+            lookup_output_schema(schema),
+            StructType([StructField("input_ordinal", IntegerType(), False)] + schema.fields),
+        )
+        self.assertEqual(lookup_output_schema(StructType()).fieldNames(), ["input_ordinal"])
+
+    def test_python_source_capabilities(self):
+        from pyspark.serializers import read_int
+        from pyspark.sql.worker.create_data_source import _main
+        from pyspark.worker_util import pickleSer
+
+        class LookupOnly(DataSource):
+            def externalLookup(self, schema, predicates):
+                return None
+
+        class DualCapability(LookupOnly):
+            def reader(self, schema):
+                return None
+
+        class InheritedDualCapability(DualCapability):
+            pass
+
+        for source_class, expected in [
+            (DataSource, (False, False)),
+            (LookupOnly, (True, False)),
+            (DualCapability, (True, True)),
+            (InheritedDualCapability, (True, True)),
+        ]:
+            with self.subTest(source=source_class.__name__):
+                infile, outfile = io.BytesIO(), io.BytesIO()
+                pickleSer._write_with_length(source_class, infile)
+                infile.write(b"\x01")
+                infile.seek(0)
+                _main(infile, outfile)
+                outfile.seek(0)
+                self.assertEqual((read_int(outfile) != 0, read_int(outfile) != 0), expected)
+
+    def test_capability_probe_does_not_invoke_source_methods(self):
+        from pyspark.serializers import read_int
+        from pyspark.sql.worker.create_data_source import _main
+        from pyspark.worker_util import pickleSer
+
+        class Source(DataSource):
+            def __init__(self, options):
+                raise AssertionError("capability discovery must not construct a source")
+
+            @classmethod
+            def name(cls):
+                raise AssertionError("capability discovery must not call name")
+
+            def schema(self):
+                raise AssertionError("capability discovery must not call schema")
+
+        infile, outfile = io.BytesIO(), io.BytesIO()
+        pickleSer._write_with_length(Source, infile)
+        infile.write(b"\x01")
+        infile.seek(0)
+        _main(infile, outfile)
+        outfile.seek(0)
+        self.assertEqual((read_int(outfile), read_int(outfile)), (0, 0))
+
+    def test_lookup_planner_round_trip_and_batching(self):
+        import pyarrow as pa
+
+        from pyspark.sql.datasource import ExternalLookup
+
+        class Lookup(ExternalLookup):
+            def selectedPredicateIndexes(self):
+                return [0]
+
+            def maxParameterRowsPerRequest(self):
+                return 3
+
+            def lookup(self, parameters):
+                for batch in parameters:
+                    self.assert_parameter_schema(batch)
+                    for ordinal, value in reversed(list(zip(*batch.to_pydict().values()))):
+                        if value != 0:
+                            yield (ordinal, value)
+                            yield (ordinal, value + 10)
+
+            def assert_parameter_schema(self, batch):
+                if batch.schema.names != ["input_ordinal", "parameter_0"]:
+                    raise ValueError("Unexpected parameter schema")
+
+        class Source(DataSource):
+            def externalLookup(self, schema, predicates):
+                return Lookup()
+
+        schema = StructType([StructField("id", IntegerType())])
+        (function, return_type), max_rows, selected = self.plan_lookup(Source({}), schema)
+        self.assertEqual(max_rows, 3)
+        self.assertEqual(selected, [0])
+        self.assertEqual(return_type.fieldNames(), ["input_ordinal", "id"])
+        inputs = pa.RecordBatch.from_arrays(
+            [pa.array([0, 1, 2], type=pa.int32()), pa.array([1, 0, 2], type=pa.int32())],
+            names=["input_ordinal", "parameter_0"],
+        )
+        outputs = list(function(iter([inputs])))
+        self.assertEqual([batch.num_rows for batch in outputs], [2, 2])
+        self.assertEqual(
+            [row for batch in outputs for row in batch.to_pylist()],
+            [
+                {"input_ordinal": 2, "id": 2},
+                {"input_ordinal": 2, "id": 12},
+                {"input_ordinal": 0, "id": 1},
+                {"input_ordinal": 0, "id": 11},
+            ],
+        )
+
+    def test_lookup_unlimited_arrow_batch_sizes(self):
+        from pyspark.sql.datasource import ExternalLookup
+
+        class Lookup(ExternalLookup):
+            def selectedPredicateIndexes(self):
+                return [0]
+
+            def maxParameterRowsPerRequest(self):
+                return 2
+
+            def lookup(self, parameters):
+                for ordinal in range(5):
+                    yield (ordinal, ordinal + 10)
+
+        class Source(DataSource):
+            def externalLookup(self, schema, predicates):
+                return Lookup()
+
+        schema = StructType([StructField("id", IntegerType())])
+        for batch_size in [0, -1]:
+            with self.subTest(batch_size=batch_size):
+                (function, _), max_rows, _ = self.plan_lookup(Source({}), schema, batch_size)
+                self.assertEqual(max_rows, 2)
+                batches = list(function(iter([])))
+                self.assertEqual([batch.num_rows for batch in batches], [5])
+                self.assertEqual(batches[0].column(0).to_pylist(), list(range(5)))
+
+    def test_lookup_tuple_ordinals_are_lossless(self):
+        import numpy as np
+        import pyarrow as pa
+
+        from pyspark.sql.datasource import ExternalLookup
+
+        class Lookup(ExternalLookup):
+            def selectedPredicateIndexes(self):
+                return [0]
+
+            def lookup(self, parameters):
+                yield self.output
+
+        class Source(DataSource):
+            def externalLookup(self, schema, predicates):
+                lookup = Lookup()
+                lookup.output = self.options["output"]
+                return lookup
+
+        schema = StructType([StructField("id", IntegerType())])
+        invalid_ordinals = [0.5, -0.5, 0.0, True, False, "0", None, -1, -(2**31) - 1, 2**31]
+        invalid_ordinals += [
+            np.bool_(True),
+            np.bool_(False),
+            np.float64(0.5),
+            np.float32(-0.5),
+            np.float64(0.0),
+            np.int32(-1),
+            np.int64(2**31),
+            np.uint64(2**63),
+        ]
+        invalid_ordinals += [pa.scalar(value) for value in [True, False, 0.5, -0.5, 0.0, -1]]
+        invalid_ordinals += [pa.scalar(None, type=pa.int32()), pa.scalar(2**31)]
+        for ordinal in invalid_ordinals:
+            for row_type in [
+                tuple,
+                list,
+                lambda values: Row(id=values[1], input_ordinal=values[0]),
+            ]:
+                with self.subTest(ordinal=ordinal, row_type=row_type):
+                    (function, _), _, _ = self.plan_lookup(
+                        Source({"output": row_type([ordinal, 17])}), schema
+                    )
+                    with self.assertRaisesRegex(Exception, "input_ordinal"):
+                        list(function(iter([])))
+
+        valid_ordinals = [
+            0,
+            2**31 - 1,
+            np.int32(0),
+            np.int64(2**31 - 1),
+            np.uint32(2**31 - 1),
+            np.uint64(2**31 - 1),
+            pa.scalar(0, type=pa.int32()),
+            pa.scalar(2**31 - 1, type=pa.int64()),
+        ]
+        for ordinal in valid_ordinals:
+            for row_type in [
+                tuple,
+                list,
+                lambda values: Row(id=values[1], input_ordinal=values[0]),
+            ]:
+                with self.subTest(ordinal=ordinal, row_type=row_type):
+                    (function, _), _, _ = self.plan_lookup(
+                        Source({"output": row_type([ordinal, 17])}), schema
+                    )
+                    self.assertEqual(
+                        list(function(iter([])))[0].to_pydict(),
+                        {
+                            "input_ordinal": [
+                                ordinal.as_py() if isinstance(ordinal, pa.Scalar) else int(ordinal)
+                            ],
+                            "id": [17],
+                        },
+                    )
+
+    def test_lookup_integer_column_ordinals(self):
+        import pyarrow as pa
+
+        from pyspark.sql.datasource import ExternalLookup
+
+        class Lookup(ExternalLookup):
+            def selectedPredicateIndexes(self):
+                return [0]
+
+            def lookup(self, parameters):
+                for batch in parameters:
+                    if self.mode == "arrow":
+                        rows = zip(batch.column(0), batch.column(1))
+                    elif self.mode == "numpy":
+                        rows = zip(batch.column(0).to_numpy(), batch.column(1).to_numpy())
+                    else:
+                        rows = batch.to_pandas().to_records(index=False)
+                    for ordinal, value in rows:
+                        if self.row_type == "row":
+                            yield Row(id=value, input_ordinal=ordinal)
+                        elif self.row_type == "list":
+                            yield [ordinal, value]
+                        else:
+                            yield (ordinal, value)
+
+        class Source(DataSource):
+            def externalLookup(self, schema, predicates):
+                lookup = Lookup()
+                lookup.mode = self.options["mode"]
+                lookup.row_type = self.options["row_type"]
+                return lookup
+
+        schema = StructType([StructField("id", IntegerType())])
+        batch = pa.record_batch(
+            [pa.array([0, 1, 2], type=pa.int32()), pa.array([17, 18, 19], type=pa.int32())],
+            names=["input_ordinal", "parameter_0"],
+        )
+        for mode in ["arrow", "numpy", "pandas"]:
+            for row_type in ["tuple", "list", "row"]:
+                with self.subTest(mode=mode, row_type=row_type):
+                    (function, _), _, _ = self.plan_lookup(
+                        Source({"mode": mode, "row_type": row_type}), schema
+                    )
+                    batches = list(function(iter([batch])))
+                    self.assertEqual(
+                        pa.Table.from_batches(batches).to_pydict(),
+                        {"input_ordinal": [0, 1, 2], "id": [17, 18, 19]},
+                    )
+
+    def test_lookup_iterator_cleanup_on_failure_and_early_close(self):
+        from pyspark.sql.datasource import ExternalLookup
+
+        class Lookup(ExternalLookup):
+            def selectedPredicateIndexes(self):
+                return [0]
+
+            def lookup(self, parameters):
+                def rows():
+                    try:
+                        yield (0, 1 if self.valid else "not an integer")
+                    finally:
+                        with open(self.path, "w") as output:
+                            output.write("closed")
+
+                self.output = rows()
+                return self.output
+
+        class Source(DataSource):
+            def externalLookup(self, schema, predicates):
+                lookup = Lookup()
+                lookup.path = self.options["path"]
+                lookup.valid = self.options["valid"]
+                return lookup
+
+        with tempfile.TemporaryDirectory() as directory:
+            schema = StructType([StructField("id", IntegerType())])
+            for valid in [False, True]:
+                with self.subTest(valid=valid):
+                    path = os.path.join(directory, str(valid))
+                    (function, _), _, _ = self.plan_lookup(
+                        Source({"path": path, "valid": valid}), schema, 1
+                    )
+                    output = function(iter([]))
+                    if valid:
+                        next(output)
+                        self.assertFalse(os.path.exists(path))
+                        output.close()
+                    else:
+                        with self.assertRaises(Exception):
+                            next(output)
+                    self.assertTrue(os.path.exists(path))
+
+    def test_lookup_arrow_results_validate_every_batch_and_ordinals(self):
+        import pyarrow as pa
+
+        from pyspark.sql.datasource import ExternalLookup
+
+        class Lookup(ExternalLookup):
+            def selectedPredicateIndexes(self):
+                return [0]
+
+            def lookup(self, parameters):
+                schema = pa.schema(
+                    [pa.field("input_ordinal", pa.int32(), False), pa.field("id", pa.int32())]
+                )
+                yield pa.RecordBatch.from_arrays(
+                    [pa.array([0], type=pa.int32()), pa.array([1], type=pa.int32())], schema=schema
+                )
+                if self.mode == "wrong_schema":
+                    yield pa.RecordBatch.from_arrays(
+                        [pa.array([0], type=pa.int32()), pa.array(["wrong"])],
+                        names=["input_ordinal", "id"],
+                    )
+                else:
+                    yield pa.RecordBatch.from_arrays(
+                        [pa.array([None], type=pa.int32()), pa.array([1], type=pa.int32())],
+                        schema=schema,
+                    )
+
+        class Source(DataSource):
+            def externalLookup(self, schema, predicates):
+                lookup = Lookup()
+                lookup.mode = self.options["mode"]
+                return lookup
+
+        schema = StructType([StructField("id", IntegerType())])
+        for mode, message in [
+            ("wrong_schema", "DATA_SOURCE_RETURN_SCHEMA_MISMATCH"),
+            ("null_ordinal", "non-null input_ordinal"),
+        ]:
+            with self.subTest(mode=mode):
+                (function, _), _, _ = self.plan_lookup(Source({"mode": mode}), schema)
+                with self.assertRaisesRegex(Exception, message):
+                    list(function(iter([])))
+
+    def test_lookup_invalid_return_types_and_rows(self):
+        from pyspark.sql.datasource import ExternalLookup
+
+        class Lookup(ExternalLookup):
+            def selectedPredicateIndexes(self):
+                return [0]
+
+            def lookup(self, parameters):
+                if self.mode == "not_iterator":
+                    return [(0, 1)]
+                if self.mode == "wrong_shape":
+                    return iter([(0,)])
+                raise RuntimeError("lookup failure is not swallowed")
+
+        class Source(DataSource):
+            def externalLookup(self, schema, predicates):
+                lookup = Lookup()
+                lookup.mode = self.options["mode"]
+                return lookup
+
+        schema = StructType([StructField("id", IntegerType())])
+        for mode, message in [
+            ("not_iterator", "DATA_SOURCE_INVALID_RETURN_TYPE"),
+            ("wrong_shape", "DATA_SOURCE_RETURN_SCHEMA_MISMATCH"),
+            ("failure", "lookup failure is not swallowed"),
+        ]:
+            with self.subTest(mode=mode):
+                (function, _), _, _ = self.plan_lookup(Source({"mode": mode}), schema)
+                with self.assertRaisesRegex(Exception, message):
+                    list(function(iter([])))
+
+
 class PythonDataSourceWorkerUtilsTests(unittest.TestCase):
     def test_profiler_accumulators_are_created_only_when_profiling_is_enabled(self):
         from pyspark.accumulators import (

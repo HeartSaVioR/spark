@@ -74,7 +74,7 @@ private[python] trait PythonArrowOutput[OUT <: AnyRef] { self: BasePythonRunner[
       private var schema: StructType = _
       private var processor: ArrowOutputProcessor = _
 
-      context.addTaskCompletionListener[Unit] { _ =>
+      registerTaskCompletionListener(context, () => {
         if (processor != null) {
           processor.close()
         }
@@ -82,7 +82,7 @@ private[python] trait PythonArrowOutput[OUT <: AnyRef] { self: BasePythonRunner[
           reader.close(false)
         }
         allocator.close()
-      }
+      })
 
       private var batchLoaded = true
 

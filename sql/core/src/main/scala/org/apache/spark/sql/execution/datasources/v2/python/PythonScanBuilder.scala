@@ -16,7 +16,8 @@
  */
 package org.apache.spark.sql.execution.datasources.v2.python
 
-import org.apache.spark.sql.connector.read.{Scan, ScanBuilder, SupportsPushDownFilters, SupportsPushDownLimit}
+import org.apache.spark.sql.connector.expressions.filter.Predicate
+import org.apache.spark.sql.connector.read.{Scan, ScanBuilder, SupportsExternalLookup, SupportsPushDownFilters, SupportsPushDownLimit, SupportsPushDownRequiredColumns}
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.sources.Filter
@@ -27,11 +28,18 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap
 class PythonScanBuilder(
     ds: PythonDataSourceV2,
     shortName: String,
-    outputSchema: StructType,
+    initialSchema: StructType,
     options: CaseInsensitiveStringMap)
     extends ScanBuilder
     with SupportsPushDownFilters
-    with SupportsPushDownLimit {
+    with SupportsPushDownLimit
+    with SupportsPushDownRequiredColumns
+    with SupportsExternalLookup {
+  private var outputSchema: StructType = initialSchema
+  private var lookupPredicates: Array[Predicate] = Array.empty
+  private var selectedLookupPredicateIndexes: Array[Int] = Array.emptyIntArray
+  private lazy val creationResult =
+    ds.getOrCreateDataSourceInPython(shortName, options, Some(initialSchema))
   private var supportedFilters: Array[Filter] = Array.empty
   // All filters handed to `pushFilters`, kept so that `pushLimit` can replay them and bring the
   // Python reader back to the same state before calling `pushLimit` on it.
@@ -64,12 +72,28 @@ class PythonScanBuilder(
       checkFiltersReplayedDeterministically(result)
       readInfo = result.readInfo
     }
-    new PythonScan(ds, shortName, outputSchema, options, supportedFilters, pushedLimit, readInfo)
+    new PythonScan(ds, shortName, outputSchema, options, supportedFilters, pushedLimit, readInfo,
+      lookupPredicates, selectedLookupPredicateIndexes)
+  }
+
+  override def pruneColumns(requiredSchema: StructType): Unit = {
+    if (selectedLookupPredicateIndexes.nonEmpty) {
+      outputSchema = requiredSchema
+    }
+  }
+
+  override def selectLookupPredicates(candidates: Array[Predicate]): Array[Predicate] = {
+    val selectedIndexes = ds.source.createLookupInfoInPython(
+      creationResult, initialSchema, candidates).map(_.selectedPredicateIndexes.toArray)
+      .getOrElse(Array.emptyIntArray)
+    lookupPredicates = candidates.clone()
+    selectedLookupPredicateIndexes = selectedIndexes
+    selectedIndexes.map(lookupPredicates.apply)
   }
 
   // Optionally called by DSv2 once to push down filters before the scan is built.
   override def pushFilters(filters: Array[Filter]): Array[Filter] = {
-    if (!SQLConf.get.pythonFilterPushDown) {
+    if (!SQLConf.get.pythonFilterPushDown || ds.source.capabilities.supportsExternalLookup) {
       return filters
     }
     allFilters = filters
@@ -99,7 +123,8 @@ class PythonScanBuilder(
   // pushable filters) are replayed here to rebuild the same reader state before `pushLimit` is
   // invoked on it in Python.
   override def pushLimit(limit: Int): Boolean = {
-    if (!SQLConf.get.pythonLimitPushDown) {
+    if (!SQLConf.get.pythonLimitPushDown || !ds.source.capabilities.supportsBatchRead ||
+        selectedLookupPredicateIndexes.nonEmpty) {
       return false
     }
 

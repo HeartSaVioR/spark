@@ -46,6 +46,7 @@ def _main(infile: IO, outfile: IO) -> None:
 
     The JVM sends the following information to this process:
     - a `DataSource` class representing the data source to be created.
+    - whether to inspect class capabilities without constructing an instance.
     - a provider name in string.
     - an optional user-specified schema in json string.
     - a dictionary of options in string.
@@ -63,6 +64,11 @@ def _main(infile: IO, outfile: IO) -> None:
                 "actual": f"'{type(data_source_cls).__name__}'",
             },
         )
+
+    if read_bool(infile):
+        write_int(int(data_source_cls.externalLookup is not DataSource.externalLookup), outfile)
+        write_int(int(data_source_cls.reader is not DataSource.reader), outfile)
+        return
 
     # Check the name method is a class method.
     if not inspect.ismethod(data_source_cls.name):

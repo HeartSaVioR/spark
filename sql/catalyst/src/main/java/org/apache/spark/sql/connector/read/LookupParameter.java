@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.connector.read;
 
+import java.io.Serializable;
+
 import org.apache.spark.annotation.Evolving;
 import org.apache.spark.sql.connector.expressions.Expression;
 import org.apache.spark.sql.types.DataType;
@@ -31,7 +33,8 @@ import org.apache.spark.sql.types.DataType;
  * @since 4.4.0
  */
 @Evolving
-public final class LookupParameter implements Expression {
+public final class LookupParameter implements Expression, Serializable {
+  private static final long serialVersionUID = 1L;
   private final DataType dataType;
 
   public LookupParameter(DataType dataType) {

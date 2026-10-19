@@ -18,9 +18,11 @@ package org.apache.spark.sql.execution.datasources.v2.python
 
 import org.apache.spark.JobArtifactSet
 import org.apache.spark.sql.classic.SparkSession
+import org.apache.spark.sql.connector.expressions.filter.Predicate
 import org.apache.spark.sql.connector.metric.CustomMetric
 import org.apache.spark.sql.connector.read._
 import org.apache.spark.sql.connector.read.streaming.MicroBatchStream
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.connector.SupportsMetadata
 import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.StructType
@@ -35,9 +37,43 @@ class PythonScan(
     pushedLimit: Option[Int] = None,
     // Read info computed during filter/limit pushdown, if any. Scoped to this scan so it does not
     // leak across scans that share the same `PythonDataSourceV2` (see `PythonScanBuilder`).
-    readInfo: Option[PythonDataSourceReadInfo] = None
+    readInfo: Option[PythonDataSourceReadInfo] = None,
+    lookupPredicates: Array[Predicate] = Array.empty,
+    selectedLookupPredicateIndexes: Array[Int] = Array.emptyIntArray
 ) extends Scan with SupportsMetadata {
   override def toBatch: Batch = new PythonBatch(ds, shortName, outputSchema, options, readInfo)
+
+  override def toExternalLookup(): ExternalLookup = {
+    if (selectedLookupPredicateIndexes.isEmpty) {
+      throw QueryCompilationErrors.pythonDataSourceError(
+        action = "plan", tpe = "external lookup",
+        msg = "External lookup predicates were not selected")
+    }
+    val creationResult = ds.getOrCreateDataSourceInPython(shortName, options, Some(outputSchema))
+    val lookupInfo = ds.source.createLookupInfoInPython(
+      creationResult, outputSchema, lookupPredicates).getOrElse {
+      throw QueryCompilationErrors.pythonDataSourceError(
+        action = "plan", tpe = "external lookup",
+        msg = "Python data source did not return an external lookup")
+    }
+    if (!lookupInfo.selectedPredicateIndexes.sameElements(selectedLookupPredicateIndexes)) {
+      throw QueryCompilationErrors.pythonDataSourceError(
+        action = "plan", tpe = "external lookup",
+        msg = "Python data source returned different external lookup predicates after pruning")
+    }
+    val jobArtifactUUID = JobArtifactSet.getCurrentJobArtifactState.map(_.uuid)
+    val sessionUUID = SparkSession.getActiveSession.collect {
+      case session if session.sessionState.conf.pythonWorkerLoggingEnabled => session.sessionUUID
+    }
+    PythonExternalLookup(
+      ds.source,
+      lookupInfo.func,
+      selectedLookupPredicateIndexes.map(lookupPredicates.apply).toIndexedSeq,
+      outputSchema,
+      lookupInfo.maxParameterRowsPerRequest,
+      jobArtifactUUID,
+      sessionUUID)
+  }
 
   override def toMicroBatchStream(checkpointLocation: String): MicroBatchStream = {
     val runner = PythonMicroBatchStream.createPythonStreamingSourceRunner(

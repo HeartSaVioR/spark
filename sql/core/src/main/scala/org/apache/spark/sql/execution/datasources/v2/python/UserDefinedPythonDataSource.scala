@@ -34,7 +34,10 @@ import org.apache.spark.sql.catalyst.expressions.variant.VariantExpressionEvalUt
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
+import org.apache.spark.sql.connector.expressions.NamedReference
+import org.apache.spark.sql.connector.expressions.filter.Predicate
 import org.apache.spark.sql.connector.metric.{CustomMetric, CustomTaskMetric}
+import org.apache.spark.sql.connector.read.LookupParameter
 import org.apache.spark.sql.connector.write._
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.metric.SQLMetric
@@ -54,6 +57,10 @@ import org.apache.spark.util.ArrayImplicits._
  * @param dataSourceCls The Python data source class.
  */
 case class UserDefinedPythonDataSource(dataSourceCls: PythonFunction) {
+
+  private[python] lazy val capabilities: PythonDataSourceCapabilities = {
+    new UserDefinedPythonDataSourceCapabilitiesRunner(dataSourceCls).runInPython()
+  }
 
   /**
    * (Driver-side) Run Python process, and get the pickled Python Data Source
@@ -140,6 +147,19 @@ case class UserDefinedPythonDataSource(dataSourceCls: PythonFunction) {
   }
 
   /**
+   * (Driver-side) Run Python process, and get the external lookup function and access path.
+   */
+  def createLookupInfoInPython(
+      pythonResult: PythonDataSourceCreationResult,
+      outputSchema: StructType,
+      candidates: Array[Predicate]): Option[PythonDataSourceLookupInfo] = {
+    new UserDefinedPythonExternalLookupRunner(
+      createPythonFunction(pythonResult.dataSource),
+      outputSchema,
+      candidates.toIndexedSeq).runInPython()
+  }
+
+  /**
    * (Driver-side) Run Python process and get pickled write function.
    */
   def createWriteInfoInPython(
@@ -178,7 +198,9 @@ case class UserDefinedPythonDataSource(dataSourceCls: PythonFunction) {
       outputSchema: StructType,
       metrics: Map[String, SQLMetric],
       jobArtifactUUID: Option[String],
-      sessionUUID: Option[String]): MapInBatchEvaluatorFactory = {
+      sessionUUID: Option[String],
+      onPythonWorkerCreated: (() => Unit) => Unit = _ => (),
+      onPythonTaskCompletion: Option[(() => Unit) => Unit] = None): MapInBatchEvaluatorFactory = {
     val pythonFunc = createPythonFunction(pickledFunc)
 
     val pythonEvalType = PythonEvalType.SQL_MAP_ARROW_ITER_UDF
@@ -206,7 +228,9 @@ case class UserDefinedPythonDataSource(dataSourceCls: PythonFunction) {
       pythonRunnerConf,
       metrics,
       jobArtifactUUID,
-      sessionUUID)
+      sessionUUID,
+      onPythonWorkerCreated,
+      onPythonTaskCompletion)
   }
 
   def createPythonMetrics(): Array[CustomMetric] = {
@@ -310,6 +334,34 @@ case class PythonDataSourceCreationResult(
     dataSource: Array[Byte],
     schema: StructType)
 
+case class PythonDataSourceCapabilities(
+    supportsExternalLookup: Boolean,
+    supportsBatchRead: Boolean)
+
+private class UserDefinedPythonDataSourceCapabilitiesRunner(dataSourceCls: PythonFunction)
+    extends PythonPlannerRunner[PythonDataSourceCapabilities](dataSourceCls) {
+
+  override val workerModule = "pyspark.sql.worker.create_data_source"
+
+  override protected def writeToPython(dataOut: DataOutputStream, pickler: Pickler): Unit = {
+    PythonWorkerUtils.writePythonFunction(dataSourceCls, dataOut)
+    dataOut.writeBoolean(true)
+  }
+
+  override protected def receiveFromPython(
+      dataIn: DataInputStream): PythonDataSourceCapabilities = {
+    val supportsExternalLookup = dataIn.readInt()
+    if (supportsExternalLookup == SpecialLengths.PYTHON_EXCEPTION_THROWN) {
+      val msg = PythonWorkerUtils.readUTF(dataIn)
+      throw QueryCompilationErrors.pythonDataSourceError(
+        action = "inspect", tpe = "capabilities", msg = msg)
+    }
+    PythonDataSourceCapabilities(
+      supportsExternalLookup = supportsExternalLookup != 0,
+      supportsBatchRead = dataIn.readInt() != 0)
+  }
+}
+
 /**
  * A runner used to create a Python data source in a Python process and return the result.
  */
@@ -331,6 +383,7 @@ private class UserDefinedPythonDataSourceRunner(
   override protected def writeToPython(dataOut: DataOutputStream, pickler: Pickler): Unit = {
     // Send python data source
     PythonWorkerUtils.writePythonFunction(dataSourceCls, dataOut)
+    dataOut.writeBoolean(false)
 
     // Send the provider name
     PythonWorkerUtils.writeUTF(provider, dataOut)
@@ -375,6 +428,98 @@ private class UserDefinedPythonDataSourceRunner(
     PythonDataSourceCreationResult(
       dataSource = pickledDataSourceInstance,
       schema = schema.asInstanceOf[StructType])
+  }
+}
+
+case class PythonDataSourceLookupInfo(
+    func: Array[Byte],
+    maxParameterRowsPerRequest: Int,
+    selectedPredicateIndexes: Seq[Int])
+
+/**
+ * A runner used to plan an external lookup with a Python data source.
+ */
+private class UserDefinedPythonExternalLookupRunner(
+    dataSource: PythonFunction,
+    schema: StructType,
+    candidates: collection.Seq[Predicate])
+    extends PythonPlannerRunner[Option[PythonDataSourceLookupInfo]](dataSource) {
+
+  private case class SerializedLookupPredicate(
+      name: String,
+      field: collection.Seq[String],
+      parameterDataType: String)
+
+  private val mapper = new ObjectMapper().registerModules(DefaultScalaModule)
+
+  override val workerModule = "pyspark.sql.worker.plan_data_source_lookup"
+
+  override protected def runnerConf: Map[String, String] = {
+    super.runnerConf ++ SQLConf.get.pythonDataSourceProfiler.map(profiler =>
+      Map(SQLConf.PYTHON_DATA_SOURCE_PROFILER.key -> profiler)
+    ).getOrElse(Map.empty)
+  }
+
+  override protected def writeToPython(dataOut: DataOutputStream, pickler: Pickler): Unit = {
+    PythonWorkerUtils.writePythonFunction(dataSource, dataOut)
+    PythonWorkerUtils.writeUTF(schema.json, dataOut)
+    PythonWorkerUtils.writeUTF(mapper.writeValueAsString(candidates.map { predicate =>
+      val children = predicate.children()
+      if (children.length != 2 || !children(0).isInstanceOf[NamedReference] ||
+          !children(1).isInstanceOf[LookupParameter]) {
+        throw QueryCompilationErrors.pythonDataSourceError(
+          action = "plan", tpe = "external lookup",
+          msg = s"Unsupported external lookup predicate shape: ${predicate.describe()}")
+      }
+      val field = children(0).asInstanceOf[NamedReference]
+      val parameter = children(1).asInstanceOf[LookupParameter]
+      SerializedLookupPredicate(
+        name = predicate.name(),
+        field = field.fieldNames().toIndexedSeq,
+        parameterDataType = parameter.dataType().json)
+    }), dataOut)
+    dataOut.writeInt(SQLConf.get.arrowMaxRecordsPerBatch)
+    dataOut.writeBoolean(SQLConf.get.pysparkBinaryAsBytes)
+  }
+
+  override protected def receiveFromPython(
+      dataIn: DataInputStream): Option[PythonDataSourceLookupInfo] = {
+    val length = dataIn.readInt()
+    if (length == SpecialLengths.PYTHON_EXCEPTION_THROWN) {
+      val msg = PythonWorkerUtils.readUTF(dataIn)
+      throw QueryCompilationErrors.pythonDataSourceError(
+        action = "plan", tpe = "external lookup", msg = msg)
+    }
+    if (length == SpecialLengths.NULL) {
+      return None
+    }
+
+    val pickledFunction = PythonWorkerUtils.readBytes(length, dataIn)
+    val maxParameterRowsPerRequest = dataIn.readInt()
+    val numSelectedPredicates = dataIn.readInt()
+    checkLookupResult(maxParameterRowsPerRequest > 0,
+      "Python external lookup must return a positive maxParameterRowsPerRequest")
+    checkLookupResult(numSelectedPredicates >= 0 && numSelectedPredicates <= candidates.length,
+      "Python external lookup returned an invalid number of selected predicates")
+    val selectedPredicateIndexes =
+      (0 until numSelectedPredicates).map(_ => dataIn.readInt())
+    checkLookupResult(
+      selectedPredicateIndexes.forall(index => index >= 0 && index < candidates.length),
+      "Python external lookup returned an out-of-range selected predicate index")
+    checkLookupResult(selectedPredicateIndexes.distinct.length == selectedPredicateIndexes.length,
+      "Python external lookup returned duplicate selected predicate indexes")
+
+    Some(PythonDataSourceLookupInfo(
+      func = pickledFunction,
+      maxParameterRowsPerRequest = maxParameterRowsPerRequest,
+      selectedPredicateIndexes = selectedPredicateIndexes))
+  }
+
+  private def checkLookupResult(condition: Boolean, message: String): Unit = {
+    if (!condition) {
+      throw QueryCompilationErrors.pythonDataSourceError(
+        action = "plan", tpe = "external lookup", msg = message)
+    }
   }
 }
 

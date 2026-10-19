@@ -16,8 +16,10 @@
  */
 package org.apache.spark.sql.execution.datasources.v2.python
 
+import java.util
+
 import org.apache.spark.sql.connector.catalog.{SupportsRead, SupportsWrite, Table, TableCapability}
-import org.apache.spark.sql.connector.catalog.TableCapability.{BATCH_READ, BATCH_WRITE, MICRO_BATCH_READ, STREAMING_WRITE, TRUNCATE}
+import org.apache.spark.sql.connector.catalog.TableCapability.{BATCH_READ, BATCH_WRITE, EXTERNAL_LOOKUP, MICRO_BATCH_READ, STREAMING_WRITE, TRUNCATE}
 import org.apache.spark.sql.connector.read.ScanBuilder
 import org.apache.spark.sql.connector.write.{LogicalWriteInfo, WriteBuilder}
 import org.apache.spark.sql.types.StructType
@@ -31,8 +33,18 @@ class PythonTable(
   ) extends Table with SupportsRead with SupportsWrite {
   override def name(): String = shortName
 
-  override def capabilities(): java.util.Set[TableCapability] = java.util.EnumSet.of(
-    BATCH_READ, BATCH_WRITE, MICRO_BATCH_READ, STREAMING_WRITE, TRUNCATE)
+  override def capabilities(): java.util.Set[TableCapability] = {
+    val capabilities = util.EnumSet.of(
+      BATCH_READ, BATCH_WRITE, MICRO_BATCH_READ, STREAMING_WRITE, TRUNCATE)
+    val sourceCapabilities = ds.source.capabilities
+    if (sourceCapabilities.supportsExternalLookup) {
+      capabilities.add(EXTERNAL_LOOKUP)
+      if (!sourceCapabilities.supportsBatchRead) {
+        capabilities.remove(BATCH_READ)
+      }
+    }
+    capabilities
+  }
 
   override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
     new PythonScanBuilder(ds, shortName, outputSchema, options)
