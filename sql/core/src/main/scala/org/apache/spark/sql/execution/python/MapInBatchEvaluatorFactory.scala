@@ -42,7 +42,8 @@ class MapInBatchEvaluatorFactory(
     val pythonMetrics: Map[String, SQLMetric],
     jobArtifactUUID: Option[String],
     sessionUUID: Option[String],
-    onPythonWorkerCreated: (() => Unit) => Unit = _ => ())
+    onPythonWorkerCreated: (() => Unit) => Unit = _ => (),
+    onPythonTaskCompletion: Option[(() => Unit) => Unit] = None)
   extends PartitionEvaluatorFactory[InternalRow, InternalRow] {
 
   override def createEvaluator(): PartitionEvaluator[InternalRow, InternalRow] =
@@ -77,7 +78,27 @@ class MapInBatchEvaluatorFactory(
         sessionUUID) with BatchedPythonArrowInput {
         override protected def onWorkerCreated(cancelWorker: () => Unit): Unit = {
           onPythonWorkerCreated(cancelWorker)
+          onPythonTaskCompletion.foreach { register =>
+            register(() => {
+              if (writer != null) {
+                closeInputResources()
+              }
+            })
+          }
         }
+
+        override protected def registerTaskCompletionListener(
+            context: TaskContext,
+            listener: () => Unit): Unit = {
+          onPythonTaskCompletion match {
+            case Some(register) => register(listener)
+            case None => super.registerTaskCompletionListener(context, listener)
+          }
+        }
+
+        override protected def needsWorkerMonitor: Boolean = onPythonTaskCompletion.isEmpty
+
+        override protected def supportsPipelinedExecution: Boolean = onPythonTaskCompletion.isEmpty
       }
       val columnarBatchIter = pyRunner.compute(batchIter, context.partitionId(), context)
 

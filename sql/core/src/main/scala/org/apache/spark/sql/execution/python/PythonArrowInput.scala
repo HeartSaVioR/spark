@@ -73,6 +73,11 @@ private[python] trait PythonArrowInput[IN] { self: BasePythonRunner[IN, _] =>
 
   protected var writer: ArrowStreamWriter = _
 
+  protected def closeInputResources(): Unit = {
+    root.close()
+    allocator.close()
+  }
+
   protected def close(): Unit = {
     Utils.tryWithSafeFinally {
       // end writes footer to the output stream and doesn't clean any resources.
@@ -80,8 +85,7 @@ private[python] trait PythonArrowInput[IN] { self: BasePythonRunner[IN, _] =>
       // in the try block.
       writer.end()
     } {
-      root.close()
-      allocator.close()
+      closeInputResources()
     }
   }
 

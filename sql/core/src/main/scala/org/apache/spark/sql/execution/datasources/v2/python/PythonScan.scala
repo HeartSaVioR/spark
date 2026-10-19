@@ -22,6 +22,7 @@ import org.apache.spark.sql.connector.expressions.filter.Predicate
 import org.apache.spark.sql.connector.metric.CustomMetric
 import org.apache.spark.sql.connector.read._
 import org.apache.spark.sql.connector.read.streaming.MicroBatchStream
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.connector.SupportsMetadata
 import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.StructType
@@ -43,15 +44,23 @@ class PythonScan(
   override def toBatch: Batch = new PythonBatch(ds, shortName, outputSchema, options, readInfo)
 
   override def toExternalLookup(): ExternalLookup = {
-    require(selectedLookupPredicateIndexes.nonEmpty,
-      "External lookup predicates were not selected")
+    if (selectedLookupPredicateIndexes.isEmpty) {
+      throw QueryCompilationErrors.pythonDataSourceError(
+        action = "plan", tpe = "external lookup",
+        msg = "External lookup predicates were not selected")
+    }
     val creationResult = ds.getOrCreateDataSourceInPython(shortName, options, Some(outputSchema))
     val lookupInfo = ds.source.createLookupInfoInPython(
       creationResult, outputSchema, lookupPredicates).getOrElse {
-      throw new IllegalStateException("Python data source did not return an external lookup")
+      throw QueryCompilationErrors.pythonDataSourceError(
+        action = "plan", tpe = "external lookup",
+        msg = "Python data source did not return an external lookup")
     }
-    require(lookupInfo.selectedPredicateIndexes.sameElements(selectedLookupPredicateIndexes),
-      "Python data source returned different external lookup predicates after pruning")
+    if (!lookupInfo.selectedPredicateIndexes.sameElements(selectedLookupPredicateIndexes)) {
+      throw QueryCompilationErrors.pythonDataSourceError(
+        action = "plan", tpe = "external lookup",
+        msg = "Python data source returned different external lookup predicates after pruning")
+    }
     val jobArtifactUUID = JobArtifactSet.getCurrentJobArtifactState.map(_.uuid)
     val sessionUUID = SparkSession.getActiveSession.collect {
       case session if session.sessionState.conf.pythonWorkerLoggingEnabled => session.sessionUUID

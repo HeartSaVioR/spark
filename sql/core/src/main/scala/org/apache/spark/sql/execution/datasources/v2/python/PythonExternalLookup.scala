@@ -18,7 +18,10 @@ package org.apache.spark.sql.execution.datasources.v2.python
 
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 
+import scala.util.control.NonFatal
+
 import org.apache.spark.TaskContext
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{BoundReference, UnsafeProjection}
 import org.apache.spark.sql.connector.expressions.{Expression => V2Expression}
@@ -56,26 +59,33 @@ private case class PythonExternalLookupReaderFactory(
     selectedPredicates: Seq[Predicate],
     outputSchema: StructType,
     jobArtifactUUID: Option[String],
-    sessionUUID: Option[String]) extends ExternalLookupReaderFactory {
+    sessionUUID: Option[String]) extends ExternalLookupReaderFactory with Logging {
 
   override def createReader(): ExternalLookupReader = new ExternalLookupReader {
     private[this] val metrics: Map[String, SQLMetric] = PythonCustomMetric.pythonMetrics
     private var activeCursor: PythonExternalLookupResultCursor = _
     private val closed = new AtomicBoolean(false)
-    private val cancelWorker = new AtomicReference[Option[() => Unit]](None)
+    private val activeRequest = new AtomicReference[PythonExternalLookupRequest]()
 
-    TaskContext.get().addTaskInterruptListener { (_, _) => cancelActiveWorker() }
-
-    private def cancelActiveWorker(): Unit = {
-      cancelWorker.getAndSet(None).foreach(_.apply())
+    TaskContext.get().addTaskCompletionListener[Unit](_ => close())
+    TaskContext.get().addTaskInterruptListener { (_, _) =>
+      try {
+        Option(activeRequest.get()).foreach(_.cancel())
+      } catch {
+        case NonFatal(error) =>
+          logWarning(log"Failed to cancel Python external lookup worker", error)
+      }
     }
 
     private def registerWorkerCancellation(cancel: () => Unit): Unit = {
-      cancelWorker.set(Some(cancel))
-      TaskContext.get().addTaskCompletionListener[Unit] { _ => cancel() }
+      activeRequest.get().registerWorkerCancellation(cancel)
       if (closed.get() || TaskContext.get().isInterrupted()) {
-        cancelActiveWorker()
+        activeRequest.get().cancel()
       }
+    }
+
+    private def registerCleanup(cleanup: () => Unit): Unit = {
+      activeRequest.get().registerCleanup(cleanup)
     }
 
     private val parameters = PythonExternalLookupSchema.parameters(selectedPredicates)
@@ -90,13 +100,16 @@ private case class PythonExternalLookupReaderFactory(
       metrics,
       jobArtifactUUID,
       sessionUUID,
-      registerWorkerCancellation)
+      registerWorkerCancellation,
+      Some(registerCleanup))
 
     override def lookupBatch(keys: Array[InternalRow]): ExternalLookupResultCursor = {
       require(!closed.get(), "Python external lookup reader is closed")
       if (activeCursor != null) {
         activeCursor.close()
       }
+      val request = new PythonExternalLookupRequest
+      activeRequest.set(request)
       val inputRows = keys.iterator.zipWithIndex.map { case (key, ordinal) =>
         val values = new Array[Any](inputSchema.length)
         values(0) = ordinal
@@ -109,7 +122,7 @@ private case class PythonExternalLookupReaderFactory(
       activeCursor = new PythonExternalLookupResultCursor(
         evaluatorFactory.createEvaluator().eval(TaskContext.getPartitionId(), inputRows),
         outputSchema,
-        () => cancelActiveWorker())
+        () => request.close())
       activeCursor
     }
 
@@ -120,13 +133,55 @@ private case class PythonExternalLookupReaderFactory(
     override def close(): Unit = {
       if (closed.compareAndSet(false, true)) {
         try {
-          cancelActiveWorker()
+          Option(activeRequest.getAndSet(null)).foreach(_.close())
         } finally {
           if (activeCursor != null) {
             activeCursor.close()
             activeCursor = null
           }
         }
+      }
+    }
+  }
+}
+
+private class PythonExternalLookupRequest extends AutoCloseable {
+  private val closed = new AtomicBoolean(false)
+  private val cancelWorker = new AtomicReference[Option[() => Unit]](None)
+  private var cleanupCallbacks = List.empty[() => Unit]
+
+  def registerWorkerCancellation(cancel: () => Unit): Unit = {
+    cancelWorker.set(Some(cancel))
+    if (closed.get()) {
+      this.cancel()
+    }
+  }
+
+  def registerCleanup(cleanup: () => Unit): Unit = {
+    if (closed.get()) {
+      cleanup()
+    } else {
+      cleanupCallbacks = cleanup :: cleanupCallbacks
+    }
+  }
+
+  def cancel(): Unit = cancelWorker.getAndSet(None).foreach(_.apply())
+
+  override def close(): Unit = {
+    if (closed.compareAndSet(false, true)) {
+      val callbacks = cleanupCallbacks
+      cleanupCallbacks = Nil
+      var failure: Throwable = null
+      (cancel _ :: callbacks).foreach { cleanup =>
+        try {
+          cleanup()
+        } catch {
+          case NonFatal(error) =>
+            if (failure == null) failure = error else failure.addSuppressed(error)
+        }
+      }
+      if (failure != null) {
+        throw failure
       }
     }
   }
@@ -177,7 +232,6 @@ private class PythonExternalLookupResultCursor(
   override def next(): Boolean = {
     if (outputIterator.hasNext) {
       current = outputIterator.next()
-      require(!current.isNullAt(0), "Python external lookup returned a null input_ordinal")
       true
     } else {
       close()

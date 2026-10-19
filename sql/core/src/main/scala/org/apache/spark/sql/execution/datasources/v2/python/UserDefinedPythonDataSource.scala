@@ -199,7 +199,8 @@ case class UserDefinedPythonDataSource(dataSourceCls: PythonFunction) {
       metrics: Map[String, SQLMetric],
       jobArtifactUUID: Option[String],
       sessionUUID: Option[String],
-      onPythonWorkerCreated: (() => Unit) => Unit = _ => ()): MapInBatchEvaluatorFactory = {
+      onPythonWorkerCreated: (() => Unit) => Unit = _ => (),
+      onPythonTaskCompletion: Option[(() => Unit) => Unit] = None): MapInBatchEvaluatorFactory = {
     val pythonFunc = createPythonFunction(pickledFunc)
 
     val pythonEvalType = PythonEvalType.SQL_MAP_ARROW_ITER_UDF
@@ -228,7 +229,8 @@ case class UserDefinedPythonDataSource(dataSourceCls: PythonFunction) {
       metrics,
       jobArtifactUUID,
       sessionUUID,
-      onPythonWorkerCreated)
+      onPythonWorkerCreated,
+      onPythonTaskCompletion)
   }
 
   def createPythonMetrics(): Array[CustomMetric] = {
@@ -465,8 +467,9 @@ private class UserDefinedPythonExternalLookupRunner(
       val children = predicate.children()
       if (children.length != 2 || !children(0).isInstanceOf[NamedReference] ||
           !children(1).isInstanceOf[LookupParameter]) {
-        throw new IllegalArgumentException(
-          s"Unsupported external lookup predicate shape: ${predicate.describe()}")
+        throw QueryCompilationErrors.pythonDataSourceError(
+          action = "plan", tpe = "external lookup",
+          msg = s"Unsupported external lookup predicate shape: ${predicate.describe()}")
       }
       val field = children(0).asInstanceOf[NamedReference]
       val parameter = children(1).asInstanceOf[LookupParameter]
@@ -494,21 +497,29 @@ private class UserDefinedPythonExternalLookupRunner(
     val pickledFunction = PythonWorkerUtils.readBytes(length, dataIn)
     val maxParameterRowsPerRequest = dataIn.readInt()
     val numSelectedPredicates = dataIn.readInt()
-    require(maxParameterRowsPerRequest > 0,
+    checkLookupResult(maxParameterRowsPerRequest > 0,
       "Python external lookup must return a positive maxParameterRowsPerRequest")
-    require(numSelectedPredicates >= 0 && numSelectedPredicates <= candidates.length,
+    checkLookupResult(numSelectedPredicates >= 0 && numSelectedPredicates <= candidates.length,
       "Python external lookup returned an invalid number of selected predicates")
     val selectedPredicateIndexes =
       (0 until numSelectedPredicates).map(_ => dataIn.readInt())
-    require(selectedPredicateIndexes.forall(index => index >= 0 && index < candidates.length),
+    checkLookupResult(
+      selectedPredicateIndexes.forall(index => index >= 0 && index < candidates.length),
       "Python external lookup returned an out-of-range selected predicate index")
-    require(selectedPredicateIndexes.distinct.length == selectedPredicateIndexes.length,
+    checkLookupResult(selectedPredicateIndexes.distinct.length == selectedPredicateIndexes.length,
       "Python external lookup returned duplicate selected predicate indexes")
 
     Some(PythonDataSourceLookupInfo(
       func = pickledFunction,
       maxParameterRowsPerRequest = maxParameterRowsPerRequest,
       selectedPredicateIndexes = selectedPredicateIndexes))
+  }
+
+  private def checkLookupResult(condition: Boolean, message: String): Unit = {
+    if (!condition) {
+      throw QueryCompilationErrors.pythonDataSourceError(
+        action = "plan", tpe = "external lookup", msg = message)
+    }
   }
 }
 

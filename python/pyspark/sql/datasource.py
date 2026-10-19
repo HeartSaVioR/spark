@@ -200,6 +200,9 @@ class DataSource(ABC):
         Implementations must reject unsupported predicate types and semantics. Selected
         predicates are trusted: Spark does not re-evaluate them on returned rows. Unselected
         predicates and literal filters remain Spark residual filters.
+        Python sources implementing this method do not receive literal filters through
+        :meth:`DataSourceReader.pushFilters`, including for ordinary reads. Ordinary
+        :meth:`DataSourceReader.pushLimit` remains available.
 
         Spark may call this method again with a pruned schema. Predicate selection and
         parameter order must remain the same. Planning runs on the driver; the returned
@@ -359,6 +362,8 @@ class ExternalLookup(ABC):
         :meth:`DataSource.externalLookup`. Each occurrence is distinct even when two
         predicates have the same column and comparison type. Return distinct integer
         indexes within that list; an empty sequence means no supported access path.
+        Selected predicates must implement Spark's comparison semantics, including
+        null handling and type-specific equality or ordering. Spark does not recheck them.
 
         .. versionadded:: 4.4.0
         """
@@ -392,14 +397,21 @@ class ExternalLookup(ABC):
         deduplicate identical parameters and reuse results within its task-scoped cache.
         Disable caching with the ``EXTERNAL_LOOKUP`` hint's ``cache_enabled=false`` option
         when results should not be reused across requests. This does not provide snapshot
-        isolation across requests.
+        isolation across requests. With caching enabled, results for identical parameters
+        must remain reusable within a task; sources that cannot satisfy this must disable it.
 
         Yield tuples in schema order or Arrow batches matching the output schema,
         including a non-nullable integer ``input_ordinal`` field. Use ``try/finally``
         inside the iterator to release connections or other request resources. Failures
         propagate to Spark and normal Spark task retries may repeat requests.
+        Each request invokes this method separately, even if Spark reuses a Python worker.
+        Consuming a request closes its Arrow resources without retaining per-request task
+        listeners or monitor threads. Request resources must not depend on worker lifetime.
+        Lookup uses synchronous streaming even when ``spark.python.udf.pipelined.enabled``
+        is enabled, so cursor closure cannot race input serialization.
         Cancellation or early cursor closure can terminate the worker without running
-        Python cleanup code.
+        Python cleanup code. Spark does not drain unfinished output; an unread worker is
+        destroyed rather than returned to the worker pool.
 
         .. versionadded:: 4.4.0
         """

@@ -396,6 +396,16 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
 
   protected def onWorkerCreated(cancelWorker: () => Unit): Unit = {}
 
+  protected def registerTaskCompletionListener(
+      context: TaskContext,
+      listener: () => Unit): Unit = {
+    context.addTaskCompletionListener[Unit](_ => listener())
+  }
+
+  protected def needsWorkerMonitor: Boolean = true
+
+  protected def supportsPipelinedExecution: Boolean = true
+
   def compute(
       inputIterator: Iterator[IN],
       partitionIndex: Int,
@@ -463,7 +473,8 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
     envVars.put("SPARK_JOB_ARTIFACT_UUID", jobArtifactUUID.getOrElse("default"))
     envVars.put("SPARK_PYTHON_RUNTIME", "PYTHON_WORKER")
     // Pipelined mode is only for UDF eval types, not NON_UDF (mapPartitions/RDD path).
-    val usePipelined = pipelinedEnabled && evalType != PythonEvalType.NON_UDF
+    val usePipelined = pipelinedEnabled && supportsPipelinedExecution &&
+      evalType != PythonEvalType.NON_UDF
     if (usePipelined) {
       envVars.put("SPARK_PIPELINED_UDF", "1")
       envVars.put("SPARK_PIPELINED_UDF_QUEUE_DEPTH", pipelinedQueueDepth.toString)
@@ -479,7 +490,7 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
     // Start a thread to feed the process input from our parent's iterator
     val writer = newWriter(env, worker, inputIterator, partitionIndex, context)
 
-    context.addTaskCompletionListener[Unit] { _ =>
+    registerTaskCompletionListener(context, () => {
       if (!reuseWorker || releasedOrClosed.compareAndSet(false, true)) {
         try {
           worker.stop()
@@ -488,7 +499,7 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
             logWarning(log"Failed to stop worker", e)
         }
       }
-    }
+    })
 
     onWorkerCreated(() => {
       if (releasedOrClosed.compareAndSet(false, true)) {
@@ -497,14 +508,14 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
       }
     })
 
-    if (reuseWorker) {
+    if (needsWorkerMonitor && reuseWorker) {
       val key = (worker, context.taskAttemptId())
       // SPARK-35009: avoid creating multiple monitor threads for the same python worker
       // and task context
       if (PythonRunner.runningMonitorThreads.add(key)) {
         new MonitorThread(SparkEnv.get, worker, context, releasedOrClosed).start()
       }
-    } else {
+    } else if (needsWorkerMonitor) {
       new MonitorThread(SparkEnv.get, worker, context, releasedOrClosed).start()
     }
 
@@ -559,7 +570,7 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
     // ClosedByInterruptException on interrupt), so this get() returns promptly in normal cases;
     // the worst case is a bounded wait for the writer to finish serializing the current row or
     // batch and observe the interrupt flag at the top of its loop.
-    context.addTaskCompletionListener[Unit] { _ =>
+    registerTaskCompletionListener(context, () => {
       writerFuture.cancel(true)
       try {
         writerFuture.get()
@@ -567,7 +578,7 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
         case _: CancellationException | _: ExecutionException | _: InterruptedException =>
           // Expected: cancel(true) raced ahead, or writer exited via _exception path.
       }
-    }
+    })
 
     // Unix domain socket channels expose no java.net.Socket, so socket() throws
     // UnsupportedOperationException and SO_TIMEOUT-based idle detection is unavailable.
@@ -773,10 +784,10 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
         if (isBarrier) {
           // Close ServerSocket on task completion.
           serverSocketChannel.foreach { server =>
-            context.addTaskCompletionListener[Unit] { _ =>
+            registerTaskCompletionListener(context, () => {
               server.close()
               if (isUnixDomainSock) sockPath.delete()
-            }
+            })
           }
           if (isUnixDomainSock) {
             logDebug(s"Started ServerSocket on with Unix Domain Socket $sockPath.")

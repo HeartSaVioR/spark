@@ -19,7 +19,7 @@ import json
 import sys
 from collections.abc import Iterator as IteratorABC
 from collections.abc import Sequence as SequenceABC
-from typing import IO, Iterable, List
+from typing import IO, Any, Iterable, Iterator, List
 
 import pyarrow as pa
 
@@ -225,7 +225,7 @@ def _main(infile: IO, outfile: IO) -> None:
         return_type = lookup_output_schema(schema)
         arrow_schema = to_arrow_schema(return_type, timezone="UTC")
 
-        def data_source_lookup_func(iterator: Iterable[pa.RecordBatch]) -> Iterable[pa.RecordBatch]:
+        def data_source_lookup_func(iterator: Iterator[pa.RecordBatch]) -> Iterable[pa.RecordBatch]:
             output_iter = lookup.lookup(iterator)
             if not isinstance(output_iter, IteratorABC):
                 raise PySparkRuntimeError(
@@ -237,15 +237,19 @@ def _main(infile: IO, outfile: IO) -> None:
                     },
                 )
 
-            def validated_output_rows():
+            def validated_output_rows() -> Iterator[Any]:
                 for row in output_iter:
-                    named_row = isinstance(row, Row) and hasattr(row, "__fields__")
+                    named_row = row if isinstance(row, Row) and hasattr(row, "__fields__") else None
                     if (
                         isinstance(row, (tuple, list))
                         and len(row) == len(return_type)
-                        and (not named_row or INPUT_ORDINAL_COLUMN_NAME in row.__fields__)
+                        and (named_row is None or INPUT_ORDINAL_COLUMN_NAME in named_row.__fields__)
                     ):
-                        ordinal = row[INPUT_ORDINAL_COLUMN_NAME] if named_row else row[0]
+                        ordinal = (
+                            named_row[INPUT_ORDINAL_COLUMN_NAME]
+                            if named_row is not None
+                            else row[0]
+                        )
                         if (
                             not isinstance(ordinal, int)
                             or isinstance(ordinal, bool)

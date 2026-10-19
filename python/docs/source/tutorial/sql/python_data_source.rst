@@ -660,6 +660,47 @@ The following example demonstrates how to implement a basic Data Source using Ar
 
     df.show()
 
+External Lookup Joins
+---------------------
+
+A Python data source can implement :meth:`~pyspark.sql.datasource.DataSource.externalLookup`
+and return an :class:`~pyspark.sql.datasource.ExternalLookup` to fetch matching rows
+using parameters from the other side of a join. A source with no ordinary ``reader``
+uses lookup automatically for an eligible join. A source supporting both access paths
+uses an ordinary join unless its lookup side has the ``EXTERNAL_LOOKUP`` hint.
+
+During planning, Spark offers comparisons whose values are typed
+:class:`~pyspark.sql.datasource.LookupParameter` objects. The connector selects distinct
+predicate indexes in its required parameter order. Each selected predicate must implement
+Spark's comparison semantics, including null handling: Spark trusts those predicates
+and does not re-evaluate them on results. Unselected comparisons remain Spark filters.
+Literal filters also remain in Spark; Python lookup-capable sources do not receive them
+through ``DataSourceReader.pushFilters``, even on ordinary reads. Ordinary limit pushdown
+is still supported.
+
+Each request sends one or more Arrow batches with ``input_ordinal`` and the selected
+parameters. Return the ordinal followed by the requested value fields, in tuples or
+Arrow batches. Ordinals are local to a request. Missing ordinals represent misses, and
+repeated ordinals represent multiple matches. A request's positive parameter-row limit
+is separate from the Arrow batch-size setting, whose zero or negative values mean unlimited.
+
+Spark may deduplicate parameters and cache results within a task. A source whose results
+cannot be reused for identical parameters must use the hint option ``cache_enabled=false``.
+Neither setting provides snapshot isolation across requests. Cache policy and the trust
+placed in selected predicates are choices in this draft API, not established community policy.
+
+Each request calls ``lookup`` separately, even with Python worker reuse enabled. Open
+request resources inside that iterator and use ``try/finally`` to close them on normal
+consumption. Spark releases completed requests' Arrow resources and cleanup callbacks
+before the task ends. Cancellation or successful early termination, such as ``LIMIT``,
+closes the cursor without draining output and destroys a worker with unread output.
+Lookup uses synchronous streaming even when ``spark.python.udf.pipelined.enabled`` is
+enabled, preventing input serialization from racing cursor cleanup. Ordinary Python
+scans still honor that setting.
+Python ``finally`` blocks are not guaranteed to run when the worker is terminated.
+Connector failures propagate, and task retries may repeat requests; there is no silent
+fallback to ordinary reads.
+
 Usage Notes
 -----------
 

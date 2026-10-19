@@ -123,7 +123,8 @@ class PythonScanBuilder(
   // pushable filters) are replayed here to rebuild the same reader state before `pushLimit` is
   // invoked on it in Python.
   override def pushLimit(limit: Int): Boolean = {
-    if (!SQLConf.get.pythonLimitPushDown || ds.source.capabilities.supportsExternalLookup) {
+    if (!SQLConf.get.pythonLimitPushDown || !ds.source.capabilities.supportsBatchRead ||
+        selectedLookupPredicateIndexes.nonEmpty) {
       return false
     }
 
