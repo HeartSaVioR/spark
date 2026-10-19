@@ -4028,18 +4028,16 @@ object SQLConf {
       .checkValue(v => Set(1, 2, 3, 4).contains(v), "Valid versions are 1, 2, 3, and 4")
       .createWithDefault(2)
 
-  val STREAMING_JOIN_WATERMARK_VERSION =
-    buildConf("spark.sql.streaming.join.watermarkVersion")
+  val STREAMING_JOIN_CHECKPOINT_USES_CORRECTED_WATERMARKS =
+    buildConf("spark.sql.streaming.join.checkpointUsesCorrectedWatermarks")
       .internal()
-      .doc("Checkpoint compatibility version for stream-stream join watermarks. " +
-        "Version 1 identifies old checkpoints that require compatibility validation; " +
-        "version 2 identifies checkpoints created with corrected watermarks. " +
-        "This is pinned in the offset log and does not select an execution mode.")
+      .doc("Whether this checkpoint uses the corrected stream-stream join watermark semantics. " +
+        "Pinned in the offset log; missing values identify old checkpoints that need " +
+        "compatibility validation. This marker does not select an execution mode.")
       .version("4.4.0")
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
-      .intConf
-      .checkValue(v => Set(1, 2).contains(v), "Valid versions are 1 and 2")
-      .createWithDefault(2)
+      .booleanConf
+      .createWithDefault(true)
 
   val STREAMING_SESSION_WINDOW_MERGE_SESSIONS_IN_LOCAL_PARTITION =
     buildConf("spark.sql.streaming.sessionWindow.merge.sessions.in.local.partition")

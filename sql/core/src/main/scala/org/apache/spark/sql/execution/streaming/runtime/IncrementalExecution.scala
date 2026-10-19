@@ -29,7 +29,7 @@ import org.apache.spark.internal.LogKeys.{BATCH_TIMESTAMP, ERROR}
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.QueryPlanningTracker
 import org.apache.spark.sql.catalyst.analysis.WidenStatefulOperatorAttributeNullability
-import org.apache.spark.sql.catalyst.expressions.{CurrentBatchTimestamp, ExpressionWithRandomSeed}
+import org.apache.spark.sql.catalyst.expressions.{And, CurrentBatchTimestamp, EqualTo, ExpressionWithRandomSeed}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern._
@@ -714,18 +714,28 @@ class IncrementalExecution(
 
     override def apply(plan: SparkPlan): SparkPlan = {
       val planWithStateOpId = plan transform composedRule
-      // Offset metadata has restored the checkpoint version by this point. Validate before
-      // writing operator metadata or opening state, including retries of an incomplete batch 0.
-      if (isFirstBatch && conf.getConf(SQLConf.STREAMING_JOIN_WATERMARK_VERSION) == 1) {
+      // isFirstBatch is the first executed batch of this run, including restarts at any batch ID.
+      // Offset metadata has restored the checkpoint marker. Validate before writing operator
+      // metadata or opening state, including retries of an incomplete batch 0.
+      if (isFirstBatch &&
+          !conf.getConf(SQLConf.STREAMING_JOIN_CHECKPOINT_USES_CORRECTED_WATERMARKS)) {
+        def watermarkColumns(input: SparkPlan): String = {
+          val columns = input.output.filter(_.metadata.contains(EventTimeWatermark.delayKey))
+          if (columns.isEmpty) "none" else columns.map(_.name).mkString(", ")
+        }
         planWithStateOpId.foreach {
           case j: StreamingSymmetricHashJoinExec
               if !StreamingSymmetricHashJoinHelper.isWatermarkCheckpointCompatible(
                 j.left.output, j.right.output, j.leftKeys, j.rightKeys) =>
+            val joinCondition = (j.leftKeys.zip(j.rightKeys).map { case (l, r) =>
+              EqualTo(l, r)
+            } ++ j.condition.full).reduce(And)
             throw new AnalysisException(
               errorClass = "STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE",
               messageParameters = Map(
-                "operatorId" -> j.getStateInfo.operatorId.toString,
-                "stateFormatVersion" -> j.stateFormatVersion.toString))
+                "joinCondition" -> joinCondition.sql,
+                "leftWatermarkColumns" -> watermarkColumns(j.left),
+                "rightWatermarkColumns" -> watermarkColumns(j.right)))
           case _ =>
         }
       }

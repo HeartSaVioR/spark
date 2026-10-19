@@ -37,11 +37,11 @@ import org.apache.spark.util.Utils
 class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
   import testImplicits._
 
-  private val watermarkVersionKey = "spark.sql.streaming.join.watermarkVersion"
+  private val correctedWatermarkKey = "spark.sql.streaming.join.checkpointUsesCorrectedWatermarks"
 
-  private def setWatermarkVersion(checkpoint: String, version: Option[String]): Unit = {
+  private def setCorrectedWatermarkMarker(checkpoint: String, marker: Option[String]): Unit = {
     def update(conf: Map[String, String]): Map[String, String] = {
-      (conf - watermarkVersionKey) ++ version.map(watermarkVersionKey -> _)
+      (conf - correctedWatermarkKey) ++ marker.map(correctedWatermarkKey -> _)
     }
     val offsetsPath = checkpoint + "/offsets"
     val log = new OffsetSeqLog(spark, offsetsPath)
@@ -65,9 +65,9 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
     }
   }
 
-  private def pinnedVersion(checkpoint: String): Option[String] = {
+  private def pinnedMarker(checkpoint: String): Option[String] = {
     new OffsetSeqLog(spark, checkpoint + "/offsets").getLatest().get._2.metadataOpt.get
-      .conf.get(watermarkVersionKey)
+      .conf.get(correctedWatermarkKey)
   }
 
   private def withJoinConf(version: Int, logVersion: Int)(f: => Unit): Unit = {
@@ -109,10 +109,10 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
   for {
     version <- Seq(1, 2, 3, 4)
     logVersion <- Seq(1, 2)
-    oldVersion <- Seq(None, Some("1"))
+    oldMarker <- Seq(None, Some("false"))
     shape <- Seq("range", "expiry", "pruned expiry")
   } {
-    test(s"SPARK-58904: reject old $shape checkpoint, V$version log=$logVersion old=$oldVersion") {
+    test(s"SPARK-58904: reject old $shape checkpoint, V$version log=$logVersion old=$oldMarker") {
       withJoinConf(version, logVersion) {
         val (leftInput, rightInput, joined) = joinInputs(shape)
         withTempDir { checkpointDir =>
@@ -124,12 +124,12 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
             StopStream)
           // Emulate old offset metadata. State is written by the current implementation;
           // rejection must not open or reinterpret it, regardless of its physical layout.
-          setWatermarkVersion(checkpoint, oldVersion)
+          setCorrectedWatermarkMarker(checkpoint, oldMarker)
           val stateBefore = snapshot(new File(checkpoint, "state"))
           val commitsBefore = snapshot(new File(checkpoint, "commits"))
           for (attempt <- 1 to 2) {
-            // Session defaults must not bypass the checkpoint-pinned version or state format.
-            withSQLConf(watermarkVersionKey -> "2",
+            // Session defaults must not bypass the checkpoint-pinned marker or state format.
+            withSQLConf(correctedWatermarkKey -> "true",
                 SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key -> "2") {
               testStream(joined)(
                 StartStream(checkpointLocation = checkpoint),
@@ -137,13 +137,16 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
                 ExpectFailure[AnalysisException](assertFailure = error => {
                   checkError(error.asInstanceOf[AnalysisException],
                     condition = "STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE",
-                    parameters = Map("operatorId" -> "0",
-                      "stateFormatVersion" -> version.toString))
+                    parameters = Map(
+                      "joinCondition" -> ".*leftKey.*rightKey.*",
+                      "leftWatermarkColumns" -> (if (shape == "expiry") "leftTime" else "none"),
+                      "rightWatermarkColumns" -> "rightTime"),
+                    matchPVals = true)
                 }))
             }
             assert(snapshot(new File(checkpoint, "state")) == stateBefore)
             assert(snapshot(new File(checkpoint, "commits")) == commitsBefore)
-            assert(pinnedVersion(checkpoint).contains("1"))
+            assert(pinnedMarker(checkpoint).contains("false"))
           }
         }
       }
@@ -165,11 +168,11 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
             MultiAddData(leftInput, (1, 10))(rightInput, (2, 10)),
             CheckNewAnswer(),
             StopStream)
-          assert(pinnedVersion(checkpoint).contains("2"))
+          assert(pinnedMarker(checkpoint).contains("true"))
           val oldCompatible = Seq("equality", "no watermark").contains(shape)
-          val expectedVersion = if (oldCompatible) "1" else "2"
-          if (oldCompatible) setWatermarkVersion(checkpoint, None)
-          withSQLConf(watermarkVersionKey -> "1",
+          val expectedMarker = if (oldCompatible) "false" else "true"
+          if (oldCompatible) setCorrectedWatermarkMarker(checkpoint, None)
+          withSQLConf(correctedWatermarkKey -> "false",
               SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key -> "2") {
             testStream(joined)(
               StartStream(checkpointLocation = checkpoint),
@@ -183,7 +186,7 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
               },
               StopStream)
           }
-          assert(pinnedVersion(checkpoint).contains(expectedVersion))
+          assert(pinnedMarker(checkpoint).contains(expectedMarker))
         }
       }
     }
@@ -202,7 +205,7 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
             StopStream)
           val offsets = new OffsetSeqLog(spark, checkpoint + "/offsets")
           assert(offsets.getLatest().get._1 == 0L)
-          setWatermarkVersion(checkpoint, None)
+          setCorrectedWatermarkMarker(checkpoint, None)
           // Emulate a crash after state was written but before the first batch committed.
           val commit = new Path(checkpoint, "commits/0")
           assert(commit.getFileSystem(spark.sessionState.newHadoopConf()).delete(commit, false))
@@ -213,7 +216,11 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
             ExpectFailure[AnalysisException](assertFailure = error => {
               checkError(error.asInstanceOf[AnalysisException],
                 condition = "STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE",
-                parameters = Map("operatorId" -> "0", "stateFormatVersion" -> version.toString))
+                parameters = Map(
+                  "joinCondition" -> ".*leftKey.*rightKey.*leftTime.*rightTime.*",
+                  "leftWatermarkColumns" -> "none",
+                  "rightWatermarkColumns" -> "rightTime"),
+                matchPVals = true)
             }))
           assert(snapshot(new File(checkpoint, "state")) == before)
           assert(snapshot(new File(checkpoint, "commits")) == commitsBefore)
@@ -221,7 +228,7 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
       }
     }
   }
-  Seq("2.4.0" -> "1", "3.5.1" -> "2").foreach { case (sparkVersion, stateVersion) =>
+  Seq("2.4.0", "3.5.1").foreach { sparkVersion =>
     test(s"SPARK-58904: reject the historical Spark $sparkVersion range checkpoint") {
       val input = MemoryStream[(Int, Long)]
       val data = input.toDF().select($"_1".as("value"), timestamp_seconds($"_2").as("timestamp"))
@@ -246,7 +253,11 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
           ExpectFailure[AnalysisException](assertFailure = error => {
             checkError(error.asInstanceOf[AnalysisException],
               condition = "STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE",
-              parameters = Map("operatorId" -> "0", "stateFormatVersion" -> stateVersion))
+              parameters = Map(
+                "joinCondition" -> ".*leftId.*rightId.*",
+                "leftWatermarkColumns" -> "leftTime",
+                "rightWatermarkColumns" -> "rightTime"),
+              matchPVals = true)
           }))
         assert(snapshot(new File(checkpointDir, "state")) == before)
         assert(snapshot(new File(checkpointDir, "commits")) == commitsBefore)

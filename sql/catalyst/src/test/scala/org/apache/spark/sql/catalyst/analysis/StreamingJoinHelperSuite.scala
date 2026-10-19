@@ -55,6 +55,27 @@ class StreamingJoinHelperSuite extends AnalysisTest {
     }
   }
 
+  test("SPARK-58904: crossed intervals bound a different timestamp on each side") {
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val leftTime = AttributeReference("leftTime", TimestampType, metadata = metadata)()
+    val leftOther = AttributeReference("leftOther", TimestampType)()
+    val rightTime = AttributeReference("rightTime", TimestampType, metadata = metadata)()
+    val rightOther = AttributeReference("rightOther", TimestampType)()
+    val left = AttributeSet(Seq(leftTime, leftOther))
+    val right = AttributeSet(Seq(rightTime, rightOther))
+    val leftInterval = leftOther > rightTime - 5 && leftOther < rightTime + 10
+    val rightInterval = rightOther > leftTime - 7 && rightOther < leftTime + 12
+
+    Seq(leftInterval && rightInterval, rightInterval && leftInterval).foreach { condition =>
+      val leftBound = StreamingJoinHelper.getStateValueWatermark(
+        left, right, Some(condition), Some(20000L)).get
+      val rightBound = StreamingJoinHelper.getStateValueWatermark(
+        right, left, Some(condition), Some(20000L)).get
+      assert(leftBound._1.semanticEquals(leftOther) && leftBound._2 == 15000L)
+      assert(rightBound._1.semanticEquals(rightOther) && rightBound._2 == 13000L)
+    }
+  }
+
   test("extract watermark from time condition") {
     val attributesToFindConstraintFor = Seq(
       AttributeReference("leftTime", TimestampType)(),

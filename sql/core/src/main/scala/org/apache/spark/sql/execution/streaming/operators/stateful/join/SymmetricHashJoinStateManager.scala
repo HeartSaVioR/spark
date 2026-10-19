@@ -252,6 +252,9 @@ class SymmetricHashJoinStateManagerV4(
   protected val keySchema = StructType(
     joinKeys.zipWithIndex.map { case (k, i) => StructField(s"field$i", k.dataType, k.nullable) })
   protected val keyAttributes = toAttributes(keySchema)
+  // A value predicate supplies its bounded column. Otherwise, key eviction gets its timestamp
+  // from the join key, or no predicate means no eviction. Falling back to our event time only
+  // chooses the storage timestamp; it does not enable eviction or timestamp range scans.
   private val eventTimeColIdxOpt = stateValueWatermarkOrdinal.orElse {
     WatermarkSupport.findEventTimeColumnIndex(
       inputValueAttributes,

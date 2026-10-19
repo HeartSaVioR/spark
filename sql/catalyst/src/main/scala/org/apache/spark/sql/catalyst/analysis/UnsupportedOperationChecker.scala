@@ -707,10 +707,9 @@ object UnsupportedOperationChecker extends Logging {
   }
 
   private def checkForStreamStreamJoinWatermark(join: Join): Unit = {
-    val (leftKeys, rightKeys) = join match {
-      case ExtractEquiJoinKeys(_, lk, rk, _, _, _, _, _) => (lk, rk)
-      case _ => (Nil, Nil)
-    }
+    val keys = ExtractEquiJoinKeys.unapply(join)
+    val leftKeys = keys.map(_._2).getOrElse(Nil)
+    val rightKeys = keys.map(_._3).getOrElse(Nil)
 
     def canEvictState(
         stateInput: LogicalPlan,
