@@ -41,6 +41,9 @@ object TableCapabilityCheck extends (LogicalPlan => Unit) {
       case r: DataSourceV2Relation if !r.table.supports(BATCH_READ) =>
         throw QueryCompilationErrors.unsupportedBatchReadError(r.table)
 
+      case r: ExternalLookupRelation if !r.table.supports(EXTERNAL_LOOKUP) =>
+        throw QueryCompilationErrors.unsupportedBatchReadError(r.table)
+
       case r: StreamingRelationV2 if !r.table.supportsAny(MICRO_BATCH_READ, CONTINUOUS_READ) =>
         throw QueryCompilationErrors.unsupportedStreamingScanError(r.table)
 

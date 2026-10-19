@@ -28,7 +28,8 @@ import org.apache.spark.sql.classic.DataFrame
 import org.apache.spark.sql.connector.catalog.{Table, TableCapability}
 import org.apache.spark.sql.connector.catalog.TableCapability._
 import org.apache.spark.sql.execution.datasources.DataSource
-import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, TableCapabilityCheck}
+import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, ExternalLookupRelation,
+  TableCapabilityCheck}
 import org.apache.spark.sql.execution.streaming.{Offset, Source}
 import org.apache.spark.sql.execution.streaming.runtime.StreamingRelation
 import org.apache.spark.sql.sources.StreamSourceProvider
@@ -60,6 +61,28 @@ class TableCapabilityCheckSuite extends AnalysisTest with SharedSparkSession {
       TableCapabilityCheck.apply(
         DataSourceV2Relation.create(CapabilityTable(), None, None, emptyMap)
       )
+    }
+    assert(e.message.contains("does not support batch scan"))
+  }
+
+  test("batch scan: external lookup capability does not satisfy batch read") {
+    val relation = DataSourceV2Relation.create(
+      CapabilityTable(EXTERNAL_LOOKUP), None, None, emptyMap)
+    val e = intercept[AnalysisException] {
+      TableCapabilityCheck.apply(relation)
+    }
+    assert(e.message.contains("does not support batch scan"))
+  }
+
+  test("external lookup relation: check external lookup capability") {
+    val lookupRelation = ExternalLookupRelation(DataSourceV2Relation.create(
+      CapabilityTable(EXTERNAL_LOOKUP), None, None, emptyMap))
+    TableCapabilityCheck.apply(lookupRelation)
+
+    val invalidLookupRelation = ExternalLookupRelation(DataSourceV2Relation.create(
+      CapabilityTable(BATCH_READ), None, None, emptyMap))
+    val e = intercept[AnalysisException] {
+      TableCapabilityCheck.apply(invalidLookupRelation)
     }
     assert(e.message.contains("does not support batch scan"))
   }

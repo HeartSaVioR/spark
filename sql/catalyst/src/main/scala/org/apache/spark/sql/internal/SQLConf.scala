@@ -2385,6 +2385,39 @@ object SQLConf {
     .bytesConf(ByteUnit.BYTE)
     .createWithDefault(8L << 30)
 
+  val JOIN_EXTERNAL_LOOKUP_CACHE_ENABLED =
+    buildConf("spark.sql.join.externalLookup.cache.enabled")
+      .doc("When true, external lookup join caches lookup results within each task.")
+      .version("4.4.0")
+      .booleanConf
+      .createWithDefault(true)
+
+  val JOIN_EXTERNAL_LOOKUP_CACHE_MAX_ENTRIES =
+    buildConf("spark.sql.join.externalLookup.cache.maxEntries")
+      .doc("Maximum number of distinct lookup keys cached per task by external lookup join.")
+      .version("4.4.0")
+      .intConf
+      .checkValue(_ > 0, "External lookup join cache max entries must be positive")
+      .createWithDefault(10000)
+
+  val JOIN_EXTERNAL_LOOKUP_CACHE_TTL =
+    buildConf("spark.sql.join.externalLookup.cache.ttl")
+      .doc("Time-to-live for entries in the per-task external lookup join cache. " +
+        "A value of 0 disables TTL-based expiration.")
+      .version("4.4.0")
+      .timeConf(TimeUnit.MILLISECONDS)
+      .checkValue(_ >= 0, "External lookup join cache TTL must be non-negative")
+      .createWithDefault(0L)
+
+  val JOIN_EXTERNAL_LOOKUP_CACHE_MAX_ROWS_PER_KEY =
+    buildConf("spark.sql.join.externalLookup.cache.maxRowsPerKey")
+      .doc("Maximum number of result rows cached for one lookup key by external lookup join. " +
+        "Keys returning more rows are not cached.")
+      .version("4.4.0")
+      .intConf
+      .checkValue(_ > 0, "External lookup join cache max rows per key must be positive")
+      .createWithDefault(1000)
+
   val INTERRUPT_ON_CANCEL = buildConf("spark.sql.execution.interruptOnCancel")
     .doc("When true, all running tasks will be interrupted if one cancels a query.")
     .version("4.0.0")
