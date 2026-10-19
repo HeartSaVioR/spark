@@ -1546,6 +1546,138 @@ class PythonDataSourceSuite extends PythonDataSourceSuiteBase {
         Row(2, 0, 10, "c", 5, "c")))
   }
 
+  test("SQLite-backed Python data source implements external lookup") {
+    assume(shouldTestPandasUDFs)
+
+    withTempDir { directory =>
+      val database = new File(directory, "lookup.db")
+      val requests = new File(directory, "requests")
+      val dataSourceScript =
+        s"""
+           |import sqlite3
+           |
+           |from pyspark.sql.datasource import (
+           |    DataSource, EqualTo, ExternalLookup, GreaterThanOrEqual, LookupParameter
+           |)
+           |
+           |class SqliteLookup(ExternalLookup):
+           |    def __init__(self, options, schema, selected):
+           |        self.options = options
+           |        self.output_fields = schema.fieldNames()
+           |        self.selected = selected
+           |
+           |    def selectedPredicateIndexes(self):
+           |        return self.selected
+           |
+           |    def maxParameterRowsPerRequest(self):
+           |        return 2
+           |
+           |    def lookup(self, batches):
+           |        conn = sqlite3.connect(self.options["path"])
+           |        try:
+           |            for batch in batches:
+           |                data = batch.to_pydict()
+           |                parameters = list(zip(
+           |                    data["input_ordinal"], data["parameter_0"], data["parameter_1"]
+           |                ))
+           |                with open(self.options["requests"], "a") as output:
+           |                    output.write(str(len(parameters)) + "\\n")
+           |                placeholders = ", ".join(["(?, ?, ?)"] * len(parameters))
+           |                columns = ", ".join(f'e."{field}"' for field in self.output_fields)
+           |                query = (
+           |                    "WITH parameters(input_ordinal, id, lower_bound) AS "
+           |                    f"(VALUES {placeholders}) "
+           |                    f"SELECT p.input_ordinal, {columns} "
+           |                    "FROM parameters p JOIN enrichments e "
+           |                    "ON e.id = p.id AND e.score >= p.lower_bound"
+           |                )
+           |                values = [value for row in parameters for value in row]
+           |                yield from conn.execute(query, values)
+           |        finally:
+           |            conn.close()
+           |
+           |class $dataSourceName(DataSource):
+           |    def schema(self):
+           |        return "id INT, score INT, label STRING"
+           |
+           |    def externalLookup(self, schema, predicates):
+           |        selected = []
+           |        for predicate_type, field in [
+           |            (EqualTo, ("id",)), (GreaterThanOrEqual, ("score",))
+           |        ]:
+           |            matches = [
+           |                index for index, predicate in enumerate(predicates)
+           |                if isinstance(predicate, predicate_type)
+           |                and predicate.attribute == field
+           |                and isinstance(predicate.value, LookupParameter)
+           |            ]
+           |            if len(matches) != 1:
+           |                return None
+           |            selected.append(matches[0])
+           |        conn = sqlite3.connect(self.options["path"])
+           |        try:
+           |            conn.execute(
+           |                "CREATE TABLE IF NOT EXISTS enrichments "
+           |                "(id INTEGER, score INTEGER, label TEXT, PRIMARY KEY (id, score))"
+           |            )
+           |            conn.executemany(
+           |                "INSERT OR IGNORE INTO enrichments VALUES (?, ?, ?)",
+           |                [(1, 12, "one"), (1, 18, "uno"), (2, 5, "two")]
+           |            )
+           |            conn.commit()
+           |        finally:
+           |            conn.close()
+           |        return SqliteLookup(self.options, schema, selected)
+           |""".stripMargin
+      val dataSource = createUserDefinedPythonDataSource(dataSourceName, dataSourceScript)
+      spark.dataSource.registerPython(dataSourceName, dataSource)
+
+      val leftSchema = StructType.fromDDL("id INT, lower_bound INT, rejected STRING")
+      val left = spark.createDataFrame(
+        JArrays.asList(
+          Row(1, 12, "missing"), Row(1, 15, "missing"), Row(2, 0, "missing"),
+          Row(3, 0, "missing"), Row(1, 12, "uno"), Row(1, 12, "missing"),
+          Row(2, 0, "two"), Row(1, 20, "missing"),
+          Row(null, 0, "missing"), Row(1, null, "missing")),
+        leftSchema).coalesce(1).as("left")
+      val lookup = spark.read.format(dataSourceName)
+        .option("path", database.toString).option("requests", requests.toString)
+        .load().hint("external_lookup", "cache_enabled=false").as("lookup")
+      val condition = col("left.id") === col("lookup.id") &&
+        col("lookup.score") >= col("left.lower_bound") &&
+        col("lookup.label") =!= col("left.rejected")
+      val matched = Seq(
+        Row(1, 12, "missing", "one"), Row(1, 12, "missing", "uno"),
+        Row(1, 15, "missing", "uno"), Row(2, 0, "missing", "two"),
+        Row(1, 12, "uno", "one"),
+        Row(1, 12, "missing", "one"), Row(1, 12, "missing", "uno"))
+      val unmatched = Seq(
+        Row(3, 0, "missing", null), Row(2, 0, "two", null), Row(1, 20, "missing", null),
+        Row(null, 0, "missing", null), Row(1, null, "missing", null))
+
+      Seq("inner", "left_outer").foreach { joinType =>
+        val joined = left.join(lookup, condition, joinType)
+          .select(col("left.id"), col("left.lower_bound"), col("left.rejected"),
+            col("lookup.label"))
+        checkAnswer(joined, matched ++ (if (joinType == "left_outer") unmatched else Nil))
+
+        val lookupJoin = collectFirst(joined.queryExecution.executedPlan) {
+          case exec: ExternalLookupJoinExec => exec
+        }.getOrElse(
+          fail(s"ExternalLookupJoinExec not found:\n${joined.queryExecution.executedPlan}"))
+        assert(lookupJoin.maxParameterRowsPerRequest == 2)
+        assert(lookupJoin.lookupOutput.map(_.name) == Seq("label"))
+        assert(lookupJoin.residualCondition.nonEmpty)
+        assert(!lookupJoin.cacheOptions.enabled)
+      }
+
+      val batchSizes = java.nio.file.Files.readAllLines(requests.toPath)
+      assert(batchSizes.size() > 2)
+      batchSizes.forEach(size => assert(size.toInt > 0 && size.toInt <= 2))
+      assert(batchSizes.contains("2"))
+    }
+  }
+
   test("register data source") {
     assume(shouldTestPandasUDFs)
     val dataSourceScript =
