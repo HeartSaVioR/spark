@@ -306,6 +306,9 @@ class PythonExternalLookupPlanningTests(unittest.TestCase):
                 self.assertEqual(batches[0].column(0).to_pylist(), list(range(5)))
 
     def test_lookup_tuple_ordinals_are_lossless(self):
+        import numpy as np
+        import pyarrow as pa
+
         from pyspark.sql.datasource import ExternalLookup
 
         class Lookup(ExternalLookup):
@@ -322,7 +325,20 @@ class PythonExternalLookupPlanningTests(unittest.TestCase):
                 return lookup
 
         schema = StructType([StructField("id", IntegerType())])
-        for ordinal in [0.5, -0.5, 0.0, True, "0", None, -(2**31) - 1, 2**31]:
+        invalid_ordinals = [0.5, -0.5, 0.0, True, False, "0", None, -1, -(2**31) - 1, 2**31]
+        invalid_ordinals += [
+            np.bool_(True),
+            np.bool_(False),
+            np.float64(0.5),
+            np.float32(-0.5),
+            np.float64(0.0),
+            np.int32(-1),
+            np.int64(2**31),
+            np.uint64(2**63),
+        ]
+        invalid_ordinals += [pa.scalar(value) for value in [True, False, 0.5, -0.5, 0.0, -1]]
+        invalid_ordinals += [pa.scalar(None, type=pa.int32()), pa.scalar(2**31)]
+        for ordinal in invalid_ordinals:
             for row_type in [
                 tuple,
                 list,
@@ -335,12 +351,79 @@ class PythonExternalLookupPlanningTests(unittest.TestCase):
                     with self.assertRaisesRegex(Exception, "input_ordinal"):
                         list(function(iter([])))
 
-        for output in [(0, 17), [0, 17], Row(id=17, input_ordinal=0)]:
-            with self.subTest(output=output):
-                (function, _), _, _ = self.plan_lookup(Source({"output": output}), schema)
-                self.assertEqual(
-                    list(function(iter([])))[0].to_pydict(), {"input_ordinal": [0], "id": [17]}
-                )
+        valid_ordinals = [
+            0,
+            2**31 - 1,
+            np.int32(0),
+            np.int64(2**31 - 1),
+            np.uint32(2**31 - 1),
+            np.uint64(2**31 - 1),
+            pa.scalar(0, type=pa.int32()),
+            pa.scalar(2**31 - 1, type=pa.int64()),
+        ]
+        for ordinal in valid_ordinals:
+            for row_type in [
+                tuple,
+                list,
+                lambda values: Row(id=values[1], input_ordinal=values[0]),
+            ]:
+                with self.subTest(ordinal=ordinal, row_type=row_type):
+                    (function, _), _, _ = self.plan_lookup(
+                        Source({"output": row_type([ordinal, 17])}), schema
+                    )
+                    self.assertEqual(
+                        list(function(iter([])))[0].to_pydict(),
+                        {"input_ordinal": [int(ordinal)], "id": [17]},
+                    )
+
+    def test_lookup_integer_column_ordinals(self):
+        import pyarrow as pa
+
+        from pyspark.sql.datasource import ExternalLookup
+
+        class Lookup(ExternalLookup):
+            def selectedPredicateIndexes(self):
+                return [0]
+
+            def lookup(self, parameters):
+                for batch in parameters:
+                    if self.mode == "arrow":
+                        rows = zip(batch.column(0), batch.column(1))
+                    elif self.mode == "numpy":
+                        rows = zip(batch.column(0).to_numpy(), batch.column(1).to_numpy())
+                    else:
+                        rows = batch.to_pandas().to_records(index=False)
+                    for ordinal, value in rows:
+                        if self.row_type == "row":
+                            yield Row(id=value, input_ordinal=ordinal)
+                        elif self.row_type == "list":
+                            yield [ordinal, value]
+                        else:
+                            yield (ordinal, value)
+
+        class Source(DataSource):
+            def externalLookup(self, schema, predicates):
+                lookup = Lookup()
+                lookup.mode = self.options["mode"]
+                lookup.row_type = self.options["row_type"]
+                return lookup
+
+        schema = StructType([StructField("id", IntegerType())])
+        batch = pa.record_batch(
+            [pa.array([0, 1, 2], type=pa.int32()), pa.array([17, 18, 19], type=pa.int32())],
+            names=["input_ordinal", "parameter_0"],
+        )
+        for mode in ["arrow", "numpy", "pandas"]:
+            for row_type in ["tuple", "list", "row"]:
+                with self.subTest(mode=mode, row_type=row_type):
+                    (function, _), _, _ = self.plan_lookup(
+                        Source({"mode": mode, "row_type": row_type}), schema
+                    )
+                    batches = list(function(iter([batch])))
+                    self.assertEqual(
+                        pa.Table.from_batches(batches).to_pydict(),
+                        {"input_ordinal": [0, 1, 2], "id": [17, 18, 19]},
+                    )
 
     def test_lookup_iterator_cleanup_on_failure_and_early_close(self):
         from pyspark.sql.datasource import ExternalLookup

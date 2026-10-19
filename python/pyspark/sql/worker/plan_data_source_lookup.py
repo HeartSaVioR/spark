@@ -16,11 +16,13 @@
 #
 
 import json
+import operator
 import sys
 from collections.abc import Iterator as IteratorABC
 from collections.abc import Sequence as SequenceABC
 from typing import IO, Any, Iterable, Iterator, List
 
+import numpy as np
 import pyarrow as pa
 
 from pyspark.errors import PySparkAssertionError, PySparkRuntimeError, PySparkTypeError
@@ -250,11 +252,15 @@ def _main(infile: IO, outfile: IO) -> None:
                             if named_row is not None
                             else row[0]
                         )
-                        if (
-                            not isinstance(ordinal, int)
-                            or isinstance(ordinal, bool)
-                            or not 0 <= ordinal <= 2**31 - 1
-                        ):
+                        if isinstance(ordinal, pa.Scalar):
+                            ordinal = ordinal.as_py()
+                        try:
+                            valid_ordinal = not isinstance(ordinal, (bool, np.bool_)) and (
+                                0 <= operator.index(ordinal) <= 2**31 - 1
+                            )
+                        except TypeError:
+                            valid_ordinal = False
+                        if not valid_ordinal:
                             raise PySparkRuntimeError(
                                 errorClass="DATA_SOURCE_TYPE_MISMATCH",
                                 messageParameters={

@@ -665,6 +665,12 @@ class PythonDataSourceSuite extends PythonDataSourceSuiteBase {
        |                while True:
        |                    time.sleep(1)
        |            rows = list(zip(data["input_ordinal"], data["parameter_0"]))
+       |            if self.options.get("ordinal") == "arrow":
+       |                rows = list(zip(batch.column(0), batch.column(1)))
+       |            elif self.options.get("ordinal") == "numpy":
+       |                rows = list(zip(batch.column(0).to_numpy(), batch.column(1).to_numpy()))
+       |            elif self.options.get("ordinal") == "pandas":
+       |                rows = list(batch.to_pandas().to_records(index=False))
        |            for ordinal, value in reversed(rows):
        |                mode = self.options.get("ordinal")
        |                if mode == "null":
@@ -1231,6 +1237,19 @@ class PythonDataSourceSuite extends PythonDataSourceSuiteBase {
         condition = "PYTHON_DATA_SOURCE_ERROR",
         parameters = Map("action" -> "plan", "type" -> "external lookup", "msg" -> message))
     }
+  }
+
+  gridTest("external lookup Python preserves integer column ordinals")(
+      Seq("arrow", "numpy", "pandas")) { mode =>
+    assume(shouldTestPandasUDFs)
+    val source = createUserDefinedPythonDataSource(dataSourceName, pythonLookupScript())
+    spark.dataSource.registerPython(dataSourceName, source)
+    val left = spark.range(1, 6, 1, 1).selectExpr("cast(id as int) as id").as("left")
+    val lookup = spark.read.format(dataSourceName).option("ordinal", mode)
+      .schema("id INT, label STRING").load().as("lookup")
+    val joined = left.join(lookup, col("left.id") === col("lookup.id"))
+      .select(col("left.id"), col("lookup.label"))
+    checkAnswer(joined, (1 until 6).map(value => Row(value, s"lookup-$value")))
   }
 
   test("external lookup Python rejects invalid result ordinals and propagates execution errors") {
