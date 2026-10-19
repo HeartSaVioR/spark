@@ -155,13 +155,13 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
       attributesWithEventWatermark: AttributeSet,
       eventWatermark: Option[Long]): Option[(Attribute, Long)] = {
 
-    val attributesInCondition = AttributeSet(
+    // Count occurrences before canonicalization so repeated attributes cannot appear unit-scaled.
+    val attributesInCondition =
       leftExpr.collect { case a: AttributeReference => a } ++
       rightExpr.collect { case a: AttributeReference => a }
-    )
     if (attributesInCondition.count(attributesToFindStateWatermarkFor.contains) > 1 ||
         attributesInCondition.count(attributesWithEventWatermark.contains) > 1) {
-      // If more than attributes present in condition from one side, then it cannot be solved
+      // Multiple attribute occurrences on either side require coefficient handling.
       return None
     }
 
@@ -178,8 +178,7 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
 
     // Canonicalization step 2: extract commutative terms
     //    rightTime-with-watermark, c1, -leftTime, -c2
-    // Preserve repeated terms such as +2 +2, which contribute twice to the cutoff.
-    val terms = collectTerms(allOnLeftExpr)
+    val terms = ExpressionSet(collectTerms(allOnLeftExpr))
     logDebug("Terms extracted from join condition:\n\t" + terms.mkString("\n\t"))
 
     // Find the term that has leftTime (i.e. the one present in attributesToFindConstraintFor
@@ -230,10 +229,7 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
     // from the other terms. That is,
     // rightTime-with-watermark, c1, -c2  =>  watermark, c1, -c2  =>  watermark + c1 + (-c2)
     logDebug(s"Constraint term from join condition:\t$constraintTerm")
-    // Exactly one state-attribute term remains after the checks above. Remove it by identity
-    // without deduplicating any remaining terms, including repeated constants.
-    val remainingTerms = terms.filterNot(_ eq constraintTerm)
-    val exprWithWatermarkSubstituted = remainingTerms.map { term =>
+    val exprWithWatermarkSubstituted = (terms - constraintTerm).map { term =>
       term.transform {
         case a @ AttributeReference(_, _, _, metadata)
           if attributesWithEventWatermark.contains(a) && metadata.contains(delayKey) =>

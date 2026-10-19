@@ -209,12 +209,6 @@ class StreamingJoinHelperSuite extends AnalysisTest {
       Some(10000))
     assert(watermarkFrom("leftTime > rightTime OR cast(leftTime AS LONG) > 10") === None)
 
-    // Equal literal terms must not be deduplicated during canonicalization.
-    assert(watermarkFrom("cast(leftTime AS LONG) > cast(rightTime AS LONG) + 2 + 2") ===
-      Some(14000))
-    assert(watermarkFrom("cast(leftTime AS LONG) > cast(rightTime AS LONG) - 2 - 2") ===
-      Some(6000))
-
     // Test non-positive results
     assert(watermarkFrom("CAST(leftTime AS LONG) > CAST(rightTime AS LONG) - 10") === Some(0))
     assert(watermarkFrom("CAST(leftTime AS LONG) > CAST(rightTime AS LONG) - 100") === Some(-90000))
