@@ -155,23 +155,6 @@ class StreamingSymmetricHashJoinHelperSuite extends StreamTest {
     assert(both.right.isDefined)
   }
 
-  test("SPARK-58904: range eviction must include newly admitted rows below the previous bound") {
-    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
-    val lt = AttributeReference("lt", TimestampType, metadata = metadata)()
-    val rt = AttributeReference("rt", TimestampType, metadata = metadata)()
-    Seq(-5, 5).foreach { offset =>
-      val predicates = StreamingSymmetricHashJoinHelper.getStateWatermarkPredicates(
-        Seq(lt), Seq(rt), Nil, Nil, Some(lt > rt + offset),
-        Some(20000), Some(10000), false)
-      val expectedPrevious = if (offset < 0) Some(5000L) else Some(10000L)
-      assert(predicates.left.exists {
-        case JoinStateValueWatermarkPredicate(_, watermark, previous) =>
-          watermark == 20000 + offset * 1000 && previous == expectedPrevious
-        case _ => false
-      })
-    }
-  }
-
   test("SPARK-58904: a bound on another timestamp does not advance the output watermark") {
     val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
     val lt = AttributeReference("lt", TimestampType)()

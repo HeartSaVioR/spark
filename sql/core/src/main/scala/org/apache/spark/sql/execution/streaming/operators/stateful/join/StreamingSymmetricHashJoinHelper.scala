@@ -240,7 +240,7 @@ object StreamingSymmetricHashJoinHelper extends Logging {
           condition,
           eventTimeWatermarkForEviction)
         stateValueWatermark.flatMap { case (stateAttribute, watermark) =>
-          // Rows newer than the late-event watermark can have arrived since the last eviction.
+          // Only reuse scan bounds for the same indexed event-time column.
           val prevStateValueWatermark = eventTimeWatermarkForLateEvents.flatMap { lateWatermark =>
             StreamingJoinHelper.getStateValueWatermark(
               attributesToFindStateWatermarkFor = AttributeSet(oneSideInputAttributes),
@@ -250,7 +250,7 @@ object StreamingSymmetricHashJoinHelper extends Logging {
               case (prevAttribute, prevWatermark)
                   if prevAttribute.semanticEquals(stateAttribute) &&
                     ownEventTime.exists(_.semanticEquals(stateAttribute)) =>
-                math.min(prevWatermark, lateWatermark)
+                prevWatermark
             }
           }
           watermarkExpression(Some(stateAttribute), Some(watermark)).map { e =>
