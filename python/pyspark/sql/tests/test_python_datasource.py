@@ -373,7 +373,12 @@ class PythonExternalLookupPlanningTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         list(function(iter([])))[0].to_pydict(),
-                        {"input_ordinal": [int(ordinal)], "id": [17]},
+                        {
+                            "input_ordinal": [
+                                ordinal.as_py() if isinstance(ordinal, pa.Scalar) else int(ordinal)
+                            ],
+                            "id": [17],
+                        },
                     )
 
     def test_lookup_integer_column_ordinals(self):

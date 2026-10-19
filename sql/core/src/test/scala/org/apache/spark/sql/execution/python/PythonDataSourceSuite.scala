@@ -667,6 +667,9 @@ class PythonDataSourceSuite extends PythonDataSourceSuiteBase {
        |            rows = list(zip(data["input_ordinal"], data["parameter_0"]))
        |            if self.options.get("ordinal") == "arrow":
        |                rows = list(zip(batch.column(0), batch.column(1)))
+       |            elif self.options.get("ordinal") == "arrow64":
+       |                import pyarrow as pa
+       |                rows = list(zip(batch.column(0).cast(pa.int64()), batch.column(1)))
        |            elif self.options.get("ordinal") == "numpy":
        |                rows = list(zip(batch.column(0).to_numpy(), batch.column(1).to_numpy()))
        |            elif self.options.get("ordinal") == "pandas":
@@ -1240,7 +1243,7 @@ class PythonDataSourceSuite extends PythonDataSourceSuiteBase {
   }
 
   gridTest("external lookup Python preserves integer column ordinals")(
-      Seq("arrow", "numpy", "pandas")) { mode =>
+      Seq("arrow", "arrow64", "numpy", "pandas")) { mode =>
     assume(shouldTestPandasUDFs)
     val source = createUserDefinedPythonDataSource(dataSourceName, pythonLookupScript())
     spark.dataSource.registerPython(dataSourceName, source)

@@ -255,12 +255,14 @@ def _main(infile: IO, outfile: IO) -> None:
                         if isinstance(ordinal, pa.Scalar):
                             ordinal = ordinal.as_py()
                         try:
-                            valid_ordinal = not isinstance(ordinal, (bool, np.bool_)) and (
-                                0 <= operator.index(ordinal) <= 2**31 - 1
+                            normalized_ordinal = (
+                                None
+                                if isinstance(ordinal, (bool, np.bool_))
+                                else operator.index(ordinal)
                             )
                         except TypeError:
-                            valid_ordinal = False
-                        if not valid_ordinal:
+                            normalized_ordinal = None
+                        if normalized_ordinal is None or not 0 <= normalized_ordinal <= 2**31 - 1:
                             raise PySparkRuntimeError(
                                 errorClass="DATA_SOURCE_TYPE_MISMATCH",
                                 messageParameters={
@@ -268,6 +270,16 @@ def _main(infile: IO, outfile: IO) -> None:
                                     "actual": repr(ordinal),
                                 },
                             )
+                        ordinal_index = (
+                            named_row.__fields__.index(INPUT_ORDINAL_COLUMN_NAME)
+                            if named_row is not None
+                            else 0
+                        )
+                        values = list(row)
+                        values[ordinal_index] = normalized_ordinal
+                        row = (
+                            Row(*named_row.__fields__)(*values) if named_row is not None else values
+                        )
                     yield row
 
             try:
