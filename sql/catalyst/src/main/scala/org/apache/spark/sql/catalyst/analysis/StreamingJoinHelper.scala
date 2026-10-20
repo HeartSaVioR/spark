@@ -178,7 +178,8 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
 
     // Canonicalization step 2: extract commutative terms
     //    rightTime-with-watermark, c1, -leftTime, -c2
-    val terms = ExpressionSet(collectTerms(allOnLeftExpr))
+    // Equal terms still contribute separately to the arithmetic sum.
+    val terms = collectTerms(allOnLeftExpr)
     logDebug("Terms extracted from join condition:\n\t" + terms.mkString("\n\t"))
 
     // Find the term that has leftTime (i.e. the one present in attributesToFindConstraintFor
@@ -229,7 +230,7 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
     // from the other terms. That is,
     // rightTime-with-watermark, c1, -c2  =>  watermark, c1, -c2  =>  watermark + c1 + (-c2)
     logDebug(s"Constraint term from join condition:\t$constraintTerm")
-    val exprWithWatermarkSubstituted = (terms - constraintTerm).map { term =>
+    val exprWithWatermarkSubstituted = terms.filterNot(_ eq constraintTerm).map { term =>
       term.transform {
         case a @ AttributeReference(_, _, _, metadata)
           if attributesWithEventWatermark.contains(a) && metadata.contains(delayKey) =>
