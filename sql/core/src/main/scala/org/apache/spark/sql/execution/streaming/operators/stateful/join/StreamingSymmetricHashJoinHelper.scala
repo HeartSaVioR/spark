@@ -17,27 +17,24 @@
 
 package org.apache.spark.sql.execution.streaming.operators.stateful.join
 
-import scala.collection.mutable.ArrayBuffer
 import scala.reflect.ClassTag
 
 import org.apache.spark.{Partition, SparkContext, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.{RDD, ZippedPartitionsBaseRDD, ZippedPartitionsPartition}
-import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.StreamingJoinHelper
-import org.apache.spark.sql.catalyst.expressions.{Add, And, Attribute, AttributeSet, Between, BoundReference, EvalMode, Expression, GreaterThan, GreaterThanOrEqual, Greatest, Least, LessThan, LessThanOrEqual, Literal, Multiply, NamedExpression, PreciseTimestampConversion, PredicateHelper, Subtract, TryEval, UnsafeProjection}
+import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeSet, BoundReference, Expression, NamedExpression, PredicateHelper}
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark._
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.streaming.operators.stateful.{StatefulOperatorStateInfo, WatermarkSupport}
 import org.apache.spark.sql.execution.streaming.operators.stateful.WatermarkSupport.watermarkExpression
 import org.apache.spark.sql.execution.streaming.state.{StateStoreCheckpointInfo, StateStoreCoordinatorRef, StateStoreProviderId}
-import org.apache.spark.sql.types.{LongType, TimestampType}
 
 
 /**
  * Helper object for [[StreamingSymmetricHashJoinExec]]. See that object for more details.
  */
-object StreamingSymmetricHashJoinHelper extends Logging with PredicateHelper {
+object StreamingSymmetricHashJoinHelper extends Logging {
 
   sealed trait JoinSide
   case object LeftSide extends JoinSide { override def toString(): String = "left" }
@@ -155,93 +152,6 @@ object StreamingSymmetricHashJoinHelper extends Logging with PredicateHelper {
       }
 
       JoinConditionSplitPredicates(leftCondition, rightCondition, joinedCondition, condition)
-    }
-  }
-
-  /**
-   * Derive inclusive scan bounds on the stored event-time column from the incoming row.
-   * For `R.time >= L.time AND R.time <= L.expiry`, incoming L bounds R.time on both sides,
-   * while incoming R only bounds L.time from above. L.expiry remains a residual condition.
-   *
-   * Direct comparisons supply row-dependent bounds. When useConstantOffsets is enabled, the
-   * existing watermark arithmetic extractor supplies missing endpoints for fixed intervals,
-   * restricting both sides to their selected event-time columns. Strict comparisons keep
-   * inclusive bounds, leaving the exact check to the full join predicate. Null or failed bounds
-   * are ignored; an endpoint with no usable bound remains unbounded.
-   */
-  def getJoinScanRange(
-      inputAttributes: Seq[Attribute],
-      indexedTime: Attribute,
-      condition: Option[Expression],
-      useConstantOffsets: Boolean = false): Option[InternalRow => (Long, Long)] = {
-    if (indexedTime.dataType != TimestampType) return None
-
-    val inputSet = AttributeSet(inputAttributes)
-    val lowerBounds = new ArrayBuffer[Expression]
-    val upperBounds = new ArrayBuffer[Expression]
-
-    def addBound(index: Expression, bound: Expression, bounds: ArrayBuffer[Expression]): Unit = {
-      if (index.semanticEquals(indexedTime) && bound.dataType == TimestampType &&
-          bound.deterministic && bound.references.subsetOf(inputSet)) {
-        // Early bound evaluation must not introduce errors the full predicate would short-circuit.
-        bounds += TryEval(bound)
-      }
-    }
-
-    def addLessThan(left: Expression, right: Expression): Unit = {
-      addBound(left, right, upperBounds)
-      addBound(right, left, lowerBounds)
-    }
-
-    condition.toSeq.flatMap(splitConjunctivePredicates).foreach {
-      case LessThan(l, r) => addLessThan(l, r)
-      case LessThanOrEqual(l, r) => addLessThan(l, r)
-      case GreaterThan(l, r) => addLessThan(r, l)
-      case GreaterThanOrEqual(l, r) => addLessThan(r, l)
-      case Between(input, lower, upper, _) =>
-        addLessThan(lower, input)
-        addLessThan(input, upper)
-      case _ =>
-    }
-
-    if (useConstantOffsets && (lowerBounds.isEmpty || upperBounds.isEmpty)) {
-      for {
-        inputTime <- WatermarkSupport.findEventTimeColumn(
-          inputAttributes, allowMultipleEventTimeColumns = false)
-          .filter(_.dataType == TimestampType)
-        lowerOffset <- StreamingJoinHelper.getStateValueWatermark(
-          AttributeSet(Seq(indexedTime)), AttributeSet(Seq(inputTime)), condition, Some(0L))
-        upperOffset <- StreamingJoinHelper.getStateValueWatermark(
-          AttributeSet(Seq(inputTime)), AttributeSet(Seq(indexedTime)), condition, Some(0L))
-      } {
-        // Preserve the existing two-offset optimization for arithmetic on the indexed column.
-        // A separate expiry column cannot supply an offset for the selected timestamp index.
-        val inputMicros = PreciseTimestampConversion(inputTime, TimestampType, LongType)
-        def offsetMicros(offset: Long): Expression =
-          Multiply(Literal(offset), Literal(1000L), EvalMode.ANSI)
-        def timestampBound(micros: Expression): Expression =
-          TryEval(PreciseTimestampConversion(micros, LongType, TimestampType))
-
-        if (lowerBounds.isEmpty) {
-          lowerBounds += timestampBound(Add(inputMicros, offsetMicros(lowerOffset), EvalMode.ANSI))
-        }
-        if (upperBounds.isEmpty) {
-          upperBounds += timestampBound(
-            Subtract(inputMicros, offsetMicros(upperOffset), EvalMode.ANSI))
-        }
-      }
-    }
-
-    if (lowerBounds.isEmpty && upperBounds.isEmpty) return None
-
-    val lower = lowerBounds.reduceOption[Expression]((l, r) => Greatest(Seq(l, r)))
-    val upper = upperBounds.reduceOption[Expression]((l, r) => Least(Seq(l, r)))
-    val projection = UnsafeProjection.create(
-      Seq(lower, upper).map(_.getOrElse(Literal(null, TimestampType))), inputAttributes)
-    Some { row =>
-      val bounds = projection(row)
-      (if (bounds.isNullAt(0)) Long.MinValue else bounds.getLong(0),
-        if (bounds.isNullAt(1)) Long.MaxValue else bounds.getLong(1))
     }
   }
 
