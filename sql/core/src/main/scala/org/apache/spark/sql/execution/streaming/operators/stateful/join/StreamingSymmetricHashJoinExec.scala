@@ -733,7 +733,12 @@ case class StreamingSymmetricHashJoinExec(
         }
         WatermarkSupport.findEventTimeColumn(
           otherSideAttrs, allowMultipleEventTimeColumns = false).flatMap { indexedTime =>
-          getJoinScanRange(inputAttributes, indexedTime, condition.full)
+          // Retain arithmetic extraction under the original state-value watermark eligibility.
+          val useConstantOffsets = stateWatermarkPredicate.exists {
+            case _: JoinStateValueWatermarkPredicate => true
+            case _ => false
+          }
+          getJoinScanRange(inputAttributes, indexedTime, condition.full, useConstantOffsets)
         }
       }
     }

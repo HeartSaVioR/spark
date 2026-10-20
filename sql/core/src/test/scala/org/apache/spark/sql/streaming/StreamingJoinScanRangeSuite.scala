@@ -23,6 +23,7 @@ import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Between, Cast, EvalMode, Literal, Predicate, TimestampAddInterval}
+import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper.getJoinScanRange
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
@@ -97,6 +98,39 @@ class StreamingJoinScanRangeSuite extends SparkFunSuite {
     val condition = rightTime >= leftTime && rightTime <= end
     val scan = getJoinScanRange(Seq(leftTime), rightTime, Some(condition)).get
     assert(scan(InternalRow(100000001L)) == (100000001L, 110000001L))
+  }
+
+  test("fixed intervals retain bounded scans in both directions") {
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 60000).build()
+    val left = AttributeReference("leftTime", TimestampType, metadata = metadata)()
+    val right = AttributeReference("rightTime", TimestampType, metadata = metadata)()
+    def shift(time: AttributeReference, seconds: Long): TimestampAddInterval =
+      TimestampAddInterval(time, Literal(Duration.ofSeconds(seconds)), Some("UTC"))
+
+    val conditions = Seq(
+      (right >= left && right <= shift(left, 10), (0L, 10L), (-10L, 0L)),
+      (left >= shift(right, -10) && left <= right, (0L, 10L), (-10L, 0L)),
+      (left >= shift(right, -5) && left <= shift(right, 5), (-5L, 5L), (-5L, 5L)),
+      (shift(left, 2) >= shift(right, -3) && shift(left, 2) <= shift(right, 7),
+        (-5L, 5L), (-5L, 5L)))
+
+    conditions.foreach { case (condition, rightOffsets, leftOffsets) =>
+      Seq((Seq(left), right, rightOffsets), (Seq(right), left, leftOffsets)).foreach {
+        case (input, index, (lowerSeconds, upperSeconds)) =>
+          val time = 100000001L
+          val (lower, upper) = getJoinScanRange(
+            input, index, Some(condition), useConstantOffsets = true)
+            .getOrElse(fail(s"No scan bounds for ${condition.sql}, index ${index.name}"))(
+              InternalRow(time))
+          val expectedLower = time + lowerSeconds * 1000000L
+          val expectedUpper = time + upperSeconds * 1000000L
+          // The existing arithmetic extractor widens each endpoint by at most one millisecond.
+          assert(lower >= expectedLower - 1000L && lower <= expectedLower,
+            s"Lost lower bound for ${condition.sql}, index ${index.name}: $lower")
+          assert(upper >= expectedUpper && upper <= expectedUpper + 1000L,
+            s"Lost upper bound for ${condition.sql}, index ${index.name}: $upper")
+      }
+    }
   }
 
   test("unsupported expressions cannot narrow the indexed timestamp range") {
