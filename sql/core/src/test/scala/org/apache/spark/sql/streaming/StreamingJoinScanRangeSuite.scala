@@ -32,6 +32,13 @@ class StreamingJoinScanRangeSuite extends SparkFunSuite {
   private val leftTime = AttributeReference("leftTime", TimestampType)()
   private val expiry = AttributeReference("expiry", TimestampType)()
   private val rightTime = AttributeReference("rightTime", TimestampType)()
+  private val watermarkMetadata =
+    new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 60000).build()
+  private val watermarkedLeft = leftTime.withMetadata(watermarkMetadata)
+  private val watermarkedRight = rightTime.withMetadata(watermarkMetadata)
+
+  private def shift(time: AttributeReference, seconds: Long): TimestampAddInterval =
+    TimestampAddInterval(time, Literal(Duration.ofSeconds(seconds)), Some("UTC"))
 
   test("scan bounds use the incoming expiry and constrain only the stored index column") {
     val condition = Some(rightTime >= leftTime && rightTime <= expiry)
@@ -101,11 +108,8 @@ class StreamingJoinScanRangeSuite extends SparkFunSuite {
   }
 
   test("fixed intervals retain bounded scans in both directions") {
-    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 60000).build()
-    val left = AttributeReference("leftTime", TimestampType, metadata = metadata)()
-    val right = AttributeReference("rightTime", TimestampType, metadata = metadata)()
-    def shift(time: AttributeReference, seconds: Long): TimestampAddInterval =
-      TimestampAddInterval(time, Literal(Duration.ofSeconds(seconds)), Some("UTC"))
+    val left = watermarkedLeft
+    val right = watermarkedRight
 
     val conditions = Seq(
       (right >= left && right <= shift(left, 10), (0L, 10L), (-10L, 0L)),
@@ -131,6 +135,54 @@ class StreamingJoinScanRangeSuite extends SparkFunSuite {
             s"Lost upper bound for ${condition.sql}, index ${index.name}: $upper")
       }
     }
+  }
+
+  test("numeric-cast predicates retain their existing scan bounds") {
+    for (dataType <- Seq(LongType, DoubleType, FloatType)) {
+      val left = Cast(watermarkedLeft, dataType)
+      val right = Cast(watermarkedRight, dataType)
+      val condition = left >= right - 5 && left <= right + 5
+      for ((input, index) <- Seq(
+          (watermarkedLeft, watermarkedRight), (watermarkedRight, watermarkedLeft))) {
+        val scan = getJoinScanRange(
+          Seq(input), index, Some(condition), useConstantOffsets = true).get
+        assert(scan(InternalRow(100000000L)) == (94999000L, 105001000L))
+      }
+    }
+  }
+
+  test("constant-offset extraction remains optional and requires both offsets") {
+    val lower = watermarkedLeft >= shift(watermarkedRight, -5)
+    val upper = watermarkedLeft <= shift(watermarkedRight, 5)
+    assert(getJoinScanRange(Seq(watermarkedLeft), watermarkedRight, Some(lower && upper),
+      useConstantOffsets = false).isEmpty)
+    for (condition <- Seq(lower, upper)) {
+      assert(getJoinScanRange(Seq(watermarkedLeft), watermarkedRight, Some(condition),
+        useConstantOffsets = true).isEmpty)
+    }
+    assert(getJoinScanRange(Seq(leftTime), watermarkedRight, Some(lower && upper),
+      useConstantOffsets = true).isEmpty)
+  }
+
+  test("constant offsets cannot use an independent stored expiry column") {
+    val condition = Some(watermarkedRight >= watermarkedLeft && watermarkedRight <= expiry)
+    val scanRight = getJoinScanRange(Seq(watermarkedLeft, expiry), watermarkedRight, condition,
+      useConstantOffsets = true).get
+    val scanLeft = getJoinScanRange(Seq(watermarkedRight), watermarkedLeft, condition,
+      useConstantOffsets = true).get
+    assert(scanRight(InternalRow(100000000L, 110000000L)) == (100000000L, 110000000L))
+    assert(scanRight(InternalRow(100000000L, 120000000L)) == (100000000L, 120000000L))
+    assert(scanLeft(InternalRow(105000000L)) == (Long.MinValue, 105000000L))
+  }
+
+  test("null or overflowing arithmetic bounds leave the affected endpoint unbounded") {
+    val condition = watermarkedLeft >= shift(watermarkedRight, -5) &&
+      watermarkedLeft <= shift(watermarkedRight, 5)
+    val scan = getJoinScanRange(Seq(watermarkedLeft), watermarkedRight, Some(condition),
+      useConstantOffsets = true).get
+    assert(scan(InternalRow(null)) == (Long.MinValue, Long.MaxValue))
+    assert(scan(InternalRow(Long.MinValue)) == (Long.MinValue, Long.MinValue + 5001000L))
+    assert(scan(InternalRow(Long.MaxValue)) == (Long.MaxValue - 5001000L, Long.MaxValue))
   }
 
   test("unsupported expressions cannot narrow the indexed timestamp range") {

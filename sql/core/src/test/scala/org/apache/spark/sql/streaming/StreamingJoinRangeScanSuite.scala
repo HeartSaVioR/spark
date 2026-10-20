@@ -18,6 +18,9 @@
 package org.apache.spark.sql.streaming
 
 import org.apache.spark.sql.Row
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.plans.logical.Join
+import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper.getJoinScanRange
 import org.apache.spark.sql.execution.streaming.runtime.MemoryStream
 import org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider
 import org.apache.spark.sql.functions._
@@ -31,6 +34,47 @@ class StreamingJoinRangeScanSuite extends StreamTest {
       SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key -> version.toString,
       SQLConf.STATE_STORE_PROVIDER_CLASS.key -> classOf[RocksDBStateStoreProvider].getName,
       SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false")(f)
+  }
+
+  test("optimized fixed-interval conditions retain bounded scans in both directions") {
+    val left = MemoryStream[(Int, Long)].toDF().toDF("leftKey", "time")
+      .select($"leftKey", timestamp_micros($"time").as("leftTime"))
+      .withWatermark("leftTime", "60 seconds")
+    val right = MemoryStream[(Int, Long)].toDF().toDF("rightKey", "time")
+      .select($"rightKey", timestamp_micros($"time").as("rightTime"))
+      .withWatermark("rightTime", "60 seconds")
+    val conditions = Seq(
+      ("rightTime BETWEEN leftTime AND leftTime + INTERVAL 10 SECONDS",
+        (0L, 10L), (-10L, 0L)),
+      ("leftTime >= rightTime - INTERVAL 10 SECONDS AND leftTime <= rightTime",
+        (0L, 10L), (-10L, 0L)),
+      ("leftTime BETWEEN rightTime - INTERVAL 5 SECONDS AND rightTime + INTERVAL 5 SECONDS",
+        (-5L, 5L), (-5L, 5L)),
+      ("leftTime + INTERVAL 2 SECONDS >= rightTime - INTERVAL 3 SECONDS AND " +
+        "leftTime + INTERVAL 2 SECONDS <= rightTime + INTERVAL 7 SECONDS",
+        (-5L, 5L), (-5L, 5L)))
+    conditions.foreach { case (condition, rightOffsets, leftOffsets) =>
+      val joined = left.join(right, expr(s"leftKey = rightKey AND $condition"))
+      val optimized = spark.sessionState.optimizer.execute(joined.queryExecution.analyzed)
+      val join = optimized.collectFirst { case j: Join => j }.get
+      for ((input, stored, timeName, (lowerSeconds, upperSeconds)) <- Seq(
+          (join.left, join.right, "rightTime", rightOffsets),
+          (join.right, join.left, "leftTime", leftOffsets))) {
+        val indexedTime = stored.output.find(_.name == timeName).get
+        val time = 100000001L
+        val row = InternalRow.fromSeq(input.output.map { attribute =>
+          if (attribute.name.endsWith("Key")) 1 else time
+        })
+        val (lower, upper) = getJoinScanRange(input.output, indexedTime, join.condition,
+          useConstantOffsets = true).getOrElse(fail(s"No bounds: $condition on $timeName"))(row)
+        val expectedLower = time + lowerSeconds * 1000000L
+        val expectedUpper = time + upperSeconds * 1000000L
+        assert(lower >= expectedLower - 1000L && lower <= expectedLower,
+          s"Lost lower bound: $condition on $timeName")
+        assert(upper >= expectedUpper && upper <= expectedUpper + 1000L,
+          s"Lost upper bound: $condition on $timeName")
+      }
+    }
   }
 
   for {
