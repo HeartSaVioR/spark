@@ -739,10 +739,16 @@ case class StreamingSymmetricHashJoinExec(
           case RightSide => (right.output, left.output)
         }
 
+        // Probes and indexes use event time. A bound on another column, such as expiry,
+        // cannot limit this scan; fall back to scanning the key when either bound is absent.
+        val thisEventTime = WatermarkSupport.findEventTimeColumn(
+          thisSideAttrs, !allowMultipleStatefulOperators).toSeq
+        val otherEventTime = WatermarkSupport.findEventTimeColumn(
+          otherSideAttrs, !allowMultipleStatefulOperators).toSeq
         val lowerBoundMs = StreamingJoinHelper.getStateValueWatermark(
-          AttributeSet(otherSideAttrs), AttributeSet(thisSideAttrs), condition.full, Some(0L))
+          AttributeSet(otherEventTime), AttributeSet(thisEventTime), condition.full, Some(0L))
         val upperBoundMs = StreamingJoinHelper.getStateValueWatermark(
-          AttributeSet(thisSideAttrs), AttributeSet(otherSideAttrs), condition.full, Some(0L))
+          AttributeSet(thisEventTime), AttributeSet(otherEventTime), condition.full, Some(0L))
 
         (lowerBoundMs, upperBoundMs) match {
           case (Some(lower), Some(upper)) =>
