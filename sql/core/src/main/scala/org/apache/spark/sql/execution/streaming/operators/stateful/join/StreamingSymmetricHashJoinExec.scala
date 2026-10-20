@@ -24,9 +24,8 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.spark.SparkException
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.analysis.StreamingJoinHelper
 import org.apache.spark.sql.catalyst.analysis.WidenStatefulOpNullability
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Expression, GenericInternalRow, JoinedRow, Literal, Predicate, UnsafeProjection, UnsafeRow}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, GenericInternalRow, JoinedRow, Literal, Predicate, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes
@@ -722,53 +721,20 @@ case class StreamingSymmetricHashJoinExec(
     private[this] val allowMultipleStatefulOperators: Boolean =
       conf.getConf(SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE)
 
-    // V4 range scan for time-interval joins (SPARK-55147). Extracts constant interval
-    // offsets from the join condition using getStateValueWatermark(eventWatermark=0).
-    // The -1 eviction adjustment widens range by ~1ms/side; postJoinFilter handles exact bounds.
-    private[this] val scanRangeOffsets: Option[(Long, Long)] = {
-      val isV4TimeIntervalJoin = stateFormatVersion >= 4 && (stateWatermarkPredicate match {
-        case Some(_: JoinStateValueWatermarkPredicate) => true
-        case _ => false
-      })
-
-      if (!isV4TimeIntervalJoin) {
+    // Matching bounds come from this row and the other side's actual timestamp index.
+    // They are independent of the watermarks used for late filtering and state eviction.
+    private[this] val joinScanRange: Option[InternalRow => (Long, Long)] = {
+      if (stateFormatVersion < 4) {
         None
       } else {
-        val (thisSideAttrs, otherSideAttrs) = joinSide match {
-          case LeftSide => (left.output, right.output)
-          case RightSide => (right.output, left.output)
+        val otherSideAttrs = joinSide match {
+          case LeftSide => right.output
+          case RightSide => left.output
         }
-
-        // Probes and indexes use event time. A bound on another column, such as expiry,
-        // cannot limit this scan; fall back to scanning the key when either bound is absent.
-        val thisEventTime = WatermarkSupport.findEventTimeColumn(
-          thisSideAttrs, !allowMultipleStatefulOperators).toSeq
-        val otherEventTime = WatermarkSupport.findEventTimeColumn(
-          otherSideAttrs, !allowMultipleStatefulOperators).toSeq
-        val lowerBoundMs = StreamingJoinHelper.getStateValueWatermark(
-          AttributeSet(otherEventTime), AttributeSet(thisEventTime), condition.full, Some(0L))
-        val upperBoundMs = StreamingJoinHelper.getStateValueWatermark(
-          AttributeSet(thisEventTime), AttributeSet(otherEventTime), condition.full, Some(0L))
-
-        (lowerBoundMs, upperBoundMs) match {
-          case (Some(lower), Some(upper)) =>
-            Some((lower * 1000L, -upper * 1000L)) // ms -> us
-          case _ => None
+        WatermarkSupport.findEventTimeColumn(
+          otherSideAttrs, allowMultipleEventTimeColumns = false).flatMap { indexedTime =>
+          getJoinScanRange(inputAttributes, indexedTime, condition.full)
         }
-      }
-    }
-
-    private[this] val eventTimeIdxForRangeScan: Int = scanRangeOffsets.map { _ =>
-      WatermarkSupport.findEventTimeColumnIndex(
-        inputAttributes, !allowMultipleStatefulOperators).getOrElse(-1)
-    }.getOrElse(-1)
-
-    private def computeTimestampRange(thisRow: UnsafeRow): Option[(Long, Long)] = {
-      scanRangeOffsets match {
-        case Some((lowerOffset, upperOffset)) if eventTimeIdxForRangeScan >= 0 =>
-          val eventTimeUs = thisRow.getLong(eventTimeIdxForRangeScan)
-          Some((eventTimeUs + lowerOffset, eventTimeUs + upperOffset))
-        case _ => None
       }
     }
 
@@ -864,7 +830,7 @@ case class StreamingSymmetricHashJoinExec(
               key,
               thatRow => generateJoinedRow(thisRow, thatRow),
               postJoinFilter,
-              timestampRange = computeTimestampRange(thisRow),
+              timestampRange = joinScanRange.map(_(thisRow)),
               skipUpdatingMatchedFlag)
           }
           val outputIter = generateOutputIter(thisRow, joinedRowIter)

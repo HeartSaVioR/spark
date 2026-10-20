@@ -17,24 +17,27 @@
 
 package org.apache.spark.sql.execution.streaming.operators.stateful.join
 
+import scala.collection.mutable.ArrayBuffer
 import scala.reflect.ClassTag
 
 import org.apache.spark.{Partition, SparkContext, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.{RDD, ZippedPartitionsBaseRDD, ZippedPartitionsPartition}
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.StreamingJoinHelper
-import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeSet, BoundReference, Expression, NamedExpression, PredicateHelper}
+import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeSet, Between, BoundReference, Expression, GreaterThan, GreaterThanOrEqual, Greatest, Least, LessThan, LessThanOrEqual, Literal, NamedExpression, PredicateHelper, TryEval, UnsafeProjection}
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark._
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.streaming.operators.stateful.{StatefulOperatorStateInfo, WatermarkSupport}
 import org.apache.spark.sql.execution.streaming.operators.stateful.WatermarkSupport.watermarkExpression
 import org.apache.spark.sql.execution.streaming.state.{StateStoreCheckpointInfo, StateStoreCoordinatorRef, StateStoreProviderId}
+import org.apache.spark.sql.types.TimestampType
 
 
 /**
  * Helper object for [[StreamingSymmetricHashJoinExec]]. See that object for more details.
  */
-object StreamingSymmetricHashJoinHelper extends Logging {
+object StreamingSymmetricHashJoinHelper extends Logging with PredicateHelper {
 
   sealed trait JoinSide
   case object LeftSide extends JoinSide { override def toString(): String = "left" }
@@ -152,6 +155,61 @@ object StreamingSymmetricHashJoinHelper extends Logging {
       }
 
       JoinConditionSplitPredicates(leftCondition, rightCondition, joinedCondition, condition)
+    }
+  }
+
+  /**
+   * Derive inclusive scan bounds on the stored event-time column from the incoming row.
+   * For `R.time >= L.time AND R.time <= L.expiry`, incoming L bounds R.time on both sides,
+   * while incoming R only bounds L.time from above. L.expiry remains a residual condition.
+   *
+   * Only direct comparisons with the indexed column are used; arithmetic on that column is
+   * not inverted. Strict comparisons keep inclusive bounds, leaving the exact check to the
+   * full join predicate. Missing, null or unevaluable bounds leave that endpoint unbounded.
+   */
+  def getJoinScanRange(
+      inputAttributes: Seq[Attribute],
+      indexedTime: Attribute,
+      condition: Option[Expression]): Option[InternalRow => (Long, Long)] = {
+    if (indexedTime.dataType != TimestampType) return None
+
+    val inputSet = AttributeSet(inputAttributes)
+    val lowerBounds = new ArrayBuffer[Expression]
+    val upperBounds = new ArrayBuffer[Expression]
+
+    def addBound(index: Expression, bound: Expression, bounds: ArrayBuffer[Expression]): Unit = {
+      if (index.semanticEquals(indexedTime) && bound.dataType == TimestampType &&
+          bound.deterministic && bound.references.subsetOf(inputSet)) {
+        bounds += TryEval(bound)
+      }
+    }
+
+    def addLessThan(left: Expression, right: Expression): Unit = {
+      addBound(left, right, upperBounds)
+      addBound(right, left, lowerBounds)
+    }
+
+    condition.toSeq.flatMap(splitConjunctivePredicates).foreach {
+      case LessThan(l, r) => addLessThan(l, r)
+      case LessThanOrEqual(l, r) => addLessThan(l, r)
+      case GreaterThan(l, r) => addLessThan(r, l)
+      case GreaterThanOrEqual(l, r) => addLessThan(r, l)
+      case Between(input, lower, upper, _) =>
+        addLessThan(lower, input)
+        addLessThan(input, upper)
+      case _ =>
+    }
+
+    if (lowerBounds.isEmpty && upperBounds.isEmpty) return None
+
+    val lower = lowerBounds.reduceOption[Expression]((l, r) => Greatest(Seq(l, r)))
+    val upper = upperBounds.reduceOption[Expression]((l, r) => Least(Seq(l, r)))
+    val projection = UnsafeProjection.create(
+      Seq(lower, upper).map(_.getOrElse(Literal(null, TimestampType))), inputAttributes)
+    Some { row =>
+      val bounds = projection(row)
+      (if (bounds.isNullAt(0)) Long.MinValue else bounds.getLong(0),
+        if (bounds.isNullAt(1)) Long.MaxValue else bounds.getLong(1))
     }
   }
 
