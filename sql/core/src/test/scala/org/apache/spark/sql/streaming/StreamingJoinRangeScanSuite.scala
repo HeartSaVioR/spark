@@ -86,4 +86,46 @@ class StreamingJoinRangeScanSuite extends StreamTest {
       }
     }
   }
+
+  for {
+    leftWatermark <- Seq(false, true)
+    rightWatermark <- Seq(false, true)
+    leftFirst <- Seq(false, true)
+  } {
+    test(s"microsecond scan bounds: watermarks=($leftWatermark,$rightWatermark), " +
+        s"left first=$leftFirst") {
+      withJoinConf(4) {
+        val leftInput = MemoryStream[(Int, Long, Long)]
+        val rightInput = MemoryStream[(Int, Long)]
+        val left = leftInput.toDF().toDF("leftKey", "start", "end")
+          .select($"leftKey", timestamp_micros($"start").as("leftTime"),
+            timestamp_micros($"end").as("expiry"))
+        val right = rightInput.toDF().toDF("rightKey", "time")
+          .select($"rightKey", timestamp_micros($"time").as("rightTime"))
+        val leftStream = if (leftWatermark) left.withWatermark("leftTime", "60 seconds") else left
+        val rightStream =
+          if (rightWatermark) right.withWatermark("rightTime", "60 seconds") else right
+        val joined = leftStream.join(rightStream,
+          expr("leftKey = rightKey AND rightTime > leftTime AND rightTime < expiry"))
+          .select(unix_micros($"expiry"), unix_micros($"rightTime"))
+        val addLeft = AddData(leftInput,
+          (1, 100000001L, 100000004L), (1, 100000001L, 100000006L))
+        val addRight = AddData(rightInput,
+          (1, 100000001L), (1, 100000002L), (1, 100000004L), (1, 100000006L))
+        val input = if (leftFirst) {
+          Seq(addLeft, CheckNewAnswer(), addRight)
+        } else {
+          Seq(addRight, CheckNewAnswer(), addLeft)
+        }
+        testStream(joined)((input ++ Seq(
+          CheckNewAnswer((100000004L, 100000002L),
+            (100000006L, 100000002L), (100000006L, 100000004L)),
+          Execute { query =>
+            assert(query.recentProgress.flatMap(_.stateOperators).forall { operator =>
+              operator.numRowsRemoved == 0 && operator.numRowsDroppedByWatermark == 0
+            })
+          })): _*)
+      }
+    }
+  }
 }

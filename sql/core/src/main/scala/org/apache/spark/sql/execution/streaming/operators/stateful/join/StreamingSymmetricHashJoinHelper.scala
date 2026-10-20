@@ -165,7 +165,8 @@ object StreamingSymmetricHashJoinHelper extends Logging with PredicateHelper {
    *
    * Only direct comparisons with the indexed column are used; arithmetic on that column is
    * not inverted. Strict comparisons keep inclusive bounds, leaving the exact check to the
-   * full join predicate. Missing, null or unevaluable bounds leave that endpoint unbounded.
+   * full join predicate. Null or failed bounds are ignored; an endpoint with no usable bound
+   * remains unbounded.
    */
   def getJoinScanRange(
       inputAttributes: Seq[Attribute],
@@ -180,6 +181,7 @@ object StreamingSymmetricHashJoinHelper extends Logging with PredicateHelper {
     def addBound(index: Expression, bound: Expression, bounds: ArrayBuffer[Expression]): Unit = {
       if (index.semanticEquals(indexedTime) && bound.dataType == TimestampType &&
           bound.deterministic && bound.references.subsetOf(inputSet)) {
+        // Early bound evaluation must not introduce errors the full predicate would short-circuit.
         bounds += TryEval(bound)
       }
     }
