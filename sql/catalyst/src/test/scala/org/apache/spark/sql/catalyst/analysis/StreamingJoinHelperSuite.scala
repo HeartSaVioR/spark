@@ -26,6 +26,17 @@ import org.apache.spark.sql.types.{IntegerType, LongType, MetadataBuilder, Times
 
 class StreamingJoinHelperSuite extends AnalysisTest {
 
+  test("state watermark extraction requires a timestamp state attribute") {
+    val stateNumber = AttributeReference("stateNumber", LongType)()
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val rightTime = AttributeReference("rightTime", TimestampType, metadata = metadata)()
+    val condition = stateNumber > rightTime.cast(LongType)
+
+    assert(StreamingJoinHelper.getStateValueWatermark(
+      AttributeSet(Seq(stateNumber)), AttributeSet(Seq(rightTime)),
+      Some(condition), Some(10000L)) === None)
+  }
+
   test("state watermark extraction preserves arithmetic term multiplicity") {
     val leftTime = AttributeReference("leftTime", TimestampType)()
     val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
