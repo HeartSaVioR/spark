@@ -36,6 +36,8 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
   import testImplicits._
 
   private val markerKey = "spark.sql.streaming.join.checkpointWatermarkSemanticsVersion"
+  private val currentMarker =
+    SQLConf.STREAMING_JOIN_CHECKPOINT_WATERMARK_SEMANTICS_VERSION.defaultValue.get.toString
 
   private def withJoinConf(version: Int, logVersion: Int)(f: => Unit): Unit = {
     withSQLConf(
@@ -111,7 +113,8 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
   for {
     version <- Seq(2, 3, 4)
     logVersion <- Seq(1, 2)
-    oldMarker <- Seq(None, Some("0"), Some("1"))
+    oldMarker <- Seq[Option[String]](None) ++
+      (0 until currentMarker.toInt).map(v => Some(v.toString))
   } {
     test(s"reject old range-column checkpoint, V$version log=$logVersion marker=$oldMarker") {
       withJoinConf(version, logVersion) {
@@ -127,7 +130,7 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
           setMarker(checkpoint, oldMarker)
           val stateBefore = snapshot(new File(checkpoint, "state"))
           val commitsBefore = snapshot(new File(checkpoint, "commits"))
-          withSQLConf(markerKey -> "2") {
+          withSQLConf(markerKey -> currentMarker) {
             testStream(joined)(
               StartStream(checkpointLocation = checkpoint),
               AddData(rightInput, (9, 400L)),
@@ -211,7 +214,7 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
             AddData(rightInput, (9, 400L)), CheckNewAnswer(), StopStream)
           val offsetLog = new OffsetSeqLog(spark, checkpoint + "/offsets")
           val pinned = offsetLog.getLatest().get._2.metadataOpt.get.conf.get(markerKey)
-          assert(pinned.contains("2"))
+          assert(pinned.contains(currentMarker))
           // The checkpoint value must override a changed session default on restart.
           withSQLConf(markerKey -> "0") {
             testStream(joined)(

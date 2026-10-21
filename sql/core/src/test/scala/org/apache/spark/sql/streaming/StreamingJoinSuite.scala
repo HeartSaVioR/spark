@@ -2354,7 +2354,7 @@ abstract class StreamingLeftSemiJoinBase extends StreamingJoinSuite {
     }
   }
 
-  test("SPARK-58904: left semi output watermark ignores unbounded right state") {
+  test("left semi output watermark ignores unbounded right state") {
     val leftInput = MemoryStream[(Int, Int)]
     val rightInput = MemoryStream[(Int, Int)]
     val left = leftInput.toDF()

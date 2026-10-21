@@ -41,6 +41,8 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
   import testImplicits._
 
   private val markerKey = SQLConf.STREAMING_JOIN_CHECKPOINT_WATERMARK_SEMANTICS_VERSION.key
+  private val currentMarker =
+    SQLConf.STREAMING_JOIN_CHECKPOINT_WATERMARK_SEMANTICS_VERSION.defaultValue.get.toString
 
   private def setMarker(checkpoint: String, marker: Option[String]): Unit = {
     def update(conf: Map[String, String]): Map[String, String] = {
@@ -150,10 +152,11 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
   for {
     version <- Seq(1, 2, 3, 4)
     logVersion <- Seq(1, 2)
-    oldMarker <- Seq(None, Some("0"), Some("1"))
+    oldMarker <- Seq[Option[String]](None) ++
+      (0 until currentMarker.toInt).map(v => Some(v.toString))
     shape <- Seq("range", "expiry", "pruned expiry", "unbounded")
   } {
-    test(s"SPARK-58904: reject old $shape checkpoint, V$version log=$logVersion old=$oldMarker") {
+    test(s"reject old $shape checkpoint, V$version log=$logVersion old=$oldMarker") {
       withJoinConf(version, logVersion) {
         val (leftInput, rightInput, joined) = joinInputs(shape)
         withTempDir { checkpointDir =>
@@ -173,7 +176,7 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
           val commitsBefore = snapshot(new File(checkpoint, "commits"))
           for (attempt <- 1 to 2) {
             // Session defaults must not bypass the checkpoint-pinned marker or state format.
-            withSQLConf(markerKey -> "2",
+            withSQLConf(markerKey -> currentMarker,
                 SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key -> "2") {
               testStream(joined)(
                 StartStream(checkpointLocation = checkpoint),
@@ -203,7 +206,7 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
     logVersion <- Seq(1, 2)
     shape <- Seq("equality", "no watermark", "range", "expiry", "pruned expiry")
   } {
-    test(s"SPARK-58904: resume compatible $shape checkpoint, V$version log=$logVersion") {
+    test(s"resume compatible $shape checkpoint, V$version log=$logVersion") {
       withJoinConf(version, logVersion) {
         val (leftInput, rightInput, joined) = joinInputs(shape)
         withTempDir { checkpointDir =>
@@ -213,9 +216,9 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
             MultiAddData(leftInput, (1, 10))(rightInput, (2, 10)),
             CheckNewAnswer(),
             StopStream)
-          assert(pinnedMarker(checkpoint).contains("2"))
+          assert(pinnedMarker(checkpoint).contains(currentMarker))
           val oldCompatible = Seq("equality", "no watermark").contains(shape)
-          val expectedMarker = if (oldCompatible) "0" else "2"
+          val expectedMarker = if (oldCompatible) "0" else currentMarker
           if (oldCompatible) setMarker(checkpoint, None)
           withSQLConf(markerKey -> "0",
               SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key -> "2") {
@@ -238,7 +241,7 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
   }
 
   Seq(2, 4).foreach { version =>
-    test(s"SPARK-58904: reject an incompatible checkpoint retrying batch zero, V$version") {
+    test(s"reject an incompatible checkpoint retrying batch zero, V$version") {
       withJoinConf(version, logVersion = 1) {
         val (leftInput, rightInput, joined) = joinInputs("range")
         withTempDir { checkpointDir =>
@@ -274,7 +277,7 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
     }
   }
   Seq("2.4.0", "3.5.1").foreach { sparkVersion =>
-    test(s"SPARK-58904: reject the historical Spark $sparkVersion range checkpoint") {
+    test(s"reject the historical Spark $sparkVersion range checkpoint") {
       val input = MemoryStream[(Int, Long)]
       val data = input.toDF().select($"_1".as("value"), timestamp_seconds($"_2").as("timestamp"))
       val left = data.select($"value".as("leftId"), $"timestamp".as("leftTime"))
