@@ -178,6 +178,9 @@ class StreamingJoinHelperSuite extends AnalysisTest {
     assert(watermarkFrom("cast(rightTime AS DOUBLE) < rightOther") === None)  // non-time attributes
     assert(watermarkFrom("leftTime > rightTime + interval 1 month") === None) // month not allowed
 
+    // Numeric state attributes cannot use timestamp eviction cutoffs.
+    assert(watermarkFrom("leftOther > cast(rightTime AS LONG)") === None)
+
     // Test static comparisons
     assert(watermarkFrom("cast(leftTime AS LONG) > 10") === Some(10000))
 

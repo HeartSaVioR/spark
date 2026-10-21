@@ -204,6 +204,7 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
       // the constraintTerm would be `leftTime` and not `-leftTime`. Hence, we return None.
       return None
     }
+
     // State eviction compares this cutoff in timestamp units against the constrained column.
     val hasTimestampStateAttribute = constraintTerm.exists {
       case a: AttributeReference =>
