@@ -26,7 +26,7 @@ import scala.util.Using
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.sql.{AnalysisException, DataFrame, Row}
-import org.apache.spark.sql.catalyst.expressions.AttributeReference
+import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference}
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
 import org.apache.spark.sql.execution.streaming.checkpointing.{OffsetMap, OffsetSeq, OffsetSeqLog}
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.{StreamingSymmetricHashJoinExec, StreamingSymmetricHashJoinHelper}
@@ -147,6 +147,17 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
       Seq(leftId), Seq(rightId)))
     assert(!compatible(Seq(leftId, leftTime), Seq(rightId),
       Seq(leftId, leftTime), Seq(rightId, rightId)))
+    assert(!compatible(Seq(leftId), Seq(rightId, rightTime),
+      Seq(leftId, leftId), Seq(rightId, rightTime)))
+    assert(!compatible(Seq(leftTime, rightTime), Seq(rightTime),
+      Seq(leftTime), Seq(rightTime)))
+    assert(!compatible(Seq(leftTime), Seq(rightTime, leftTime),
+      Seq(leftTime), Seq(rightTime)))
+    // Metadata alone must not select an earlier key or hide a computed watermarked key.
+    val computed = Alias(leftTime, "computed")()
+    assert(!compatible(Seq(leftTime), Seq(rightTime),
+      Seq(computed, leftTime), Seq(rightTime, rightTime)))
+    assert(!compatible(Seq(leftId), Seq(rightId), Seq(computed), Seq(rightId)))
   }
 
   for {
