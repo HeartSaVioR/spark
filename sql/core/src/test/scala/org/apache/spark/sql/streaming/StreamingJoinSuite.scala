@@ -240,27 +240,34 @@ abstract class StreamingJoinSuite
       joinType: String,
       watermark: String = "10 seconds",
       lowerBound: String = "interval 5 seconds",
-      upperBound: String = "interval 5 seconds")
+      upperBound: String = "interval 5 seconds",
+      leftWatermark: Boolean = true,
+      rightWatermark: Boolean = true,
+      joinOnTime: Boolean = false)
     : (MemoryStream[(Int, Int)], MemoryStream[(Int, Int)], DataFrame) = {
 
     val leftInput = MemoryStream[(Int, Int)]
     val rightInput = MemoryStream[(Int, Int)]
 
-    val df1 = leftInput.toDF().toDF("leftKey", "time")
+    val left = leftInput.toDF().toDF("leftKey", "time")
       .select($"leftKey", timestamp_seconds($"time") as "leftTime",
         ($"leftKey" * 2) as "leftValue")
-      .withWatermark("leftTime", watermark)
+    val df1 = if (leftWatermark) left.withWatermark("leftTime", watermark) else left
 
-    val df2 = rightInput.toDF().toDF("rightKey", "time")
+    val right = rightInput.toDF().toDF("rightKey", "time")
       .select($"rightKey", timestamp_seconds($"time") as "rightTime",
         ($"rightKey" * 3) as "rightValue")
-      .withWatermark("rightTime", watermark)
+    val df2 = if (rightWatermark) right.withWatermark("rightTime", watermark) else right
 
+    val timeCondition = if (joinOnTime) {
+      "leftTime = rightTime"
+    } else {
+      s"leftTime BETWEEN rightTime - $lowerBound AND rightTime + $upperBound"
+    }
     val joined =
       df1.join(
         df2,
-        expr("leftKey = rightKey AND " +
-          s"leftTime BETWEEN rightTime - $lowerBound AND rightTime + $upperBound"),
+        expr(s"leftKey = rightKey AND $timeCondition"),
         joinType)
 
     val select = if (joinType == "left_semi") {
@@ -1332,6 +1339,17 @@ abstract class StreamingOuterJoinBase extends StreamingJoinSuite {
         }
       }
     }
+  }
+
+  test("corrected left outer equality join requires a right watermark") {
+    val (leftInput, _, joined) = setupJoinWithRangeCondition(
+      "left_outer", leftWatermark = true, rightWatermark = false, joinOnTime = true)
+    val error = intercept[AnalysisException] {
+      testStream(joined)(
+        AddData(leftInput, (1, 5)),
+        CheckNewAnswer())
+    }
+    assert(error.getMessage.contains("a watermark on the right input"))
   }
 
   Seq("left_outer", "right_outer").foreach { joinType =>
