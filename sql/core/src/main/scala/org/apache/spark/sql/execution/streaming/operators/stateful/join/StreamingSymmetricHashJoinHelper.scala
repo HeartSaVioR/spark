@@ -326,8 +326,20 @@ object StreamingSymmetricHashJoinHelper extends Logging {
     Seq((leftAttributes, rightAttributes), (rightAttributes, leftAttributes)).forall {
       case (input, other) =>
         val eventTime = input.find(_.metadata.contains(delayKey))
-        eventTime.isEmpty || getStateValueWatermarkForInput(input, other, condition, Some(0L))
-          .forall { case (attribute, _) => eventTime.exists(_.semanticEquals(attribute)) }
+        eventTime.isEmpty || !other.exists(_.metadata.contains(delayKey)) || {
+          getStateValueWatermarkForInput(input, other, condition, Some(0L)) match {
+            case Some((attribute, _)) => eventTime.exists(_.semanticEquals(attribute))
+            case None =>
+              // The old solver also considered non-timestamp columns, such as numeric expiry
+              // cast to timestamp, and applied their cutoff to event time. No corrected bound
+              // does not prove that old state was safe. Only accept this case when the condition
+              // cannot have constrained another column of this input.
+              condition.forall { expression =>
+                expression.references.intersect(AttributeSet(input))
+                  .forall(attribute => eventTime.exists(_.semanticEquals(attribute)))
+              }
+          }
+        }
     }
   }
 

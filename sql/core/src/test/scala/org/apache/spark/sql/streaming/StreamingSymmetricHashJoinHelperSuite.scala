@@ -154,7 +154,6 @@ class StreamingSymmetricHashJoinHelperSuite extends StreamTest {
       })
     }
   }
-
   for (boundEventTime <- Seq(false, true)) {
     test(s"range eviction keeps the bounded column, event-time bound=$boundEventTime") {
       val watermark = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000L).build()

@@ -88,6 +88,26 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
     (leftInput, rightInput, joined)
   }
 
+  private def inputsWithNumericExpiry(useEventTimeLowerBound: Boolean):
+      (MemoryStream[(Int, Long, Long)], MemoryStream[(Int, Long)], DataFrame) = {
+    val leftInput = MemoryStream[(Int, Long, Long)]
+    val rightInput = MemoryStream[(Int, Long)]
+    val left = leftInput.toDF().toDF("leftKey", "start", "end")
+      .select($"leftKey", timestamp_seconds($"start").as("leftTime"), $"end".as("expiry"))
+      .withWatermark("leftTime", "60 seconds")
+    val right = rightInput.toDF().toDF("rightKey", "time")
+      .select($"rightKey", timestamp_seconds($"time").as("rightTime"))
+      .withWatermark("rightTime", "60 seconds")
+    val timeRange = if (useEventTimeLowerBound) {
+      "rightTime BETWEEN leftTime AND CAST(expiry AS TIMESTAMP)"
+    } else {
+      "rightTime <= CAST(expiry AS TIMESTAMP)"
+    }
+    val joined = left.join(right, expr(s"leftKey = rightKey AND $timeRange"), "inner")
+      .select($"leftKey", $"rightTime".cast("long"), $"leftTime".cast("long"))
+    (leftInput, rightInput, joined)
+  }
+
   for {
     version <- Seq(2, 3, 4)
     logVersion <- Seq(1, 2)
@@ -104,6 +124,48 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
               AddData(leftInput, (1, 100L, 700L)), AddData(rightInput, (1, 100L)))),
             CheckNewAnswer(Row(1, 100L, 100L)), StopStream)
           // Only offset metadata is historical. Rejection must precede opening the state.
+          setMarker(checkpoint, oldMarker)
+          val stateBefore = snapshot(new File(checkpoint, "state"))
+          val commitsBefore = snapshot(new File(checkpoint, "commits"))
+          withSQLConf(markerKey -> "1") {
+            testStream(joined)(
+              StartStream(checkpointLocation = checkpoint),
+              AddData(rightInput, (9, 400L)),
+              ExpectFailure[AnalysisException](assertFailure = error => {
+                checkError(error.asInstanceOf[AnalysisException],
+                  condition = "STREAMING_JOIN_RANGE_EVICTION_CHECKPOINT_INCOMPATIBLE",
+                  parameters = Map.empty)
+              }))
+          }
+          assert(snapshot(new File(checkpoint, "state")) == stateBefore)
+          assert(snapshot(new File(checkpoint, "commits")) == commitsBefore)
+        }
+      }
+    }
+  }
+
+  for {
+    version <- Seq(2, 3, 4)
+    logVersion <- Seq(1, 2)
+    oldMarker <- Seq(None, Some("0"))
+    useEventTimeLowerBound <- Seq(false, true)
+  } {
+    val boundDescription = if (useEventTimeLowerBound) "with event-time bound" else "only"
+    test(s"reject old numeric-expiry $boundDescription checkpoint, " +
+        s"V$version log=$logVersion marker=$oldMarker") {
+      withJoinConf(version, logVersion) {
+        val (leftInput, rightInput, joined) =
+          inputsWithNumericExpiry(useEventTimeLowerBound)
+        withTempDir { checkpointDir =>
+          val checkpoint = checkpointDir.getCanonicalPath
+          testStream(joined)(
+            StartStream(checkpointLocation = checkpoint),
+            StreamProgressLockedActions(Seq(
+              AddData(leftInput, (1, 100L, 700L)), AddData(rightInput, (1, 100L)))),
+            CheckNewAnswer(Row(1, 100L, 100L)), StopStream)
+          val offsetLog = new OffsetSeqLog(spark, checkpoint + "/offsets")
+          val pinned = offsetLog.getLatest().get._2.metadataOpt.get.conf.get(markerKey)
+          assert(pinned.contains("1"))
           setMarker(checkpoint, oldMarker)
           val stateBefore = snapshot(new File(checkpoint, "state"))
           val commitsBefore = snapshot(new File(checkpoint, "commits"))
@@ -148,6 +210,37 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
           assert(pinned.contains("1"))
           if (oldCompatible) setMarker(checkpoint, None)
           // The checkpoint value must override a changed session default on restart.
+          withSQLConf(markerKey -> "0") {
+            testStream(joined)(
+              StartStream(checkpointLocation = checkpoint),
+              AddData(rightInput, (1, 460L)), CheckNewAnswer(Row(1, 460L, 100L)), StopStream)
+          }
+        }
+      }
+    }
+  }
+
+  for {
+    version <- Seq(2, 3, 4)
+    logVersion <- Seq(1, 2)
+  } {
+    test(s"resume current numeric-expiry checkpoint, V$version log=$logVersion") {
+      withJoinConf(version, logVersion) {
+        val (leftInput, rightInput, joined) =
+          inputsWithNumericExpiry(useEventTimeLowerBound = true)
+        withTempDir { checkpointDir =>
+          val checkpoint = checkpointDir.getCanonicalPath
+          testStream(joined)(
+            StartStream(checkpointLocation = checkpoint),
+            StreamProgressLockedActions(Seq(
+              AddData(leftInput, (1, 100L, 700L)), AddData(rightInput, (9, 100L)))),
+            CheckNewAnswer(),
+            StreamProgressLockedActions(Seq(
+              AddData(leftInput, (8, 400L, 1000L)), AddData(rightInput, (9, 400L)))),
+            CheckNewAnswer(),
+            AddData(rightInput, (9, 400L)), CheckNewAnswer(), StopStream)
+          val offsetLog = new OffsetSeqLog(spark, checkpoint + "/offsets")
+          assert(offsetLog.getLatest().get._2.metadataOpt.get.conf.get(markerKey).contains("1"))
           withSQLConf(markerKey -> "0") {
             testStream(joined)(
               StartStream(checkpointLocation = checkpoint),
