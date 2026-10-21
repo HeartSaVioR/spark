@@ -186,6 +186,8 @@ class StreamingJoinHelperSuite extends AnalysisTest {
       "leftTime > rightTime + interval 5 seconds AND cast(leftTime AS LONG) > 10") ===
       Some(15000))
     assert(watermarkFrom("cast(leftTime AS LONG) > 10") === None)
+    assert(watermarkFrom("leftTime > rightTime AND cast(leftTime AS LONG) > 10") === Some(10000))
+    assert(watermarkFrom("leftTime > rightTime OR cast(leftTime AS LONG) > 10") === None)
 
     // Test non-positive results
     assert(watermarkFrom("CAST(leftTime AS LONG) > CAST(rightTime AS LONG) - 10") === Some(0))
