@@ -225,7 +225,6 @@ object StreamingSymmetricHashJoinHelper extends Logging {
       // State is bounded by future input from the opposite side, not by its own watermark.
       val joinKeyOrdinalForWatermark = StreamingJoinHelper.getStateKeyWatermarkOrdinal(
         otherSideJoinKeys, otherSideInputAttributes)
-      val isWatermarkDefinedOnInput = oneSideInputAttributes.exists(_.metadata.contains(delayKey))
       val isWatermarkDefinedOnJoinKey = joinKeyOrdinalForWatermark.isDefined
 
       if (isWatermarkDefinedOnJoinKey) { // case 1 and 3 in the StreamingSymmetricHashJoinExec docs
@@ -255,8 +254,9 @@ object StreamingSymmetricHashJoinHelper extends Logging {
             eventTimeWatermarkForEviction.get,
             prevStateKeyWatermark)
         }
-      } else if (isWatermarkDefinedOnInput) { // case 2 in the StreamingSymmetricHashJoinExec docs
-        val otherSideEventTime = otherSideInputAttributes.find(_.metadata.contains(delayKey))
+      } else { // case 2 in the StreamingSymmetricHashJoinExec docs
+        // Future matches are limited by the opposite watermark. This input needs no watermark;
+        // its event-time column may also have been pruned from the physical join.
         getStateValueWatermarkForInput(oneSideInputAttributes, otherSideInputAttributes,
           condition, eventTimeWatermarkForEviction).flatMap { case (attribute, watermark) =>
           // Late filtering only constrains the input's event-time column. A different indexed
@@ -267,15 +267,14 @@ object StreamingSymmetricHashJoinHelper extends Logging {
               .exists(_.semanticEquals(attribute))
           }.flatMap { lateWatermark =>
             StreamingJoinHelper.getStateValueWatermark(AttributeSet(Seq(attribute)),
-              AttributeSet(otherSideEventTime.toSeq), condition, Some(lateWatermark))
+              AttributeSet(otherSideInputAttributes.find(_.metadata.contains(delayKey)).toSeq),
+              condition, Some(lateWatermark))
               .filter(_ <= lateWatermark)
           }
           watermarkExpression(Some(attribute), Some(watermark)).map { e =>
             JoinStateValueWatermarkPredicate(e, watermark, prevStateValueWatermark)
           }
         }
-      } else {
-        None
       }
     }
 
