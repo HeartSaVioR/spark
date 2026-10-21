@@ -221,16 +221,8 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
       return None
     }
 
-    // A lower bound on the other side's watermarked time only bounds this expression when
-    // that time has a positive sign. With a negative sign, later input can still match old state.
-    val hasNegativeWatermarkTerm = terms.exists {
-      case UnaryMinus(child, _) =>
-        child.references.exists { attribute =>
-          attributesWithEventWatermark.contains(attribute) && attribute.metadata.contains(delayKey)
-        }
-      case _ => false
-    }
-    if (hasNegativeWatermarkTerm) return None
+    // A negative opposite-time term lets later input match old state instead of bounding it.
+    if (watermarkTerms.head.isInstanceOf[UnaryMinus]) return None
 
     // Replace watermark attribute with watermark value, and generate the resolved expression
     // from the other terms. That is,
