@@ -198,6 +198,9 @@ object StreamingSymmetricHashJoinHelper extends Logging {
           } else {
             0L
           }
+        }.orElse {
+          // Without an eviction bound, retained rows can still emit old event times.
+          Some(0L)
         }
       } else {
         None
