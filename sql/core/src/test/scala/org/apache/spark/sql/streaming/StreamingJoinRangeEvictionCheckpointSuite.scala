@@ -35,7 +35,7 @@ import org.apache.spark.sql.internal.SQLConf
 class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
   import testImplicits._
 
-  private val markerKey = "spark.sql.streaming.join.checkpointUsesCorrectedRangeEviction"
+  private val markerKey = "spark.sql.streaming.join.checkpointWatermarkSemanticsVersion"
 
   private def withJoinConf(version: Int, logVersion: Int)(f: => Unit): Unit = {
     withSQLConf(
@@ -91,7 +91,7 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
   for {
     version <- Seq(2, 3, 4)
     logVersion <- Seq(1, 2)
-    oldMarker <- Seq(None, Some("false"))
+    oldMarker <- Seq(None, Some("0"))
   } {
     test(s"reject old range-column checkpoint, V$version log=$logVersion marker=$oldMarker") {
       withJoinConf(version, logVersion) {
@@ -107,7 +107,7 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
           setMarker(checkpoint, oldMarker)
           val stateBefore = snapshot(new File(checkpoint, "state"))
           val commitsBefore = snapshot(new File(checkpoint, "commits"))
-          withSQLConf(markerKey -> "true") {
+          withSQLConf(markerKey -> "1") {
             testStream(joined)(
               StartStream(checkpointLocation = checkpoint),
               AddData(rightInput, (9, 400L)),
@@ -145,10 +145,10 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
             AddData(rightInput, (9, 400L)), CheckNewAnswer(), StopStream)
           val offsetLog = new OffsetSeqLog(spark, checkpoint + "/offsets")
           val pinned = offsetLog.getLatest().get._2.metadataOpt.get.conf.get(markerKey)
-          assert(pinned.contains("true"))
+          assert(pinned.contains("1"))
           if (oldCompatible) setMarker(checkpoint, None)
           // The checkpoint value must override a changed session default on restart.
-          withSQLConf(markerKey -> "false") {
+          withSQLConf(markerKey -> "0") {
             testStream(joined)(
               StartStream(checkpointLocation = checkpoint),
               AddData(rightInput, (1, 460L)), CheckNewAnswer(Row(1, 460L, 100L)), StopStream)

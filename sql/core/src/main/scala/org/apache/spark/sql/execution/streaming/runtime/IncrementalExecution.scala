@@ -717,7 +717,7 @@ class IncrementalExecution(
       // Validate the checkpoint-pinned semantics before writing metadata or opening state,
       // including a restart retrying an incomplete batch zero.
       if (isFirstBatch &&
-          !conf.getConf(SQLConf.STREAMING_JOIN_CHECKPOINT_USES_CORRECTED_RANGE_EVICTION)) {
+          conf.getConf(SQLConf.STREAMING_JOIN_CHECKPOINT_WATERMARK_SEMANTICS_VERSION) < 1) {
         planWithStateOpId.foreach {
           case j: StreamingSymmetricHashJoinExec
               if !StreamingSymmetricHashJoinHelper.isRangeEvictionCheckpointCompatible(
