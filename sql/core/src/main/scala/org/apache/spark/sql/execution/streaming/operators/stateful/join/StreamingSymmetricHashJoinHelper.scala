@@ -243,7 +243,16 @@ object StreamingSymmetricHashJoinHelper extends Logging {
           JoinStateKeyWatermarkPredicate(
             e,
             eventTimeWatermarkForEviction.get,
-            eventTimeWatermarkForLateEvents)
+            // V4 can skip keys at or below the previous watermark only if late-input filtering
+            // rejects new rows in that range on this same key. A watermark on the other input's
+            // equality key can drive eviction even when this input has no watermark, or has one
+            // on a different column. New rows can then pass late-input filtering with keys
+            // already eligible for eviction. V4 must scan from the beginning to find them;
+            // otherwise, outer joins can fail to emit null rows for these unmatched inputs.
+            eventTimeWatermarkForLateEvents.filter { _ =>
+              oneSideInputAttributes.find(_.metadata.contains(delayKey))
+                .exists(oneSideJoinKeys(joinKeyOrdinalForWatermark.get).semanticEquals)
+            })
         }
       } else if (isWatermarkDefinedOnInput) { // case 2 in the StreamingSymmetricHashJoinExec docs
         val stateValueWatermark = StreamingJoinHelper.getStateValueWatermark(
@@ -251,12 +260,15 @@ object StreamingSymmetricHashJoinHelper extends Logging {
           attributesWithEventWatermark = AttributeSet(otherSideInputAttributes),
           condition,
           eventTimeWatermarkForEviction)
-        val prevStateValueWatermark = eventTimeWatermarkForLateEvents.flatMap { _ =>
+        // A row can pass late-input filtering but already be eligible for eviction in this batch.
+        // When the previous join-derived state cutoff is ahead of the late-input watermark, a new
+        // row can fall at or below that cutoff. V4 must scan from the beginning to find such rows.
+        val prevStateValueWatermark = eventTimeWatermarkForLateEvents.flatMap { lateWatermark =>
           StreamingJoinHelper.getStateValueWatermark(
             attributesToFindStateWatermarkFor = AttributeSet(oneSideInputAttributes),
             attributesWithEventWatermark = AttributeSet(otherSideInputAttributes),
             condition,
-            eventTimeWatermarkForLateEvents)
+            eventTimeWatermarkForLateEvents).filter(_ <= lateWatermark)
         }
         val inputAttributeWithWatermark = oneSideInputAttributes.find(_.metadata.contains(delayKey))
         val expr = watermarkExpression(inputAttributeWithWatermark, stateValueWatermark)
