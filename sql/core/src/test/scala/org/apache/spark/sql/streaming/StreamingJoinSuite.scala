@@ -2140,6 +2140,39 @@ abstract class StreamingFullOuterJoinBase extends StreamingJoinSuite {
 
   import testImplicits._
 
+  test("full outer equality join uses different watermark key ordinals") {
+    val leftInput = MemoryStream[(Int, Int)]
+    val rightInput = MemoryStream[(Int, Int)]
+    val left = leftInput.toDF().toDF("a", "b")
+      .select(timestamp_seconds($"a").as("la"), timestamp_seconds($"b").as("lb"))
+      .withWatermark("la", "10 seconds")
+    val right = rightInput.toDF().toDF("a", "b")
+      .select(timestamp_seconds($"a").as("ra"), timestamp_seconds($"b").as("rb"))
+      .withWatermark("rb", "10 seconds")
+    val joined = left.join(right, expr("la = ra AND lb = rb"), "full_outer")
+      .select($"la".cast("int"), $"lb".cast("int"), $"ra".cast("int"), $"rb".cast("int"))
+    withSQLConf(SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+      testStream(joined)(
+        MultiAddData(leftInput, (5, 50))(rightInput, (80, 50)),
+        CheckNewAnswer(),
+        MultiAddData(leftInput, (60, 100))(rightInput, (70, 50)),
+        CheckNewAnswer(),
+        AddData(leftInput, (70, 100)),
+        CheckNewAnswer(),
+        AddData(rightInput, (5, 50)),
+        CheckNewAnswer(Row(5, 50, 5, 50)),
+        AddData(leftInput, (90, 10)),
+        CheckNewAnswer(Row(90, 10, null, null)),
+        MultiAddData(leftInput, (200, 200))(rightInput, (200, 200)),
+        CheckNewAnswer(Row(200, 200, 200, 200)),
+        MultiAddData(leftInput, (210, 210))(rightInput, (210, 210)),
+        CheckNewAnswer(Row(210, 210, 210, 210), Row(60, 100, null, null),
+          Row(70, 100, null, null), Row(null, null, 80, 50), Row(null, null, 70, 50))
+      )
+    }
+  }
+
+
   test("stream-stream full outer join does not support Update mode") {
     val input1 = MemoryStream[Int]
     val input2 = MemoryStream[Int]

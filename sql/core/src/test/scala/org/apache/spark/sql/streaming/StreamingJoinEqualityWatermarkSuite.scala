@@ -76,4 +76,30 @@ class StreamingJoinEqualityWatermarkSuite extends StreamTest {
       }
     }
   }
+
+  test("V4 window equality retains state for future unwatermarked input") {
+    withSQLConf(
+      SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key -> "4",
+      SQLConf.STATE_STORE_PROVIDER_CLASS.key -> classOf[RocksDBStateStoreProvider].getName) {
+      val leftInput = MemoryStream[Int]
+      val rightInput = MemoryStream[Int]
+      val left = leftInput.toDF()
+        .select($"value".as("key"), timestamp_seconds($"value").as("time"))
+        .withWatermark("time", "10 seconds")
+        .select($"key", window($"time", "10 seconds"))
+      val right = rightInput.toDF()
+        .select($"value".as("key"), timestamp_seconds($"value").as("time"))
+        .select($"key", window($"time", "10 seconds"))
+      val joined = left.join(right, Seq("key", "window"))
+        .select($"key", $"window.end".cast("long"))
+      testStream(joined)(
+        AddData(leftInput, 1), CheckNewAnswer(),
+        AddData(rightInput, 1), CheckNewAnswer(Row(1, 10L)),
+        AddData(leftInput, 25), CheckNewAnswer(),
+        StopStream, StartStream(),
+        // The right input has no late filter; its old window must still find left state.
+        AddData(rightInput, 1), CheckNewAnswer(Row(1, 10L)),
+        AddData(leftInput, 5), CheckNewAnswer())
+    }
+  }
 }

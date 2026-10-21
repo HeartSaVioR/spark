@@ -323,46 +323,17 @@ object StreamingSymmetricHashJoinHelper extends Logging {
       }
     }
 
-    def ownEventTimeKeyOrdinal(keys: Seq[Expression], eventTime: Attribute): Option[Int] = {
-      keys.zipWithIndex.collectFirst {
-        case (key: NamedExpression, index)
-            if key.metadata.contains(delayKey) && key.semanticEquals(eventTime) => index
-      }
-    }
-
     val leftOrdinals = watermarkKeyOrdinals(leftKeys)
     val rightOrdinals = watermarkKeyOrdinals(rightKeys)
     if (leftEventTime.isEmpty && rightEventTime.isEmpty) {
       leftOrdinals.isEmpty && rightOrdinals.isEmpty
     } else if (leftEventTime.size == 1 && rightEventTime.size == 1) {
-      val leftOrdinal = ownEventTimeKeyOrdinal(leftKeys, leftEventTime.head)
-      val rightOrdinal = ownEventTimeKeyOrdinal(rightKeys, rightEventTime.head)
+      val leftOrdinal = StreamingJoinHelper.getStateKeyWatermarkOrdinal(leftKeys, leftAttributes)
+      val rightOrdinal = StreamingJoinHelper.getStateKeyWatermarkOrdinal(rightKeys, rightAttributes)
       leftOrdinal.isDefined && leftOrdinal == rightOrdinal &&
         leftOrdinals == leftOrdinal.toSeq && rightOrdinals == rightOrdinal.toSeq
     } else {
       false
-    }
-  }
-
-  private[join] def findJoinKeyOrdinalForWatermark(
-      leftKeys: Seq[Expression],
-      rightKeys: Seq[Expression]): Option[Int] = {
-    // Join keys of both sides generate rows of the same fields, that is, same sequence of data
-    // types. If one side (say left side) has a column (say timestamp) that has a watermark on it,
-    // then it will never consider joining keys that are < state key watermark (i.e. event time
-    // watermark). On the other side (i.e. right side), even if there is no watermark defined,
-    // there has to be an equivalent column (i.e., timestamp). And any right side data that has the
-    // timestamp < watermark will not match will not match with left side data, as the left side get
-    // filtered with the explicitly defined watermark. So, the watermark in timestamp column in
-    // left side keys effectively causes the timestamp on the right side to have a watermark.
-    // We will use the ordinal of the left timestamp in the left keys to find the corresponding
-    // right timestamp in the right keys.
-    leftKeys.zipWithIndex.collectFirst {
-      case (ne: NamedExpression, index) if ne.metadata.contains(delayKey) => index
-    } orElse {
-      rightKeys.zipWithIndex.collectFirst {
-        case (ne: NamedExpression, index) if ne.metadata.contains(delayKey) => index
-      }
     }
   }
 
