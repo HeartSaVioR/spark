@@ -217,13 +217,14 @@ object StreamingSymmetricHashJoinHelper extends Logging {
     WatermarkSupport.findEventTimeColumn(rightAttributes,
       allowMultipleEventTimeColumns = useFirstEventTimeColumn)
 
-    val joinKeyOrdinalForWatermark: Option[Int] = findJoinKeyOrdinalForWatermark(
-      leftKeys, rightKeys)
-
     def getOneSideStateWatermarkPredicate(
         oneSideInputAttributes: Seq[Attribute],
         oneSideJoinKeys: Seq[Expression],
-        otherSideInputAttributes: Seq[Attribute]): Option[JoinStateWatermarkPredicate] = {
+        otherSideInputAttributes: Seq[Attribute],
+        otherSideJoinKeys: Seq[Expression]): Option[JoinStateWatermarkPredicate] = {
+      // State is bounded by future input from the opposite side, not by its own watermark.
+      val joinKeyOrdinalForWatermark = StreamingJoinHelper.getStateKeyWatermarkOrdinal(
+        otherSideJoinKeys, otherSideInputAttributes)
       val isWatermarkDefinedOnInput = oneSideInputAttributes.exists(_.metadata.contains(delayKey))
       val isWatermarkDefinedOnJoinKey = joinKeyOrdinalForWatermark.isDefined
 
@@ -278,9 +279,9 @@ object StreamingSymmetricHashJoinHelper extends Logging {
     }
 
     val leftStateWatermarkPredicate =
-      getOneSideStateWatermarkPredicate(leftAttributes, leftKeys, rightAttributes)
+      getOneSideStateWatermarkPredicate(leftAttributes, leftKeys, rightAttributes, rightKeys)
     val rightStateWatermarkPredicate =
-      getOneSideStateWatermarkPredicate(rightAttributes, rightKeys, leftAttributes)
+      getOneSideStateWatermarkPredicate(rightAttributes, rightKeys, leftAttributes, leftKeys)
     JoinStateWatermarkPredicates(leftStateWatermarkPredicate, rightStateWatermarkPredicate)
   }
 
