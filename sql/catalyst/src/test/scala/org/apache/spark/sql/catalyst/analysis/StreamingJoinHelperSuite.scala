@@ -181,8 +181,11 @@ class StreamingJoinHelperSuite extends AnalysisTest {
     // Numeric state attributes cannot use timestamp eviction cutoffs.
     assert(watermarkFrom("leftOther > cast(rightTime AS LONG)") === None)
 
-    // Test static comparisons
-    assert(watermarkFrom("cast(leftTime AS LONG) > 10") === Some(10000))
+    // A constant-only condition cannot advance the bound with the opposite watermark.
+    assert(watermarkFrom("cast(leftTime AS LONG) > 10") === None)
+    assert(watermarkFrom(
+      "leftTime > rightTime - interval 5 seconds AND cast(leftTime AS LONG) > 10") ===
+      Some(5000))
 
     // Test non-positive results
     assert(watermarkFrom("CAST(leftTime AS LONG) > CAST(rightTime AS LONG) - 10") === Some(0))
