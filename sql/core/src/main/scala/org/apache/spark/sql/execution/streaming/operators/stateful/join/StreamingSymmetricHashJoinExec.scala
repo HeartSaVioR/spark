@@ -28,6 +28,7 @@ import org.apache.spark.sql.catalyst.analysis.StreamingJoinHelper
 import org.apache.spark.sql.catalyst.analysis.WidenStatefulOpNullability
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Expression, GenericInternalRow, JoinedRow, Literal, Predicate, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.plans._
+import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
@@ -697,7 +698,11 @@ case class StreamingSymmetricHashJoinExec(
       stateFormatVersion = stateFormatVersion,
       skippedNullValueCount = skippedNullValueCount,
       joinStoreGenerator = joinStateManagerStoreGenerator,
-      joinKeyOrdinalForWatermark = joinKeyOrdinalForWatermark)
+      joinKeyOrdinalForWatermark = joinKeyOrdinalForWatermark,
+      stateValueWatermarkColumnOrdinal = stateWatermarkPredicate.collect {
+        case p: JoinStateValueWatermarkPredicate =>
+          inputAttributes.indexWhere(p.expr.references.contains)
+      })
 
     private[this] val keyGenerator = UnsafeProjection.create(joinKeys, inputAttributes)
 
@@ -731,7 +736,17 @@ case class StreamingSymmetricHashJoinExec(
         case _ => false
       })
 
-      if (!isV4TimeIntervalJoin) {
+      val indexesEventTimeColumns = Seq(
+        (stateWatermarkPredicates.left, left.output),
+        (stateWatermarkPredicates.right, right.output)).forall {
+        case (Some(p: JoinStateValueWatermarkPredicate), attributes) =>
+          attributes.find(_.metadata.contains(EventTimeWatermark.delayKey)).exists { eventTime =>
+            p.expr.references.forall(_.semanticEquals(eventTime))
+          }
+        case _ => true
+      }
+      // These offsets relate the two event-time columns. They cannot constrain an expiry index.
+      if (!isV4TimeIntervalJoin || !indexesEventTimeColumns) {
         None
       } else {
         val (thisSideAttrs, otherSideAttrs) = joinSide match {

@@ -29,6 +29,7 @@ import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.streaming.operators.stateful.{StatefulOperatorStateInfo, WatermarkSupport}
 import org.apache.spark.sql.execution.streaming.operators.stateful.WatermarkSupport.watermarkExpression
 import org.apache.spark.sql.execution.streaming.state.{StateStoreCheckpointInfo, StateStoreCoordinatorRef, StateStoreProviderId}
+import org.apache.spark.sql.types.TimestampType
 
 
 /**
@@ -188,11 +189,16 @@ object StreamingSymmetricHashJoinHelper extends Logging {
       if (isWatermarkDefinedOnJoinKey) { // case 1 and 3 in the StreamingSymmetricHashJoinExec docs
         eventTimeWatermarkForEviction
       } else if (isWatermarkDefinedOnInput) { // case 2 in the StreamingSymmetricHashJoinExec docs
-        StreamingJoinHelper.getStateValueWatermark(
-          attributesToFindStateWatermarkFor = AttributeSet(oneSideInputAttributes),
-          attributesWithEventWatermark = AttributeSet(otherSideInputAttributes),
-          condition,
-          eventTimeWatermarkForEviction)
+        getStateValueWatermarkForInput(oneSideInputAttributes, otherSideInputAttributes,
+          condition, eventTimeWatermarkForEviction).map { case (attribute, watermark) =>
+          // A bound on expiry does not bound the event time of rows still buffered in state.
+          if (oneSideInputAttributes.find(_.metadata.contains(delayKey))
+              .exists(_.semanticEquals(attribute))) {
+            watermark
+          } else {
+            0L
+          }
+        }
       } else {
         None
       }
@@ -262,27 +268,22 @@ object StreamingSymmetricHashJoinHelper extends Logging {
             prevStateKeyWatermark)
         }
       } else if (isWatermarkDefinedOnInput) { // case 2 in the StreamingSymmetricHashJoinExec docs
-        val stateValueWatermark = StreamingJoinHelper.getStateValueWatermark(
-          attributesToFindStateWatermarkFor = AttributeSet(oneSideInputAttributes),
-          attributesWithEventWatermark = AttributeSet(otherSideInputAttributes),
-          condition,
-          eventTimeWatermarkForEviction)
-        // A row can pass late-input filtering but already be eligible for eviction in this batch.
-        // When the previous join-derived state cutoff is ahead of the late-input watermark, a new
-        // row can fall at or below that cutoff. V4 must scan from the beginning to find such rows.
-        val prevStateValueWatermark = eventTimeWatermarkForLateEvents.flatMap { lateWatermark =>
-          StreamingJoinHelper.getStateValueWatermark(
-            attributesToFindStateWatermarkFor = AttributeSet(oneSideInputAttributes),
-            attributesWithEventWatermark = AttributeSet(otherSideInputAttributes),
-            condition,
-            eventTimeWatermarkForLateEvents).filter(_ <= lateWatermark)
-        }
-        val inputAttributeWithWatermark = oneSideInputAttributes.find(_.metadata.contains(delayKey))
-        val expr = watermarkExpression(inputAttributeWithWatermark, stateValueWatermark)
-        expr.map { e =>
-          // watermarkExpression only provides the expression when eventTimeWatermarkForEviction
-          // is defined
-          JoinStateValueWatermarkPredicate(e, stateValueWatermark.get, prevStateValueWatermark)
+        getStateValueWatermarkForInput(oneSideInputAttributes, otherSideInputAttributes,
+          condition, eventTimeWatermarkForEviction).flatMap { case (attribute, watermark) =>
+          // Late filtering only constrains the input's event-time column. A different indexed
+          // column can admit values below the previous cutoff and must be scanned from the start.
+          // Also scan from the start if the derived cutoff exceeds the late-input watermark.
+          val prevStateValueWatermark = eventTimeWatermarkForLateEvents.filter { _ =>
+            oneSideInputAttributes.find(_.metadata.contains(delayKey))
+              .exists(_.semanticEquals(attribute))
+          }.flatMap { lateWatermark =>
+            StreamingJoinHelper.getStateValueWatermark(AttributeSet(Seq(attribute)),
+              AttributeSet(otherSideInputAttributes), condition, Some(lateWatermark))
+              .filter(_ <= lateWatermark)
+          }
+          watermarkExpression(Some(attribute), Some(watermark)).map { e =>
+            JoinStateValueWatermarkPredicate(e, watermark, prevStateValueWatermark)
+          }
         }
       } else {
         None
@@ -294,6 +295,40 @@ object StreamingSymmetricHashJoinHelper extends Logging {
     val rightStateWatermarkPredicate =
       getOneSideStateWatermarkPredicate(rightAttributes, rightKeys, leftAttributes)
     JoinStateWatermarkPredicates(leftStateWatermarkPredicate, rightStateWatermarkPredicate)
+  }
+
+  /** Keep each cutoff attached to the column constrained by the join condition. */
+  private def getStateValueWatermarkForInput(
+      inputAttributes: Seq[Attribute],
+      otherInputAttributes: Seq[Attribute],
+      condition: Option[Expression],
+      eventWatermark: Option[Long]): Option[(Attribute, Long)] = {
+    val eventTime = inputAttributes.find(_.metadata.contains(delayKey))
+    // Prefer the existing event-time index when it has a valid bound. Otherwise choose a stable
+    // timestamp column, e.g. the expiry in rightTime BETWEEN leftTime AND expiry.
+    val candidates = eventTime.toSeq ++ inputAttributes.filter { attribute =>
+      attribute.dataType == TimestampType && !eventTime.exists(_.semanticEquals(attribute))
+    }
+    candidates.iterator.flatMap { attribute =>
+      StreamingJoinHelper.getStateValueWatermark(AttributeSet(Seq(attribute)),
+        AttributeSet(otherInputAttributes), condition, eventWatermark).map(attribute -> _)
+    }.take(1).toSeq.headOption
+  }
+
+  /** Old checkpoints are safe only when value eviction still uses the same timestamp column. */
+  def isRangeEvictionCheckpointCompatible(
+      leftAttributes: Seq[Attribute],
+      rightAttributes: Seq[Attribute],
+      leftKeys: Seq[Expression],
+      rightKeys: Seq[Expression],
+      condition: Option[Expression]): Boolean = {
+    if (findJoinKeyOrdinalForWatermark(leftKeys, rightKeys).isDefined) return true
+    Seq((leftAttributes, rightAttributes), (rightAttributes, leftAttributes)).forall {
+      case (input, other) =>
+        val eventTime = input.find(_.metadata.contains(delayKey))
+        eventTime.isEmpty || getStateValueWatermarkForInput(input, other, condition, Some(0L))
+          .forall { case (attribute, _) => eventTime.exists(_.semanticEquals(attribute)) }
+    }
   }
 
   private[join] def findJoinKeyOrdinalForWatermark(
