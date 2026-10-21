@@ -29,7 +29,7 @@ import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.streaming.operators.stateful.{StatefulOperatorStateInfo, WatermarkSupport}
 import org.apache.spark.sql.execution.streaming.operators.stateful.WatermarkSupport.watermarkExpression
 import org.apache.spark.sql.execution.streaming.state.{StateStoreCheckpointInfo, StateStoreCoordinatorRef, StateStoreProviderId}
-import org.apache.spark.sql.types.TimestampType
+import org.apache.spark.sql.types.{StructType, TimestampType}
 
 
 /**
@@ -307,13 +307,16 @@ object StreamingSymmetricHashJoinHelper extends Logging {
    * Conservatively prove that older state can use the current watermark semantics. Without
    * watermarks there is no affected state. Otherwise each side must have exactly one event-time
    * column, and its own event time must be the sole watermarked equality key at the same ordinal.
-   * This excludes range bounds and retained event times with no eviction bound.
+   * This excludes range bounds and retained event times with no eviction bound. V4 additionally
+   * requires the selected equality key timestamp to be provably non-null, because old V4 indexed
+   * null selected key timestamps and timestamp eviction does not recheck the key predicate.
    */
   private[sql] def isWatermarkCheckpointCompatible(
       leftAttributes: Seq[Attribute],
       rightAttributes: Seq[Attribute],
       leftKeys: Seq[Expression],
-      rightKeys: Seq[Expression]): Boolean = {
+      rightKeys: Seq[Expression],
+      stateFormatVersion: Int): Boolean = {
     val leftEventTime = leftAttributes.filter(_.metadata.contains(delayKey))
     val rightEventTime = rightAttributes.filter(_.metadata.contains(delayKey))
 
@@ -323,6 +326,13 @@ object StreamingSymmetricHashJoinHelper extends Logging {
       }
     }
 
+    def selectedKeyTimestampCanBeNull(key: Attribute): Boolean = key.dataType match {
+      case struct: StructType =>
+        key.nullable || struct.fields.lift(1).forall(_.nullable)
+      case _ =>
+        key.nullable
+    }
+
     val leftOrdinals = watermarkKeyOrdinals(leftKeys)
     val rightOrdinals = watermarkKeyOrdinals(rightKeys)
     if (leftEventTime.isEmpty && rightEventTime.isEmpty) {
@@ -330,8 +340,12 @@ object StreamingSymmetricHashJoinHelper extends Logging {
     } else if (leftEventTime.size == 1 && rightEventTime.size == 1) {
       val leftOrdinal = StreamingJoinHelper.getStateKeyWatermarkOrdinal(leftKeys, leftAttributes)
       val rightOrdinal = StreamingJoinHelper.getStateKeyWatermarkOrdinal(rightKeys, rightAttributes)
-      leftOrdinal.isDefined && leftOrdinal == rightOrdinal &&
+      val alignedOwnEventTimeKeys = leftOrdinal.isDefined && leftOrdinal == rightOrdinal &&
         leftOrdinals == leftOrdinal.toSeq && rightOrdinals == rightOrdinal.toSeq
+      val selectedKeysAreNonNull = stateFormatVersion < 4 || alignedOwnEventTimeKeys &&
+        !selectedKeyTimestampCanBeNull(leftEventTime.head) &&
+        !selectedKeyTimestampCanBeNull(rightEventTime.head)
+      alignedOwnEventTimeKeys && selectedKeysAreNonNull
     } else {
       false
     }

@@ -729,7 +729,8 @@ class IncrementalExecution(
         planWithStateOpId.foreach {
           case j: StreamingSymmetricHashJoinExec
               if !StreamingSymmetricHashJoinHelper.isWatermarkCheckpointCompatible(
-                j.left.output, j.right.output, j.leftKeys, j.rightKeys) =>
+                j.left.output, j.right.output, j.leftKeys, j.rightKeys,
+                j.stateFormatVersion) =>
             val conditions = j.leftKeys.zip(j.rightKeys).map { case (left, right) =>
               EqualTo(left, right)
             } ++ j.condition.full
