@@ -111,7 +111,7 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
   for {
     version <- Seq(2, 3, 4)
     logVersion <- Seq(1, 2)
-    oldMarker <- Seq(None, Some("0"))
+    oldMarker <- Seq(None, Some("0"), Some("1"))
   } {
     test(s"reject old range-column checkpoint, V$version log=$logVersion marker=$oldMarker") {
       withJoinConf(version, logVersion) {
@@ -127,14 +127,18 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
           setMarker(checkpoint, oldMarker)
           val stateBefore = snapshot(new File(checkpoint, "state"))
           val commitsBefore = snapshot(new File(checkpoint, "commits"))
-          withSQLConf(markerKey -> "1") {
+          withSQLConf(markerKey -> "2") {
             testStream(joined)(
               StartStream(checkpointLocation = checkpoint),
               AddData(rightInput, (9, 400L)),
               ExpectFailure[AnalysisException](assertFailure = error => {
                 checkError(error.asInstanceOf[AnalysisException],
-                  condition = "STREAMING_JOIN_RANGE_EVICTION_CHECKPOINT_INCOMPATIBLE",
-                  parameters = Map.empty)
+                  condition = "STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE",
+                  parameters = Map(
+                    "joinCondition" -> ".*leftKey.*rightKey.*",
+                    "leftWatermarkColumns" -> "leftTime",
+                    "rightWatermarkColumns" -> "rightTime"),
+                  matchPVals = true)
               }))
           }
           assert(snapshot(new File(checkpoint, "state")) == stateBefore)
@@ -189,11 +193,11 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
   for {
     version <- Seq(2, 3, 4)
     logVersion <- Seq(1, 2)
-    oldCompatible <- Seq(false, true)
+    expiryBound <- Seq(false, true)
   } {
-    test(s"resume range checkpoint, V$version log=$logVersion old-compatible=$oldCompatible") {
+    test(s"resume range checkpoint, V$version log=$logVersion expiry=$expiryBound") {
       withJoinConf(version, logVersion) {
-        val (leftInput, rightInput, joined) = inputs(expiryBound = !oldCompatible)
+        val (leftInput, rightInput, joined) = inputs(expiryBound)
         withTempDir { checkpointDir =>
           val checkpoint = checkpointDir.getCanonicalPath
           testStream(joined)(
@@ -207,8 +211,7 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
             AddData(rightInput, (9, 400L)), CheckNewAnswer(), StopStream)
           val offsetLog = new OffsetSeqLog(spark, checkpoint + "/offsets")
           val pinned = offsetLog.getLatest().get._2.metadataOpt.get.conf.get(markerKey)
-          assert(pinned.contains("1"))
-          if (oldCompatible) setMarker(checkpoint, None)
+          assert(pinned.contains("2"))
           // The checkpoint value must override a changed session default on restart.
           withSQLConf(markerKey -> "0") {
             testStream(joined)(
@@ -275,8 +278,12 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
             StartStream(checkpointLocation = checkpoint),
             ExpectFailure[AnalysisException](assertFailure = error => {
               checkError(error.asInstanceOf[AnalysisException],
-                condition = "STREAMING_JOIN_RANGE_EVICTION_CHECKPOINT_INCOMPATIBLE",
-                parameters = Map.empty)
+                condition = "STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE",
+                parameters = Map(
+                  "joinCondition" -> ".*leftKey.*rightKey.*",
+                  "leftWatermarkColumns" -> "leftTime",
+                  "rightWatermarkColumns" -> "rightTime"),
+                matchPVals = true)
             }))
           assert(snapshot(new File(checkpoint, "state")) == stateBefore)
         }

@@ -7956,9 +7956,10 @@
     ],
     "sqlState" : "42K03"
   },
-  "STREAMING_JOIN_RANGE_EVICTION_CHECKPOINT_INCOMPATIBLE" : {
+  "STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE" : {
     "message" : [
-      "This stream-stream join checkpoint predates eviction on the timestamp column bounded by the join condition. Its state may have been removed prematurely or indexed on a different column. Restart the query with a new checkpoint location."
+      "Cannot reuse the checkpoint for the stream-stream join with condition <joinCondition>. Watermarked columns: left [<leftWatermarkColumns>], right [<rightWatermarkColumns>].",
+      "This Spark version changes how watermarks determine which rows can still match. Spark cannot verify that rows saved by the previous version can be reused safely for this join. Start the query with a new checkpoint and replay the required input, accounting for previously written results to avoid duplicates and correct any missing or incorrect output."
     ],
     "sqlState" : "0A000"
   },

@@ -318,31 +318,44 @@ object StreamingSymmetricHashJoinHelper extends Logging {
     }.take(1).toSeq.headOption
   }
 
-  /** Old checkpoints are safe only when value eviction still uses the same timestamp column. */
-  def isRangeEvictionCheckpointCompatible(
+  /**
+   * Conservatively prove that older state can use the current watermark semantics. Without
+   * watermarks there is no affected state. Otherwise each side must have exactly one event-time
+   * column, and its own event time must be the sole watermarked equality key at the same ordinal.
+   * This excludes range bounds and retained event times with no eviction bound.
+   */
+  private[sql] def isWatermarkCheckpointCompatible(
       leftAttributes: Seq[Attribute],
       rightAttributes: Seq[Attribute],
       leftKeys: Seq[Expression],
-      rightKeys: Seq[Expression],
-      condition: Option[Expression]): Boolean = {
-    if (findJoinKeyOrdinalForWatermark(leftKeys, rightKeys).isDefined) return true
-    Seq((leftAttributes, rightAttributes), (rightAttributes, leftAttributes)).forall {
-      case (input, other) =>
-        val eventTime = input.find(_.metadata.contains(delayKey))
-        eventTime.isEmpty || !other.exists(_.metadata.contains(delayKey)) || {
-          getStateValueWatermarkForInput(input, other, condition, Some(0L)) match {
-            case Some((attribute, _)) => eventTime.exists(_.semanticEquals(attribute))
-            case None =>
-              // The old solver also considered non-timestamp columns, such as numeric expiry
-              // cast to timestamp, and applied their cutoff to event time. No corrected bound
-              // does not prove that old state was safe. Only accept this case when the condition
-              // cannot have constrained another column of this input.
-              condition.forall { expression =>
-                expression.references.intersect(AttributeSet(input))
-                  .forall(attribute => eventTime.exists(_.semanticEquals(attribute)))
-              }
-          }
-        }
+      rightKeys: Seq[Expression]): Boolean = {
+    val leftEventTime = leftAttributes.filter(_.metadata.contains(delayKey))
+    val rightEventTime = rightAttributes.filter(_.metadata.contains(delayKey))
+
+    def watermarkKeyOrdinals(keys: Seq[Expression]): Seq[Int] = {
+      keys.zipWithIndex.collect {
+        case (key: NamedExpression, index) if key.metadata.contains(delayKey) => index
+      }
+    }
+
+    def ownEventTimeKeyOrdinal(keys: Seq[Expression], eventTime: Attribute): Option[Int] = {
+      keys.zipWithIndex.collectFirst {
+        case (key: NamedExpression, index)
+            if key.metadata.contains(delayKey) && key.semanticEquals(eventTime) => index
+      }
+    }
+
+    val leftOrdinals = watermarkKeyOrdinals(leftKeys)
+    val rightOrdinals = watermarkKeyOrdinals(rightKeys)
+    if (leftEventTime.isEmpty && rightEventTime.isEmpty) {
+      leftOrdinals.isEmpty && rightOrdinals.isEmpty
+    } else if (leftEventTime.size == 1 && rightEventTime.size == 1) {
+      val leftOrdinal = ownEventTimeKeyOrdinal(leftKeys, leftEventTime.head)
+      val rightOrdinal = ownEventTimeKeyOrdinal(rightKeys, rightEventTime.head)
+      leftOrdinal.isDefined && leftOrdinal == rightOrdinal &&
+        leftOrdinals == leftOrdinal.toSeq && rightOrdinals == rightOrdinal.toSeq
+    } else {
+      false
     }
   }
 

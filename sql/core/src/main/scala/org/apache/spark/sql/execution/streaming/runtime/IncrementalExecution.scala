@@ -29,7 +29,7 @@ import org.apache.spark.internal.LogKeys.{BATCH_TIMESTAMP, ERROR}
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.QueryPlanningTracker
 import org.apache.spark.sql.catalyst.analysis.WidenStatefulOperatorAttributeNullability
-import org.apache.spark.sql.catalyst.expressions.{CurrentBatchTimestamp, ExpressionWithRandomSeed}
+import org.apache.spark.sql.catalyst.expressions.{And, CurrentBatchTimestamp, EqualTo, ExpressionWithRandomSeed}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern._
@@ -714,17 +714,32 @@ class IncrementalExecution(
 
     override def apply(plan: SparkPlan): SparkPlan = {
       val planWithStateOpId = plan transform composedRule
-      // Validate the checkpoint-pinned semantics before writing metadata or opening state,
+      // Validate the checkpoint-pinned semantics before writing state metadata or opening state,
       // including a restart retrying an incomplete batch zero.
+      val requiredWatermarkSemanticsVersion =
+        SQLConf.STREAMING_JOIN_CHECKPOINT_WATERMARK_SEMANTICS_VERSION.defaultValue.get
       if (isFirstBatch &&
-          conf.getConf(SQLConf.STREAMING_JOIN_CHECKPOINT_WATERMARK_SEMANTICS_VERSION) < 1) {
+          conf.getConf(SQLConf.STREAMING_JOIN_CHECKPOINT_WATERMARK_SEMANTICS_VERSION) <
+            requiredWatermarkSemanticsVersion) {
+        def watermarkColumns(input: SparkPlan): String = {
+          val columns = input.output.filter(
+            _.metadata.contains(EventTimeWatermark.delayKey))
+          if (columns.isEmpty) "none" else columns.map(_.name).mkString(", ")
+        }
         planWithStateOpId.foreach {
           case j: StreamingSymmetricHashJoinExec
-              if !StreamingSymmetricHashJoinHelper.isRangeEvictionCheckpointCompatible(
-                j.left.output, j.right.output, j.leftKeys, j.rightKeys, j.condition.full) =>
+              if !StreamingSymmetricHashJoinHelper.isWatermarkCheckpointCompatible(
+                j.left.output, j.right.output, j.leftKeys, j.rightKeys) =>
+            val conditions = j.leftKeys.zip(j.rightKeys).map { case (left, right) =>
+              EqualTo(left, right)
+            } ++ j.condition.full
+            val joinCondition = conditions.reduceOption(And).map(_.sql).getOrElse("none")
             throw new AnalysisException(
-              errorClass = "STREAMING_JOIN_RANGE_EVICTION_CHECKPOINT_INCOMPATIBLE",
-              messageParameters = Map.empty)
+              errorClass = "STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE",
+              messageParameters = Map(
+                "joinCondition" -> joinCondition,
+                "leftWatermarkColumns" -> watermarkColumns(j.left),
+                "rightWatermarkColumns" -> watermarkColumns(j.right)))
           case _ =>
         }
       }
