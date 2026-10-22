@@ -21,7 +21,7 @@ import org.apache.hadoop.fs.Path
 import org.scalatest.Tag
 
 import org.apache.spark.SparkIllegalArgumentException
-import org.apache.spark.sql.Row
+import org.apache.spark.sql.{DataFrame, Row}
 import org.apache.spark.sql.execution.datasources.v2.state.StateSourceOptions
 import org.apache.spark.sql.execution.streaming.checkpointing.CheckpointFileManager
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinExec
@@ -607,7 +607,7 @@ class StreamingFullOuterJoinV4Suite
         .add("end", TimestampType)
 
       def nullableWindowPlan(input: MemoryStream[(Int, Int)], timeName: String,
-          windowName: String) = {
+          windowName: String): DataFrame = {
         input.toDF().toDF("a", "b")
           .select(timestamp_seconds($"a").as(timeName),
             when($"b" < 0, lit(null).cast(windowType)).otherwise(
@@ -618,7 +618,7 @@ class StreamingFullOuterJoinV4Suite
       }
 
       def boundedWindowPlan(input: MemoryStream[(Int, Int)], timeName: String,
-          windowName: String) = {
+          windowName: String): DataFrame = {
         input.toDF().toDF("a", "b")
           .select(timestamp_seconds($"a").as(timeName), timestamp_seconds($"b").as("t"))
           .withWatermark("t", "10 seconds")

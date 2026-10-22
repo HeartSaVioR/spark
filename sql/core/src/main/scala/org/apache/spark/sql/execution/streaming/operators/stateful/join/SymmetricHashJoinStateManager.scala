@@ -458,6 +458,8 @@ class SymmetricHashJoinStateManagerV4(
     val eventTimeOpt = extractEventTimeFnFromKey(key)
     val hasNullKeyEventTime = joinKeyOrdinalForWatermark.isDefined && eventTimeOpt.isEmpty
     val eventTime = if (hasNullKeyEventTime) {
+      // A null selected key timestamp makes the key watermark predicate SQL-unknown.
+      // Keep it in a primary random bucket only, so timestamp eviction cannot remove it.
       random.nextInt(bucketCountForNoEventTime)
     } else {
       eventTimeOpt.getOrElse(extractEventTimeFn(value))

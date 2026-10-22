@@ -2456,32 +2456,6 @@ abstract class StreamingLeftSemiJoinBase extends StreamingJoinSuite {
     }
   }
 
-  Seq(true).foreach { joinOnTime =>
-    test(s"left semi with right watermark, equality=$joinOnTime") {
-      val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
-        "left_semi", leftWatermark = false, joinOnTime = joinOnTime)
-
-      withSQLConf(SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
-        testStream(joined)(
-          AddData(leftInput, (1, 5)),
-          CheckNewAnswer(),
-          AddData(rightInput, (2, 30)),
-          CheckNewAnswer(),
-          AddData(rightInput, (2, 40)),
-          CheckNewAnswer(),
-          assertNumStateRows(total = Seq(2), updated = Seq(3),
-            droppedByWatermark = Seq(0), removed = Some(Seq(1))),
-          AddData(leftInput, (3, 5)),
-          CheckNewAnswer(),
-          AddData(leftInput, (2, 30)),
-          CheckNewAnswer(Row(2, 30)),
-          assertNumStateRows(total = Seq(2), updated = Seq(1),
-            droppedByWatermark = Seq(0), removed = Some(Seq(1)))
-        )
-      }
-    }
-  }
-
   testWithAppendAndUpdate("windowed left semi join") { outputMode =>
     withTempDir { checkpointDir =>
       val (leftInput, rightInput, joined) = setupWindowedJoin("left_semi")
@@ -2582,6 +2556,32 @@ abstract class StreamingLeftSemiJoinBase extends StreamingJoinSuite {
       MultiAddData(leftInput, (3, 40))(rightInput, (3, 40)),
       CheckNewAnswer(Row(20L, 2L))
     )
+  }
+
+  Seq(true).foreach { joinOnTime =>
+    test(s"left semi with right watermark, equality=$joinOnTime") {
+      val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
+        "left_semi", leftWatermark = false, joinOnTime = joinOnTime)
+
+      withSQLConf(SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+        testStream(joined)(
+          AddData(leftInput, (1, 5)),
+          CheckNewAnswer(),
+          AddData(rightInput, (2, 30)),
+          CheckNewAnswer(),
+          AddData(rightInput, (2, 40)),
+          CheckNewAnswer(),
+          assertNumStateRows(total = Seq(2), updated = Seq(3),
+            droppedByWatermark = Seq(0), removed = Some(Seq(1))),
+          AddData(leftInput, (3, 5)),
+          CheckNewAnswer(),
+          AddData(leftInput, (2, 30)),
+          CheckNewAnswer(Row(2, 30)),
+          assertNumStateRows(total = Seq(2), updated = Seq(1),
+            droppedByWatermark = Seq(0), removed = Some(Seq(1)))
+        )
+      }
+    }
   }
 
   testWithAppendAndUpdate("left semi early state exclusion on left") { outputMode =>
