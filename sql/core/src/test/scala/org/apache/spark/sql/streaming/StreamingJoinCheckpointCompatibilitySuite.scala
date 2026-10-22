@@ -101,21 +101,11 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
       MemoryStream[(Int, Int)], DataFrame) = {
     val leftInput = MemoryStream[(Int, Int)]
     val rightInput = MemoryStream[(Int, Int)]
-    val leftTime = if (shape == "equality") {
-      coalesce(timestamp_seconds($"time"), lit(new java.sql.Timestamp(0L))).as("leftTime")
-    } else {
-      timestamp_seconds($"time").as("leftTime")
-    }
-    val rightTime = if (shape == "equality") {
-      coalesce(timestamp_seconds($"time"), lit(new java.sql.Timestamp(0L))).as("rightTime")
-    } else {
-      timestamp_seconds($"time").as("rightTime")
-    }
     val leftData = leftInput.toDF().toDF("leftKey", "time")
-      .select($"leftKey", leftTime,
+      .select($"leftKey", timestamp_seconds($"time").as("leftTime"),
         timestamp_seconds($"time" + 10).as("expiry"))
     val rightData = rightInput.toDF().toDF("rightKey", "time")
-      .select($"rightKey", rightTime)
+      .select($"rightKey", timestamp_seconds($"time").as("rightTime"))
     val left = if (Seq("equality", "expiry", "pruned expiry", "unbounded")
         .contains(shape)) {
       leftData.withWatermark("leftTime", "100 seconds")
@@ -126,10 +116,6 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
       rightData.withWatermark("rightTime", "100 seconds")
     } else {
       rightData
-    }
-    if (shape == "equality") {
-      assertNonNullableOutput(left, "leftTime")
-      assertNonNullableOutput(right, "rightTime")
     }
     val condition = shape match {
       case "range" => "leftKey = rightKey AND leftTime > rightTime - INTERVAL 5 SECONDS"
@@ -241,13 +227,18 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
       nullable = true, metadata = watermarkMetadata)()
     val nonNullWindow = AttributeReference("window", nonNullWindowType,
       nullable = false, metadata = watermarkMetadata)()
+    val nonNullKeyNullableInput = nonNullLeftTime.withNullability(true)
+    val nullableInputNonNullKey = nullableLeftTime.withNullability(false)
 
     def compatible(
         leftAttribute: Attribute,
         rightAttribute: Attribute,
-        stateFormatVersion: Int): Boolean = {
+        stateFormatVersion: Int,
+        leftKey: Option[Attribute] = None,
+        rightKey: Option[Attribute] = None): Boolean = {
       StreamingSymmetricHashJoinHelper.isWatermarkCheckpointCompatible(
-        Seq(leftAttribute), Seq(rightAttribute), Seq(leftAttribute), Seq(rightAttribute),
+        Seq(leftAttribute), Seq(rightAttribute),
+        Seq(leftKey.getOrElse(leftAttribute)), Seq(rightKey.getOrElse(rightAttribute)),
         stateFormatVersion)
     }
 
@@ -259,6 +250,10 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
     assert(!compatible(nullableEndWindow, nonNullWindow, stateFormatVersion = 4))
     assert(!compatible(nullableStructWindow, nonNullWindow, stateFormatVersion = 4))
     assert(compatible(nonNullWindow, nonNullWindow, stateFormatVersion = 4))
+    assert(compatible(nonNullLeftTime, nonNullRightTime, stateFormatVersion = 4,
+      leftKey = Some(nonNullKeyNullableInput), rightKey = Some(nonNullRightTime)))
+    assert(!compatible(nullableLeftTime, nonNullRightTime, stateFormatVersion = 4,
+      leftKey = Some(nullableInputNonNullKey), rightKey = Some(nonNullRightTime)))
   }
 
   for {
@@ -399,6 +394,19 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
             StartStream(checkpointLocation = checkpoint),
             MultiAddData(leftInput, 30L)(rightInput, 30L),
             CheckNewAnswer(Row(30L, 30L)),
+            Execute { query =>
+              val join = query.lastExecution.executedPlan.collect {
+                case j: StreamingSymmetricHashJoinExec => j
+              }.head
+              val leftEventTime = join.left.output
+                .filter(_.metadata.contains(EventTimeWatermark.delayKey)).head
+              val rightEventTime = join.right.output
+                .filter(_.metadata.contains(EventTimeWatermark.delayKey)).head
+              assert(!leftEventTime.nullable, s"Expected non-null left event time: $join")
+              assert(!rightEventTime.nullable, s"Expected non-null right event time: $join")
+              assert(join.leftKeys.head.nullable, s"Expected nullable physical left key: $join")
+              assert(join.rightKeys.head.nullable, s"Expected nullable physical right key: $join")
+            },
             StopStream)
         }
         assert(pinnedMarker(checkpoint).contains("0"))
