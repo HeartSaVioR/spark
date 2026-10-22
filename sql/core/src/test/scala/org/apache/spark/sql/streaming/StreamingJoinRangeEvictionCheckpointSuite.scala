@@ -154,7 +154,7 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
   for {
     version <- Seq(2, 3, 4)
     logVersion <- Seq(1, 2)
-    oldMarker <- Seq(None, Some("0"))
+    oldMarker <- Seq(None, Some("0"), Some((currentMarker.toInt - 1).toString)).distinct
     useEventTimeLowerBound <- Seq(false, true)
   } {
     val boundDescription = if (useEventTimeLowerBound) "with event-time bound" else "only"
@@ -172,18 +172,22 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
             CheckNewAnswer(Row(1, 100L, 100L)), StopStream)
           val offsetLog = new OffsetSeqLog(spark, checkpoint + "/offsets")
           val pinned = offsetLog.getLatest().get._2.metadataOpt.get.conf.get(markerKey)
-          assert(pinned.contains("1"))
+          assert(pinned.contains(currentMarker))
           setMarker(checkpoint, oldMarker)
           val stateBefore = snapshot(new File(checkpoint, "state"))
           val commitsBefore = snapshot(new File(checkpoint, "commits"))
-          withSQLConf(markerKey -> "1") {
+          withSQLConf(markerKey -> currentMarker) {
             testStream(joined)(
               StartStream(checkpointLocation = checkpoint),
               AddData(rightInput, (9, 400L)),
               ExpectFailure[AnalysisException](assertFailure = error => {
                 checkError(error.asInstanceOf[AnalysisException],
-                  condition = "STREAMING_JOIN_RANGE_EVICTION_CHECKPOINT_INCOMPATIBLE",
-                  parameters = Map.empty)
+                  condition = "STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE",
+                  parameters = Map(
+                    "joinCondition" -> ".*leftKey.*rightKey.*",
+                    "leftWatermarkColumns" -> "leftTime",
+                    "rightWatermarkColumns" -> "rightTime"),
+                  matchPVals = true)
               }))
           }
           assert(snapshot(new File(checkpoint, "state")) == stateBefore)
@@ -246,7 +250,8 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
             CheckNewAnswer(),
             AddData(rightInput, (9, 400L)), CheckNewAnswer(), StopStream)
           val offsetLog = new OffsetSeqLog(spark, checkpoint + "/offsets")
-          assert(offsetLog.getLatest().get._2.metadataOpt.get.conf.get(markerKey).contains("1"))
+          assert(offsetLog.getLatest().get._2.metadataOpt.get.conf.get(markerKey)
+            .contains(currentMarker))
           withSQLConf(markerKey -> "0") {
             testStream(joined)(
               StartStream(checkpointLocation = checkpoint),
