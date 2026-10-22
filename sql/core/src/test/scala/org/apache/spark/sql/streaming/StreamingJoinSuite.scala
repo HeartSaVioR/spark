@@ -2354,42 +2354,6 @@ abstract class StreamingLeftSemiJoinBase extends StreamingJoinSuite {
     }
   }
 
-  test("left semi output watermark ignores unbounded right state") {
-    val leftInput = MemoryStream[(Int, Int)]
-    val rightInput = MemoryStream[(Int, Int)]
-    val left = leftInput.toDF()
-      .select($"_1".as("leftKey"), timestamp_seconds($"_2").as("leftTime"))
-      .withWatermark("leftTime", "0 seconds")
-    val right = rightInput.toDF()
-      .select($"_1".as("rightKey"), timestamp_seconds($"_2").as("rightTime"))
-      .withWatermark("rightTime", "0 seconds")
-    val result = left.join(right,
-      expr("leftKey = rightKey AND leftTime > rightTime - INTERVAL 5 SECONDS"), "left_semi")
-      .groupBy(window($"leftTime", "10 seconds"))
-      .count()
-      .select($"window.start".cast("long"), $"count")
-
-    testStream(result)(
-      MultiAddData(leftInput, (1, 5))(rightInput, (1, 5)),
-      CheckNewAnswer(),
-      MultiAddData(leftInput, (2, 20))(rightInput, (2, 20)),
-      // Left state is bounded at 15 seconds. Retained right timestamps are not output.
-      CheckNewAnswer(Row(0L, 1L)),
-      Execute { query =>
-        val plan = query.lastExecution.executedPlan
-        val join = plan.collect { case j: StreamingSymmetricHashJoinExec => j }.head
-        val aggregation = plan.collect { case s: StateStoreSaveExec => s }.head
-        assert(join.produceOutputWatermark(20000L) === Some(15000L))
-        assert(aggregation.eventTimeWatermarkForEviction === Some(15000L))
-      },
-      // A fresh left row can still match old right state without emitting its old timestamp.
-      AddData(leftInput, (1, 25)),
-      CheckNewAnswer(),
-      MultiAddData(leftInput, (3, 40))(rightInput, (3, 40)),
-      CheckNewAnswer(Row(20L, 2L))
-    )
-  }
-
   testWithAppendAndUpdate("windowed left semi join") { outputMode =>
     withTempDir { checkpointDir =>
       val (leftInput, rightInput, joined) = setupWindowedJoin("left_semi")
@@ -2454,6 +2418,42 @@ abstract class StreamingLeftSemiJoinBase extends StreamingJoinSuite {
           droppedByWatermark = Seq(1), removed = Some(Seq(0)))
       )
     }
+  }
+
+  test("left semi output watermark ignores unbounded right state") {
+    val leftInput = MemoryStream[(Int, Int)]
+    val rightInput = MemoryStream[(Int, Int)]
+    val left = leftInput.toDF()
+      .select($"_1".as("leftKey"), timestamp_seconds($"_2").as("leftTime"))
+      .withWatermark("leftTime", "0 seconds")
+    val right = rightInput.toDF()
+      .select($"_1".as("rightKey"), timestamp_seconds($"_2").as("rightTime"))
+      .withWatermark("rightTime", "0 seconds")
+    val result = left.join(right,
+      expr("leftKey = rightKey AND leftTime > rightTime - INTERVAL 5 SECONDS"), "left_semi")
+      .groupBy(window($"leftTime", "10 seconds"))
+      .count()
+      .select($"window.start".cast("long"), $"count")
+
+    testStream(result)(
+      MultiAddData(leftInput, (1, 5))(rightInput, (1, 5)),
+      CheckNewAnswer(),
+      MultiAddData(leftInput, (2, 20))(rightInput, (2, 20)),
+      // Left state is bounded at 15 seconds. Retained right timestamps are not output.
+      CheckNewAnswer(Row(0L, 1L)),
+      Execute { query =>
+        val plan = query.lastExecution.executedPlan
+        val join = plan.collect { case j: StreamingSymmetricHashJoinExec => j }.head
+        val aggregation = plan.collect { case s: StateStoreSaveExec => s }.head
+        assert(join.produceOutputWatermark(20000L) === Some(15000L))
+        assert(aggregation.eventTimeWatermarkForEviction === Some(15000L))
+      },
+      // A fresh left row can still match old right state without emitting its old timestamp.
+      AddData(leftInput, (1, 25)),
+      CheckNewAnswer(),
+      MultiAddData(leftInput, (3, 40))(rightInput, (3, 40)),
+      CheckNewAnswer(Row(20L, 2L))
+    )
   }
 
   testWithAppendAndUpdate("left semi early state exclusion on left") { outputMode =>
