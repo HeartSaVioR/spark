@@ -257,6 +257,7 @@ object StreamingSymmetricHashJoinHelper extends Logging {
       } else { // case 2 in the StreamingSymmetricHashJoinExec docs
         // Future matches are limited by the opposite watermark. This input needs no watermark;
         // its event-time column may also have been pruned from the physical join.
+        val otherSideEventTime = otherSideInputAttributes.find(_.metadata.contains(delayKey))
         getStateValueWatermarkForInput(oneSideInputAttributes, otherSideInputAttributes,
           condition, eventTimeWatermarkForEviction).flatMap { case (attribute, watermark) =>
           // Late filtering only constrains the input's event-time column. A different indexed
@@ -267,8 +268,7 @@ object StreamingSymmetricHashJoinHelper extends Logging {
               .exists(_.semanticEquals(attribute))
           }.flatMap { lateWatermark =>
             StreamingJoinHelper.getStateValueWatermark(AttributeSet(Seq(attribute)),
-              AttributeSet(otherSideInputAttributes.find(_.metadata.contains(delayKey)).toSeq),
-              condition, Some(lateWatermark))
+              AttributeSet(otherSideEventTime.toSeq), condition, Some(lateWatermark))
               .filter(_ <= lateWatermark)
           }
           watermarkExpression(Some(attribute), Some(watermark)).map { e =>
