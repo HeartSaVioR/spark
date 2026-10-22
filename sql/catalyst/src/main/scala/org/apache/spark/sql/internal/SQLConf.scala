@@ -4152,8 +4152,8 @@ object SQLConf {
       .version("4.4.0")
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .intConf
-      .checkValue(v => v >= 0 && v <= 15, "Supported versions are 0 through 15")
-      .createWithDefault(15)
+      .checkValue(v => v >= 0 && v <= 16, "Supported versions are 0 through 16")
+      .createWithDefault(16)
 
   val STREAMING_SESSION_WINDOW_MERGE_SESSIONS_IN_LOCAL_PARTITION =
     buildConf("spark.sql.streaming.sessionWindow.merge.sessions.in.local.partition")
