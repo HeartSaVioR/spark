@@ -154,6 +154,33 @@ case class DataSourceV2Relation(
 }
 
 /**
+ * A logical placeholder for a table that supports external lookup but not batch scan.
+ *
+ * The placeholder lets a Dataset carry the table until an external lookup hint consumes it. It
+ * must never be planned as an ordinary scan.
+ */
+case class ExternalLookupRelation(relation: DataSourceV2Relation)
+  extends DataSourceV2RelationBase(
+    relation.table,
+    relation.output,
+    relation.catalog,
+    relation.identifier,
+    relation.options,
+    relation.timeTravelSpec) {
+
+  def table: Table = relation.table
+
+  override def output: Seq[AttributeReference] = relation.output
+
+  override def newInstance(): ExternalLookupRelation =
+    copy(relation = relation.newInstance())
+
+  override def computeStats(): Statistics = Statistics(sizeInBytes = conf.defaultSizeInBytes)
+
+  override val nodePatterns: Seq[TreePattern] = Seq(DATA_SOURCE_V2_RELATION)
+}
+
+/**
  * A logical plan for a DSv2 table with a scan already created.
  *
  * This is used in the optimizer to push filters and projection down before conversion to physical

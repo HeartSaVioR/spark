@@ -668,7 +668,8 @@ class Analyzer(
     Batch("Disable Hints", Once,
       new ResolveHints.DisableHints),
     Batch("Hints", fixedPoint,
-      Seq(ResolveHints.ResolveJoinStrategyHints,
+      Seq(ResolveExternalLookupHint,
+        ResolveHints.ResolveJoinStrategyHints,
         ResolveHints.ResolveCoalesceHints) ++
         hintResolutionRules: _*),
     Batch("Simple Sanity Check", Once,
@@ -760,6 +761,7 @@ class Analyzer(
       Seq(ResolveUpdateEventTimeWatermarkColumn) ++
       extendedResolutionRules ++
       Seq(NameStreamingSources) : _*),
+    Batch("Resolve External Lookup Join", Once, ResolveExternalLookupJoin),
     Batch("Remove TempResolvedColumn", Once, RemoveTempResolvedColumn),
     Batch("Post-Hoc Resolution", Once,
       Seq(ResolveCommandsWithIfExists) ++

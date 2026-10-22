@@ -82,6 +82,20 @@ public interface Scan {
   }
 
   /**
+   * Returns the physical representation of this scan for key-based external lookup. Data sources
+   * must override this method when the table advertises
+   * {@link TableCapability#EXTERNAL_LOOKUP}.
+   *
+   * @throws UnsupportedOperationException
+   *
+   * @since 4.4.0
+   */
+  default ExternalLookup toExternalLookup() {
+    throw new SparkUnsupportedOperationException(
+      "DATA_SOURCE_EXTERNAL_LOOKUP_NOT_SUPPORTED", Map.of("description", description()));
+  }
+
+  /**
    * Returns the physical representation of this scan for streaming query with micro-batch mode. By
    * default this method throws exception, data sources must overwrite this method to provide an
    * implementation, if the {@link Table} that creates this scan returns

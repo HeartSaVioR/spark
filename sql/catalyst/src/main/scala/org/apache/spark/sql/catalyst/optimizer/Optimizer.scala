@@ -1553,6 +1553,20 @@ object ColumnPruning extends Rule[LogicalPlan] {
     case j @ Join(_, right, LeftExistence(_), _, _) =>
       j.copy(right = prunedChild(right, j.references))
 
+    // ExternalLookupJoin is not a Join subtype, so teach generic column pruning its output
+    // semantics while the lookup side is still an ordinary logical plan.
+    case p @ Project(_, j: ExternalLookupJoin) =>
+      val required = p.references ++ j.references
+      val demandedRightOutput = j.demandedRightOutput.filter(p.references.contains)
+      p.copy(child = j.copy(
+        left = prunedChild(j.left, required),
+        right = prunedChild(j.right, required),
+        demandedRightOutput = demandedRightOutput))
+    case j: ExternalLookupJoin if j.joinType == LeftSemi || j.joinType == LeftAnti =>
+      j.copy(
+        right = prunedChild(j.right, j.references),
+        demandedRightOutput = Seq.empty)
+
     // all the columns will be used to compare, so we can't prune them
     case p @ Project(_, _: SetOperation) => p
     case p @ Project(_, _: Distinct) => p
