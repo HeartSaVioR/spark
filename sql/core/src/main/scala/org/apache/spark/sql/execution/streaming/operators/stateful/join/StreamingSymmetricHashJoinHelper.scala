@@ -29,7 +29,7 @@ import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.streaming.operators.stateful.{StatefulOperatorStateInfo, WatermarkSupport}
 import org.apache.spark.sql.execution.streaming.operators.stateful.WatermarkSupport.watermarkExpression
 import org.apache.spark.sql.execution.streaming.state.{StateStoreCheckpointInfo, StateStoreCoordinatorRef, StateStoreProviderId}
-import org.apache.spark.sql.types.TimestampType
+import org.apache.spark.sql.types.{StructType, TimestampType}
 
 
 /**
@@ -217,13 +217,14 @@ object StreamingSymmetricHashJoinHelper extends Logging {
     WatermarkSupport.findEventTimeColumn(rightAttributes,
       allowMultipleEventTimeColumns = useFirstEventTimeColumn)
 
-    val joinKeyOrdinalForWatermark: Option[Int] = findJoinKeyOrdinalForWatermark(
-      leftKeys, rightKeys)
-
     def getOneSideStateWatermarkPredicate(
         oneSideInputAttributes: Seq[Attribute],
         oneSideJoinKeys: Seq[Expression],
-        otherSideInputAttributes: Seq[Attribute]): Option[JoinStateWatermarkPredicate] = {
+        otherSideInputAttributes: Seq[Attribute],
+        otherSideJoinKeys: Seq[Expression]): Option[JoinStateWatermarkPredicate] = {
+      // State is bounded by future input from the opposite side, not by its own watermark.
+      val joinKeyOrdinalForWatermark = StreamingJoinHelper.getStateKeyWatermarkOrdinal(
+        otherSideJoinKeys, otherSideInputAttributes)
       val isWatermarkDefinedOnInput = oneSideInputAttributes.exists(_.metadata.contains(delayKey))
       val isWatermarkDefinedOnJoinKey = joinKeyOrdinalForWatermark.isDefined
 
@@ -278,9 +279,9 @@ object StreamingSymmetricHashJoinHelper extends Logging {
     }
 
     val leftStateWatermarkPredicate =
-      getOneSideStateWatermarkPredicate(leftAttributes, leftKeys, rightAttributes)
+      getOneSideStateWatermarkPredicate(leftAttributes, leftKeys, rightAttributes, rightKeys)
     val rightStateWatermarkPredicate =
-      getOneSideStateWatermarkPredicate(rightAttributes, rightKeys, leftAttributes)
+      getOneSideStateWatermarkPredicate(rightAttributes, rightKeys, leftAttributes, leftKeys)
     JoinStateWatermarkPredicates(leftStateWatermarkPredicate, rightStateWatermarkPredicate)
   }
 
@@ -306,13 +307,16 @@ object StreamingSymmetricHashJoinHelper extends Logging {
    * Conservatively prove that older state can use the current watermark semantics. Without
    * watermarks there is no affected state. Otherwise each side must have exactly one event-time
    * column, and its own event time must be the sole watermarked equality key at the same ordinal.
-   * This excludes range bounds and retained event times with no eviction bound.
+   * This excludes range bounds and retained event times with no eviction bound. V4 additionally
+   * requires the selected equality key timestamp to be provably non-null, because old V4 indexed
+   * null selected key timestamps and timestamp eviction does not recheck the key predicate.
    */
   private[sql] def isWatermarkCheckpointCompatible(
       leftAttributes: Seq[Attribute],
       rightAttributes: Seq[Attribute],
       leftKeys: Seq[Expression],
-      rightKeys: Seq[Expression]): Boolean = {
+      rightKeys: Seq[Expression],
+      stateFormatVersion: Int): Boolean = {
     val leftEventTime = leftAttributes.filter(_.metadata.contains(delayKey))
     val rightEventTime = rightAttributes.filter(_.metadata.contains(delayKey))
 
@@ -322,11 +326,11 @@ object StreamingSymmetricHashJoinHelper extends Logging {
       }
     }
 
-    def ownEventTimeKeyOrdinal(keys: Seq[Expression], eventTime: Attribute): Option[Int] = {
-      keys.zipWithIndex.collectFirst {
-        case (key: NamedExpression, index)
-            if key.metadata.contains(delayKey) && key.semanticEquals(eventTime) => index
-      }
+    def selectedKeyTimestampCanBeNull(key: Attribute): Boolean = key.dataType match {
+      case struct: StructType =>
+        key.nullable || struct.fields.lift(1).forall(_.nullable)
+      case _ =>
+        key.nullable
     }
 
     val leftOrdinals = watermarkKeyOrdinals(leftKeys)
@@ -334,34 +338,16 @@ object StreamingSymmetricHashJoinHelper extends Logging {
     if (leftEventTime.isEmpty && rightEventTime.isEmpty) {
       leftOrdinals.isEmpty && rightOrdinals.isEmpty
     } else if (leftEventTime.size == 1 && rightEventTime.size == 1) {
-      val leftOrdinal = ownEventTimeKeyOrdinal(leftKeys, leftEventTime.head)
-      val rightOrdinal = ownEventTimeKeyOrdinal(rightKeys, rightEventTime.head)
-      leftOrdinal.isDefined && leftOrdinal == rightOrdinal &&
+      val leftOrdinal = StreamingJoinHelper.getStateKeyWatermarkOrdinal(leftKeys, leftAttributes)
+      val rightOrdinal = StreamingJoinHelper.getStateKeyWatermarkOrdinal(rightKeys, rightAttributes)
+      val alignedOwnEventTimeKeys = leftOrdinal.isDefined && leftOrdinal == rightOrdinal &&
         leftOrdinals == leftOrdinal.toSeq && rightOrdinals == rightOrdinal.toSeq
+      val selectedKeysAreNonNull = stateFormatVersion < 4 || alignedOwnEventTimeKeys &&
+        !selectedKeyTimestampCanBeNull(leftEventTime.head) &&
+        !selectedKeyTimestampCanBeNull(rightEventTime.head)
+      alignedOwnEventTimeKeys && selectedKeysAreNonNull
     } else {
       false
-    }
-  }
-
-  private[join] def findJoinKeyOrdinalForWatermark(
-      leftKeys: Seq[Expression],
-      rightKeys: Seq[Expression]): Option[Int] = {
-    // Join keys of both sides generate rows of the same fields, that is, same sequence of data
-    // types. If one side (say left side) has a column (say timestamp) that has a watermark on it,
-    // then it will never consider joining keys that are < state key watermark (i.e. event time
-    // watermark). On the other side (i.e. right side), even if there is no watermark defined,
-    // there has to be an equivalent column (i.e., timestamp). And any right side data that has the
-    // timestamp < watermark will not match will not match with left side data, as the left side get
-    // filtered with the explicitly defined watermark. So, the watermark in timestamp column in
-    // left side keys effectively causes the timestamp on the right side to have a watermark.
-    // We will use the ordinal of the left timestamp in the left keys to find the corresponding
-    // right timestamp in the right keys.
-    leftKeys.zipWithIndex.collectFirst {
-      case (ne: NamedExpression, index) if ne.metadata.contains(delayKey) => index
-    } orElse {
-      rightKeys.zipWithIndex.collectFirst {
-        case (ne: NamedExpression, index) if ne.metadata.contains(delayKey) => index
-      }
     }
   }
 

@@ -299,13 +299,22 @@ class SymmetricHashJoinStateManagerV4(
   }
 
   private val extractEventTimeFnFromKey: UnsafeRow => Option[Long] = { row =>
-    joinKeyOrdinalForWatermark.map { idx =>
-      val attr = keyAttributes(idx)
-      if (attr.dataType.isInstanceOf[StructType]) {
-        // NOTE: We assume this is window struct, as same as WatermarkSupport.watermarkExpression
-        row.getStruct(idx, 2).getLong(1)
+    joinKeyOrdinalForWatermark.flatMap { idx =>
+      if (row.isNullAt(idx)) {
+        None
       } else {
-        row.getLong(idx)
+        val attr = keyAttributes(idx)
+        if (attr.dataType.isInstanceOf[StructType]) {
+          // NOTE: We assume this is window struct, as same as WatermarkSupport.watermarkExpression
+          val window = row.getStruct(idx, 2)
+          if (window == null || window.isNullAt(1)) {
+            None
+          } else {
+            Some(window.getLong(1))
+          }
+        } else {
+          Some(row.getLong(idx))
+        }
       }
     }
   }
@@ -446,10 +455,18 @@ class SymmetricHashJoinStateManagerV4(
   private val tsWithKey = new TsWithKeyTypeStore
 
   override def append(key: UnsafeRow, value: UnsafeRow, matched: Boolean): Unit = {
-    val eventTime = extractEventTimeFnFromKey(key).getOrElse(extractEventTimeFn(value))
+    val eventTimeOpt = extractEventTimeFnFromKey(key)
+    val hasNullKeyEventTime = joinKeyOrdinalForWatermark.isDefined && eventTimeOpt.isEmpty
+    val eventTime = if (hasNullKeyEventTime) {
+      // A null selected key timestamp makes the key watermark predicate SQL-unknown.
+      // Keep it in a primary random bucket only, so timestamp eviction cannot remove it.
+      random.nextInt(bucketCountForNoEventTime)
+    } else {
+      eventTimeOpt.getOrElse(extractEventTimeFn(value))
+    }
     // We always do blind merge for appending new value.
     keyWithTsToValues.append(key, eventTime, value, matched)
-    if (hasEventTime) {
+    if (hasEventTime && !hasNullKeyEventTime) {
       tsWithKey.add(eventTime, key)
     }
   }

@@ -1129,22 +1129,23 @@ abstract class StreamingInnerJoinSuite extends StreamingInnerJoinBase {
       StartStream(),
 
       AddData(input1, 25),
-      CheckNewAnswer(),   // watermark = 15, no-data-batch should remove 2 rows having window=[0,10]
-      assertNumStateRows(total = 1, updated = 1),
+      CheckNewAnswer(),
+      assertNumStateRows(total = 2, updated = 1),
 
       AddData(input2, 25),
       CheckNewAnswer((25, 30, 50, 75)),
-      assertNumStateRows(total = 2, updated = 1),
+      assertNumStateRows(total = 3, updated = 1),
       StopStream,
       StartStream(),
 
+      // The unwatermarked right input can still match left state without entering right state.
       AddData(input2, 1),
-      CheckNewAnswer(),                             // Should not join as < 15 removed
-      assertNumStateRows(total = 2, updated = 0),   // row not add as 1 < state key watermark = 15
+      CheckNewAnswer((1, 10, 2, 3)),
+      assertNumStateRows(total = 3, updated = 0),
 
       AddData(input1, 5),
-      CheckNewAnswer(),                             // Same reason as above
-      assertNumStateRows(total = 2, updated = 0, droppedByWatermark = 1)
+      CheckNewAnswer(),
+      assertNumStateRows(total = 3, updated = 0, droppedByWatermark = 1)
     )
   }
 
@@ -1190,14 +1191,14 @@ abstract class StreamingInnerJoinSuite extends StreamingInnerJoinBase {
         total = Seq(2), updated = Seq(1), droppedByWatermark = Seq(0), removed = Some(Seq(0))),
 
       AddData(input1, 25),
-      CheckNewAnswer(),   // watermark = 15, no-data-batch should remove 2 rows having window=[0,10]
+      CheckNewAnswer(),
       assertNumStateRows(
-        total = Seq(1), updated = Seq(1), droppedByWatermark = Seq(0), removed = Some(Seq(2))),
+        total = Seq(2), updated = Seq(1), droppedByWatermark = Seq(0), removed = Some(Seq(1))),
 
       AddData(input2, 25),
       CheckNewAnswer((25, 30, 50, 75)),
       assertNumStateRows(
-        total = Seq(2), updated = Seq(1), droppedByWatermark = Seq(0), removed = Some(Seq(0)))
+        total = Seq(3), updated = Seq(1), droppedByWatermark = Seq(0), removed = Some(Seq(0)))
     )
   }
 
@@ -1350,6 +1351,56 @@ abstract class StreamingOuterJoinBase extends StreamingJoinSuite {
         CheckNewAnswer())
     }
     assert(error.getMessage.contains("a watermark on the right input"))
+  }
+
+  for {
+    (joinType, leftWatermark, rightWatermark, expected) <- Seq(
+      ("left_outer", false, true, Row(1, null, 5, null)),
+      ("right_outer", true, false, Row(null, 1, null, 5)))
+    joinOnTime <- Seq(true)
+  } {
+    test(s"$joinType with one watermark, equality=$joinOnTime") {
+      val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
+        joinType, leftWatermark = leftWatermark, rightWatermark = rightWatermark,
+        joinOnTime = joinOnTime)
+      val stateInput = if (joinType == "left_outer") leftInput else rightInput
+      val watermarkInput = if (joinType == "left_outer") rightInput else leftInput
+      val laterUnmatched = if (joinType == "left_outer") {
+        Row(3, null, 5, null)
+      } else {
+        Row(null, 3, null, 5)
+      }
+
+      withTempDir { checkpoint =>
+        withSQLConf(SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+          testStream(joined)(
+            StartStream(checkpointLocation = checkpoint.getCanonicalPath),
+            AddData(stateInput, (1, 5)),
+            CheckNewAnswer(),
+            AddData(watermarkInput, (2, 30)),
+            CheckNewAnswer(),
+            AddData(watermarkInput, (2, 40)),
+            CheckNewAnswer(expected),
+            assertNumStateRows(total = 2, updated = 3),
+            StopStream,
+            StartStream(checkpointLocation = checkpoint.getCanonicalPath),
+            // The unwatermarked input can introduce rows below an earlier eviction cutoff.
+            AddData(stateInput, (3, 5)),
+            CheckNewAnswer(laterUnmatched),
+            AddData(watermarkInput, (3, 5)),
+            CheckNewAnswer(),
+            AddData(watermarkInput, (4, 50)),
+            CheckNewAnswer(),
+            // Watermarked-side state must survive for future unwatermarked input.
+            AddData(stateInput, (2, 30)),
+            CheckNewAnswer(Row(2, 2, 30, 30)),
+            assertNumStateRows(total = 3,
+              updated = if (joinType == "left_outer") 3 else 2,
+              droppedByWatermark = 1)
+          )
+        }
+      }
+    }
   }
 
   Seq("left_outer", "right_outer").foreach { joinType =>
@@ -2089,6 +2140,39 @@ abstract class StreamingFullOuterJoinBase extends StreamingJoinSuite {
 
   import testImplicits._
 
+  test("full outer equality join uses different watermark key ordinals") {
+    val leftInput = MemoryStream[(Int, Int)]
+    val rightInput = MemoryStream[(Int, Int)]
+    val left = leftInput.toDF().toDF("a", "b")
+      .select(timestamp_seconds($"a").as("la"), timestamp_seconds($"b").as("lb"))
+      .withWatermark("la", "10 seconds")
+    val right = rightInput.toDF().toDF("a", "b")
+      .select(timestamp_seconds($"a").as("ra"), timestamp_seconds($"b").as("rb"))
+      .withWatermark("rb", "10 seconds")
+    val joined = left.join(right, expr("la = ra AND lb = rb"), "full_outer")
+      .select($"la".cast("int"), $"lb".cast("int"), $"ra".cast("int"), $"rb".cast("int"))
+    withSQLConf(SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+      testStream(joined)(
+        MultiAddData(leftInput, (5, 50))(rightInput, (80, 50)),
+        CheckNewAnswer(),
+        MultiAddData(leftInput, (60, 100))(rightInput, (70, 50)),
+        CheckNewAnswer(),
+        AddData(leftInput, (70, 100)),
+        CheckNewAnswer(),
+        AddData(rightInput, (5, 50)),
+        CheckNewAnswer(Row(5, 50, 5, 50)),
+        AddData(leftInput, (90, 10)),
+        CheckNewAnswer(Row(90, 10, null, null)),
+        MultiAddData(leftInput, (200, 200))(rightInput, (200, 200)),
+        CheckNewAnswer(Row(200, 200, 200, 200)),
+        MultiAddData(leftInput, (210, 210))(rightInput, (210, 210)),
+        CheckNewAnswer(Row(210, 210, 210, 210), Row(60, 100, null, null),
+          Row(70, 100, null, null), Row(null, null, 80, 50), Row(null, null, 70, 50))
+      )
+    }
+  }
+
+
   test("stream-stream full outer join does not support Update mode") {
     val input1 = MemoryStream[Int]
     val input2 = MemoryStream[Int]
@@ -2472,6 +2556,32 @@ abstract class StreamingLeftSemiJoinBase extends StreamingJoinSuite {
       MultiAddData(leftInput, (3, 40))(rightInput, (3, 40)),
       CheckNewAnswer(Row(20L, 2L))
     )
+  }
+
+  Seq(true).foreach { joinOnTime =>
+    test(s"left semi with right watermark, equality=$joinOnTime") {
+      val (leftInput, rightInput, joined) = setupJoinWithRangeCondition(
+        "left_semi", leftWatermark = false, joinOnTime = joinOnTime)
+
+      withSQLConf(SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+        testStream(joined)(
+          AddData(leftInput, (1, 5)),
+          CheckNewAnswer(),
+          AddData(rightInput, (2, 30)),
+          CheckNewAnswer(),
+          AddData(rightInput, (2, 40)),
+          CheckNewAnswer(),
+          assertNumStateRows(total = Seq(2), updated = Seq(3),
+            droppedByWatermark = Seq(0), removed = Some(Seq(1))),
+          AddData(leftInput, (3, 5)),
+          CheckNewAnswer(),
+          AddData(leftInput, (2, 30)),
+          CheckNewAnswer(Row(2, 30)),
+          assertNumStateRows(total = Seq(2), updated = Seq(1),
+            droppedByWatermark = Seq(0), removed = Some(Seq(1)))
+        )
+      }
+    }
   }
 
   testWithAppendAndUpdate("left semi early state exclusion on left") { outputMode =>

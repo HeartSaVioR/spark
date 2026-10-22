@@ -32,6 +32,10 @@ Please refer [Migration Guide: SQL, Datasets and DataFrame](../sql-migration-gui
   met. Update their watermarks and join conditions using the
   [join support table](apis-on-dataframes-and-datasets.html#support-matrix-for-joins-in-streaming-queries).
 
+- Spark 4.4 corrects cases where stream-stream equality joins could discard rows before their
+  matches arrived or output unmatched rows too early. Queries with a watermark on only one
+  input may now keep more rows in memory or on disk.
+
 - Spark 4.4 preserves the output watermark of a stream-stream join when retained state can
   still emit old event times. Downstream stateful operators may retain more state, take longer
   to finalize results, or stop making progress while the join has no event-time eviction bound.
