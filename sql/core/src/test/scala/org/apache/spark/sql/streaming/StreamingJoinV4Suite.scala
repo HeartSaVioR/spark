@@ -21,7 +21,7 @@ import org.apache.hadoop.fs.Path
 import org.scalatest.Tag
 
 import org.apache.spark.SparkIllegalArgumentException
-import org.apache.spark.sql.Row
+import org.apache.spark.sql.{DataFrame, Row}
 import org.apache.spark.sql.execution.datasources.v2.state.StateSourceOptions
 import org.apache.spark.sql.execution.streaming.checkpointing.CheckpointFileManager
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinExec
@@ -360,7 +360,7 @@ class StreamingInnerJoinV4Suite
   }
 
   testWithVirtualColumnFamilyJoins(
-    "SPARK-56406: secondary index only populated on watermarked side for time interval join") {
+    "SPARK-56406: secondary index supports one-sided watermark time interval joins") {
     withTempDir { checkpointDir =>
       val leftInput = MemoryStream[(Int, Int)]
       val rightInput = MemoryStream[(Int, Int)]
@@ -372,11 +372,8 @@ class StreamingInnerJoinV4Suite
       val df2 = rightInput.toDF().toDF("rightKey", "time")
         .select($"rightKey", timestamp_seconds($"time") as "rightTime",
           ($"rightKey" * 3) as "rightValue")
-      // Only left side has watermark; watermark is on a value column, not the join key.
-      // joinKeyOrdinalForWatermark is None -> only left has hasEventTime = true.
-      // Neither side can actually evict: the left state watermark is derived from the right
-      // side's watermark via the join condition, which is absent here. The left secondary
-      // index is populated but never used for eviction.
+      // The left watermark and range condition permit right-state eviction. The right
+      // secondary index must be populated even though rightTime has no watermark metadata.
 
       val joined = df1.join(df2,
         expr("leftKey = rightKey AND " +
@@ -400,9 +397,8 @@ class StreamingInnerJoinV4Suite
           // Left has watermark on a value column -> hasEventTime = true, secondary index populated.
           assert(readStateStore(checkpointLoc, "left-tsWithKey") > 0,
             "left secondary index should be populated (watermark on left value column)")
-          // Right has no watermark -> hasEventTime = false, secondary index empty.
-          assert(readStateStore(checkpointLoc, "right-tsWithKey") === 0,
-            "right secondary index should be empty (no watermark on right side)")
+          assert(readStateStore(checkpointLoc, "right-tsWithKey") > 0,
+            "right secondary index should be populated for range eviction")
         },
         StopStream
       )
@@ -593,7 +589,91 @@ class StreamingOuterJoinV4Suite
 @SlowSQLTest
 class StreamingFullOuterJoinV4Suite
   extends StreamingFullOuterJoinBase
-  with TestWithV4StateFormat
+  with TestWithV4StateFormat {
+
+  import testImplicits._
+
+  Seq("left", "right").foreach { nullableWindowSide =>
+    test(s"full outer join keeps null $nullableWindowSide window keys unbounded") {
+      val nullWindowOnLeft = nullableWindowSide == "left"
+      val nullInput = MemoryStream[(Int, Int)]
+      val boundedInput = MemoryStream[(Int, Int)]
+      val windowType = new StructType()
+        .add("start", TimestampType)
+        .add("end", TimestampType)
+
+      def nullableWindowPlan(input: MemoryStream[(Int, Int)], timeName: String,
+          windowName: String): DataFrame = {
+        input.toDF().toDF("a", "b")
+          .select(timestamp_seconds($"a").as(timeName),
+            when($"b" < 0, lit(null).cast(windowType)).otherwise(
+              struct(
+                timestamp_seconds($"b").as("start"),
+                timestamp_seconds($"b" + 10).as("end"))).as(windowName))
+          .withWatermark(timeName, "10 seconds")
+      }
+
+      def boundedWindowPlan(input: MemoryStream[(Int, Int)], timeName: String,
+          windowName: String): DataFrame = {
+        input.toDF().toDF("a", "b")
+          .select(timestamp_seconds($"a").as(timeName), timestamp_seconds($"b").as("t"))
+          .withWatermark("t", "10 seconds")
+          .select(col(timeName), window($"t", "10 seconds").as(windowName))
+      }
+
+      val (leftInput, rightInput, left, right) = if (nullWindowOnLeft) {
+        val left = nullableWindowPlan(nullInput, "la", "lb")
+        val right = boundedWindowPlan(boundedInput, "ra", "rb")
+        (nullInput, boundedInput, left, right)
+      } else {
+        val left = boundedWindowPlan(boundedInput, "la", "lb")
+        val right = nullableWindowPlan(nullInput, "ra", "rb")
+        (boundedInput, nullInput, left, right)
+      }
+
+      val joined = left.join(right, expr("la = ra AND lb = rb"), "full_outer")
+        .select(
+          $"la".cast("long"),
+          $"lb.end".cast("long"),
+          $"ra".cast("long"),
+          $"rb.end".cast("long"))
+
+      withSQLConf(SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+        withTempDir { checkpointDir =>
+          val oldBoundedWindowRow = if (nullWindowOnLeft) {
+            Row(110, 120, null, null)
+          } else {
+            Row(null, null, 110, 120)
+          }
+          val laterBoundedWindowRows = Seq(
+            Row(1000, 1010, null, null),
+            Row(null, null, 2000, 2010))
+          val startStream = StartStream(checkpointLocation = checkpointDir.getCanonicalPath)
+
+          testStream(joined)(
+            startStream,
+            AddData(nullInput, (100, -1), (110, 110)),
+            CheckNewAnswer(),
+            StopStream,
+            startStream,
+            MultiAddData(leftInput, (1000, 1000))(rightInput, (2000, 2000)),
+            CheckNewAnswer(),
+            AddData(leftInput),
+            CheckNewAnswer(oldBoundedWindowRow),
+            assertNumStateRows(total = 3, updated = 2),
+            StopStream,
+            startStream,
+            MultiAddData(leftInput, (3000, 3000))(rightInput, (4000, 4000)),
+            CheckNewAnswer(),
+            AddData(leftInput),
+            CheckNewAnswer(laterBoundedWindowRows: _*),
+            assertNumStateRows(total = 3, updated = 2),
+            StopStream)
+        }
+      }
+    }
+  }
+}
 
 @SlowSQLTest
 class StreamingLeftSemiJoinV4Suite
