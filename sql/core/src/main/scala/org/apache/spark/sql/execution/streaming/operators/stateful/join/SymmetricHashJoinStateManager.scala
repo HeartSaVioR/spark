@@ -254,7 +254,7 @@ class SymmetricHashJoinStateManagerV4(
   protected val keySchema = StructType(
     joinKeys.zipWithIndex.map { case (k, i) => StructField(s"field$i", k.dataType, k.nullable) })
   protected val keyAttributes = toAttributes(keySchema)
-  private val eventTimeColIdxOpt = {
+  private val valueTimestampColumnOrdinal = {
     val eventTimeColIdx = WatermarkSupport.findEventTimeColumnIndex(
       inputValueAttributes,
       // NOTE: This does not accept multiple event time columns. This is not the same with the
@@ -265,20 +265,20 @@ class SymmetricHashJoinStateManagerV4(
     stateValueWatermarkColumnOrdinal.orElse(eventTimeColIdx)
   }
 
-  // When there is no event time column in the value and no watermark ordinal in the key,
+  // When there is no indexed timestamp column in the value and no watermark ordinal in the key,
   // the secondary index (TsWithKey) will never be used for eviction. Skip writing to it
   // to avoid unnecessary RocksDB merge overhead.
   // TODO(SPARK-56536): This could be further optimized by also considering whether the state
-  //   watermark predicate is defined. Even when an event time column exists, the secondary index
-  //   is unused if eviction is not possible (e.g., only one side defines a watermark in a time
-  //   interval join). That would require propagating the predicate information here.
-  private val hasEventTime: Boolean =
-    eventTimeColIdxOpt.isDefined || joinKeyOrdinalForWatermark.isDefined
+  //   watermark predicate is defined. Even when an indexed timestamp column exists, the secondary
+  //   index is unused if eviction is not possible (e.g., only one side defines a watermark in a
+  //   time interval join). That would require propagating the predicate information here.
+  private val hasTimestampForEviction: Boolean =
+    valueTimestampColumnOrdinal.isDefined || joinKeyOrdinalForWatermark.isDefined
 
   private val random = new scala.util.Random(System.currentTimeMillis())
-  private val bucketCountForNoEventTime = 1024
-  private val extractEventTimeFn: UnsafeRow => Long = { row =>
-    eventTimeColIdxOpt match {
+  private val bucketCountWithoutTimestamp = 1024
+  private val extractTimestampFromValue: UnsafeRow => Long = { row =>
+    valueTimestampColumnOrdinal match {
       case Some(idx) =>
         val attr = inputValueAttributes(idx)
 
@@ -290,15 +290,15 @@ class SymmetricHashJoinStateManagerV4(
         }
 
       case _ =>
-        // When event time column is not available, we will use random bucketing strategy to decide
+        // When no timestamp column is available, we will use random bucketing strategy to decide
         // where the new value will be stored. There is a trade-off between the bucket size and the
         // number of values in each bucket; we can tune the bucket size with the configuration if
         // we figure out the magic number to not work well.
-        random.nextInt(bucketCountForNoEventTime)
+        random.nextInt(bucketCountWithoutTimestamp)
     }
   }
 
-  private val extractEventTimeFnFromKey: UnsafeRow => Option[Long] = { row =>
+  private val extractTimestampFromKey: UnsafeRow => Option[Long] = { row =>
     joinKeyOrdinalForWatermark.map { idx =>
       val attr = keyAttributes(idx)
       if (attr.dataType.isInstanceOf[StructType]) {
@@ -446,11 +446,11 @@ class SymmetricHashJoinStateManagerV4(
   private val tsWithKey = new TsWithKeyTypeStore
 
   override def append(key: UnsafeRow, value: UnsafeRow, matched: Boolean): Unit = {
-    val eventTime = extractEventTimeFnFromKey(key).getOrElse(extractEventTimeFn(value))
+    val timestamp = extractTimestampFromKey(key).getOrElse(extractTimestampFromValue(value))
     // We always do blind merge for appending new value.
-    keyWithTsToValues.append(key, eventTime, value, matched)
-    if (hasEventTime) {
-      tsWithKey.add(eventTime, key)
+    keyWithTsToValues.append(key, timestamp, value, matched)
+    if (hasTimestampForEviction) {
+      tsWithKey.add(timestamp, key)
     }
   }
 
@@ -506,7 +506,7 @@ class SymmetricHashJoinStateManagerV4(
       }
     }
 
-    val ret = extractEventTimeFnFromKey(key) match {
+    val ret = extractTimestampFromKey(key) match {
       case Some(ts) =>
         val valuesAndMatchedIter = keyWithTsToValues.get(key, ts)
         getJoinedRowsFromTsAndValues(ts, valuesAndMatchedIter.toArray)
@@ -579,7 +579,7 @@ class SymmetricHashJoinStateManagerV4(
       }
     }
 
-    val ret = extractEventTimeFnFromKey(key) match {
+    val ret = extractTimestampFromKey(key) match {
       case Some(ts) =>
         val valuesAndMatchedIter = keyWithTsToValues.get(key, ts)
         getJoinedRowsFromTsAndValues(ts, valuesAndMatchedIter.toArray)
@@ -606,8 +606,8 @@ class SymmetricHashJoinStateManagerV4(
   }
 
   override def evictByTimestamp(endTimestamp: Long, startTimestamp: Option[Long] = None): Long = {
-    require(hasEventTime,
-      "evictByTimestamp requires event time; secondary index was not populated")
+    require(hasTimestampForEviction,
+      "evictByTimestamp requires a timestamp column; secondary index was not populated")
     var removed = 0L
     tsWithKey.scanEvictedKeys(endTimestamp, startTimestamp).foreach { evicted =>
       val key = evicted.key
@@ -625,8 +625,8 @@ class SymmetricHashJoinStateManagerV4(
 
   override def evictAndReturnByTimestamp(
       endTimestamp: Long, startTimestamp: Option[Long] = None): Iterator[KeyToValuePair] = {
-    require(hasEventTime,
-      "evictAndReturnByTimestamp requires event time; secondary index was not populated")
+    require(hasTimestampForEviction,
+      "evictAndReturnByTimestamp requires a timestamp column; secondary index was not populated")
     val reusableKeyToValuePair = KeyToValuePair()
 
     tsWithKey.scanEvictedKeys(endTimestamp, startTimestamp).flatMap { evicted =>

@@ -159,6 +159,10 @@ object StreamingSymmetricHashJoinHelper extends Logging {
     }
   }
 
+  /**
+   * Get the state watermarks used to derive the join's output watermark. A value-eviction cutoff
+   * may constrain a different timestamp column and therefore not bound buffered event times.
+   */
   def getStateWatermark(
       leftAttributes: Seq[Attribute],
       rightAttributes: Seq[Attribute],
@@ -191,7 +195,11 @@ object StreamingSymmetricHashJoinHelper extends Logging {
       } else if (isWatermarkDefinedOnInput) { // case 2 in the StreamingSymmetricHashJoinExec docs
         getStateValueWatermarkForInput(oneSideInputAttributes, otherSideInputAttributes,
           condition, eventTimeWatermarkForEviction).map { case (attribute, watermark) =>
-          // A bound on expiry does not bound the event time of rows still buffered in state.
+          // Only a cutoff on this input's event-time column also bounds the event times of
+          // buffered rows that may still produce output. Otherwise return zero to hold back the
+          // output watermark. Returning None would omit this side from produceOutputWatermark's
+          // minimum and allow the output watermark to advance. State eviction uses the original
+          // cutoff on the selected column in getStateWatermarkPredicates below.
           if (oneSideInputAttributes.find(_.metadata.contains(delayKey))
               .exists(_.semanticEquals(attribute))) {
             watermark
@@ -272,11 +280,11 @@ object StreamingSymmetricHashJoinHelper extends Logging {
           condition, eventTimeWatermarkForEviction).flatMap { case (attribute, watermark) =>
           // Late filtering only constrains the input's event-time column. A different indexed
           // column can admit values below the previous cutoff and must be scanned from the start.
-          // Also scan from the start if the derived cutoff exceeds the late-input watermark.
           val prevStateValueWatermark = eventTimeWatermarkForLateEvents.filter { _ =>
             oneSideInputAttributes.find(_.metadata.contains(delayKey))
               .exists(_.semanticEquals(attribute))
           }.flatMap { lateWatermark =>
+            // Also scan from the start if the derived cutoff exceeds the late-input watermark.
             StreamingJoinHelper.getStateValueWatermark(AttributeSet(Seq(attribute)),
               AttributeSet(otherSideInputAttributes), condition, Some(lateWatermark))
               .filter(_ <= lateWatermark)
@@ -304,8 +312,9 @@ object StreamingSymmetricHashJoinHelper extends Logging {
       condition: Option[Expression],
       eventWatermark: Option[Long]): Option[(Attribute, Long)] = {
     val eventTime = inputAttributes.find(_.metadata.contains(delayKey))
-    // Prefer the existing event-time index when it has a valid bound. Otherwise choose a stable
-    // timestamp column, e.g. the expiry in rightTime BETWEEN leftTime AND expiry.
+    // First try the watermarked column. If it has no inferable bound, try the other timestamp
+    // columns in input schema order and use the first with a bound. This makes the indexed column
+    // deterministic for a fixed input schema and join condition.
     val candidates = eventTime.toSeq ++ inputAttributes.filter { attribute =>
       attribute.dataType == TimestampType && !eventTime.exists(_.semanticEquals(attribute))
     }
@@ -315,13 +324,24 @@ object StreamingSymmetricHashJoinHelper extends Logging {
     }.take(1).toSeq.headOption
   }
 
-  /** Old checkpoints are safe only when value eviction still uses the same timestamp column. */
+  /**
+   * Whether a legacy checkpoint can resume without changing the column used for range eviction.
+   * Key-based eviction is unchanged. For value eviction, check both inputs: an input without a
+   * watermark, or without an opposite-side watermark, had no legacy range-eviction cutoff.
+   * Otherwise, any new cutoff must constrain the input's own event-time column, which was always
+   * the column used by legacy eviction.
+   *
+   * If no timestamp bound is inferred, only accept conditions that reference no other attribute
+   * of that input. The old solver could derive a cutoff from another column, including a numeric
+   * one, and apply it to event time. Removing that cutoff cannot restore already-evicted state.
+   */
   def isRangeEvictionCheckpointCompatible(
       leftAttributes: Seq[Attribute],
       rightAttributes: Seq[Attribute],
       leftKeys: Seq[Expression],
       rightKeys: Seq[Expression],
       condition: Option[Expression]): Boolean = {
+    // An event-time equality key selects key eviction, so no range-column check is needed.
     if (findJoinKeyOrdinalForWatermark(leftKeys, rightKeys).isDefined) return true
     Seq((leftAttributes, rightAttributes), (rightAttributes, leftAttributes)).forall {
       case (input, other) =>
@@ -330,10 +350,10 @@ object StreamingSymmetricHashJoinHelper extends Logging {
           getStateValueWatermarkForInput(input, other, condition, Some(0L)) match {
             case Some((attribute, _)) => eventTime.exists(_.semanticEquals(attribute))
             case None =>
-              // The old solver also considered non-timestamp columns, such as numeric expiry
-              // cast to timestamp, and applied their cutoff to event time. No corrected bound
-              // does not prove that old state was safe. Only accept this case when the condition
-              // cannot have constrained another column of this input.
+              // For example, otherTime <= CAST(numericColumn AS TIMESTAMP) previously produced
+              // a cutoff from numericColumn that was applied to this input's event-time column.
+              // The timestamp-only candidates above now produce no cutoff, but cannot undo the
+              // earlier eviction. Reject unless no other input column could supply a bound.
               condition.forall { expression =>
                 expression.references.intersect(AttributeSet(input))
                   .forall(attribute => eventTime.exists(_.semanticEquals(attribute)))

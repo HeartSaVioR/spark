@@ -699,6 +699,7 @@ case class StreamingSymmetricHashJoinExec(
       skippedNullValueCount = skippedNullValueCount,
       joinStoreGenerator = joinStateManagerStoreGenerator,
       joinKeyOrdinalForWatermark = joinKeyOrdinalForWatermark,
+      // The predicate can constrain either the event-time column or another timestamp column.
       stateValueWatermarkColumnOrdinal = stateWatermarkPredicate.collect {
         case p: JoinStateValueWatermarkPredicate =>
           inputAttributes.indexWhere(p.expr.references.contains)
@@ -743,9 +744,13 @@ case class StreamingSymmetricHashJoinExec(
           attributes.find(_.metadata.contains(EventTimeWatermark.delayKey)).exists { eventTime =>
             p.expr.references.forall(_.semanticEquals(eventTime))
           }
+        // A one-sided range can leave the other side without a value-eviction predicate. Without
+        // that predicate, the state manager indexes its event-time column if present. This check
+        // also runs for key-eviction joins, which isV4TimeIntervalJoin excludes from range scans.
         case _ => true
       }
-      // These offsets relate the two event-time columns. They cannot constrain an expiry index.
+      // These offsets relate the two watermarked event-time columns. They are valid only when
+      // the timestamp index also stores those event-time columns.
       if (!isV4TimeIntervalJoin || !indexesEventTimeColumns) {
         None
       } else {
