@@ -242,7 +242,8 @@ class SymmetricHashJoinStateManagerV4(
     snapshotOptions: Option[SnapshotOptions] = None,
     joinStoreGenerator: JoinStateManagerStoreGenerator,
     joinKeyOrdinalForWatermark: Option[Int] = None,
-    readOnly: Boolean = false)
+    readOnly: Boolean = false,
+    stateValueWatermarkColumnOrdinal: Option[Int] = None)
   extends SymmetricHashJoinStateManager with SupportsEvictByTimestamp with Logging {
 
   // TODO: [SPARK-55729] Once the new state manager is integrated to stream-stream join operator,
@@ -253,12 +254,16 @@ class SymmetricHashJoinStateManagerV4(
   protected val keySchema = StructType(
     joinKeys.zipWithIndex.map { case (k, i) => StructField(s"field$i", k.dataType, k.nullable) })
   protected val keyAttributes = toAttributes(keySchema)
-  private val eventTimeColIdxOpt = WatermarkSupport.findEventTimeColumnIndex(
-    inputValueAttributes,
-    // NOTE: This does not accept multiple event time columns. This is not the same with the
-    // operator which we offer the backward compatibility, but it involves too many layers to
-    // pass the information. The information is in SQLConf.
-    allowMultipleEventTimeColumns = false)
+  private val eventTimeColIdxOpt = {
+    val eventTimeColIdx = WatermarkSupport.findEventTimeColumnIndex(
+      inputValueAttributes,
+      // NOTE: This does not accept multiple event time columns. This is not the same with the
+      // operator which we offer the backward compatibility, but it involves too many layers to
+      // pass the information. The information is in SQLConf.
+      allowMultipleEventTimeColumns = false)
+    // Validate event-time columns above even when eviction indexes a different timestamp.
+    stateValueWatermarkColumnOrdinal.orElse(eventTimeColIdx)
+  }
 
   // When there is no event time column in the value and no watermark ordinal in the key,
   // the secondary index (TsWithKey) will never be used for eviction. Skip writing to it
@@ -294,13 +299,22 @@ class SymmetricHashJoinStateManagerV4(
   }
 
   private val extractEventTimeFnFromKey: UnsafeRow => Option[Long] = { row =>
-    joinKeyOrdinalForWatermark.map { idx =>
-      val attr = keyAttributes(idx)
-      if (attr.dataType.isInstanceOf[StructType]) {
-        // NOTE: We assume this is window struct, as same as WatermarkSupport.watermarkExpression
-        row.getStruct(idx, 2).getLong(1)
+    joinKeyOrdinalForWatermark.flatMap { idx =>
+      if (row.isNullAt(idx)) {
+        None
       } else {
-        row.getLong(idx)
+        val attr = keyAttributes(idx)
+        if (attr.dataType.isInstanceOf[StructType]) {
+          // NOTE: We assume this is window struct, as same as WatermarkSupport.watermarkExpression
+          val window = row.getStruct(idx, 2)
+          if (window == null || window.isNullAt(1)) {
+            None
+          } else {
+            Some(window.getLong(1))
+          }
+        } else {
+          Some(row.getLong(idx))
+        }
       }
     }
   }
@@ -441,10 +455,18 @@ class SymmetricHashJoinStateManagerV4(
   private val tsWithKey = new TsWithKeyTypeStore
 
   override def append(key: UnsafeRow, value: UnsafeRow, matched: Boolean): Unit = {
-    val eventTime = extractEventTimeFnFromKey(key).getOrElse(extractEventTimeFn(value))
+    val eventTimeOpt = extractEventTimeFnFromKey(key)
+    val hasNullKeyEventTime = joinKeyOrdinalForWatermark.isDefined && eventTimeOpt.isEmpty
+    val eventTime = if (hasNullKeyEventTime) {
+      // A null selected key timestamp makes the key watermark predicate SQL-unknown.
+      // Keep it in a primary random bucket only, so timestamp eviction cannot remove it.
+      random.nextInt(bucketCountForNoEventTime)
+    } else {
+      eventTimeOpt.getOrElse(extractEventTimeFn(value))
+    }
     // We always do blind merge for appending new value.
     keyWithTsToValues.append(key, eventTime, value, matched)
-    if (hasEventTime) {
+    if (hasEventTime && !hasNullKeyEventTime) {
       tsWithKey.add(eventTime, key)
     }
   }
@@ -2183,13 +2205,14 @@ object SymmetricHashJoinStateManager {
       snapshotOptions: Option[SnapshotOptions] = None,
       joinStoreGenerator: JoinStateManagerStoreGenerator,
       joinKeyOrdinalForWatermark: Option[Int] = None,
-      readOnly: Boolean = false): SymmetricHashJoinStateManager = {
+      readOnly: Boolean = false,
+      stateValueWatermarkColumnOrdinal: Option[Int] = None): SymmetricHashJoinStateManager = {
     if (stateFormatVersion == 4) {
       new SymmetricHashJoinStateManagerV4(
         joinSide, inputValueAttributes, joinKeys, stateInfo, storeConf, hadoopConf,
         partitionId, keyToNumValuesStateStoreCkptId, keyWithIndexToValueStateStoreCkptId,
         stateFormatVersion, skippedNullValueCount, useStateStoreCoordinator, snapshotOptions,
-        joinStoreGenerator, joinKeyOrdinalForWatermark, readOnly
+        joinStoreGenerator, joinKeyOrdinalForWatermark, readOnly, stateValueWatermarkColumnOrdinal
       )
     } else if (stateFormatVersion == 3) {
       new SymmetricHashJoinStateManagerV2(

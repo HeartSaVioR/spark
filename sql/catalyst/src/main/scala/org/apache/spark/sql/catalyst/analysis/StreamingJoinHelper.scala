@@ -52,6 +52,25 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
   }
 
   /**
+   * Find the equality key filtered by this input's watermark. Its ordinal can be used to
+   * evict the opposite input's state, whose equality keys have the same ordering.
+   * For leftTime = rightTime, a watermark on rightTime bounds leftTime even when leftTime
+   * has no watermark. It does not bound right-side state without a watermark on leftTime.
+   */
+  def getStateKeyWatermarkOrdinal(
+      keys: Seq[Expression],
+      inputAttributes: Seq[Attribute]): Option[Int] = {
+    // When multiple stateful operators are disabled, late filtering uses the first event-time
+    // column. Otherwise, execution rejects multiple distinct event-time columns.
+    inputAttributes.find(_.metadata.contains(delayKey)).flatMap { eventTime =>
+      keys.indexWhere(_.semanticEquals(eventTime)) match {
+        case ordinal if ordinal >= 0 => Some(ordinal)
+        case _ => None
+      }
+    }
+  }
+
+  /**
    * Get state value watermark (see [[StreamingSymmetricHashJoinExec]] for context about it)
    * given the join condition and the event time watermark. This is how it works.
    * - The condition is split into conjunctive predicates, and we find the predicates of the
@@ -185,6 +204,25 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
       // the constraintTerm would be `leftTime` and not `-leftTime`. Hence, we return None.
       return None
     }
+
+    // State eviction compares this cutoff in timestamp units against the constrained column.
+    val hasTimestampStateAttribute = constraintTerm.exists {
+      case a: AttributeReference =>
+        attributesToFindStateWatermarkFor.contains(a) && a.dataType == TimestampType
+      case _ => false
+    }
+    if (!hasTimestampStateAttribute) return None
+
+    // A bound must advance with the opposite watermark. The occurrence check above limits
+    // each input to one attribute, so there can be at most one opposite watermark term.
+    val watermarkTerms = terms.filter(_.references.exists(attributesWithEventWatermark.contains))
+    if (watermarkTerms.isEmpty ||
+        !watermarkTerms.head.references.forall(_.metadata.contains(delayKey))) {
+      return None
+    }
+
+    // A negative opposite-time term lets later input match old state instead of bounding it.
+    if (watermarkTerms.head.isInstanceOf[UnaryMinus]) return None
 
     // Replace watermark attribute with watermark value, and generate the resolved expression
     // from the other terms. That is,
