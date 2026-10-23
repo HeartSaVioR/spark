@@ -37,7 +37,8 @@ class StreamingJoinRangeEvictionSuite extends StreamTest {
   for {
     version <- Seq(2, 3, 4)
     joinType <- Seq("inner", "left_outer", "right_outer")
-    shape <- Seq("between", "conjunction", "upper", "interval", "downstream")
+    shape <- Seq("between", "conjunction", "upper", "pruned", "interval", "downstream")
+    if joinType != "right_outer" || shape != "pruned"
   } {
     test(s"range eviction uses bounded timestamp, V$version $joinType $shape") {
       withJoinConf(version) {
@@ -69,9 +70,14 @@ class StreamingJoinRangeEvictionSuite extends StreamTest {
         } else {
           output
         }
-        val result = deduplicated.select($"leftKey", $"matchTime", $"leftTime".cast("long"))
-        val matched = Row(1, 460L, 100L)
-        val unmatched = Row(2, null, 100L)
+        // Retain the watermarked column for the upper-only case; explicitly test pruning too.
+        val result = if (shape == "pruned") {
+          deduplicated.select($"leftKey", $"matchTime")
+        } else {
+          deduplicated.select($"leftKey", $"matchTime", $"leftTime".cast("long"))
+        }
+        val matched = if (shape == "pruned") Row(1, 460L) else Row(1, 460L, 100L)
+        val unmatched = if (shape == "pruned") Row(2, null) else Row(2, null, 100L)
         testStream(result)(
           StreamProgressLockedActions(Seq(
             AddData(leftInput, (1, 100L, 700L), (2, 100L, 700L)), AddData(rightInput, (9, 100L)))),
@@ -87,8 +93,11 @@ class StreamingJoinRangeEvictionSuite extends StreamTest {
               case j: StreamingSymmetricHashJoinExec => j
             }.get
             assert(join.eventTimeWatermarkForEviction.contains(340000L))
-            if (shape != "interval") {
+            if (shape != "interval" && shape != "pruned") {
               assert(join.produceOutputWatermark(340000L).contains(0L))
+            }
+            if (joinType != "right_outer") {
+              assert(join.left.output.exists(_.name == "leftTime") == (shape != "pruned"))
             }
           },
           AddData(rightInput, (1, 460L)),
@@ -136,6 +145,67 @@ class StreamingJoinRangeEvictionSuite extends StreamTest {
           // The start passes late filtering, but expiry is below the previous eviction cutoff.
           AddData(leftInput, (3, 460L, 200L)), CheckNewAnswer(Row(3, null, 460L)),
           AddData(rightInput, (9, 500L)), CheckNewAnswer())
+      }
+    }
+  }
+
+  for {
+    version <- Seq(2, 3, 4)
+    retainedSide <- Seq("left", "right")
+  } {
+    test(s"crossed intervals retain $retainedSide state until expiry, V$version") {
+      withJoinConf(version) {
+        val leftInput = MemoryStream[(Int, Long, Long)]
+        val rightInput = MemoryStream[(Int, Long, Long)]
+        val left = leftInput.toDF().toDF("leftKey", "time", "other")
+          .select($"leftKey", timestamp_seconds($"time").as("leftTime"),
+            timestamp_seconds($"other").as("leftOther"))
+          .withWatermark("leftTime", "60 seconds")
+        val right = rightInput.toDF().toDF("rightKey", "time", "other")
+          .select($"rightKey", timestamp_seconds($"time").as("rightTime"),
+            timestamp_seconds($"other").as("rightOther"))
+          .withWatermark("rightTime", "60 seconds")
+        val joined = left.join(right, expr(
+          "leftKey = rightKey AND " +
+            "leftOther BETWEEN rightTime - INTERVAL 10 SECONDS AND " +
+            "rightTime + INTERVAL 10 SECONDS AND " +
+            "rightOther BETWEEN leftTime - INTERVAL 10 SECONDS AND " +
+            "leftTime + INTERVAL 10 SECONDS"), "full_outer")
+          .select(coalesce($"leftKey", $"rightKey").as("key"),
+            $"leftTime".cast("long"), $"rightTime".cast("long"))
+          .where($"key".isin(1, 2))
+        val (retained, arriving, matched, unmatched) = if (retainedSide == "left") {
+          (leftInput, rightInput, Row(1, 100L, 460L), Row(2, 100L, null))
+        } else {
+          (rightInput, leftInput, Row(1, 460L, 100L), Row(2, null, 100L))
+        }
+        testStream(joined)(
+          StreamProgressLockedActions(Seq(
+            AddData(retained, (1, 100L, 460L), (2, 100L, 460L)),
+            AddData(arriving, (9, 100L, 100L)))),
+          CheckNewAnswer(),
+          StreamProgressLockedActions(Seq(
+            AddData(leftInput, (8, 400L, 800L)), AddData(rightInput, (9, 400L, 800L)))),
+          CheckNewAnswer(),
+          AddData(arriving, (9, 400L, 800L)),
+          CheckNewAnswer(),
+          Execute { query =>
+            val join = query.lastExecution.executedPlan.collectFirst {
+              case j: StreamingSymmetricHashJoinExec => j
+            }.get
+            assert(join.eventTimeWatermarkForEviction.contains(340000L))
+            assert(join.stateWatermarkPredicates.left.get.expr.references.map(_.name).toSet ==
+              Set("leftOther"))
+            assert(join.stateWatermarkPredicates.right.get.expr.references.map(_.name).toSet ==
+              Set("rightOther"))
+          },
+          AddData(arriving, (1, 460L, 100L)),
+          CheckNewAnswer(matched),
+          StreamProgressLockedActions(Seq(
+            AddData(leftInput, (8, 1000L, 1600L)), AddData(rightInput, (9, 1000L, 1600L)))),
+          CheckNewAnswer(),
+          AddData(arriving, (9, 1100L, 1600L)),
+          CheckNewAnswer(unmatched))
       }
     }
   }

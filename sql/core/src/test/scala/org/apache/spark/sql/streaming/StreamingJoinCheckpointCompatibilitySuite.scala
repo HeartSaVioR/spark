@@ -168,6 +168,21 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
     (leftInput, rightInput, joined)
   }
 
+  test("checkpoint watermark semantics has one current generation") {
+    val entry = SQLConf.STREAMING_JOIN_CHECKPOINT_WATERMARK_SEMANTICS_VERSION
+    val conf = new SQLConf
+    assert(conf.getConf(entry) == 1)
+    Seq(0, 1).foreach { version =>
+      conf.setConfString(entry.key, version.toString)
+      assert(conf.getConf(entry) == version)
+    }
+    Seq(-1, 2).foreach { version =>
+      intercept[IllegalArgumentException] {
+        conf.setConfString(entry.key, version.toString)
+      }
+    }
+  }
+
   test("checkpoint compatibility requires one aligned own-event-time equality key") {
     val watermarkMetadata = new MetadataBuilder()
       .putLong(EventTimeWatermark.delayKey, 0L).build()
@@ -259,8 +274,7 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
   for {
     version <- Seq(1, 2, 3, 4)
     logVersion <- Seq(1, 2)
-    oldMarker <- Seq[Option[String]](None) ++
-      (0 until currentMarker.toInt).map(v => Some(v.toString))
+    oldMarker <- Seq(None, Some("0"))
     shape <- Seq("range", "expiry", "pruned expiry", "unbounded")
   } {
     test(s"reject old $shape checkpoint, V$version log=$logVersion old=$oldMarker") {

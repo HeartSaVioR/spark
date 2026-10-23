@@ -4146,14 +4146,15 @@ object SQLConf {
     buildConf("spark.sql.streaming.join.checkpointWatermarkSemanticsVersion")
       .internal()
       .doc("Checkpoint generation for stream-stream join watermark semantics, persisted in " +
-        "the offset log. Older generations are accepted only when the query plan proves that " +
-        "its state and output watermark semantics are unchanged. The generation validates " +
-        "compatibility; it does not select a legacy execution path.")
+        "the offset log. Version 0 denotes legacy semantics and version 1 denotes the current " +
+        "semantics. Legacy checkpoints are accepted only when the query plan proves that state " +
+        "and output watermark semantics are unchanged. The generation validates compatibility; " +
+        "it does not select a legacy execution path.")
       .version("4.4.0")
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .intConf
-      .checkValue(v => v >= 0 && v <= 16, "Supported versions are 0 through 16")
-      .createWithDefault(16)
+      .checkValue(v => v >= 0 && v <= 1, "Supported versions are 0 and 1")
+      .createWithDefault(1)
 
   val STREAMING_SESSION_WINDOW_MERGE_SESSIONS_IN_LOCAL_PARTITION =
     buildConf("spark.sql.streaming.sessionWindow.merge.sessions.in.local.partition")

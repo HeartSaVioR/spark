@@ -35,7 +35,7 @@ import org.apache.spark.sql.internal.SQLConf
 class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
   import testImplicits._
 
-  private val markerKey = "spark.sql.streaming.join.checkpointWatermarkSemanticsVersion"
+  private val markerKey = SQLConf.STREAMING_JOIN_CHECKPOINT_WATERMARK_SEMANTICS_VERSION.key
   private val currentMarker =
     SQLConf.STREAMING_JOIN_CHECKPOINT_WATERMARK_SEMANTICS_VERSION.defaultValue.get.toString
 
@@ -113,8 +113,7 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
   for {
     version <- Seq(2, 3, 4)
     logVersion <- Seq(1, 2)
-    oldMarker <- Seq[Option[String]](None) ++
-      (0 until currentMarker.toInt).map(v => Some(v.toString))
+    oldMarker <- Seq(None, Some("0"))
   } {
     test(s"reject old range-column checkpoint, V$version log=$logVersion marker=$oldMarker") {
       withJoinConf(version, logVersion) {
@@ -154,7 +153,7 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
   for {
     version <- Seq(2, 3, 4)
     logVersion <- Seq(1, 2)
-    oldMarker <- Seq(None, Some("0"), Some((currentMarker.toInt - 1).toString)).distinct
+    oldMarker <- Seq(None, Some("0"))
     useEventTimeLowerBound <- Seq(false, true)
   } {
     val boundDescription = if (useEventTimeLowerBound) "with event-time bound" else "only"
