@@ -265,6 +265,33 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
     }
   }
 
+  test("an empty lookup side does not call the connector") {
+    val lookup = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
+    val left = Seq(1, 3).toDF("id")
+    withTempView("empty_side_lookup", "empty_side_left") {
+      lookup.createOrReplaceTempView("empty_side_lookup")
+      left.createOrReplaceTempView("empty_side_left")
+      Seq("inner" -> "INNER", "left_outer" -> "LEFT OUTER").foreach { case (joinType, sqlJoin) =>
+        val expected =
+          if (joinType == "inner") Seq.empty[Row] else Seq(Row(1, null, null), Row(3, null, null))
+        val empty = lookup.where(lit(false))
+        Seq(
+          () => left.join(empty, left("id") === empty("id"), joinType),
+          () => sql(s"SELECT * FROM empty_side_left l $sqlJoin JOIN " +
+            "(SELECT * FROM empty_side_lookup WHERE 1 = 0) r ON l.id = r.id")).foreach { query =>
+          SimpleExternalLookupDataSource.resetCounters()
+          val joined = query()
+          assert(!joined.queryExecution.optimizedPlan.exists(
+            _.isInstanceOf[PreparedExternalLookupJoin]))
+          checkAnswer(joined, expected)
+          assert(SimpleExternalLookupDataSource.lookupCandidates.get() === Seq.empty)
+          assert(SimpleExternalLookupDataSource.readerCount.get() === 0)
+          assert(SimpleExternalLookupDataSource.requestCount.get() === 0)
+        }
+      }
+    }
+  }
+
   test("an external lookup hint is found beneath an alias on either join side") {
     val dual = spark.read.format(classOf[DualCapabilityExternalLookupDataSource].getName).load()
     val left = Seq(1).toDF("id")
