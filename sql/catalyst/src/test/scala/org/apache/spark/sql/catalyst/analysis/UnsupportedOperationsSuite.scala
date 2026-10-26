@@ -582,9 +582,34 @@ class UnsupportedOperationsSuite extends SparkFunSuite with SQLHelper {
         OutputMode.Append(), Seq("requires a watermark on the right input"))
     }
 
+    // Each side's state is evicted by the key that the opposite watermark bounds.
     assertSupportedInStreamingPlan("full outer with different watermark key ordinals",
       left.join(right, joinType = FullOuter,
         condition = Some(leftTime === rightTime && leftOther === rightOther)), OutputMode.Append())
+  }
+
+  {
+    val leftTime = AttributeReference("leftTime", TimestampType)()
+      .withMetadata(watermarkMetadata)
+    val rightTime = AttributeReference("rightTime", TimestampType)()
+      .withMetadata(watermarkMetadata)
+    val rightOther = AttributeReference("rightOther", TimestampType)()
+    val left = new TestStreamingRelation(leftTime)
+    val right = new TestStreamingRelation(Seq(rightTime, rightOther))
+
+    // A key computed from the opposite event time by a constant is bounded by its watermark.
+    Seq(10, -10).foreach { offset =>
+      Seq(LeftOuter, RightOuter, FullOuter, LeftSemi).foreach { joinType =>
+        assertSupportedInStreamingPlan(s"$joinType with a key shifted by $offset",
+          left.join(right, joinType = joinType,
+            condition = Some(leftTime === rightTime + offset)), OutputMode.Append())
+      }
+      assertNotSupportedInStreamingPlan(
+        s"LeftOuter with a key shifted by $offset from an unwatermarked column",
+        left.join(right, joinType = LeftOuter,
+          condition = Some(leftTime === rightOther + offset)), OutputMode.Append(),
+        Seq("requires a watermark on the right input"))
+    }
   }
 
   // multi-aggregations only supported in Append mode
