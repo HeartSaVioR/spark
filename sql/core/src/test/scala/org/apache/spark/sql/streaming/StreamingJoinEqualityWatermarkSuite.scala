@@ -224,11 +224,28 @@ class StreamingJoinEqualityWatermarkSuite extends StreamTest {
     }
   }
 
+  // (shift, watermark row, evicting row, right time, left time by zone, other left rows)
+  // Each left time is the right time shifted in that zone. In Los Angeles a day across the
+  // spring-forward change is 23 hours and across the fall-back change 25 hours.
+  private val dayShifts = Seq(
+    // One day after 2024-03-09T20:00Z.
+    ("+ INTERVAL 1 DAY", 1710012600000L, 1710012660000L, 1710014400000L,
+      Map("UTC" -> 1710100800000L, "America/Los_Angeles" -> 1710097200000L), Nil),
+    // One day and 36 hours before 2024-11-03T20:00Z. The other left row keeps the left
+    // watermark above the right one.
+    ("- INTERVAL 1 DAY", 1730662200000L, 1730662260000L, 1730664000000L,
+      Map("UTC" -> 1730577600000L, "America/Los_Angeles" -> 1730574000000L),
+      Seq(1730678400000L)),
+    ("- INTERVAL 36 HOURS", 1730662200000L, 1730662260000L, 1730664000000L,
+      Map("UTC" -> 1730534400000L, "America/Los_Angeles" -> 1730530800000L),
+      Seq(1730678400000L)))
+
   for {
     version <- Seq(2, 3, 4)
     zone <- Seq("America/Los_Angeles", "UTC")
+    (shift, watermarkRow, evictingRow, rightTime, leftTimes, otherLeftRows) <- dayShifts
   } {
-    test(s"equality on an opposite event time shifted by one day, V$version $zone") {
+    test(s"equality on an opposite event time $shift across DST, V$version $zone") {
       withSQLConf(
         SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key -> version.toString,
         SQLConf.STATE_STORE_PROVIDER_CLASS.key -> classOf[RocksDBStateStoreProvider].getName,
@@ -242,17 +259,15 @@ class StreamingJoinEqualityWatermarkSuite extends StreamTest {
         val right = rightInput.toDF().toDF("rk", "ms")
           .select($"rk", timestamp_millis($"ms").as("rt"))
           .withWatermark("rt", "0 seconds")
-        val joined = left.join(right, expr("lk = rk AND lt = rt + INTERVAL 1 DAY"))
+        val joined = left.join(right, expr(s"lk = rk AND lt = rt $shift"))
           .select($"lk", $"rk")
-        // rightTime is 2024-03-09T20:00Z. One day later is 2024-03-10T19:00Z in Los Angeles,
-        // 23 hours across the spring-forward change, and 2024-03-10T20:00Z in UTC.
-        val rightTime = 1710014400000L
-        val leftTime = if (zone == "UTC") 1710100800000L else 1710097200000L
+        val leftRows = (1, leftTimes(zone)) +: otherLeftRows.map(time => (8, time))
         testStream(joined)(
-          MultiAddData(leftInput, (1, leftTime))(rightInput, (9, 1710012600000L)),
+          StreamProgressLockedActions(Seq(
+            AddData(leftInput, leftRows: _*), AddData(rightInput, (9, watermarkRow)))),
           CheckNewAnswer(),
-          // Evicts at watermark 2024-03-09T19:30Z, below rightTime.
-          AddData(rightInput, (9, 1710012660000L)),
+          // Evicts at the right watermark, which is below rightTime.
+          AddData(rightInput, (9, evictingRow)),
           CheckNewAnswer(),
           AddData(rightInput, (1, rightTime)),
           CheckNewAnswer(Row(1, 1)))

@@ -129,13 +129,16 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
     def isExactInterval(e: Expression, timeZoneId: Option[String]): Boolean = {
       def fixedOffset: Boolean =
         timeZoneId.exists(id => DateTimeUtils.getZoneId(id).getRules.isFixedOffset)
+      // An interval that fails to evaluate gives no bound; the query reports the error at run time.
+      def value: Option[Any] = try Option(e.eval()) catch { case NonFatal(_) => None }
       e.foldable && (e.dataType match {
         case _: DayTimeIntervalType =>
-          Option(e.eval()).exists { v =>
-            math.abs(v.asInstanceOf[Long]) < MICROS_PER_DAY || fixedOffset
+          value.exists { v =>
+            val micros = v.asInstanceOf[Long]
+            -MICROS_PER_DAY < micros && micros < MICROS_PER_DAY || fixedOffset
           }
         case CalendarIntervalType =>
-          Option(e.eval()).exists { v =>
+          value.exists { v =>
             val interval = v.asInstanceOf[CalendarInterval]
             interval.months == 0 && (interval.days == 0 || fixedOffset)
           }
