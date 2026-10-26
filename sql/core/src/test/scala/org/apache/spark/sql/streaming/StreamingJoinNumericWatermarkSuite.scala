@@ -20,33 +20,29 @@ package org.apache.spark.sql.streaming
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.execution.streaming.runtime.MemoryStream
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.internal.SQLConf
 
 class StreamingJoinNumericWatermarkSuite extends StreamTest {
   import testImplicits._
 
-  for (version <- Seq(2, 3, 4)) {
-    test(s"left outer join cannot use a numeric state field for range eviction, V$version") {
-      withSQLConf(SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key -> version.toString) {
-        val leftInput = MemoryStream[(Int, Long, Long)]
-        val rightInput = MemoryStream[(Int, Long)]
-        val left = leftInput.toDF().toDF("leftKey", "n", "time")
-          .select($"leftKey", $"n", timestamp_seconds($"time").as("lt"))
-          .withWatermark("lt", "1 second")
-        val right = rightInput.toDF().toDF("rightKey", "time")
-          .select($"rightKey", timestamp_seconds($"time").as("rt"))
-          .withWatermark("rt", "1 second")
-        val joined = left.join(right,
-          expr("leftKey = rightKey AND n > CAST(rt AS BIGINT)"), "left_outer")
-          .select($"leftKey", $"n", $"lt")
+  // Analysis rejects the plan before any state format is used.
+  test("left outer join cannot use a numeric state field for range eviction") {
+    val leftInput = MemoryStream[(Int, Long, Long)]
+    val rightInput = MemoryStream[(Int, Long)]
+    val left = leftInput.toDF().toDF("leftKey", "n", "time")
+      .select($"leftKey", $"n", timestamp_seconds($"time").as("lt"))
+      .withWatermark("lt", "1 second")
+    val right = rightInput.toDF().toDF("rightKey", "time")
+      .select($"rightKey", timestamp_seconds($"time").as("rt"))
+      .withWatermark("rt", "1 second")
+    val joined = left.join(right,
+      expr("leftKey = rightKey AND n > CAST(rt AS BIGINT)"), "left_outer")
+      .select($"leftKey", $"n", $"lt")
 
-        val error = intercept[AnalysisException] {
-          testStream(joined)(
-            AddData(leftInput, (1, 20L, 20L)),
-            CheckNewAnswer())
-        }
-        assert(error.getMessage.contains("a watermark on the right input and a time constraint"))
-      }
+    val error = intercept[AnalysisException] {
+      testStream(joined)(
+        AddData(leftInput, (1, 20L, 20L)),
+        CheckNewAnswer())
     }
+    assert(error.getMessage.contains("a watermark on the right input and a time constraint"))
   }
 }
