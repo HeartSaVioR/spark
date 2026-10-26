@@ -415,6 +415,7 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.JOIN_TYPE",
       parameters = Map(
         "joinType" -> "RIGHT OUTER",
+        "relation" -> "`DualCapabilityExternalLookupTable`",
         "supportedJoinTypes" -> "INNER, LEFT OUTER, LEFT SEMI, LEFT ANTI"))
 
     checkError(
