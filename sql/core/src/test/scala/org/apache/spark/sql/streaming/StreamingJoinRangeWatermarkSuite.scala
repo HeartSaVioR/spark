@@ -23,7 +23,9 @@ import org.apache.spark.sql.execution.streaming.runtime.MemoryStream
 import org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.tags.SlowSQLTest
 
+@SlowSQLTest
 class StreamingJoinRangeWatermarkSuite extends StreamTest {
   import testImplicits._
 
@@ -34,12 +36,13 @@ class StreamingJoinRangeWatermarkSuite extends StreamTest {
       SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false")(f)
   }
 
+  // StreamingJoinRangeEvictionSuite covers the other range shapes. Here leftTime is not
+  // selected, so it is pruned from the join input and only the right watermark bounds expiry.
   for {
     version <- Seq(2, 3, 4)
     joinType <- Seq("inner", "left_outer")
-    shape <- Seq("between", "conjunction", "upper", "pruned", "interval")
   } {
-    test(s"expiry-column eviction, V$version $joinType $shape") {
+    test(s"expiry-column eviction with a pruned event-time column, V$version $joinType") {
       withJoinConf(version) {
         val leftInput = MemoryStream[(Int, Long, Long)]
         val rightInput = MemoryStream[(Int, Long)]
@@ -50,21 +53,8 @@ class StreamingJoinRangeWatermarkSuite extends StreamTest {
         val right = rightInput.toDF().toDF("rightKey", "time")
           .select($"rightKey", timestamp_seconds($"time").as("rightTime"))
           .withWatermark("rightTime", "60 seconds")
-        val range = shape match {
-          case "between" => "rightTime BETWEEN leftTime AND expiry"
-          case "conjunction" => "rightTime >= leftTime AND rightTime <= expiry"
-          case "interval" => "rightTime BETWEEN leftTime AND leftTime + INTERVAL 10 MINUTES"
-          case _ => "rightTime <= expiry"
-        }
-        val joined = left.join(right, expr(s"leftKey = rightKey AND $range"), joinType)
-        // Retain the watermarked column for the upper-only case; explicitly test pruning too.
-        val result = if (shape == "pruned") {
-          joined.select($"leftKey", $"rightTime".cast("long"))
-        } else {
-          joined.select($"leftKey", $"rightTime".cast("long"), $"leftTime".cast("long"))
-        }
-        val matched = if (shape == "pruned") Row(1, 460L) else Row(1, 460L, 100L)
-        val unmatched = if (shape == "pruned") Row(2, null) else Row(2, null, 100L)
+        val result = left.join(right, expr("leftKey = rightKey AND rightTime <= expiry"), joinType)
+          .select($"leftKey", $"rightTime".cast("long"))
         testStream(result)(
           StreamProgressLockedActions(Seq(
             AddData(leftInput, (1, 100L, 700L), (2, 100L, 700L)), AddData(rightInput, (9, 100L)))),
@@ -80,15 +70,15 @@ class StreamingJoinRangeWatermarkSuite extends StreamTest {
               case j: StreamingSymmetricHashJoinExec => j
             }.get
             assert(join.eventTimeWatermarkForEviction.contains(340000L))
-            assert(join.left.output.exists(_.name == "leftTime") == (shape != "pruned"))
+            assert(!join.left.output.exists(_.name == "leftTime"))
           },
           AddData(rightInput, (1, 460L)),
-          CheckNewAnswer(matched),
+          CheckNewAnswer(Row(1, 460L)),
           StreamProgressLockedActions(Seq(
             AddData(leftInput, (8, 1000L, 1600L)), AddData(rightInput, (9, 1000L)))),
           CheckNewAnswer(),
           AddData(rightInput, (9, 1100L)),
-          CheckNewAnswer((if (joinType == "left_outer") Seq(unmatched) else Seq.empty): _*)
+          CheckNewAnswer((if (joinType == "left_outer") Seq(Row(2, null)) else Seq.empty): _*)
         )
       }
     }
