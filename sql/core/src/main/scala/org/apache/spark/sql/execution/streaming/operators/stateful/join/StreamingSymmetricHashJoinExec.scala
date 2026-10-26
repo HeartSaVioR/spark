@@ -28,6 +28,7 @@ import org.apache.spark.sql.catalyst.analysis.StreamingJoinHelper
 import org.apache.spark.sql.catalyst.analysis.WidenStatefulOpNullability
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Expression, GenericInternalRow, JoinedRow, Literal, Predicate, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.plans._
+import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
@@ -403,19 +404,19 @@ case class StreamingSymmetricHashJoinExec(
     // Create left and right side hash joiners and store in the joiner manager.
     // Both sides should use the same store generator if we are re-using the same store instance.
     val joinStateManagerStoreGenerator = new JoinStateManagerStoreGenerator()
-    val joinKeyOrdinalForWatermark =
-      StreamingSymmetricHashJoinHelper.findJoinKeyOrdinalForWatermark(leftKeys, rightKeys)
     val joinerManager = OneSideHashJoinerManager(
       new OneSideHashJoiner(
         LeftSide, left.output, leftKeys, leftInputIter,
         condition.leftSideOnly, postJoinFilter, stateWatermarkPredicates.left, partitionId,
         checkpointIds.left.keyToNumValues, checkpointIds.left.keyWithIndexToValue,
-        skippedNullValueCount, joinStateManagerStoreGenerator, joinKeyOrdinalForWatermark),
+        skippedNullValueCount, joinStateManagerStoreGenerator,
+        StreamingJoinHelper.getStateKeyWatermarkOrdinal(rightKeys, right.output)),
       new OneSideHashJoiner(
         RightSide, right.output, rightKeys, rightInputIter,
         condition.rightSideOnly, postJoinFilter, stateWatermarkPredicates.right, partitionId,
         checkpointIds.right.keyToNumValues, checkpointIds.right.keyWithIndexToValue,
-        skippedNullValueCount, joinStateManagerStoreGenerator, joinKeyOrdinalForWatermark))
+        skippedNullValueCount, joinStateManagerStoreGenerator,
+        StreamingJoinHelper.getStateKeyWatermarkOrdinal(leftKeys, left.output)))
 
     //  Join one side input using the other side's buffered/state rows. Here is how it is done.
     //
@@ -697,7 +698,11 @@ case class StreamingSymmetricHashJoinExec(
       stateFormatVersion = stateFormatVersion,
       skippedNullValueCount = skippedNullValueCount,
       joinStoreGenerator = joinStateManagerStoreGenerator,
-      joinKeyOrdinalForWatermark = joinKeyOrdinalForWatermark)
+      joinKeyOrdinalForWatermark = joinKeyOrdinalForWatermark,
+      stateValueWatermarkColumnOrdinal = stateWatermarkPredicate.collect {
+        case p: JoinStateValueWatermarkPredicate =>
+          inputAttributes.indexWhere(p.expr.references.contains)
+      })
 
     private[this] val keyGenerator = UnsafeProjection.create(joinKeys, inputAttributes)
 
@@ -731,7 +736,17 @@ case class StreamingSymmetricHashJoinExec(
         case _ => false
       })
 
-      if (!isV4TimeIntervalJoin) {
+      val indexesEventTimeColumns = Seq(
+        (stateWatermarkPredicates.left, left.output),
+        (stateWatermarkPredicates.right, right.output)).forall {
+        case (Some(p: JoinStateValueWatermarkPredicate), attributes) =>
+          attributes.find(_.metadata.contains(EventTimeWatermark.delayKey)).exists { eventTime =>
+            p.expr.references.forall(_.semanticEquals(eventTime))
+          }
+        case _ => true
+      }
+      // These offsets relate the two event-time columns. They cannot constrain an expiry index.
+      if (!isV4TimeIntervalJoin || !indexesEventTimeColumns) {
         None
       } else {
         val (thisSideAttrs, otherSideAttrs) = joinSide match {

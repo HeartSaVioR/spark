@@ -26,6 +26,17 @@ import org.apache.spark.sql.types.{IntegerType, LongType, MetadataBuilder, Times
 
 class StreamingJoinHelperSuite extends AnalysisTest {
 
+  test("state watermark extraction requires a timestamp state attribute") {
+    val stateNumber = AttributeReference("stateNumber", LongType)()
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val rightTime = AttributeReference("rightTime", TimestampType, metadata = metadata)()
+    val condition = stateNumber > rightTime.cast(LongType)
+
+    assert(StreamingJoinHelper.getStateValueWatermark(
+      AttributeSet(Seq(stateNumber)), AttributeSet(Seq(rightTime)),
+      Some(condition), Some(10000L)) === None)
+  }
+
   test("state watermark extraction preserves arithmetic term multiplicity") {
     val leftTime = AttributeReference("leftTime", TimestampType)()
     val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
@@ -152,6 +163,12 @@ class StreamingJoinHelperSuite extends AnalysisTest {
     assert(watermarkFrom("CAST(leftTime AS LONG) - 2.0 > CAST(rightTime AS LONG) + 1")
       === Some(13000))
 
+    // A later rightTime can still match an old leftTime when both terms have the same sign.
+    assert(watermarkFrom(
+      "CAST(leftTime AS LONG) + CAST(rightTime AS LONG) > 100") === None)
+    assert(watermarkFrom(
+      "100 < CAST(rightTime AS LONG) + CAST(leftTime AS LONG)") === None)
+
     // Test multiple conditions, should return minimum watermark
     assert(watermarkFrom(
       "leftTime > rightTime - interval 3 second AND rightTime < leftTime + interval 2 seconds") ===
@@ -167,8 +184,23 @@ class StreamingJoinHelperSuite extends AnalysisTest {
     assert(watermarkFrom("cast(rightTime AS DOUBLE) < rightOther") === None)  // non-time attributes
     assert(watermarkFrom("leftTime > rightTime + interval 1 month") === None) // month not allowed
 
-    // Test static comparisons
-    assert(watermarkFrom("cast(leftTime AS LONG) > 10") === Some(10000))
+    // Numeric state attributes cannot use timestamp eviction cutoffs.
+    assert(watermarkFrom("leftOther > cast(rightTime AS LONG)") === None)
+
+    // A constant-only condition cannot advance the bound with the opposite watermark.
+    assert(watermarkFrom(
+      "leftTime > rightTime + interval 5 seconds AND cast(leftTime AS LONG) > 10") ===
+      Some(15000))
+    assert(watermarkFrom("cast(leftTime AS LONG) > 10") === None)
+    assert(watermarkFrom("leftTime > rightTime AND cast(leftTime AS LONG) > 10") === Some(10000))
+    assert(watermarkFrom("leftTime > rightTime OR cast(leftTime AS LONG) > 10") === None)
+    assert(watermarkFrom(
+      "cast(leftTime AS LONG) + cast(leftTime AS LONG) > cast(rightTime AS LONG)") === None)
+    assert(watermarkFrom(
+      "cast(leftTime AS LONG) > cast(rightTime AS LONG) + cast(rightTime AS LONG)") === None)
+    assert(watermarkFrom(
+      "leftTime > rightTime AND cast(leftTime AS LONG) + cast(rightTime AS LONG) > 100") ===
+      Some(10000))
 
     // Test non-positive results
     assert(watermarkFrom("CAST(leftTime AS LONG) > CAST(rightTime AS LONG) - 10") === Some(0))
