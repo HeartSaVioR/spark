@@ -420,7 +420,7 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
 
     checkError(
       exception = intercept[AnalysisException] {
-        left.crossJoin(lookup.hint("external_lookup")).queryExecution.analyzed
+        left.crossJoin(lookup.hint("external_lookup")).queryExecution.optimizedPlan
       },
       condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.MISSING_JOIN_CONDITION",
       parameters = Map.empty)
