@@ -1172,6 +1172,27 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
     assert(SimpleExternalLookupDataSource.pushedPredicateFields.get() === Seq("department"))
   }
 
+  test("an empty lookup side gives semi and anti join results without a connector call") {
+    val lookup = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
+    val left = streamOf(Seq(1, 3).toDF("id"))
+    val empty = lookup.where(lit(false))
+    Seq(
+      ("left_semi", Seq.empty[Row]),
+      ("left_anti", Seq(Row(1), Row(3)))).foreach { case (joinType, expected) =>
+      Seq(
+        () => left.join(empty, left("id") === empty("id"), joinType),
+        () => left.join(lookup, left("id") === lookup("id") && lit(false), joinType)).foreach {
+        query =>
+          SimpleExternalLookupDataSource.resetCounters()
+          val joined = query()
+          checkStream(joined, expected)
+          assert(SimpleExternalLookupDataSource.lookupCandidates.get() === Seq.empty)
+          assert(SimpleExternalLookupDataSource.readerCount.get() === 0)
+          assert(SimpleExternalLookupDataSource.requestCount.get() === 0)
+      }
+    }
+  }
+
   test("external lookup join supports left semi and left anti joins") {
     SimpleExternalLookupDataSource.resetCounters()
     val lookup = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
