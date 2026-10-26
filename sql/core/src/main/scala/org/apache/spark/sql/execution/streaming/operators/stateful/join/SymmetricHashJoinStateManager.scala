@@ -299,13 +299,22 @@ class SymmetricHashJoinStateManagerV4(
   }
 
   private val extractTimestampFromKey: UnsafeRow => Option[Long] = { row =>
-    joinKeyOrdinalForWatermark.map { idx =>
-      val attr = keyAttributes(idx)
-      if (attr.dataType.isInstanceOf[StructType]) {
-        // NOTE: We assume this is window struct, as same as WatermarkSupport.watermarkExpression
-        row.getStruct(idx, 2).getLong(1)
+    joinKeyOrdinalForWatermark.flatMap { idx =>
+      if (row.isNullAt(idx)) {
+        None
       } else {
-        row.getLong(idx)
+        val attr = keyAttributes(idx)
+        if (attr.dataType.isInstanceOf[StructType]) {
+          // NOTE: We assume this is window struct, as same as WatermarkSupport.watermarkExpression
+          val window = row.getStruct(idx, 2)
+          if (window == null || window.isNullAt(1)) {
+            None
+          } else {
+            Some(window.getLong(1))
+          }
+        } else {
+          Some(row.getLong(idx))
+        }
       }
     }
   }
@@ -446,10 +455,18 @@ class SymmetricHashJoinStateManagerV4(
   private val tsWithKey = new TsWithKeyTypeStore
 
   override def append(key: UnsafeRow, value: UnsafeRow, matched: Boolean): Unit = {
-    val timestamp = extractTimestampFromKey(key).getOrElse(extractTimestampFromValue(value))
+    val keyTimestamp = extractTimestampFromKey(key)
+    val hasNullKeyTimestamp = joinKeyOrdinalForWatermark.isDefined && keyTimestamp.isEmpty
+    val timestamp = if (hasNullKeyTimestamp) {
+      // A null selected key timestamp makes the key watermark predicate SQL-unknown.
+      // Keep it in a primary random bucket only, so timestamp eviction cannot remove it.
+      random.nextInt(bucketCountWithoutTimestamp)
+    } else {
+      keyTimestamp.getOrElse(extractTimestampFromValue(value))
+    }
     // We always do blind merge for appending new value.
     keyWithTsToValues.append(key, timestamp, value, matched)
-    if (hasTimestampForEviction) {
+    if (hasTimestampForEviction && !hasNullKeyTimestamp) {
       tsWithKey.add(timestamp, key)
     }
   }
