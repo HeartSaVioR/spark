@@ -1193,6 +1193,16 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
     }
   }
 
+  test("external lookup pads CHAR columns as a batch read does") {
+    val lookup = spark.read
+      .format(classOf[ReadSchemaExternalLookupDataSource].getName)
+      .option("kind", "char")
+      .load()
+    val left = Seq(1).toDF("id")
+    // The connector returns "ab" for a CHAR(5) column; read-side padding makes it "ab   ".
+    checkAnswer(left.join(lookup, left("id") === lookup("id")), Seq(Row(1, 1, "ab   ")))
+  }
+
   test("external lookup join supports left semi and left anti joins") {
     SimpleExternalLookupDataSource.resetCounters()
     val lookup = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
@@ -1507,17 +1517,14 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       parameters = Map("table" -> "`ReadSchemaExternalLookupTable`", "field" -> "`name`"))
   }
 
-  test("a lookup-only table that needs read-side CHAR or VARCHAR handling is rejected") {
-    val parameters = Map("relation" -> "`ReadSchemaExternalLookupTable`", "column" -> "`name`")
-    checkError(
-      exception = intercept[AnalysisException](readSchemaLookup("char")),
-      condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.CHAR_VARCHAR_COLUMN",
-      parameters = parameters)
+  test("external lookup applies the read-side VARCHAR check under standard semantics") {
     withSQLConf(SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "true") {
-      checkError(
-        exception = intercept[AnalysisException](readSchemaLookup("varchar")),
-        condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.CHAR_VARCHAR_COLUMN",
-        parameters = parameters)
+      val left = streamOf(Seq(1).toDF("id"))
+      val varchar = readSchemaLookup("varchar")
+      val run = runStream(left.join(varchar, left("id") === varchar("id")))
+      QueryTest.sameRows(Seq(Row(1, 1, "ab")), run.rows).foreach(fail(_))
+      // The check is a lookup-side projection over the connector's value rows.
+      assert(run.lookupJoin.lookupTransforms.nonEmpty)
     }
   }
 
