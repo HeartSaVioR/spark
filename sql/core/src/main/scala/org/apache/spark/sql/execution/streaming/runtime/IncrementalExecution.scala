@@ -26,6 +26,7 @@ import org.apache.hadoop.fs.Path
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{BATCH_TIMESTAMP, ERROR}
+import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.QueryPlanningTracker
 import org.apache.spark.sql.catalyst.analysis.WidenStatefulOperatorAttributeNullability
 import org.apache.spark.sql.catalyst.expressions.{CurrentBatchTimestamp, ExpressionWithRandomSeed}
@@ -713,6 +714,20 @@ class IncrementalExecution(
 
     override def apply(plan: SparkPlan): SparkPlan = {
       val planWithStateOpId = plan transform composedRule
+      // Validate the checkpoint-pinned semantics before writing metadata or opening state,
+      // including a restart retrying an incomplete batch zero.
+      if (isFirstBatch &&
+          conf.getConf(SQLConf.STREAMING_JOIN_CHECKPOINT_WATERMARK_SEMANTICS_VERSION) < 1) {
+        planWithStateOpId.foreach {
+          case j: StreamingSymmetricHashJoinExec
+              if !StreamingSymmetricHashJoinHelper.isRangeEvictionCheckpointCompatible(
+                j.left.output, j.right.output, j.leftKeys, j.rightKeys, j.condition.full) =>
+            throw new AnalysisException(
+              errorClass = "STREAMING_JOIN_RANGE_EVICTION_CHECKPOINT_INCOMPATIBLE",
+              messageParameters = Map.empty)
+          case _ =>
+        }
+      }
       // Need to check before write to metadata because we need to detect add operator
       // Only check when streaming is restarting and is first batch
       if (isFirstBatch && currentBatchId != 0) {
