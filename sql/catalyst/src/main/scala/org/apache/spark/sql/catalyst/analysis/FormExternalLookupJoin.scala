@@ -83,10 +83,11 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
     }
     val markers = lookupHints(join.right)
     val lookupTable = ExternalLookupRelations.table(accessPath(join.right).last)
-    val lookupOnly = lookupTable.exists(ExternalLookupRelations.isLookupOnly)
-    // TODO: allow the EXTERNAL_LOOKUP hint once it is introduced, and apply these checks to the
-    //   joins it opts in.
-    if (markers.isEmpty && !lookupOnly) return NotLookupJoin
+    // A lookup-only table can be read only by a lookup join, and the hint opts a join in. Either
+    // way the join must run as an external lookup join, and the checks below apply.
+    if (!lookupTable.exists(ExternalLookupRelations.isLookupOnly) && markers.isEmpty) {
+      return NotLookupJoin
+    }
     if (markers.length > 1) {
       return Ineligible(QueryCompilationErrors.invalidExternalLookupHintError("MULTIPLE_HINTS"))
     }
