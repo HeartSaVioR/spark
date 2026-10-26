@@ -74,9 +74,11 @@ object PrepareExternalLookupJoin extends Rule[LogicalPlan] with PredicateHelper
     val unmatched = Project(join.left.output ++ nullLookupColumns, join.left)
     join.joinType match {
       case LeftOuter => unmatched
+      case LeftAnti => join.left
       // The stream side is kept under a false filter rather than replaced by an empty relation,
       // so that its sources, watermarks and stateful operators still run in every micro-batch.
       // PruneFilters decides whether a streaming subplan may be pruned.
+      case LeftSemi => Filter(Literal.FalseLiteral, join.left)
       case _ => Filter(Literal.FalseLiteral, unmatched)
     }
   }
