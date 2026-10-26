@@ -20,8 +20,19 @@ package org.apache.spark.sql.catalyst.plans.logical
 import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Expression}
 import org.apache.spark.sql.catalyst.plans.{Inner, JoinType, LeftOuter}
-import org.apache.spark.sql.catalyst.trees.TreePattern.{EXTERNAL_LOOKUP_JOIN, TreePattern}
+import org.apache.spark.sql.catalyst.trees.TreePattern.{EXTERNAL_LOOKUP_HINT, EXTERNAL_LOOKUP_JOIN,
+  TreePattern}
 import org.apache.spark.sql.connector.read.{ExternalLookupReaderFactory, Scan}
+
+/** Occurrence-local marker produced by resolving the `external_lookup` hint. */
+case class ExternalLookupHint(child: LogicalPlan) extends UnaryNode {
+  override def output: Seq[Attribute] = child.output
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(EXTERNAL_LOOKUP_HINT)
+
+  override protected def withNewChildInternal(newChild: LogicalPlan): ExternalLookupHint =
+    copy(child = newChild)
+}
 
 /**
  * A lookup join retained through ordinary expression and operator optimization.
