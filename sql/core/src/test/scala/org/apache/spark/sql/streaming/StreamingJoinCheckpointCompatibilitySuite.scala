@@ -416,6 +416,38 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
     }
   }
 
+  test("resume old V4 window equality checkpoint") {
+    withJoinConf(version = 4, logVersion = 2) {
+      val leftInput = MemoryStream[Int]
+      val rightInput = MemoryStream[Int]
+      def windowed(input: MemoryStream[Int]): DataFrame = input.toDF()
+        .select($"value".as("key"), timestamp_seconds($"value").as("time"))
+        .withWatermark("time", "10 seconds")
+        .select($"key", window($"time", "10 seconds"))
+      // TimeWindow declares the window end nullable, but window() computes it from a non-null
+      // event time, so old V4 state cannot contain a null selected key timestamp.
+      val joined = windowed(leftInput).join(windowed(rightInput), Seq("key", "window"))
+        .select($"key", $"window.end".cast("long"))
+      withTempDir { checkpointDir =>
+        val checkpoint = checkpointDir.getCanonicalPath
+        testStream(joined)(
+          StartStream(checkpointLocation = checkpoint),
+          MultiAddData(leftInput, 1)(rightInput, 2),
+          CheckNewAnswer(),
+          StopStream)
+        setMarker(checkpoint, None)
+        withSQLConf(markerKey -> "0") {
+          testStream(joined)(
+            StartStream(checkpointLocation = checkpoint),
+            MultiAddData(leftInput, 30)(rightInput, 30),
+            CheckNewAnswer(Row(30, 40L)),
+            StopStream)
+        }
+        assert(pinnedMarker(checkpoint).contains("0"))
+      }
+    }
+  }
+
   Seq(2, 4).foreach { version =>
     test(s"reject an incompatible checkpoint retrying batch zero, V$version") {
       withJoinConf(version, logVersion = 1) {

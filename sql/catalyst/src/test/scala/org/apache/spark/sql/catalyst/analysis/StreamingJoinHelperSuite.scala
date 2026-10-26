@@ -18,7 +18,7 @@
 package org.apache.spark.sql.catalyst.analysis
 
 import org.apache.spark.sql.catalyst.dsl.expressions._
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, AttributeSet}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, AttributeSet, EqualTo, Expression, Literal}
 import org.apache.spark.sql.catalyst.optimizer.SimpleTestOptimizer
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.plans.logical.{EventTimeWatermark, Filter, LeafNode, Statistics}
@@ -44,6 +44,45 @@ class StreamingJoinHelperSuite extends AnalysisTest {
         assert(StreamingJoinHelper.getStateValueWatermark(
           AttributeSet(Seq(leftTime)), AttributeSet(Seq(rightTime)),
           Some(condition), Some(10000L)) === expected)
+      }
+    }
+  }
+
+  test("equality key watermark on the event time plus a constant") {
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val eventTime = AttributeReference("eventTime", TimestampType, metadata = metadata)()
+    val other = AttributeReference("other", TimestampType)()
+
+    case class DummyLeafNode() extends LeafNode {
+      override def output: Seq[Attribute] = Seq(eventTime, other)
+      override def computeStats(): Statistics = Statistics(sizeInBytes = BigInt(0))
+    }
+
+    def key(keyStr: String): Expression = {
+      val plan = Filter(EqualTo(CatalystSqlParser.parseExpression(keyStr), Literal(null)),
+        DummyLeafNode())
+      SimpleAnalyzer.execute(plan).asInstanceOf[Filter].condition
+        .asInstanceOf[EqualTo].left
+    }
+
+    val cases = Seq(
+      // The event time itself is bounded by the watermark.
+      ("eventTime", Some(10000L), Some(10000L)),
+      // A constant shifts the bound, less 1 ms as for range conditions.
+      ("eventTime + INTERVAL 2 SECONDS", Some(11999L), Some(7999L)),
+      ("eventTime - INTERVAL 2 SECONDS", Some(7999L), Some(11999L)),
+      // Keys that the watermark does not bound.
+      ("other + INTERVAL 2 SECONDS", None, None),
+      ("date_trunc('MINUTE', eventTime)", None, None))
+    cases.foreach { case (keyStr, keyWatermark, eventTimeWatermark) =>
+      withClue(keyStr) {
+        val keys = Seq(key(keyStr))
+        assert(StreamingJoinHelper.getStateKeyWatermark(
+          keys, Seq(eventTime, other), 0, Some(10000L)) === keyWatermark)
+        assert(StreamingJoinHelper.getEventTimeWatermarkFromKey(
+          keys, Seq(eventTime, other), 0, 10000L) === eventTimeWatermark)
+        assert(StreamingJoinHelper.getStateKeyWatermarkOrdinal(
+          keys, Seq(eventTime, other)) === keyWatermark.map(_ => 0))
       }
     }
   }

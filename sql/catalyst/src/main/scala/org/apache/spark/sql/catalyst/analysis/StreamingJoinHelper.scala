@@ -22,8 +22,6 @@ import scala.util.control.NonFatal
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys._
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
-import org.apache.spark.sql.catalyst.plans.logical.{EventTimeWatermark, LogicalPlan}
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark._
 import org.apache.spark.sql.catalyst.util.DateTimeConstants.MICROS_PER_DAY
 import org.apache.spark.sql.types._
@@ -35,29 +33,23 @@ import org.apache.spark.unsafe.types.CalendarInterval
 object StreamingJoinHelper extends PredicateHelper with Logging {
 
   /**
-   * Check the provided logical plan to see if its join keys contain a watermark attribute.
-   *
-   * Will return false if the plan is not an equijoin.
-   * @param plan the logical plan to check
-   */
-  def isWatermarkInJoinKeys(plan: LogicalPlan): Boolean = {
-    plan match {
-      case ExtractEquiJoinKeys(_, leftKeys, rightKeys, _, _, _, _, _) =>
-        (leftKeys ++ rightKeys).exists {
-          case a: AttributeReference => a.metadata.contains(EventTimeWatermark.delayKey)
-          case _ => false
-        }
-      case _ => false
-    }
-  }
-
-  /**
    * Find the equality key filtered by this input's watermark. Its ordinal can be used to
    * evict the opposite input's state, whose equality keys have the same ordering.
    * For leftTime = rightTime, a watermark on rightTime bounds leftTime even when leftTime
    * has no watermark. It does not bound right-side state without a watermark on leftTime.
+   * A key computed from the event time by adding a constant, such as
+   * leftTime = rightTime + INTERVAL 10 SECONDS, is bounded too; see [[getStateKeyWatermark]].
    */
   def getStateKeyWatermarkOrdinal(
+      keys: Seq[Expression],
+      inputAttributes: Seq[Attribute]): Option[Int] = {
+    getEventTimeKeyOrdinal(keys, inputAttributes).orElse {
+      keys.indices.find(getStateKeyWatermark(keys, inputAttributes, _, Some(0L)).isDefined)
+    }
+  }
+
+  /** Find the equality key that is this input's event-time column itself. */
+  def getEventTimeKeyOrdinal(
       keys: Seq[Expression],
       inputAttributes: Seq[Attribute]): Option[Int] = {
     // When multiple stateful operators are disabled, late filtering uses the first event-time
@@ -69,6 +61,61 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
       }
     }
   }
+
+  /**
+   * Get the cutoff for the opposite input's equality key at `ordinal`, given this input's
+   * watermark. `keys` and `inputAttributes` belong to this input, whose future rows have an event
+   * time above the watermark. When the key is that event time, the equal key of any state row
+   * they can still match is above the watermark too. When the key is the event time plus a
+   * constant, solving `stateKey >= rightTime + INTERVAL 10 SECONDS` shifts the cutoff by that
+   * constant, less 1 ms as for range conditions. Returns None for any other key.
+   */
+  def getStateKeyWatermark(
+      keys: Seq[Expression],
+      inputAttributes: Seq[Attribute],
+      ordinal: Int,
+      eventWatermark: Option[Long]): Option[Long] = {
+    if (getEventTimeKeyOrdinal(keys, inputAttributes).contains(ordinal)) {
+      eventWatermark
+    } else {
+      eventTimeOfKey(keys(ordinal), inputAttributes).flatMap { eventTime =>
+        val stateKey = AttributeReference("stateKey", TimestampType)()
+        getStateValueWatermark(AttributeSet(Seq(stateKey)), AttributeSet(Seq(eventTime)),
+          Some(GreaterThanOrEqual(stateKey, keys(ordinal))), eventWatermark)
+      }
+    }
+  }
+
+  /**
+   * Get a bound on this input's event time for state rows whose equality key at `ordinal` is
+   * above `keyWatermark`. When the key is the event time, the bound is the key watermark. When
+   * the key is the event time plus a constant, solving
+   * `leftTime + INTERVAL 10 SECONDS >= keyWatermark` subtracts that constant, less 1 ms.
+   * Returns None for any other key.
+   */
+  def getEventTimeWatermarkFromKey(
+      keys: Seq[Expression],
+      inputAttributes: Seq[Attribute],
+      ordinal: Int,
+      keyWatermark: Long): Option[Long] = {
+    if (getEventTimeKeyOrdinal(keys, inputAttributes).contains(ordinal)) {
+      Some(keyWatermark)
+    } else {
+      eventTimeOfKey(keys(ordinal), inputAttributes).flatMap { eventTime =>
+        val keyWithWatermark = AttributeReference("stateKey", TimestampType,
+          metadata = new MetadataBuilder().putLong(delayKey, 0L).build())()
+        getStateValueWatermark(AttributeSet(Seq(eventTime)), AttributeSet(Seq(keyWithWatermark)),
+          Some(GreaterThanOrEqual(keys(ordinal), keyWithWatermark)), Some(keyWatermark))
+      }
+    }
+  }
+
+  /** The input's event-time column, if a timestamp key refers to nothing else. */
+  private def eventTimeOfKey(key: Expression, inputAttributes: Seq[Attribute]): Option[Attribute] =
+    inputAttributes.find(_.metadata.contains(delayKey)).filter { eventTime =>
+      key.dataType == TimestampType && key.references.nonEmpty &&
+        key.references.forall(_.semanticEquals(eventTime))
+    }
 
   /**
    * Get state value watermark (see [[StreamingSymmetricHashJoinExec]] for context about it)
