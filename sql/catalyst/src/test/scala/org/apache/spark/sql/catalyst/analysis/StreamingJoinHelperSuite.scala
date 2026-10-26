@@ -23,7 +23,7 @@ import org.apache.spark.sql.catalyst.optimizer.SimpleTestOptimizer
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.plans.logical.{EventTimeWatermark, Filter, LeafNode, Statistics}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{IntegerType, LongType, MetadataBuilder, TimestampType}
+import org.apache.spark.sql.types.{DayTimeIntervalType, IntegerType, LongType, MetadataBuilder, TimestampType}
 import org.apache.spark.unsafe.types.CalendarInterval
 
 class StreamingJoinHelperSuite extends AnalysisTest {
@@ -136,6 +136,10 @@ class StreamingJoinHelperSuite extends AnalysisTest {
             TimestampAddInterval(eventTime, Literal(interval), Some(zone))) === expected)
         }
     }
+
+    // The smallest day-time interval is many days long, although its absolute value overflows.
+    assert(watermark(TimestampAddInterval(eventTime,
+      Literal(Long.MinValue, DayTimeIntervalType()), Some("America/Los_Angeles"))) === None)
   }
 
   test("extract watermark from time condition") {

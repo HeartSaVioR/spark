@@ -133,7 +133,10 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
       def value: Option[Any] = try Option(e.eval()) catch { case NonFatal(_) => None }
       e.foldable && (e.dataType match {
         case _: DayTimeIntervalType =>
-          value.exists(v => math.abs(v.asInstanceOf[Long]) < MICROS_PER_DAY || fixedOffset)
+          value.exists { v =>
+            val micros = v.asInstanceOf[Long]
+            -MICROS_PER_DAY < micros && micros < MICROS_PER_DAY || fixedOffset
+          }
         case CalendarIntervalType =>
           value.exists { v =>
             val interval = v.asInstanceOf[CalendarInterval]
