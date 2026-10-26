@@ -45,12 +45,13 @@ class ColumnPruningSuite extends PlanTest {
     val lookup = LocalRelation($"key".int, $"value".string, $"extra".string)
     val Seq(id, label) = stream.output
     val Seq(key, value, _) = lookup.output
-    val join = ExternalLookupJoin(stream, lookup, Inner, Some(id === key), lookup.output)
+    val cache = ExternalLookupCacheOptions(enabled = false, 1, 0, 1)
+    val join = ExternalLookupJoin(stream, lookup, Inner, Some(id === key), cache, lookup.output)
 
     val optimized = Optimize.execute(Project(Seq(label, value), join))
     val correctAnswer = Project(Seq(label, value),
       ExternalLookupJoin(stream, Project(Seq(key, value), lookup), Inner, Some(id === key),
-        Seq(value)))
+        cache, Seq(value)))
     comparePlans(optimized, correctAnswer)
   }
 
@@ -59,10 +60,12 @@ class ColumnPruningSuite extends PlanTest {
     val lookup = LocalRelation($"key".int, $"value".string)
     val id = stream.output.head
     val key = lookup.output.head
+    val cache = ExternalLookupCacheOptions(enabled = false, 1, 0, 1)
     Seq(LeftSemi, LeftAnti).foreach { joinType =>
-      val join = ExternalLookupJoin(stream, lookup, joinType, Some(id === key), lookup.output)
+      val join =
+        ExternalLookupJoin(stream, lookup, joinType, Some(id === key), cache, lookup.output)
       val correctAnswer = ExternalLookupJoin(
-        stream, Project(Seq(key), lookup), joinType, Some(id === key), Seq.empty)
+        stream, Project(Seq(key), lookup), joinType, Some(id === key), cache, Seq.empty)
       comparePlans(Optimize.execute(join), correctAnswer)
     }
   }
