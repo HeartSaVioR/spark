@@ -513,7 +513,7 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
             checkError(error.asInstanceOf[AnalysisException],
               condition = "STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE",
               parameters = Map(
-                "joinCondition" -> ".*leftId.*rightId.*",
+                "joinCondition" -> "left\\.leftId = right\\.rightId AND .*",
                 "leftWatermarkColumns" -> "leftTime",
                 "rightWatermarkColumns" -> "rightTime"),
               matchPVals = true)

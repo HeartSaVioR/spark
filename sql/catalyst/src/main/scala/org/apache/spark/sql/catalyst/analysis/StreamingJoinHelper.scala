@@ -37,7 +37,7 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
    * evict the opposite input's state, whose equality keys have the same ordering.
    * For leftTime = rightTime, a watermark on rightTime bounds leftTime even when leftTime
    * has no watermark. It does not bound right-side state without a watermark on leftTime.
-   * A key computed from the event time by adding a constant, such as
+   * A key computed from the event time by adding a constant interval, such as
    * leftTime = rightTime + INTERVAL 10 SECONDS, is bounded too; see [[getStateKeyWatermark]].
    */
   def getStateKeyWatermarkOrdinal(
@@ -66,9 +66,9 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
    * Get the cutoff for the opposite input's equality key at `ordinal`, given this input's
    * watermark. `keys` and `inputAttributes` belong to this input, whose future rows have an event
    * time above the watermark. When the key is that event time, the equal key of any state row
-   * they can still match is above the watermark too. When the key is the event time plus a
-   * constant, solving `stateKey >= rightTime + INTERVAL 10 SECONDS` shifts the cutoff by that
-   * constant, less 1 ms as for range conditions. Returns None for any other key.
+   * they can still match is above the watermark too. When the key is the event time shifted by
+   * an interval, solving `stateKey >= rightTime + INTERVAL 10 SECONDS` shifts the cutoff by that
+   * interval, less 1 ms as for range conditions. Returns None for any other key.
    */
   def getStateKeyWatermark(
       keys: Seq[Expression],
@@ -89,7 +89,7 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
   /**
    * Get a bound on this input's event time for state rows whose equality key at `ordinal` is
    * above `keyWatermark`. When the key is the event time, the bound is the key watermark. When
-   * the key is the event time plus a constant, solving
+   * the key is the event time shifted by an interval, solving
    * `leftTime + INTERVAL 10 SECONDS >= keyWatermark` subtracts that constant, less 1 ms.
    * Returns None for any other key.
    */
@@ -110,12 +110,37 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
     }
   }
 
-  /** The input's event-time column, if a timestamp key refers to nothing else. */
+  /** The input's event-time column, if a timestamp key is that column shifted by intervals. */
   private def eventTimeOfKey(key: Expression, inputAttributes: Seq[Attribute]): Option[Attribute] =
     inputAttributes.find(_.metadata.contains(delayKey)).filter { eventTime =>
-      key.dataType == TimestampType && key.references.nonEmpty &&
-        key.references.forall(_.semanticEquals(eventTime))
+      key.dataType == TimestampType && isIntervalShift(key, eventTime)
     }
+
+  /**
+   * Whether the expression is the event time plus or minus constant intervals. Other functions
+   * and casts from other types are not accepted: a truncation such as
+   * CAST(CAST(rightTime AS BIGINT) AS TIMESTAMP) can map a later event time below the watermark.
+   */
+  private def isIntervalShift(expr: Expression, eventTime: Attribute): Boolean = {
+    def isInterval(e: Expression): Boolean = e.foldable && (e.dataType match {
+      case CalendarIntervalType | _: DayTimeIntervalType => true
+      case _ => false
+    })
+    expr match {
+      case a: Attribute => a.semanticEquals(eventTime)
+      // The analyzer wraps timestamp + interval in a cast to the same timestamp type.
+      case Cast(child, TimestampType, _, _) if child.dataType == TimestampType =>
+        isIntervalShift(child, eventTime)
+      case TimestampAddInterval(start, interval, _) =>
+        isInterval(interval) && isIntervalShift(start, eventTime)
+      case DatetimeSub(_, _, replacement) => isIntervalShift(replacement, eventTime)
+      case Add(left, right, _) =>
+        isInterval(right) && isIntervalShift(left, eventTime) ||
+          isInterval(left) && isIntervalShift(right, eventTime)
+      case Subtract(left, right, _) => isInterval(right) && isIntervalShift(left, eventTime)
+      case _ => false
+    }
+  }
 
   /**
    * Get state value watermark (see [[StreamingSymmetricHashJoinExec]] for context about it)
