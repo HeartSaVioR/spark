@@ -1299,8 +1299,8 @@ regarding watermark delays and whether data will be dropped or not.
 
 Unmatched output and state removal use the same cutoff, derived from the opposite input's
 watermark and the time constraint. In the example above, the `clickTime` watermark finalizes
-impressions; no watermark on `impressionTime` is needed for this. Full outer joins require
-watermarks and time constraints in both directions to finalize both sides.
+impressions. Full outer joins require watermarks and time constraints in both directions to
+finalize both sides.
 
 ###### Caveats
 There are a few important characteristics to note regarding how the outer results are generated.
@@ -3596,7 +3596,8 @@ the effect of the change is not well-defined. For all of them:
   - *Streaming deduplication*: For example, `sdf.dropDuplicates("a")`. Any change in number or type of deduplicating columns is not allowed.
 
   - *Stream-stream join*: For example, `sdf1.join(sdf2, ...)` (i.e. both inputs are generated with `sparkSession.readStream`). Changes
-    in the schema or equi-joining columns are not allowed. Changes in join type (outer or inner) are not allowed. Other changes in the join condition are ill-defined.
+    in the schema or equi-joining columns are not allowed. Changes in join type (outer or inner) are not allowed. Other changes in the join condition are ill-defined. In particular, the join condition decides which column
+    Spark uses to find rows to remove from the state, so changing it can remove rows that could still match.
 
   - *Arbitrary stateful operation*: For example, `sdf.groupByKey(...).mapGroupsWithState(...)` or `sdf.groupByKey(...).flatMapGroupsWithState(...)`.
     Any change to the schema of the user-defined state and the type of timeout is not allowed.

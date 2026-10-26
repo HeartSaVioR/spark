@@ -18,6 +18,8 @@
 package org.apache.spark.sql.streaming
 
 import org.apache.spark.sql.Row
+import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinExec
+import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper.{JoinStateKeyWatermarkPredicate, JoinStateValueWatermarkPredicate}
 import org.apache.spark.sql.execution.streaming.runtime.MemoryStream
 import org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider
 import org.apache.spark.sql.functions._
@@ -100,6 +102,94 @@ class StreamingJoinEqualityWatermarkSuite extends StreamTest {
         // The right input has no late filter; its old window must still find left state.
         AddData(rightInput, 1), CheckNewAnswer(Row(1, 10L)),
         AddData(leftInput, 5), CheckNewAnswer())
+    }
+  }
+
+  for {
+    version <- Seq(2, 3, 4)
+    offset <- Seq(10, -10)
+  } {
+    test(s"equality on a shifted opposite event time evicts state, V$version offset=$offset") {
+      withSQLConf(
+        SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key -> version.toString,
+        SQLConf.STATE_STORE_PROVIDER_CLASS.key -> classOf[RocksDBStateStoreProvider].getName,
+        SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+        val leftInput = MemoryStream[(Int, Int)]
+        val rightInput = MemoryStream[(Int, Int)]
+        val left = leftInput.toDF().toDF("lk", "lt")
+          .select($"lk", timestamp_seconds($"lt").as("lt"))
+          .withWatermark("lt", "10 seconds")
+        val right = rightInput.toDF().toDF("rk", "rt")
+          .select($"rk", timestamp_seconds($"rt").as("rt"))
+          .withWatermark("rt", "10 seconds")
+        // A left row matches the right row whose time is `offset` seconds earlier.
+        val joined = left.join(right,
+          expr(s"lk = rk AND lt = rt + INTERVAL $offset SECONDS"), "left_outer")
+          .select($"lk", $"lt".cast("int"), $"rk", $"rt".cast("int"))
+        testStream(joined)(
+          MultiAddData(leftInput, (1, 100 + offset), (2, 90 + offset), (3, 145 + offset))(
+            rightInput, (9, 50)),
+          CheckNewAnswer(),
+          AddData(rightInput, (1, 100)),
+          CheckNewAnswer(Row(1, 100 + offset, 1, 100)),
+          MultiAddData(leftInput, (9, 300))(rightInput, (9, 150)),
+          // At watermark 90, a future right row can still have time 90.
+          CheckNewAnswer(),
+          AddData(rightInput, (9, 151)),
+          // At watermark 140, the left key cutoff is 140 + offset.
+          CheckNewAnswer(Row(2, 90 + offset, null, null)),
+          Execute { query =>
+            val join = query.lastExecution.executedPlan.collectFirst {
+              case j: StreamingSymmetricHashJoinExec => j
+            }.get
+            // Retained left rows are above 140 + offset, retained right rows above 140 - offset.
+            assert(join.produceOutputWatermark(140000L).contains(129999L))
+          },
+          // Right time 145 is above watermark 140, so (3, 145 + offset) must still be in state.
+          AddData(rightInput, (3, 145)),
+          CheckNewAnswer(Row(3, 145 + offset, 3, 145)))
+      }
+    }
+  }
+
+  for (version <- Seq(2, 3, 4)) {
+    test(s"key eviction on one side and value eviction on the other keep a match, V$version") {
+      withSQLConf(
+        SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key -> version.toString,
+        SQLConf.STATE_STORE_PROVIDER_CLASS.key -> classOf[RocksDBStateStoreProvider].getName,
+        SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+        val leftInput = MemoryStream[(Int, Long)]
+        val rightInput = MemoryStream[(Int, Long, Long)]
+        val left = leftInput.toDF().toDF("leftId", "seconds")
+          .select($"leftId", timestamp_seconds($"seconds").as("leftTime"))
+          .withWatermark("leftTime", "1 hour")
+        val right = rightInput.toDF().toDF("rightId", "keySeconds", "seconds")
+          .select($"rightId", timestamp_seconds($"keySeconds").as("rightKeyTime"),
+            timestamp_seconds($"seconds").as("rightTime"))
+          .withWatermark("rightTime", "1 hour")
+        // The leftTime watermark bounds rightKeyTime, so the right side evicts by key, while the
+        // left side evicts on leftTime. The V4 left joiner derives a time window for its lookups
+        // into the right state, which must use the exact key timestamp instead.
+        val joined = left.join(right, expr(
+          "leftId = rightId AND leftTime = rightKeyTime AND " +
+            "rightTime >= leftTime + INTERVAL 10 SECONDS AND " +
+            "rightTime <= leftTime + INTERVAL 20 SECONDS"))
+          .select($"leftId", $"leftTime".cast("long"), $"rightTime".cast("long"))
+        testStream(joined)(
+          AddData(rightInput, (1, 100L, 115L)),
+          CheckNewAnswer(),
+          Execute { query =>
+            val join = query.lastExecution.executedPlan.collectFirst {
+              case j: StreamingSymmetricHashJoinExec => j
+            }.get
+            assert(join.stateWatermarkPredicates.left.exists(
+              _.isInstanceOf[JoinStateValueWatermarkPredicate]))
+            assert(join.stateWatermarkPredicates.right.exists(
+              _.isInstanceOf[JoinStateKeyWatermarkPredicate]))
+          },
+          AddData(leftInput, (1, 100L)),
+          CheckNewAnswer(Row(1, 100L, 115L)))
+      }
     }
   }
 }
