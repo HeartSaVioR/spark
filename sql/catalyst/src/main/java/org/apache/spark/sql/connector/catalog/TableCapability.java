@@ -36,6 +36,19 @@ public enum TableCapability {
   BATCH_READ,
 
   /**
+   * Signals that the table has at least one parameterized external lookup access path. A
+   * particular join may still be ineligible when its join condition does not contain predicates
+   * that form a complete access path.
+   * <p>
+   * An eligible join over a table that supports this capability but not {@link #BATCH_READ} is
+   * planned as an external lookup join. A table that supports both keeps the ordinary join
+   * strategies unless the query requests external lookup with the {@code EXTERNAL_LOOKUP} hint.
+   *
+   * @since 4.4.0
+   */
+  EXTERNAL_LOOKUP,
+
+  /**
    * Signals that the table supports reads in micro-batch streaming execution mode.
    */
   MICRO_BATCH_READ,
