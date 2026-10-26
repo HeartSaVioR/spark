@@ -1632,11 +1632,17 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       .format(classOf[SimpleExternalLookupDataSource].getName)
       .option("maxBatchSize", "1")
       .load()
-      .hint("external_lookup", "cache_max_entries=1")
-    val left = Seq(1, 2, 1).toDF("id").coalesce(1)
+      .hint("external_lookup", "cache_max_entries=2")
+    val left = Seq(1, 2, 1, 3, 1, 2).toDF("id").coalesce(1)
 
-    left.join(lookup, left("id") === lookup("id"), "left_outer").collect()
-    assert(SimpleExternalLookupDataSource.requestedKeys.asScala.toSeq === Seq(1, 2, 1))
+    val rows = left.join(lookup, left("id") === lookup("id"), "left_outer").collect().toSeq
+    val engineering = Seq(Row(1, 1, "engineering"), Row(1, 1, "research"))
+    val expected = engineering ++ engineering ++ engineering ++
+      Seq(Row(2, 2, "sales"), Row(2, 2, "sales"), Row(3, null, null))
+    assert(rows.sortBy(_.toString) === expected.sortBy(_.toString))
+    // With room for two keys, the third key evicts the least recently used key 2, not key 1,
+    // which was used more recently.
+    assert(SimpleExternalLookupDataSource.requestedKeys.asScala.toSeq === Seq(1, 2, 3, 2))
   }
 
   test("an upstream limit stops one-to-many cursor consumption") {
@@ -1965,7 +1971,11 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
 
   test("external lookup cache is scoped to a task") {
     SimpleExternalLookupDataSource.resetCounters()
-    val lookup = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
+    // One row per batch, so a task can avoid its second request only through its cache.
+    val lookup = spark.read
+      .format(classOf[SimpleExternalLookupDataSource].getName)
+      .option("maxBatchSize", "1")
+      .load()
     val left = spark.sparkContext.parallelize(Seq(2, 2, 2, 2), numSlices = 2).toDF("id")
 
     assert(left.join(lookup, left("id") === lookup("id")).count() === 4)
