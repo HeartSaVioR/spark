@@ -344,6 +344,7 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
     }
     assert(joinType.getCondition === "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.JOIN_TYPE")
     assert(joinType.getMessageParameters.get("joinType") === "RIGHT OUTER")
+    assert(joinType.getMessageParameters.get("relation") === "`DualCapabilityExternalLookupTable`")
     checkError(
       exception = intercept[AnalysisException] {
         left.crossJoin(dual).queryExecution.analyzed
@@ -759,6 +760,27 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
           condition = "INVALID_EXTERNAL_LOOKUP_HINT.RELATION_NOT_FOUND",
           parameters = Map("relations" -> "`external_lookup_right`"))
       }
+    }
+  }
+
+  test("a catalog-resolved lookup-only table in an ineligible join fails with the reason") {
+    withSQLConf(
+        s"spark.sql.catalog.$ExternalLookupCatalogName" ->
+          classOf[ExternalLookupTestCatalog].getName) {
+      val table = s"$ExternalLookupCatalogName.ns.lookup"
+      val left = Seq(1).toDF("id")
+      checkError(
+        exception = intercept[AnalysisException] {
+          left.crossJoin(spark.read.table(table)).queryExecution.optimizedPlan
+        },
+        condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.MISSING_JOIN_CONDITION",
+        parameters = Map.empty)
+      val fullOuter = intercept[AnalysisException] {
+        sql(s"SELECT * FROM $table r FULL OUTER JOIN $table s ON r.id = s.id")
+      }
+      assert(fullOuter.getCondition === "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.JOIN_TYPE")
+      assert(fullOuter.getMessageParameters.asScala.toMap - "supportedJoinTypes" ===
+        Map("joinType" -> "FULL OUTER", "relation" -> "`SimpleExternalLookupTable`"))
     }
   }
 

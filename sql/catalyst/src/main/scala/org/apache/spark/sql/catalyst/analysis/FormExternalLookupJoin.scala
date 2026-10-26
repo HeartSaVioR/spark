@@ -28,9 +28,9 @@ import org.apache.spark.sql.catalyst.plans.{Inner, LeftOuter}
 import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupHint, ExternalLookupJoin,
   Filter, Join, JoinStrategyHint, LogicalPlan, Project, ResolvedHint, SubqueryAlias,
   UnresolvedHint, UnresolvedWith, View}
-import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.catalyst.rules.{Rule, RuleId}
 import org.apache.spark.sql.catalyst.trees.TreePattern.{COMMON_EXPR_REF, EXTERNAL_LOOKUP_HINT, JOIN,
-  WITH_EXPRESSION}
+  UNRESOLVED_HINT, WITH_EXPRESSION}
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryErrorsBase}
 import org.apache.spark.sql.execution.datasources.v2.ExternalLookupRelations
 import org.apache.spark.sql.internal.SQLConf
@@ -38,7 +38,7 @@ import org.apache.spark.sql.internal.SQLConf
 /** Resolves the `external_lookup` option hint to an occurrence-local marker. */
 object ResolveExternalLookupHint extends Rule[LogicalPlan] {
   override def apply(plan: LogicalPlan): LogicalPlan =
-    ExternalLookupJoinEligibility.resolveHints(plan)
+    ExternalLookupJoinEligibility.resolveHints(plan, ruleId)
 }
 
 /**
@@ -65,8 +65,8 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
   private val HintName = "EXTERNAL_LOOKUP"
   private val SupportedJoinTypes = Seq(Inner, LeftOuter)
 
-  private[analysis] def resolveHints(plan: LogicalPlan): LogicalPlan =
-    plan.resolveOperatorsUp {
+  private[analysis] def resolveHints(plan: LogicalPlan, hintRuleId: RuleId): LogicalPlan =
+    plan.resolveOperatorsUpWithPruning(_.containsPattern(UNRESOLVED_HINT), hintRuleId) {
       case UnresolvedHint(name, parameters, child)
           if name.toUpperCase(Locale.ROOT) == HintName =>
         resolveHint(parameters, child)
@@ -82,7 +82,6 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
       return ineligible("LOOKUP_TABLE_ON_LEFT", toSQLId(leftLookupOnlyTable.get.name()))
     }
     val markers = lookupHints(join.right)
-    // TODO: look through projections, filters and aliases above the lookup relation.
     val lookupTable = ExternalLookupRelations.table(accessPath(join.right).last)
     val lookupOnly = lookupTable.exists(ExternalLookupRelations.isLookupOnly)
     // TODO: allow the EXTERNAL_LOOKUP hint once it is introduced, and apply these checks to the
@@ -108,10 +107,9 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
       // no longer is by then.
       case None if join.condition.exists(SubqueryExpression.hasSubquery) =>
         ineligible("SUBQUERY_IN_JOIN_CONDITION", relation)
-      case None if join.right.isStreaming && markers.nonEmpty =>
+      case None if join.right.isStreaming =>
         Ineligible(QueryCompilationErrors.unsupportedExternalLookupJoinError(
           "STREAMING_LOOKUP_SIDE"))
-      case None if join.right.isStreaming => NotLookupJoin
       case None => Eligible
     }
   }
