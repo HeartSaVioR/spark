@@ -424,17 +424,16 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.MISSING_JOIN_CONDITION",
       parameters = Map.empty)
 
-    SimpleExternalLookupDataSource.resetCounters()
-    val optedOut = left.join(
-      lookup.hint("external_lookup").hint("merge"),
-      left("id") === lookup("id"),
-      "right_outer")
-    assert(!runStream(optedOut).plan.exists(_.isInstanceOf[PreparedExternalLookupJoin]))
-    checkStream(optedOut, Seq(
-      Row(1, 1, "engineering"),
-      Row(1, 1, "research"),
-      Row(null, 2, "sales")))
-    assert(SimpleExternalLookupDataSource.requestCount.get() === 0)
+    // A strategy hint on the same join conflicts before the join type is checked.
+    checkError(
+      exception = intercept[AnalysisException] {
+        left.join(
+          lookup.hint("external_lookup").hint("merge"),
+          left("id") === lookup("id"),
+          "right_outer").queryExecution.analyzed
+      },
+      condition = "INVALID_EXTERNAL_LOOKUP_HINT.CONFLICTING_JOIN_STRATEGY",
+      parameters = Map("strategy" -> "MERGE", "relation" -> "`DualCapabilityExternalLookupTable`"))
   }
 
   test("external lookup predicate negotiation includes type and null semantics") {
