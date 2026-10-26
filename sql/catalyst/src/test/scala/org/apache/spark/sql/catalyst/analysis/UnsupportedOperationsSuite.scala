@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
+import java.time.Duration
 import java.util.Locale
 
 import org.apache.spark.SparkFunSuite
@@ -24,7 +25,7 @@ import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.dsl.plans._
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, MonotonicallyIncreasingID, NamedExpression}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, Literal, MonotonicallyIncreasingID, NamedExpression, TimestampAddInterval}
 import org.apache.spark.sql.catalyst.expressions.aggregate.Count
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
@@ -597,19 +598,28 @@ class UnsupportedOperationsSuite extends SparkFunSuite with SQLHelper {
     val left = new TestStreamingRelation(leftTime)
     val right = new TestStreamingRelation(Seq(rightTime, rightOther))
 
+    def shift(time: Expression, seconds: Int): Expression =
+      TimestampAddInterval(time, Literal(Duration.ofSeconds(seconds)))
+
     // A key computed from the opposite event time by a constant is bounded by its watermark.
     Seq(10, -10).foreach { offset =>
       Seq(LeftOuter, RightOuter, FullOuter, LeftSemi).foreach { joinType =>
         assertSupportedInStreamingPlan(s"$joinType with a key shifted by $offset",
           left.join(right, joinType = joinType,
-            condition = Some(leftTime === rightTime + offset)), OutputMode.Append())
+            condition = Some(leftTime === shift(rightTime, offset))), OutputMode.Append())
       }
       assertNotSupportedInStreamingPlan(
         s"LeftOuter with a key shifted by $offset from an unwatermarked column",
         left.join(right, joinType = LeftOuter,
-          condition = Some(leftTime === rightOther + offset)), OutputMode.Append(),
+          condition = Some(leftTime === shift(rightOther, offset))), OutputMode.Append(),
         Seq("requires a watermark on the right input"))
     }
+
+    // Truncation can map a future right row below the watermark, so it does not bound the key.
+    assertNotSupportedInStreamingPlan("LeftOuter with a key truncated from the right event time",
+      left.join(right, joinType = LeftOuter,
+        condition = Some(leftTime === rightTime.cast(LongType).cast(TimestampType))),
+      OutputMode.Append(), Seq("requires a watermark on the right input"))
   }
 
   // multi-aggregations only supported in Append mode

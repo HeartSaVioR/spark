@@ -84,7 +84,10 @@ class StreamingJoinHelperSuite extends AnalysisTest {
       ("eventTime - INTERVAL 2 SECONDS", Some(7999L), Some(11999L)),
       // Keys that the watermark does not bound.
       ("other + INTERVAL 2 SECONDS", None, None),
-      ("date_trunc('MINUTE', eventTime)", None, None))
+      ("date_trunc('MINUTE', eventTime)", None, None),
+      // Truncation can map a later event time below the watermark.
+      ("CAST(CAST(eventTime AS BIGINT) AS TIMESTAMP)", None, None),
+      ("CAST(CAST(eventTime AS BIGINT) + 10 AS TIMESTAMP)", None, None))
     cases.foreach { case (keyStr, keyWatermark, eventTimeWatermark) =>
       withClue(keyStr) {
         val keys = Seq(key(keyStr))

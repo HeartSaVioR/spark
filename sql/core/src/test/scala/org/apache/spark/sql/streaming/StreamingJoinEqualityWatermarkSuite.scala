@@ -192,4 +192,35 @@ class StreamingJoinEqualityWatermarkSuite extends StreamTest {
       }
     }
   }
+
+  for (version <- Seq(2, 3, 4)) {
+    test(s"equality on a truncated opposite event time keeps matchable state, V$version") {
+      withSQLConf(
+        SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key -> version.toString,
+        SQLConf.STATE_STORE_PROVIDER_CLASS.key -> classOf[RocksDBStateStoreProvider].getName,
+        SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false") {
+        val leftInput = MemoryStream[(Int, Long)]
+        val rightInput = MemoryStream[(Int, Long)]
+        val left = leftInput.toDF().toDF("lk", "ms")
+          .select($"lk", timestamp_millis($"ms").as("lt"))
+          .withWatermark("lt", "10 seconds")
+        val right = rightInput.toDF().toDF("rk", "ms")
+          .select($"rk", timestamp_millis($"ms").as("rt"))
+          .withWatermark("rt", "10 seconds")
+        val joined = left.join(right,
+          expr("lk = rk AND lt = CAST(CAST(rt AS BIGINT) AS TIMESTAMP)"))
+          .select($"lk", $"rk")
+        testStream(joined)(
+          MultiAddData(leftInput, (1, 25000L))(rightInput, (9, 25000L)),
+          CheckNewAnswer(),
+          MultiAddData(leftInput, (8, 35500L))(rightInput, (9, 35500L)),
+          CheckNewAnswer(),
+          AddData(rightInput, (9, 35600L)),
+          CheckNewAnswer(),
+          // rt = 25.7 seconds is above the watermark 25.5 seconds but truncates to lt = 25.
+          AddData(rightInput, (1, 25700L)),
+          CheckNewAnswer(Row(1, 1)))
+      }
+    }
+  }
 }
