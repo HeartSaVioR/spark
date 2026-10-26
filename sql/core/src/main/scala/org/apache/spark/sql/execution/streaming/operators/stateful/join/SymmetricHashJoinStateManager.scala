@@ -446,10 +446,13 @@ class SymmetricHashJoinStateManagerV4(
     // When no timestamp is available, we will use random bucketing strategy to decide where the
     // new value will be stored. There is a trade-off between the bucket size and the number of
     // values in each bucket; we can tune the bucket size with the configuration if we figure out
-    // the magic number to not work well.
+    // the magic number to not work well. On a side that is indexed by timestamp, use buckets
+    // below any real timestamp: evicting a real row removes every value with the same key and
+    // timestamp, which must not include a row without a timestamp.
+    val bucket = random.nextInt(bucketCountWithoutTimestamp)
+    val bucketTimestamp = if (hasTimestampForEviction) Long.MinValue + bucket else bucket.toLong
     // We always do blind merge for appending new value.
-    keyWithTsToValues.append(
-      key, timestamp.getOrElse(random.nextInt(bucketCountWithoutTimestamp)), value, matched)
+    keyWithTsToValues.append(key, timestamp.getOrElse(bucketTimestamp), value, matched)
     if (hasTimestampForEviction && timestamp.isDefined) {
       tsWithKey.add(timestamp.get, key)
     }

@@ -1201,6 +1201,19 @@ class SymmetricHashJoinStateManagerEventTimeInValueSuite
     }
   }
 
+  test("StreamingJoinStateManager V4 - null indexed time survives evicting real rows") {
+    withJoinStateManager(inputValueAttributes, joinKeyExpressions, stateFormatVersion = 4) {
+      manager =>
+        implicit val mgr = manager
+        manager.append(toJoinKeyRow(40), toInputValueWithNullTime(40), matched = false)
+        // Put a real row at every timestamp that a random bucket for rows without a timestamp
+        // could use, so they would share a (key, timestamp) list.
+        (0 until 1024).foreach(append(40, _))
+        assert(removeByValue(1023) === 1024)
+        assert(manager.get(toJoinKeyRow(40)).map(_.isNullAt(1)).toSeq === Seq(true))
+    }
+  }
+
   test("StreamingJoinStateManager V4 - null indexed window is not evicted") {
     val windowType = new StructType().add("start", TimestampType).add("end", TimestampType)
     val attributes = toAttributes(new StructType()
