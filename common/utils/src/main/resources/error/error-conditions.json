@@ -2886,11 +2886,6 @@
       "The join cannot be executed as an external lookup join:"
     ],
     "subClass" : {
-      "CHAR_VARCHAR_COLUMN" : {
-        "message" : [
-          "The column <column> of the lookup-only table <relation> needs read-side CHAR padding or a VARCHAR length check, which an external lookup join does not support."
-        ]
-      },
       "CONFLICTING_JOIN_STRATEGY" : {
         "message" : [
           "The join strategy hint <strategy> cannot be honored by an external lookup join over <relation>. Remove the <strategy> hint."
