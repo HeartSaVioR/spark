@@ -307,6 +307,24 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       Row(20, 2, "b", 2, "sales")))
   }
 
+  test("an external lookup hint on an ineligible join is rejected") {
+    val dual = spark.read.format(classOf[DualCapabilityExternalLookupDataSource].getName).load()
+      .hint("external_lookup")
+    val left = Seq(1).toDF("id")
+
+    val joinType = intercept[AnalysisException] {
+      left.join(dual, left("id") === dual("id"), "right_outer").queryExecution.analyzed
+    }
+    assert(joinType.getCondition === "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.JOIN_TYPE")
+    assert(joinType.getMessageParameters.get("joinType") === "RIGHT OUTER")
+    checkError(
+      exception = intercept[AnalysisException] {
+        left.crossJoin(dual).queryExecution.analyzed
+      },
+      condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.MISSING_JOIN_CONDITION",
+      parameters = Map.empty)
+  }
+
   test("an external lookup join is a stream-static join with the lookup-only table on the right") {
     val lookup = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
     val batch = Seq(1).toDF("id")
