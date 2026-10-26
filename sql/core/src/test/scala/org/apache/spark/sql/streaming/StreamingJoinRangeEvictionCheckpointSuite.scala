@@ -31,7 +31,9 @@ import org.apache.spark.sql.execution.streaming.runtime.MemoryStream
 import org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.tags.SlowSQLTest
 
+@SlowSQLTest
 class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
   import testImplicits._
 
@@ -113,8 +115,8 @@ class StreamingJoinRangeEvictionCheckpointSuite extends StreamTest {
   for {
     version <- Seq(2, 3, 4)
     logVersion <- Seq(1, 2)
-    oldMarker <- Seq[Option[String]](None) ++
-      (0 until currentMarker.toInt).map(v => Some(v.toString))
+    // Every marker below the current one takes the same rejection branch.
+    oldMarker <- Seq(None, Some("0"), Some((currentMarker.toInt - 1).toString)).distinct
   } {
     test(s"reject old range-column checkpoint, V$version log=$logVersion marker=$oldMarker") {
       withJoinConf(version, logVersion) {
