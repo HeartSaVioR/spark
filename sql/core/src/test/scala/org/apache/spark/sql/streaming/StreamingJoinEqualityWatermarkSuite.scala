@@ -223,4 +223,40 @@ class StreamingJoinEqualityWatermarkSuite extends StreamTest {
       }
     }
   }
+
+  for {
+    version <- Seq(2, 3, 4)
+    zone <- Seq("America/Los_Angeles", "UTC")
+  } {
+    test(s"equality on an opposite event time shifted by one day, V$version $zone") {
+      withSQLConf(
+        SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key -> version.toString,
+        SQLConf.STATE_STORE_PROVIDER_CLASS.key -> classOf[RocksDBStateStoreProvider].getName,
+        SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false",
+        SQLConf.SESSION_LOCAL_TIMEZONE.key -> zone) {
+        val leftInput = MemoryStream[(Int, Long)]
+        val rightInput = MemoryStream[(Int, Long)]
+        val left = leftInput.toDF().toDF("lk", "ms")
+          .select($"lk", timestamp_millis($"ms").as("lt"))
+          .withWatermark("lt", "0 seconds")
+        val right = rightInput.toDF().toDF("rk", "ms")
+          .select($"rk", timestamp_millis($"ms").as("rt"))
+          .withWatermark("rt", "0 seconds")
+        val joined = left.join(right, expr("lk = rk AND lt = rt + INTERVAL 1 DAY"))
+          .select($"lk", $"rk")
+        // rightTime is 2024-03-09T20:00Z. One day later is 2024-03-10T19:00Z in Los Angeles,
+        // 23 hours across the spring-forward change, and 2024-03-10T20:00Z in UTC.
+        val rightTime = 1710014400000L
+        val leftTime = if (zone == "UTC") 1710100800000L else 1710097200000L
+        testStream(joined)(
+          MultiAddData(leftInput, (1, leftTime))(rightInput, (9, 1710012600000L)),
+          CheckNewAnswer(),
+          // Evicts at watermark 2024-03-09T19:30Z, below rightTime.
+          AddData(rightInput, (9, 1710012660000L)),
+          CheckNewAnswer(),
+          AddData(rightInput, (1, rightTime)),
+          CheckNewAnswer(Row(1, 1)))
+      }
+    }
+  }
 }

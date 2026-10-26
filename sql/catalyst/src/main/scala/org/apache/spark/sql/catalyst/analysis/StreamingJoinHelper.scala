@@ -24,6 +24,7 @@ import org.apache.spark.internal.LogKeys._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark._
 import org.apache.spark.sql.catalyst.util.DateTimeConstants.MICROS_PER_DAY
+import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.CalendarInterval
 
@@ -122,22 +123,38 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
    * CAST(CAST(rightTime AS BIGINT) AS TIMESTAMP) can map a later event time below the watermark.
    */
   private def isIntervalShift(expr: Expression, eventTime: Attribute): Boolean = {
-    def isInterval(e: Expression): Boolean = e.foldable && (e.dataType match {
-      case CalendarIntervalType | _: DayTimeIntervalType => true
-      case _ => false
-    })
+    // Spark adds the whole days of an interval in the session time zone, where a day can be 23
+    // or 25 hours across a daylight saving change, but the solver counts a day as 24 hours.
+    // Accept whole days only in a fixed-offset time zone.
+    def isExactInterval(e: Expression, timeZoneId: Option[String]): Boolean = {
+      def fixedOffset: Boolean =
+        timeZoneId.exists(id => DateTimeUtils.getZoneId(id).getRules.isFixedOffset)
+      e.foldable && (e.dataType match {
+        case _: DayTimeIntervalType =>
+          Option(e.eval()).exists { v =>
+            math.abs(v.asInstanceOf[Long]) < MICROS_PER_DAY || fixedOffset
+          }
+        case CalendarIntervalType =>
+          Option(e.eval()).exists { v =>
+            val interval = v.asInstanceOf[CalendarInterval]
+            interval.months == 0 && (interval.days == 0 || fixedOffset)
+          }
+        case _ => false
+      })
+    }
     expr match {
       case a: Attribute => a.semanticEquals(eventTime)
       // The analyzer wraps timestamp + interval in a cast to the same timestamp type.
       case Cast(child, TimestampType, _, _) if child.dataType == TimestampType =>
         isIntervalShift(child, eventTime)
-      case TimestampAddInterval(start, interval, _) =>
-        isInterval(interval) && isIntervalShift(start, eventTime)
+      case TimestampAddInterval(start, interval, timeZoneId) =>
+        isExactInterval(interval, timeZoneId) && isIntervalShift(start, eventTime)
       case DatetimeSub(_, _, replacement) => isIntervalShift(replacement, eventTime)
       case Add(left, right, _) =>
-        isInterval(right) && isIntervalShift(left, eventTime) ||
-          isInterval(left) && isIntervalShift(right, eventTime)
-      case Subtract(left, right, _) => isInterval(right) && isIntervalShift(left, eventTime)
+        isExactInterval(right, None) && isIntervalShift(left, eventTime) ||
+          isExactInterval(left, None) && isIntervalShift(right, eventTime)
+      case Subtract(left, right, _) =>
+        isExactInterval(right, None) && isIntervalShift(left, eventTime)
       case _ => false
     }
   }

@@ -22,6 +22,7 @@ import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference,
 import org.apache.spark.sql.catalyst.optimizer.SimpleTestOptimizer
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.plans.logical.{EventTimeWatermark, Filter, LeafNode, Statistics}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{IntegerType, LongType, MetadataBuilder, TimestampType}
 
 class StreamingJoinHelperSuite extends AnalysisTest {
@@ -98,6 +99,32 @@ class StreamingJoinHelperSuite extends AnalysisTest {
         assert(StreamingJoinHelper.getStateKeyWatermarkOrdinal(
           keys, Seq(eventTime, other)) === keyWatermark.map(_ => 0))
       }
+    }
+  }
+
+  test("equality key watermark with a day-sized shift needs a fixed-offset time zone") {
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val eventTime = AttributeReference("eventTime", TimestampType, metadata = metadata)()
+
+    case class DummyLeafNode() extends LeafNode {
+      override def output: Seq[Attribute] = Seq(eventTime)
+      override def computeStats(): Statistics = Statistics(sizeInBytes = BigInt(0))
+    }
+
+    // Spark adds whole days in the session time zone, where a day can be 23 or 25 hours.
+    Seq("UTC" -> Some(10000L + 86400000L - 1), "America/Los_Angeles" -> None).foreach {
+      case (zone, expected) =>
+        withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> zone) {
+          val plan = Filter(EqualTo(
+            CatalystSqlParser.parseExpression("eventTime + INTERVAL 1 DAY"), Literal(null)),
+            DummyLeafNode())
+          val key = SimpleAnalyzer.execute(plan).asInstanceOf[Filter].condition
+            .asInstanceOf[EqualTo].left
+          withClue(zone) {
+            assert(StreamingJoinHelper.getStateKeyWatermark(
+              Seq(key), Seq(eventTime), 0, Some(10000L)) === expected)
+          }
+        }
     }
   }
 
