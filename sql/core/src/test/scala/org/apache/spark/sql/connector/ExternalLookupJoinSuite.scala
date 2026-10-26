@@ -614,14 +614,16 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
   test("external lookup preserves non-deterministic projection and filter boundaries") {
     val rawLookup = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
     val lookup = rawLookup
-      .select($"id", rand(0).as("sample"))
-      .filter($"sample" >= 0)
-      .select($"id")
-    val left = streamOf(Seq(1).toDF("id"))
+      .select($"id", $"department", rand(3).as("sample"))
+      .filter($"sample" >= 0.5)
+      .select($"id", $"department")
+    // Both copies of key 1 share one looked-up row set, and the seeded sample is drawn once per
+    // looked-up row, so the duplicates must see the same rows.
+    val left = streamOf(Seq(1, 1, 2).toDF("id"))
 
     checkStream(
       left.join(lookup, left("id") === lookup("id"), "inner"),
-      Seq(Row(1, 1), Row(1, 1)))
+      Seq(Row(1, 1, "research"), Row(1, 1, "research"), Row(2, 2, "sales")))
   }
 
   test("external lookup hint rejects invalid placement and relation targets") {
