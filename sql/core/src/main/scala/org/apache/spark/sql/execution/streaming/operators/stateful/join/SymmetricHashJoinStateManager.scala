@@ -277,24 +277,20 @@ class SymmetricHashJoinStateManagerV4(
 
   private val random = new scala.util.Random(System.currentTimeMillis())
   private val bucketCountWithoutTimestamp = 1024
-  private val extractTimestampFromValue: UnsafeRow => Long = { row =>
-    valueTimestampColumnOrdinal match {
-      case Some(idx) =>
-        val attr = inputValueAttributes(idx)
-
-        if (attr.dataType.isInstanceOf[StructType]) {
-          // NOTE: We assume this is window struct, as same as WatermarkSupport.watermarkExpression
-          row.getStruct(idx, 2).getLong(1)
-        } else {
-          row.getLong(idx)
-        }
-
-      case _ =>
-        // When no timestamp column is available, we will use random bucketing strategy to decide
-        // where the new value will be stored. There is a trade-off between the bucket size and the
-        // number of values in each bucket; we can tune the bucket size with the configuration if
-        // we figure out the magic number to not work well.
-        random.nextInt(bucketCountWithoutTimestamp)
+  // A null indexed timestamp makes the value-eviction predicate SQL-unknown, so V2 and V3 never
+  // evict such a row. Return None for it, so it is kept out of the timestamp eviction index.
+  private val extractTimestampFromValue: UnsafeRow => Option[Long] = { row =>
+    valueTimestampColumnOrdinal.flatMap { idx =>
+      val attr = inputValueAttributes(idx)
+      if (row.isNullAt(idx)) {
+        None
+      } else if (attr.dataType.isInstanceOf[StructType]) {
+        // NOTE: We assume this is window struct, as same as WatermarkSupport.watermarkExpression
+        val window = row.getStruct(idx, 2)
+        if (window.isNullAt(1)) None else Some(window.getLong(1))
+      } else {
+        Some(row.getLong(idx))
+      }
     }
   }
 
@@ -446,11 +442,16 @@ class SymmetricHashJoinStateManagerV4(
   private val tsWithKey = new TsWithKeyTypeStore
 
   override def append(key: UnsafeRow, value: UnsafeRow, matched: Boolean): Unit = {
-    val timestamp = extractTimestampFromKey(key).getOrElse(extractTimestampFromValue(value))
+    val timestamp = extractTimestampFromKey(key).orElse(extractTimestampFromValue(value))
+    // When no timestamp is available, we will use random bucketing strategy to decide where the
+    // new value will be stored. There is a trade-off between the bucket size and the number of
+    // values in each bucket; we can tune the bucket size with the configuration if we figure out
+    // the magic number to not work well.
     // We always do blind merge for appending new value.
-    keyWithTsToValues.append(key, timestamp, value, matched)
-    if (hasTimestampForEviction) {
-      tsWithKey.add(timestamp, key)
+    keyWithTsToValues.append(
+      key, timestamp.getOrElse(random.nextInt(bucketCountWithoutTimestamp)), value, matched)
+    if (hasTimestampForEviction && timestamp.isDefined) {
+      tsWithKey.add(timestamp.get, key)
     }
   }
 
