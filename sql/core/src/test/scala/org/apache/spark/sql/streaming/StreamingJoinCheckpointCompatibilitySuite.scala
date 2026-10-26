@@ -35,8 +35,10 @@ import org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{IntegerType, MetadataBuilder, TimestampType}
+import org.apache.spark.tags.SlowSQLTest
 import org.apache.spark.util.Utils
 
+@SlowSQLTest
 class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
   import testImplicits._
 
@@ -163,8 +165,8 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
   for {
     version <- Seq(1, 2, 3, 4)
     logVersion <- Seq(1, 2)
-    oldMarker <- Seq[Option[String]](None) ++
-      (0 until currentMarker.toInt).map(v => Some(v.toString))
+    // Every marker below the current one takes the same rejection branch.
+    oldMarker <- Seq(None, Some("0"), Some((currentMarker.toInt - 1).toString)).distinct
     shape <- Seq("range", "expiry", "pruned expiry", "unbounded")
   } {
     test(s"reject old $shape checkpoint, V$version log=$logVersion old=$oldMarker") {
@@ -287,6 +289,9 @@ class StreamingJoinCheckpointCompatibilitySuite extends StreamTest {
       }
     }
   }
+
+  // Both bundled historical join checkpoints are range joins, which are rejected, so they no
+  // longer cover resuming from old state. No historical equality-join checkpoint is bundled.
   Seq("2.4.0", "3.5.1").foreach { sparkVersion =>
     test(s"reject the historical Spark $sparkVersion range checkpoint") {
       val input = MemoryStream[(Int, Long)]

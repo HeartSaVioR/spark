@@ -29,7 +29,7 @@ import org.apache.spark.internal.LogKeys.{BATCH_TIMESTAMP, ERROR}
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.QueryPlanningTracker
 import org.apache.spark.sql.catalyst.analysis.WidenStatefulOperatorAttributeNullability
-import org.apache.spark.sql.catalyst.expressions.{And, CurrentBatchTimestamp, EqualTo, ExpressionWithRandomSeed}
+import org.apache.spark.sql.catalyst.expressions.{CurrentBatchTimestamp, ExpressionWithRandomSeed}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern._
@@ -730,10 +730,12 @@ class IncrementalExecution(
           case j: StreamingSymmetricHashJoinExec
               if !StreamingSymmetricHashJoinHelper.isWatermarkCheckpointCompatible(
                 j.left.output, j.right.output, j.leftKeys, j.rightKeys) =>
-            val conditions = j.leftKeys.zip(j.rightKeys).map { case (left, right) =>
-              EqualTo(left, right)
-            } ++ j.condition.full
-            val joinCondition = conditions.reduceOption(And).map(_.sql).getOrElse("none")
+            // Name the side of each equality key; both inputs often use the same column names.
+            val keyConditions = j.leftKeys.zip(j.rightKeys).map { case (left, right) =>
+              s"left.${left.sql} = right.${right.sql}"
+            }
+            val conditions = keyConditions ++ j.condition.full.map(_.sql)
+            val joinCondition = if (conditions.isEmpty) "none" else conditions.mkString(" AND ")
             throw new AnalysisException(
               errorClass = "STREAMING_JOIN_CHECKPOINT_INCOMPATIBLE",
               messageParameters = Map(

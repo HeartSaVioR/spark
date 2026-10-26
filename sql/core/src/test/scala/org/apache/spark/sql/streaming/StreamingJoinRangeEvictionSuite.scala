@@ -23,7 +23,9 @@ import org.apache.spark.sql.execution.streaming.runtime.MemoryStream
 import org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.tags.SlowSQLTest
 
+@SlowSQLTest
 class StreamingJoinRangeEvictionSuite extends StreamTest {
   import testImplicits._
 
@@ -34,10 +36,13 @@ class StreamingJoinRangeEvictionSuite extends StreamTest {
       SQLConf.STREAMING_NO_DATA_MICRO_BATCHES_ENABLED.key -> "false")(f)
   }
 
+  // V3 shares V2's eviction code. BETWEEN is replaced by the conjunction before planning, so it
+  // only adds coverage for the outer-join watermark check during analysis.
   for {
-    version <- Seq(2, 3, 4)
+    version <- Seq(2, 4)
     joinType <- Seq("inner", "left_outer", "right_outer")
     shape <- Seq("between", "conjunction", "upper", "interval", "downstream")
+    if shape != "between" || joinType != "inner"
   } {
     test(s"range eviction uses bounded timestamp, V$version $joinType $shape") {
       withJoinConf(version) {

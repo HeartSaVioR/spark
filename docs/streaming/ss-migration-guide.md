@@ -25,7 +25,7 @@ Please refer [Migration Guide: SQL, Datasets and DataFrame](../sql-migration-gui
 
 ## Upgrading from Structured Streaming 4.3 to 4.4
 
-- Spark 4.4 preserves the output watermark of a stream-stream join when retained state can
+- Spark 4.4 holds back the output watermark of a stream-stream join when retained state can
   still emit old event times. Downstream stateful operators may retain more state, take longer
   to finalize results, or stop making progress while the join has no event-time eviction bound.
 
