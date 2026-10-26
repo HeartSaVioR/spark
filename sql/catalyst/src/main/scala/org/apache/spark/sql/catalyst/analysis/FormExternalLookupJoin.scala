@@ -25,9 +25,9 @@ import org.apache.spark.sql.catalyst.expressions.{CommonExpressionRef, Expressio
   SubqueryExpression, With}
 import org.apache.spark.sql.catalyst.optimizer.EliminateResolvedHint
 import org.apache.spark.sql.catalyst.plans.{Inner, LeftOuter}
-import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupHint, ExternalLookupJoin, Join,
-  JoinStrategyHint, LogicalPlan, ResolvedHint, SubqueryAlias, UnresolvedHint, UnresolvedWith,
-  View}
+import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupHint, ExternalLookupJoin,
+  Filter, Join, JoinStrategyHint, LogicalPlan, Project, ResolvedHint, SubqueryAlias,
+  UnresolvedHint, UnresolvedWith, View}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.{COMMON_EXPR_REF, EXTERNAL_LOOKUP_HINT, JOIN,
   WITH_EXPRESSION}
@@ -136,7 +136,8 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
    * read by a nested join does not make the outer join a lookup candidate.
    */
   private def accessPath(plan: LogicalPlan): Seq[LogicalPlan] = plan match {
-    case node @ (_: ExternalLookupHint | _: ResolvedHint) =>
+    case node @ (_: ExternalLookupHint | _: ResolvedHint | _: SubqueryAlias | _: View |
+        _: Project | _: Filter) =>
       node +: accessPath(node.children.head)
     case other => Seq(other)
   }
@@ -146,7 +147,7 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
 
   private def removeLookupHints(plan: LogicalPlan): LogicalPlan = plan match {
     case marker: ExternalLookupHint => removeLookupHints(marker.child)
-    case node: ResolvedHint =>
+    case node @ (_: ResolvedHint | _: SubqueryAlias | _: View | _: Project | _: Filter) =>
       node.withNewChildren(Seq(removeLookupHints(node.children.head)))
     case other => other
   }

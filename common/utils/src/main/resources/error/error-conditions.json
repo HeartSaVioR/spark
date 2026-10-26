@@ -2903,7 +2903,7 @@
       },
       "LOOKUP_PLAN" : {
         "message" : [
-          "The lookup side must be a DSv2 table, with no other operator between the table and the join."
+          "The lookup side must be a DSv2 table, with no projection or filter left between the table and the join after optimization."
         ]
       },
       "LOOKUP_TABLE_ON_LEFT" : {

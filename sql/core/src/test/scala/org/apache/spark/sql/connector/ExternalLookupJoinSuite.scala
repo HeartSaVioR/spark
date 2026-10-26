@@ -178,6 +178,38 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       parameters = Map("table" -> "`DualCapabilityExternalLookupTable`"))
   }
 
+  test("an ordinary join over an enriched lookup join result stays ordinary") {
+    val lookup = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
+    val events = Seq(1, 2).toDF("id")
+    val enriched = events.join(lookup, events("id") === lookup("id"))
+      .select(events("id").as("event_id"), lookup("department"))
+    val base = Seq((1, "a"), (2, "b")).toDF("id", "tag")
+    val expected = Seq(
+      Row(1, "a", 1, "engineering"), Row(1, "a", 1, "research"), Row(2, "b", 2, "sales"))
+    def lookupJoinCount(df: DataFrame): Int =
+      df.queryExecution.optimizedPlan.collect { case j: PreparedExternalLookupJoin => j }.size
+
+    val joined = base.join(enriched, base("id") === enriched("event_id"))
+    assert(lookupJoinCount(joined) === 1)
+    checkAnswer(joined, expected)
+
+    withTempView("external_lookup_base", "external_lookup_events", "external_lookup_right") {
+      base.createOrReplaceTempView("external_lookup_base")
+      events.createOrReplaceTempView("external_lookup_events")
+      lookup.createOrReplaceTempView("external_lookup_right")
+      val sqlJoined = sql(
+        """
+          |SELECT b.id, b.tag, e.event_id, e.department
+          |FROM external_lookup_base b JOIN (
+          |  SELECT v.id AS event_id, r.department
+          |  FROM external_lookup_events v JOIN external_lookup_right r ON v.id = r.id) e
+          |ON b.id = e.event_id
+          |""".stripMargin)
+      assert(lookupJoinCount(sqlJoined) === 1)
+      checkAnswer(sqlJoined, expected)
+    }
+  }
+
   test("a physical strategy hint does not disable lookup for a lookup-only table") {
     val lookup = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
     val left = Seq(1, 3).toDF("id")
@@ -205,6 +237,24 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
           "GROUP BY id"),
         Seq(Row(1, 2), Row(2, 1)))
     }
+  }
+
+  test("an external lookup hint is found beneath an alias on either join side") {
+    val dual = spark.read.format(classOf[DualCapabilityExternalLookupDataSource].getName).load()
+    val left = Seq(1).toDF("id")
+
+    val aliased = dual.hint("external_lookup").as("r")
+    val joined = left.join(aliased, left("id") === $"r.id")
+    assert(joined.queryExecution.optimizedPlan.exists(_.isInstanceOf[PreparedExternalLookupJoin]))
+    checkAnswer(joined, Seq(Row(1, 1, "engineering"), Row(1, 1, "research")))
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        left.hint("external_lookup").as("l").join(dual, $"l.id" === dual("id"))
+          .queryExecution.analyzed
+      },
+      condition = "INVALID_EXTERNAL_LOOKUP_HINT.NOT_ON_LOOKUP_SIDE",
+      parameters = Map.empty)
   }
 
   test("a strategy hint on a nested join does not disable an outer lookup join") {
@@ -564,6 +614,41 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       Map("joinType" -> "FULL OUTER", "relation" -> "`SimpleExternalLookupTable`"))
   }
 
+  test("catalog-resolved tables follow the same lookup selection") {
+    withSQLConf(
+        s"spark.sql.catalog.$ExternalLookupCatalogName" ->
+          classOf[ExternalLookupTestCatalog].getName) {
+      withTempView("external_lookup_left") {
+        Seq(1, 3).toDF("id").createOrReplaceTempView("external_lookup_left")
+        def query(table: String, hint: String = ""): DataFrame = sql(
+          s"""
+            |SELECT $hint l.id, r.department
+            |FROM external_lookup_left l
+            |LEFT JOIN $ExternalLookupCatalogName.ns.$table r ON l.id = r.id
+            |""".stripMargin)
+        val expected = Seq(Row(1, "engineering"), Row(1, "research"), Row(3, null))
+        def usesLookup(df: DataFrame): Boolean =
+          df.queryExecution.optimizedPlan.exists(_.isInstanceOf[PreparedExternalLookupJoin])
+
+        SimpleExternalLookupDataSource.resetCounters()
+        val lookupOnly = query("lookup")
+        assert(usesLookup(lookupOnly))
+        checkAnswer(lookupOnly, expected)
+        assert(SimpleExternalLookupDataSource.requestCount.get() > 0)
+
+        SimpleExternalLookupDataSource.resetCounters()
+        val dual = query("dual")
+        assert(!usesLookup(dual))
+        checkAnswer(dual, expected)
+        assert(SimpleExternalLookupDataSource.readerCount.get() === 0)
+
+        val hintedDual = query("dual", "/*+ EXTERNAL_LOOKUP(r) */")
+        assert(usesLookup(hintedDual))
+        checkAnswer(hintedDual, expected)
+      }
+    }
+  }
+
   test("a named external lookup hint targets unaliased, multipart, and aliased relations") {
     withSQLConf(
         s"spark.sql.catalog.$ExternalLookupCatalogName" ->
@@ -603,6 +688,38 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
           condition = "INVALID_EXTERNAL_LOOKUP_HINT.RELATION_NOT_FOUND",
           parameters = Map("relations" -> "`external_lookup_right`"))
       }
+    }
+  }
+
+  test("a catalog-resolved table can be composed into DataFrame joins") {
+    withSQLConf(
+        s"spark.sql.catalog.$ExternalLookupCatalogName" ->
+          classOf[ExternalLookupTestCatalog].getName) {
+      val left = Seq(1, 3).toDF("id")
+      val expected = Seq(Row(1, 1, "engineering"), Row(1, 1, "research"), Row(3, null, null))
+      def usesLookup(df: DataFrame): Boolean =
+        df.queryExecution.optimizedPlan.exists(_.isInstanceOf[PreparedExternalLookupJoin])
+
+      val lookupOnly = spark.table(s"$ExternalLookupCatalogName.ns.lookup")
+      val lookupJoin = left.join(lookupOnly, left("id") === lookupOnly("id"), "left_outer")
+      assert(usesLookup(lookupJoin))
+      checkAnswer(lookupJoin, expected)
+
+      val dual = spark.table(s"$ExternalLookupCatalogName.ns.dual")
+      val ordinary = left.join(dual, left("id") === dual("id"), "left_outer")
+      assert(!usesLookup(ordinary))
+      checkAnswer(ordinary, expected)
+      val hinted = dual.hint("external_lookup")
+      val hintedJoin = left.join(hinted, left("id") === hinted("id"), "left_outer")
+      assert(usesLookup(hintedJoin))
+      checkAnswer(hintedJoin, expected)
+
+      checkError(
+        exception = intercept[AnalysisException] { lookupOnly.collect() },
+        condition = "UNSUPPORTED_FEATURE.TABLE_OPERATION",
+        parameters = Map(
+          "tableName" -> "`SimpleExternalLookupTable`",
+          "operation" -> "batch scan"))
     }
   }
 
