@@ -18,12 +18,13 @@
 package org.apache.spark.sql.catalyst.analysis
 
 import org.apache.spark.sql.catalyst.dsl.expressions._
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, AttributeSet, EqualTo, Expression, Literal}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, AttributeSet, EqualTo, Expression, Literal, TimestampAddInterval}
 import org.apache.spark.sql.catalyst.optimizer.SimpleTestOptimizer
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.plans.logical.{EventTimeWatermark, Filter, LeafNode, Statistics}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{IntegerType, LongType, MetadataBuilder, TimestampType}
+import org.apache.spark.unsafe.types.CalendarInterval
 
 class StreamingJoinHelperSuite extends AnalysisTest {
 
@@ -100,19 +101,39 @@ class StreamingJoinHelperSuite extends AnalysisTest {
       override def computeStats(): Statistics = Statistics(sizeInBytes = BigInt(0))
     }
 
+    def resolve(keyStr: String): Expression = {
+      val plan = Filter(EqualTo(CatalystSqlParser.parseExpression(keyStr), Literal(null)),
+        DummyLeafNode())
+      SimpleAnalyzer.execute(plan).asInstanceOf[Filter].condition.asInstanceOf[EqualTo].left
+    }
+    def watermark(key: Expression): Option[Long] =
+      StreamingJoinHelper.getStateKeyWatermark(Seq(key), Seq(eventTime), 0, Some(10000L))
+
     // Spark adds whole days in the session time zone, where a day can be 23 or 25 hours.
-    Seq("UTC" -> Some(10000L + 86400000L - 1), "America/Los_Angeles" -> None).foreach {
-      case (zone, expected) =>
-        withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> zone) {
-          val plan = Filter(EqualTo(
-            CatalystSqlParser.parseExpression("eventTime + INTERVAL 1 DAY"), Literal(null)),
-            DummyLeafNode())
-          val key = SimpleAnalyzer.execute(plan).asInstanceOf[Filter].condition
-            .asInstanceOf[EqualTo].left
-          withClue(zone) {
-            assert(StreamingJoinHelper.getStateKeyWatermark(
-              Seq(key), Seq(eventTime), 0, Some(10000L)) === expected)
-          }
+    val day = 86400000L
+    Seq(
+      ("eventTime + INTERVAL 1 DAY", Some(10000L + day - 1)),
+      ("eventTime - INTERVAL 36 HOURS", Some(10000L - day * 3 / 2 - 1))).foreach {
+      case (keyStr, utcWatermark) =>
+        Seq("UTC" -> utcWatermark, "America/Los_Angeles" -> None).foreach {
+          case (zone, expected) =>
+            withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> zone) {
+              withClue(s"$keyStr $zone") {
+                assert(watermark(resolve(keyStr)) === expected)
+              }
+            }
+        }
+    }
+
+    // A calendar interval counts its days the same way; its microseconds are always exact.
+    Seq(
+      (new CalendarInterval(0, 1, 0), "UTC", Some(10000L + day - 1)),
+      (new CalendarInterval(0, 1, 0), "America/Los_Angeles", None),
+      (new CalendarInterval(0, 0, 2000000L), "America/Los_Angeles", Some(11999L))).foreach {
+      case (interval, zone, expected) =>
+        withClue(s"$interval $zone") {
+          assert(watermark(
+            TimestampAddInterval(eventTime, Literal(interval), Some(zone))) === expected)
         }
     }
   }
