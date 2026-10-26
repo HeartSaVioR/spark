@@ -93,16 +93,12 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
     }
     val relation = lookupTable.map(table => toSQLId(table.name())).getOrElse("the lookup side")
     if (!join.left.isStreaming) return ineligible("STATIC_LEFT_SIDE", relation)
-    // A join hint the user wrote on a lookup-only join is never silently dropped: an external
-    // lookup join cannot run a physical join strategy, and a lookup-only table has no batch scan
-    // for one.
+    // A join hint the user wrote is never silently dropped: an external lookup join cannot run a
+    // physical join strategy, and a lookup-only table has no batch scan for one.
     joinStrategyHint(join) match {
-      case Some(strategy) if lookupOnly =>
+      case Some(strategy) =>
         ineligible("CONFLICTING_JOIN_STRATEGY", relation,
           Map("strategy" -> toSQLStmt(strategy.displayName)))
-      // A lookup-only table has no batch scan, so a physical strategy hint cannot apply to it.
-      // For a table that also supports batch reads, the strategy hint wins.
-      case Some(_) => NotLookupJoin
       case None if join.condition.isEmpty => MissingCondition
       case None if !SupportedJoinTypes.contains(join.joinType) =>
         ineligible("JOIN_TYPE", relation, Map(

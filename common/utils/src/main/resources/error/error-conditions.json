@@ -2893,7 +2893,7 @@
       },
       "CONFLICTING_JOIN_STRATEGY" : {
         "message" : [
-          "The join strategy hint <strategy> cannot be honored by an external lookup join over <relation>. Remove the <strategy> hint."
+          "The join strategy hint <strategy> cannot be honored by an external lookup join over <relation>. Remove the <strategy> hint, or the `EXTERNAL_LOOKUP` hint if the table also supports batch reads."
         ]
       },
       "JOIN_TYPE" : {

@@ -52,7 +52,8 @@ import org.apache.spark.sql.execution.streaming.operators.stateful.StreamingDedu
 import org.apache.spark.sql.execution.streaming.runtime.{IncrementalExecution, MemoryStream,
   StreamingQueryWrapper}
 import org.apache.spark.sql.execution.streaming.sources.LowLatencyMemoryStream
-import org.apache.spark.sql.functions.{coalesce, col, concat, expr, length, lit, to_json}
+import org.apache.spark.sql.functions.{broadcast, coalesce, col, concat, expr, length, lit,
+  to_json}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.{StreamingQueryException, StreamRealTimeModeE2ESuiteBase}
 import org.apache.spark.sql.test.SharedSparkSession
@@ -146,18 +147,35 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
     assert(SimpleExternalLookupDataSource.requestCount.get() > 0)
   }
 
-  test("a physical join strategy hint overrides the external lookup hint") {
-    SimpleExternalLookupDataSource.resetCounters()
-    val lookup = spark.read
-      .format(classOf[DualCapabilityExternalLookupDataSource].getName)
-      .load()
-      .hint("external_lookup")
-      .hint("merge")
+  test("a physical join strategy hint conflicts with the external lookup hint") {
+    val dual = spark.read.format(classOf[DualCapabilityExternalLookupDataSource].getName).load()
     val left = Seq(1).toDF("id")
-    val joined = left.join(lookup, left("id") === lookup("id"), "inner")
+    Seq(
+      "broadcast" -> "BROADCAST",
+      "merge" -> "MERGE",
+      "shuffle_hash" -> "SHUFFLE_HASH",
+      "shuffle_replicate_nl" -> "SHUFFLE_REPLICATE_NL").foreach { case (hint, strategy) =>
+      val lookupSide = dual.hint("external_lookup").hint(hint)
+      val streamSide = left.hint(hint)
+      val hinted = dual.hint("external_lookup")
+      Seq(
+        () => left.join(lookupSide, left("id") === lookupSide("id")),
+        () => streamSide.join(hinted, streamSide("id") === hinted("id"))).foreach { query =>
+        checkError(
+          exception = intercept[AnalysisException] { query().queryExecution.analyzed },
+          condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.CONFLICTING_JOIN_STRATEGY",
+          parameters = Map(
+            "strategy" -> strategy,
+            "relation" -> "`DualCapabilityExternalLookupTable`"))
+      }
+    }
 
-    assert(!joined.queryExecution.optimizedPlan.exists(_.isInstanceOf[PreparedExternalLookupJoin]))
-    checkAnswer(joined, Seq(Row(1, 1, "engineering"), Row(1, 1, "research")))
+    // Without the lookup hint, the strategy hint plans the ordinary join it asks for.
+    SimpleExternalLookupDataSource.resetCounters()
+    val ordinary = left.join(dual.hint("merge"), left("id") === dual("id"))
+    assert(!ordinary.queryExecution.optimizedPlan.exists(
+      _.isInstanceOf[PreparedExternalLookupJoin]))
+    checkAnswer(ordinary, Seq(Row(1, 1, "engineering"), Row(1, 1, "research")))
     assert(SimpleExternalLookupDataSource.requestCount.get() === 0)
   }
 
@@ -176,6 +194,26 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       },
       condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.NO_LOOKUP_PREDICATE",
       parameters = Map("table" -> "`DualCapabilityExternalLookupTable`"))
+  }
+
+  test("a physical strategy hint on a lookup-only join is rejected") {
+    val lookup = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
+    val left = Seq(1, 3).toDF("id")
+    val withLookupHint = lookup.hint("external_lookup").hint("shuffle_hash")
+    Seq(
+      "BROADCAST" ->
+        (() => left.join(lookup.hint("broadcast"), left("id") === lookup("id"), "left_outer")),
+      "BROADCAST" ->
+        (() => left.join(broadcast(lookup), left("id") === lookup("id"), "left_outer")),
+      "MERGE" -> (() => left.hint("merge").join(lookup, left("id") === lookup("id"))),
+      "SHUFFLE_HASH" ->
+        (() => left.join(withLookupHint, left("id") === withLookupHint("id")))).foreach {
+      case (strategy, query) =>
+        checkError(
+          exception = intercept[AnalysisException] { query().queryExecution.analyzed },
+          condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.CONFLICTING_JOIN_STRATEGY",
+          parameters = Map("strategy" -> strategy, "relation" -> "`SimpleExternalLookupTable`"))
+    }
   }
 
   test("an ordinary join over an enriched lookup join result stays ordinary") {
@@ -207,18 +245,6 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
           |""".stripMargin)
       assert(lookupJoinCount(sqlJoined) === 1)
       checkAnswer(sqlJoined, expected)
-    }
-  }
-
-  test("a physical strategy hint does not disable lookup for a lookup-only table") {
-    val lookup = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
-    val left = Seq(1, 3).toDF("id")
-    val expected = Seq(Row(1, 1, "engineering"), Row(1, 1, "research"), Row(3, null, null))
-    Seq(
-      left.join(lookup.hint("broadcast"), left("id") === lookup("id"), "left_outer"),
-      left.hint("merge").join(lookup, left("id") === lookup("id"), "left_outer")).foreach { df =>
-      assert(df.queryExecution.optimizedPlan.exists(_.isInstanceOf[PreparedExternalLookupJoin]))
-      checkAnswer(df, expected)
     }
   }
 
