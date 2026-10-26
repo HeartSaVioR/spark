@@ -591,6 +591,19 @@ class UnsupportedOperationsSuite extends SparkFunSuite with SQLHelper {
         Seq("requires a watermark on the right input"))
     }
 
+    // Whole days are added in the session time zone, where a day can be 23 or 25 hours.
+    Seq("UTC" -> true, "America/Los_Angeles" -> false).foreach { case (zone, supported) =>
+      val dayShift = TimestampAddInterval(rightTime, Literal(Duration.ofDays(1)), Some(zone))
+      val plan = left.join(right, joinType = LeftOuter, condition = Some(leftTime === dayShift))
+      val name = s"LeftOuter with a key shifted by one day in $zone"
+      if (supported) {
+        assertSupportedInStreamingPlan(name, plan, OutputMode.Append())
+      } else {
+        assertNotSupportedInStreamingPlan(name, plan, OutputMode.Append(),
+          Seq("requires a watermark on the right input"))
+      }
+    }
+
     // Truncation can map a future right row below the watermark, so it does not bound the key.
     assertNotSupportedInStreamingPlan("LeftOuter with a key truncated from the right event time",
       left.join(right, joinType = LeftOuter,
