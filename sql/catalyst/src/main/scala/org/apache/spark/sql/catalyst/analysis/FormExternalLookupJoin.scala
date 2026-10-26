@@ -21,7 +21,7 @@ import scala.annotation.tailrec
 
 import org.apache.spark.sql.catalyst.expressions.SubqueryExpression
 import org.apache.spark.sql.catalyst.optimizer.EliminateResolvedHint
-import org.apache.spark.sql.catalyst.plans.{Inner, LeftOuter}
+import org.apache.spark.sql.catalyst.plans.{Inner, LeftAnti, LeftOuter, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupHint, ExternalLookupJoin, Join,
   JoinStrategyHint, LogicalPlan, ResolvedHint, SubqueryAlias, UnaryNode, View}
 import org.apache.spark.sql.catalyst.rules.Rule
@@ -56,7 +56,7 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
   /** The join must run as an external lookup join but cannot. */
   case class Ineligible(error: Throwable) extends Eligibility
 
-  private val SUPPORTED_JOIN_TYPES = Seq(Inner, LeftOuter)
+  private val SUPPORTED_JOIN_TYPES = Seq(Inner, LeftOuter, LeftSemi, LeftAnti)
 
   def apply(join: Join): Eligibility = {
     if (lookupHints(join.left).nonEmpty) {

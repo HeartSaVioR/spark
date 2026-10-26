@@ -2918,7 +2918,7 @@
       },
       "NO_LOOKUP_CANDIDATE" : {
         "message" : [
-          "The join condition has no lookup predicate that Spark can offer to table <table>. Spark offers only an equality `=` between a lookup column, with no cast or other expression applied to it, and an expression over the streaming side. If the lookup column is cast to match the streaming side, cast the streaming-side expression to the lookup column's type instead."
+          "The join condition has no lookup predicate that Spark can offer to table <table>. Spark offers only the comparisons `=`, `<=>`, `<`, `<=`, `>` and `>=` between a lookup column, with no cast or other expression applied to it, and an expression over the streaming side. If the lookup column is cast to match the streaming side, cast the streaming-side expression to the lookup column's type instead."
         ]
       },
       "NO_LOOKUP_PREDICATE" : {

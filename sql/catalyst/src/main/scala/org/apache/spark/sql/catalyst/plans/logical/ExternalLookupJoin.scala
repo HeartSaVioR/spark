@@ -18,8 +18,9 @@
 package org.apache.spark.sql.catalyst.plans.logical
 
 import org.apache.spark.SparkException
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Expression}
-import org.apache.spark.sql.catalyst.plans.{Inner, JoinType, LeftOuter}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Expression,
+  NamedExpression}
+import org.apache.spark.sql.catalyst.plans.{Inner, JoinType, LeftAnti, LeftOuter, LeftSemi}
 import org.apache.spark.sql.catalyst.trees.TreePattern.{EXTERNAL_LOOKUP_HINT, EXTERNAL_LOOKUP_JOIN,
   TreePattern}
 import org.apache.spark.sql.connector.read.{ExternalLookupReaderFactory, Scan}
@@ -64,12 +65,36 @@ case class ExternalLookupJoin(
   override def output: Seq[Attribute] = joinType match {
     case Inner => left.output ++ right.output
     case LeftOuter => left.output ++ right.output.map(_.withNullability(true))
+    case LeftSemi | LeftAnti => left.output
     case other => throw SparkException.internalError(s"Unexpected external lookup join type $other")
+  }
+
+  override def maxRows: Option[Long] = joinType match {
+    case LeftSemi | LeftAnti => left.maxRows
+    case _ => None
   }
 
   override protected def withNewChildrenInternal(
       newLeft: LogicalPlan,
       newRight: LogicalPlan): ExternalLookupJoin = copy(left = newLeft, right = newRight)
+}
+
+/** One optimized lookup-side operation, retained in evaluation order. */
+sealed trait ExternalLookupTransform {
+  def input: Seq[Attribute]
+  def output: Seq[Attribute]
+}
+
+case class ExternalLookupProject(
+    projectList: Seq[NamedExpression],
+    input: Seq[Attribute]) extends ExternalLookupTransform {
+  override def output: Seq[Attribute] = projectList.map(_.toAttribute)
+}
+
+case class ExternalLookupFilter(
+    condition: Expression,
+    input: Seq[Attribute]) extends ExternalLookupTransform {
+  override def output: Seq[Attribute] = input
 }
 
 /** A lookup join after its optimized lookup side has been converted to an external operation. */
@@ -81,6 +106,7 @@ case class PreparedExternalLookupJoin(
     maxParameterRowsPerRequest: Int,
     lookupInput: Seq[Attribute],
     lookupOutput: Seq[Attribute],
+    lookupTransforms: Seq[ExternalLookupTransform],
     lookupParameters: Seq[Expression],
     nullSafeParameters: Seq[Boolean],
     joinType: JoinType,
@@ -89,6 +115,7 @@ case class PreparedExternalLookupJoin(
   override def output: Seq[Attribute] = joinType match {
     case Inner => child.output ++ lookupOutput
     case LeftOuter => child.output ++ lookupOutput.map(_.withNullability(true))
+    case LeftSemi | LeftAnti => child.output
     case other => throw SparkException.internalError(s"Unexpected external lookup join type $other")
   }
 
