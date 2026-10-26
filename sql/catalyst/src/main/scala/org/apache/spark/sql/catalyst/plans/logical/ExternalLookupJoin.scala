@@ -26,9 +26,16 @@ import org.apache.spark.sql.catalyst.trees.TreePattern.{EXTERNAL_LOOKUP_HINT, EX
   TreePattern}
 import org.apache.spark.sql.connector.read.{ExternalLookupReaderFactory, Scan}
 
+case class ExternalLookupCacheOptions(
+    enabled: Boolean,
+    maxEntries: Int,
+    ttlMillis: Long,
+    maxRowsPerKey: Int)
+
 /**
  * Marks the plan below it as the lookup side that the `EXTERNAL_LOOKUP` hint asks an external
- * lookup join to read. The external lookup join rules consume it when they form the join.
+ * lookup join to read, with the hint's cache options. The external lookup join rules consume it
+ * when they form the join.
  *
  * Join strategy hints are [[ResolvedHint]] nodes with a [[JoinStrategyHint]]. This hint is not,
  * because that representation cannot keep two of its guarantees:
@@ -38,7 +45,9 @@ import org.apache.spark.sql.connector.read.{ExternalLookupReaderFactory, Scan}
  *  - It selects how the lookup side is read, not a physical join. `EliminateResolvedHint` moves
  *    every [[ResolvedHint]] it can attach into `Join.hint`, for physical join selection.
  */
-case class ExternalLookupHint(child: LogicalPlan) extends UnaryNode {
+case class ExternalLookupHint(
+    child: LogicalPlan,
+    cacheOptions: ExternalLookupCacheOptions) extends UnaryNode {
   override def output: Seq[Attribute] = child.output
 
   final override val nodePatterns: Seq[TreePattern] = Seq(EXTERNAL_LOOKUP_HINT)
@@ -60,6 +69,7 @@ case class ExternalLookupJoin(
     right: LogicalPlan,
     joinType: JoinType,
     condition: Option[Expression],
+    cacheOptions: ExternalLookupCacheOptions,
     requiredLookupOutput: Seq[Attribute]) extends BinaryNode {
 
   final override val nodePatterns: Seq[TreePattern] = Seq(EXTERNAL_LOOKUP_JOIN)
@@ -169,7 +179,8 @@ case class PreparedExternalLookupJoin(
     lookupParameters: Seq[Expression],
     nullSafeParameters: Seq[Boolean],
     joinType: JoinType,
-    residualCondition: Option[Expression]) extends UnaryNode {
+    residualCondition: Option[Expression],
+    cacheOptions: ExternalLookupCacheOptions) extends UnaryNode {
 
   override def output: Seq[Attribute] = joinType match {
     case Inner => child.output ++ lookupOutput
