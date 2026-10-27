@@ -32,9 +32,11 @@ import org.apache.spark.sql.{AnalysisException, DataFrame, Dataset}
 import org.apache.spark.sql.catalyst.plans.logical.{Deduplicate, EventTimeWatermark}
 import org.apache.spark.sql.catalyst.util.DateTimeConstants._
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.UTC
+import org.apache.spark.sql.execution.streaming.checkpointing.OffsetSeqMetadata
 import org.apache.spark.sql.execution.streaming.operators.stateful.{EventTimeStats, StateStoreSaveExec, StreamingDeduplicateExec}
 import org.apache.spark.sql.execution.streaming.runtime._
 import org.apache.spark.sql.execution.streaming.sources.MemorySink
+import org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider
 import org.apache.spark.sql.functions.{count, expr, struct, timestamp_seconds, to_timestamp, window}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.OutputMode._
@@ -664,7 +666,10 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
     }
   }
 
-  private def buildTestQueryForMultiEventTimeColumns(dedupColumns: Seq[String])
+  private def buildTestQueryForMultiEventTimeColumns(
+      dedupColumns: Seq[String],
+      joinCondition: String = "id1 = id2 AND ts1 >= ts2 + INTERVAL 10 SECONDS " +
+        "AND ts1 <= ts2 + INTERVAL 10 SECONDS")
     : (MemoryStream[(String, Long)], MemoryStream[(String, Long)], DataFrame) = {
     val input1 = MemoryStream[(String, Long)]
     val input2 = MemoryStream[(String, Long)]
@@ -676,7 +681,7 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
       .selectExpr("_1 AS id2", "timestamp_seconds(_2) AS ts2")
       .withWatermark("ts2", "2 minutes")
 
-    val joined = df1.join(df2, expr("id1 = id2 AND ts1 = ts2 + INTERVAL 10 SECONDS"), "inner")
+    val joined = df1.join(df2, expr(joinCondition), "inner")
       .selectExpr("id1", "ts1", "ts2")
     // the output of join contains both ts1 and ts2
     val dedup = joined.dropDuplicates(dedupColumns)
@@ -703,6 +708,50 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
       .map(_.name)
       .toSet
     assert(eventTimeColumns === Set(expected))
+  }
+
+  private def assertUnsafeAutomaticEventTimeSelection(df: DataFrame): Unit = {
+    withTempDir { checkpoint =>
+      val execution = new IncrementalExecution(
+        spark,
+        df.queryExecution.analyzed,
+        Append(),
+        checkpoint.getAbsolutePath,
+        ju.UUID.randomUUID(),
+        ju.UUID.randomUUID(),
+        currentBatchId = 0,
+        prevOffsetSeqMetadata = None,
+        offsetSeqMetadata = OffsetSeqMetadata(),
+        watermarkPropagator = WatermarkPropagator.noop(),
+        isFirstBatch = true)
+      val error = intercept[AnalysisException] {
+        execution.optimizedPlan
+      }
+      assert(error.getCondition === "MULTIPLE_EVENT_TIME_COLUMNS")
+    }
+  }
+
+  private def buildChainedJoinForEventTimeSelection(condition: String)
+      : (MemoryStream[(String, Long, Long)], MemoryStream[(String, Long, Long)],
+        MemoryStream[(String, Long, Long)], DataFrame) = {
+    val input1 = MemoryStream[(String, Long, Long)]
+    val input2 = MemoryStream[(String, Long, Long)]
+    val input3 = MemoryStream[(String, Long, Long)]
+    val df1 = input1.toDF()
+      .selectExpr("_1 AS id1", "timestamp_seconds(_2) AS ts1")
+      .withWatermark("ts1", "10 seconds")
+    val df2 = input2.toDF()
+      .selectExpr("_1 AS id2", "timestamp_seconds(_2) AS ts2")
+      .withWatermark("ts2", "10 seconds")
+    val df3 = input3.toDF()
+      .selectExpr("_1 AS id3", "timestamp_seconds(_2) AS ts3", "timestamp_seconds(_3) AS expiry")
+      .withWatermark("ts3", "10 seconds")
+    val firstJoin = df1.join(df2, expr(
+      "id1 = id2 AND ts1 >= ts2 - INTERVAL 1000 SECONDS " +
+        "AND ts1 <= ts2 - INTERVAL 1000 SECONDS"))
+    val joined = firstJoin.join(df3, expr(condition))
+      .selectExpr("id1", "CAST(ts1 AS LONG)", "CAST(ts2 AS LONG)", "CAST(ts3 AS LONG)")
+    (input1, input2, input3, joined)
   }
 
   test("stateful operator picks the first event time column when keys do not identify one") {
@@ -733,6 +782,87 @@ class EventTimeWatermarkSuite extends StreamTest with BeforeAndAfter with Matche
         CheckAnswer(("A", 200L, 190L)),
         assertDedupEventTimeColumn("ts2")
       )
+    }
+  }
+
+  test("compatibility mode keeps the first input event time when keys prefer another") {
+    withSQLConf(
+      SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE.key -> "false",
+      SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+      val (input1, input2, dedup) =
+        buildTestQueryForMultiEventTimeColumns(Seq("id1", "ts2", "ts1"))
+      testStream(dedup)(
+        MultiAddData(
+          (input1, Seq(("A", 200L))),
+          (input2, Seq(("A", 190L)))),
+        CheckAnswer(("A", 200L, 190L)),
+        Execute { query =>
+          val operator = query.lastExecution.executedPlan.collectFirst {
+            case deduplicate: StreamingDeduplicateExec => deduplicate
+          }.get
+          val eventTimeColumns = operator.watermarkExpressionForLateEvents.toSeq
+            .flatMap(_.references)
+            .map(_.name)
+            .toSet
+          assert(eventTimeColumns === Set("ts1"))
+        }
+      )
+    }
+  }
+
+  Seq(
+    "shifted equality" -> "id1 = id2 AND ts1 = ts2 + INTERVAL 10 SECONDS",
+    "one-sided range" -> "id1 = id2 AND ts1 > ts2 - INTERVAL 10 SECONDS",
+    "unbounded join" -> "id1 = id2"
+  ).foreach { case (description, condition) =>
+    test(s"automatic event time selection rejects $description lineage") {
+      withSQLConf(SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE.key -> "true") {
+        val (_, _, dedup) =
+          buildTestQueryForMultiEventTimeColumns(Seq("id1", "ts2"), condition)
+        assertUnsafeAutomaticEventTimeSelection(dedup)
+      }
+    }
+  }
+
+  Seq(
+    "different marked clocks" ->
+      "id1 = id3 AND ts1 < ts3 AND ts2 > ts3 - INTERVAL 10 SECONDS",
+    "an unmarked bound target" ->
+      ("id1 = id3 AND ts1 > ts3 - INTERVAL 10 SECONDS " +
+        "AND ts1 < ts3 + INTERVAL 10 SECONDS AND ts1 < expiry"),
+    "a missing reverse bound" -> "id1 = id3 AND ts1 > ts3 - INTERVAL 10 SECONDS"
+  ).foreach { case (description, condition) =>
+    test(s"automatic event time selection rejects $description") {
+      withSQLConf(SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE.key -> "true") {
+        val (_, _, _, joined) = buildChainedJoinForEventTimeSelection(condition)
+        assertUnsafeAutomaticEventTimeSelection(joined)
+      }
+    }
+  }
+
+  Seq(2, 3, 4).foreach { version =>
+    test(s"bounded event time selection recovers with join state format $version") {
+      withSQLConf(
+        SQLConf.STATEFUL_OPERATOR_ALLOW_MULTIPLE.key -> "true",
+        SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key -> version.toString,
+        SQLConf.STATE_STORE_PROVIDER_CLASS.key -> classOf[RocksDBStateStoreProvider].getName) {
+        val (input1, input2, input3, joined) = buildChainedJoinForEventTimeSelection(
+          "id1 = id3 AND ts2 >= ts3 - INTERVAL 5 SECONDS " +
+            "AND ts2 <= ts3 + INTERVAL 5 SECONDS")
+        testStream(joined)(
+          MultiAddData(
+            (input1, Seq(("A", 50L, 0L))),
+            (input2, Seq(("A", 1050L, 0L))),
+            (input3, Seq(("A", 1050L, 9000L)))),
+          CheckNewAnswer(("A", 50L, 1050L, 1050L)),
+          StopStream,
+          StartStream(),
+          MultiAddData(
+            (input1, Seq(("B", 70L, 0L))),
+            (input2, Seq(("B", 1070L, 0L))),
+            (input3, Seq(("B", 1070L, 9000L)))),
+          CheckNewAnswer(("B", 70L, 1070L, 1070L)))
+      }
     }
   }
 

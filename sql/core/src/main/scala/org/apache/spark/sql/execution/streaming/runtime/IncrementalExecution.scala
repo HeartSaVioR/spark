@@ -26,9 +26,10 @@ import org.apache.hadoop.fs.Path
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{BATCH_TIMESTAMP, ERROR}
+import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.QueryPlanningTracker
-import org.apache.spark.sql.catalyst.analysis.WidenStatefulOperatorAttributeNullability
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, CurrentBatchTimestamp, Expression, ExpressionWithRandomSeed}
+import org.apache.spark.sql.catalyst.analysis.{StreamingJoinHelper, WidenStatefulOperatorAttributeNullability}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, AttributeSet, CurrentBatchTimestamp, Expression, ExpressionWithRandomSeed}
 import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
@@ -152,8 +153,12 @@ class IncrementalExecution(
         ts.toLiteral
       case e: ExpressionWithRandomSeed => e.withNewSeed(Utils.random.nextLong())
     }
-    WidenStatefulOperatorAttributeNullability(
-      SelectEventTimeWatermarkForStatefulOperators(optimized))
+    val selectedEventTimePlan = if (allowMultipleStatefulOperators) {
+      SelectEventTimeWatermarkForStatefulOperators(optimized)
+    } else {
+      optimized
+    }
+    WidenStatefulOperatorAttributeNullability(selectedEventTimePlan)
   }
 
   /**
@@ -189,6 +194,34 @@ class IncrementalExecution(
       case _ => operator.expressions
     }
 
+    private def isSafeRangeJoin(join: Join): Boolean = {
+      val leftEventTime = join.left.output.find(_.metadata.contains(EventTimeWatermark.delayKey))
+      val rightEventTime = join.right.output.find(_.metadata.contains(EventTimeWatermark.delayKey))
+      (leftEventTime, rightEventTime) match {
+        case (Some(leftTime), Some(rightTime))
+            if !StreamingJoinHelper.isWatermarkInJoinKeys(join) =>
+          Seq((join.left, leftTime, rightTime), (join.right, rightTime, leftTime)).forall {
+            case (input, eventTime, otherEventTime) =>
+              def stateWatermark(attributes: Seq[Attribute]): Option[Long] = {
+                StreamingJoinHelper.getStateValueWatermark(
+                  AttributeSet(attributes),
+                  AttributeSet(Seq(otherEventTime)),
+                  join.condition,
+                  Some(0L))
+              }
+              stateWatermark(Seq(eventTime)).nonEmpty &&
+                stateWatermark(input.output.filterNot(_.semanticEquals(eventTime))).isEmpty
+          }
+        case _ => false
+      }
+    }
+
+    private def failEventTimeSelection(eventTimeAttributes: Seq[Attribute]): Nothing = {
+      throw new AnalysisException(
+        errorClass = "MULTIPLE_EVENT_TIME_COLUMNS",
+        messageParameters = Map("eventTimeCols" -> eventTimeAttributes.mkString("(", ",", ")")))
+    }
+
     private def projectSelectedEventTimeColumn(
         child: LogicalPlan,
         preferred: Seq[Expression]): LogicalPlan = {
@@ -197,6 +230,13 @@ class IncrementalExecution(
       if (eventTimeAttributes.map(_.exprId).distinct.size <= 1) {
         child
       } else {
+        val hasUnsafeJoinLineage = child.exists {
+          case join: Join if join.isStateful => !isSafeRangeJoin(join)
+          case _ => false
+        }
+        if (hasUnsafeJoinLineage) {
+          failEventTimeSelection(eventTimeAttributes)
+        }
         val selectedExprId = preferred.iterator
           .flatMap(_.collect { case attr: Attribute => attr.exprId })
           .find(id => eventTimeAttributes.exists(_.exprId == id))
@@ -244,6 +284,9 @@ class IncrementalExecution(
     override def apply(plan: LogicalPlan): LogicalPlan = plan.transformUp {
       case operator =>
         val updatedOperator = if (operator.isStateful) {
+          val multipleEventTimeColumns = operator.children.filter(_.isStreaming)
+            .map(_.output.filter(_.metadata.contains(EventTimeWatermark.delayKey)))
+            .find(_.map(_.exprId).distinct.size > 1)
           val newChildren = operator.children.zipWithIndex.map { case (child, index) =>
             if (child.isStreaming) {
               projectSelectedEventTimeColumn(child, preferredExpressions(operator, index))
@@ -251,7 +294,11 @@ class IncrementalExecution(
               child
             }
           }
-          operator.withNewChildren(newChildren)
+          operator.withNewChildren(newChildren) match {
+            case join: Join if multipleEventTimeColumns.nonEmpty && !isSafeRangeJoin(join) =>
+              failEventTimeSelection(multipleEventTimeColumns.get)
+            case selectedOperator => selectedOperator
+          }
         } else {
           operator
         }
