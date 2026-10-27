@@ -297,6 +297,25 @@ object StreamingJoinHelper extends PredicateHelper with Logging {
       return None
     }
 
+    // State eviction compares this cutoff in timestamp units against the constrained column.
+    val hasTimestampStateAttribute = constraintTerm.exists {
+      case a: AttributeReference =>
+        attributesToFindStateWatermarkFor.contains(a) && a.dataType == TimestampType
+      case _ => false
+    }
+    if (!hasTimestampStateAttribute) return None
+
+    // A bound must advance with the opposite watermark. The occurrence check above limits
+    // each input to one attribute, so there can be at most one opposite watermark term.
+    val watermarkTerms = terms.filter(_.references.exists(attributesWithEventWatermark.contains))
+    if (watermarkTerms.isEmpty ||
+        !watermarkTerms.head.references.forall(_.metadata.contains(delayKey))) {
+      return None
+    }
+
+    // A negative opposite-time term lets later input match old state instead of bounding it.
+    if (watermarkTerms.head.isInstanceOf[UnaryMinus]) return None
+
     // Replace watermark attribute with watermark value, and generate the resolved expression
     // from the other terms. That is,
     // rightTime-with-watermark, c1, -c2  =>  watermark, c1, -c2  =>  watermark + c1 + (-c2)
