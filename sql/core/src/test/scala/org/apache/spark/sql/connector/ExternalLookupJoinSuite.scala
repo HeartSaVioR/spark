@@ -1477,11 +1477,11 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
 
   test("predicates move below an external lookup join as they do below a join") {
     val lookup = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
-    val left = Seq((1, true), (2, false), (3, true)).toDF("id", "flag").coalesce(1)
+    val left = streamOf(Seq((1, true), (2, false), (3, true)).toDF("id", "flag"))
     val key = left("id") === lookup("id")
     def check(joined: DataFrame, expected: Set[Row], requestedKeys: Seq[Int]): Unit = {
       SimpleExternalLookupDataSource.resetCounters()
-      assert(joined.collect().toSet === expected)
+      assert(runStream(joined).rows.toSet === expected)
       assert(SimpleExternalLookupDataSource.requestedKeys.asScala.toSeq === requestedKeys)
     }
     val matched = Set(Row(1, true, 1, "engineering"), Row(1, true, 1, "research"))
