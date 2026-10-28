@@ -1198,7 +1198,7 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       .format(classOf[SimpleExternalLookupDataSource].getName)
       .option("maxBatchSize", "1")
       .load()
-    val left = Seq(1, 2).toDF("id").coalesce(1)
+    val left = streamOf(Seq(1, 2).toDF("id"))
 
     withTempView("external_lookup_left", "external_lookup_right") {
       left.createOrReplaceTempView("external_lookup_left")
@@ -1213,10 +1213,10 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
           |) */ l.id, r.department
           |FROM external_lookup_left l JOIN external_lookup_right r ON l.id = r.id
           |""".stripMargin)
-      checkAnswer(
-        query,
-        Seq(Row(1, "engineering"), Row(1, "research"), Row(2, "sales")))
-      val prepared = query.queryExecution.optimizedPlan.collectFirst {
+      val run = runStream(query)
+      assert(QueryTest.sameRows(
+        Seq(Row(1, "engineering"), Row(1, "research"), Row(2, "sales")), run.rows).isEmpty)
+      val prepared = run.plan.collectFirst {
         case externalLookup: PreparedExternalLookupJoin => externalLookup
       }.get
       assert(prepared.cacheOptions === ExternalLookupCacheOptions(
@@ -1498,8 +1498,8 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
         .option("maxBatchSize", "1")
         .load()
       val hinted = lookup.hint("external_lookup", cacheHint: _*)
-      val left = Seq(1, 2, 1).toDF("id").coalesce(1)
-      checkAnswer(
+      val left = streamOf(Seq(1, 2, 1).toDF("id"))
+      checkStream(
         left.join(hinted, left("id") === hinted("id"), "inner"),
         Seq(Row(1, 1, "engineering"), Row(1, 1, "research"), Row(2, 2, "sales"),
           Row(1, 1, "engineering"), Row(1, 1, "research")))
@@ -1522,8 +1522,8 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       val hinted = if (hintParameters.isEmpty) lookup else {
         lookup.hint("external_lookup", hintParameters: _*)
       }
-      val left = Seq(1, 1).toDF("id").coalesce(1)
-      left.join(hinted, left("id") === hinted("id"), "inner").collect()
+      val left = streamOf(Seq(1, 1).toDF("id"))
+      runStream(left.join(hinted, left("id") === hinted("id"), "inner"))
       SimpleExternalLookupDataSource.requestCount.get()
     }
 
@@ -1543,8 +1543,8 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
         .load()
       val hintParameters: Seq[Any] = if (cacheDisabled) Seq("cache_enabled=false") else Nil
       val lookup = unhintedLookup.hint("external_lookup", hintParameters: _*)
-      val left = keys.toDF("id").coalesce(1)
-      val rows = left.join(lookup, left("id") === lookup("id"), "left_outer").collect().toSeq
+      val left = streamOf(keys.toDF("id"))
+      val rows = runStream(left.join(lookup, left("id") === lookup("id"), "left_outer")).rows
       rows -> SimpleExternalLookupDataSource.requestCount.get()
     }
 
@@ -1570,14 +1570,15 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       .option("maxBatchSize", "1")
       .load()
       .hint("external_lookup", "cache_ttl=1ms")
-    val left = Seq(2, 2).toDF("id").coalesce(1)
+    val left = streamOf(Seq(2, 2).toDF("id"))
 
     ExternalLookupJoinExec.withCacheTimeNanos { () =>
       val now = clock.get()
       clock.set(expiredAt)
       now
     } {
-      assert(left.join(lookup, left("id") === lookup("id"), "left_outer").count() === 2)
+      val joined = left.join(lookup, left("id") === lookup("id"), "left_outer")
+      assert(runStream(joined).rows.size === 2)
     }
     assert(SimpleExternalLookupDataSource.requestedKeys.asScala.toSeq === Seq(2, 2))
   }
@@ -1593,12 +1594,12 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       .hint("external_lookup", "cache_ttl=1ms")
     // Batches [2, 1] and [2, 2]. The clock is read when the first batch writes the cache and on
     // each cache probe; it expires the entry for key 2 between the two rows of the second batch.
-    val left = Seq(2, 1, 2, 2).toDF("id").coalesce(1)
+    val left = streamOf(Seq(2, 1, 2, 2).toDF("id"))
 
     val rows = ExternalLookupJoinExec.withCacheTimeNanos { () =>
       if (calls.incrementAndGet() <= 2) 0L else expired
     } {
-      left.join(lookup, left("id") === lookup("id"), "inner").collect().toSeq
+      runStream(left.join(lookup, left("id") === lookup("id"), "inner")).rows
     }
     assert(rows.map(_.getInt(0)).sorted === Seq(1, 1, 2, 2, 2))
     assert(SimpleExternalLookupDataSource.requestedKeys.asScala.toSeq === Seq(2, 1))
@@ -1611,11 +1612,10 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       .option("maxBatchSize", "1")
       .load()
       .hint("external_lookup")
-    val left = Seq(1, 1).toDF("id").coalesce(1)
+    val left = streamOf(Seq(1, 1).toDF("id"))
     val query = left.join(lookup, left("id") === lookup("id"), "inner")
 
-    query.collect()
-    val operator = query.queryExecution.executedPlan.collectFirst {
+    val operator = runStream(query).execution.executedPlan.collectFirst {
       case externalLookup: ExternalLookupJoinExec => externalLookup
     }.get
     assert(operator.metrics("numInputRows").value === 2)
@@ -1633,9 +1633,9 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       .option("maxBatchSize", "1")
       .load()
       .hint("external_lookup", "cache_max_entries=2")
-    val left = Seq(1, 2, 1, 3, 1, 2).toDF("id").coalesce(1)
+    val left = streamOf(Seq(1, 2, 1, 3, 1, 2).toDF("id"))
 
-    val rows = left.join(lookup, left("id") === lookup("id"), "left_outer").collect().toSeq
+    val rows = runStream(left.join(lookup, left("id") === lookup("id"), "left_outer")).rows
     val engineering = Seq(Row(1, 1, "engineering"), Row(1, 1, "research"))
     val expected = engineering ++ engineering ++ engineering ++
       Seq(Row(2, 2, "sales"), Row(2, 2, "sales"), Row(3, null, null))
@@ -1665,10 +1665,10 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       .option("maxBatchSize", 1)
       .load()
       .hint("external_lookup", "cache_max_rows_per_key=1")
-    val left = Seq(1, 1).toDF("id").coalesce(1)
+    val left = streamOf(Seq(1, 1).toDF("id"))
 
-    assert(left.join(
-      lookup, left("id") === lookup("id"), "inner").count() === 4)
+    assert(runStream(left.join(
+      lookup, left("id") === lookup("id"), "inner")).rows.size === 4)
     assert(SimpleExternalLookupDataSource.requestCount.get() === 2)
   }
 
@@ -1688,10 +1688,10 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
     val nan1 = java.lang.Double.longBitsToDouble(0x7ff8000000000001L)
     val nan2 = java.lang.Double.longBitsToDouble(0x7ff8000000000002L)
     // Put equivalent keys in different input batches to exercise cache identity as well.
-    val left = Seq(-0.0d, nan1, 0.0d, nan2).toDF("key").coalesce(1)
+    val left = streamOf(Seq(-0.0d, nan1, 0.0d, nan2).toDF("key"))
     val lookup = semanticLookup("double")
 
-    assert(left.join(lookup, left("key") === lookup("key")).count() === 4)
+    assert(runStream(left.join(lookup, left("key") === lookup("key"))).rows.size === 4)
     assert(SemanticKeyExternalLookupDataSource.requestSizes.asScala.toSeq === Seq(2))
   }
 
@@ -1976,9 +1976,9 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       .format(classOf[SimpleExternalLookupDataSource].getName)
       .option("maxBatchSize", "1")
       .load()
-    val left = spark.sparkContext.parallelize(Seq(2, 2, 2, 2), numSlices = 2).toDF("id")
+    val left = streamOf(Seq(2, 2, 2, 2).toDF("id"), 2)
 
-    assert(left.join(lookup, left("id") === lookup("id")).count() === 4)
+    assert(runStream(left.join(lookup, left("id") === lookup("id"))).rows.size === 4)
     assert(SimpleExternalLookupDataSource.readerCount.get() === 2)
     assert(SimpleExternalLookupDataSource.requestedKeys.asScala.toSeq === Seq(2, 2))
   }
