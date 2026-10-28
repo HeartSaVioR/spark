@@ -419,9 +419,7 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
         "supportedJoinTypes" -> "INNER, LEFT OUTER, LEFT SEMI, LEFT ANTI"))
 
     checkError(
-      exception = intercept[AnalysisException] {
-        left.crossJoin(lookup.hint("external_lookup")).queryExecution.optimizedPlan
-      },
+      exception = streamFailure[AnalysisException](left.crossJoin(lookup.hint("external_lookup"))),
       condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.MISSING_JOIN_CONDITION",
       parameters = Map.empty)
 
@@ -1199,9 +1197,9 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       .format(classOf[ReadSchemaExternalLookupDataSource].getName)
       .option("kind", "char")
       .load()
-    val left = Seq(1).toDF("id")
+    val left = streamOf(Seq(1).toDF("id"))
     // The connector returns "ab" for a CHAR(5) column; read-side padding makes it "ab   ".
-    checkAnswer(left.join(lookup, left("id") === lookup("id")), Seq(Row(1, 1, "ab   ")))
+    checkStream(left.join(lookup, left("id") === lookup("id")), Seq(Row(1, 1, "ab   ")))
   }
 
   test("external lookup join supports left semi and left anti joins") {
