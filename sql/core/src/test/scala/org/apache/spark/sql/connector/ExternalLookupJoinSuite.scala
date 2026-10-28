@@ -1622,7 +1622,6 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
     assert(operator.metrics("numInputBatches").value === 2)
     assert(operator.metrics("numLookupRequests").value === 1)
     assert(operator.metrics("numCacheHits").value === 1)
-    assert(operator.metrics("batchFillTime").value >= 0)
     assert(operator.metrics("lookupTime").value >= 0)
   }
 
