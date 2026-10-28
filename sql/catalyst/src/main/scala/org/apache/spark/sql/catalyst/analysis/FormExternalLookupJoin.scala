@@ -77,7 +77,7 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
       return Ineligible(QueryCompilationErrors.invalidExternalLookupHintError("NOT_ON_LOOKUP_SIDE"))
     }
     // The lookup-only table must be on the right side; the sides are never swapped.
-    val leftLookupOnlyTable = ExternalLookupRelations.lookupOnlyTable(join.left)
+    val leftLookupOnlyTable = ExternalLookupRelations.lookupOnlyTable(accessPath(join.left).last)
     if (leftLookupOnlyTable.isDefined) {
       return ineligible("LOOKUP_TABLE_ON_LEFT", toSQLId(leftLookupOnlyTable.get.name()))
     }
