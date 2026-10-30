@@ -1520,6 +1520,22 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
     assert(uncachedRequests * 2 === cachedRequests * 3)
   }
 
+  test("cache options of a hint apply through the operators between the hint and the join") {
+    val lookup = spark.read
+      .format(classOf[SimpleExternalLookupDataSource].getName)
+      .option("maxBatchSize", "1")
+      .load()
+      .hint("external_lookup", "cache_enabled=false")
+      .select($"id", upper($"department").as("department"))
+    val left = streamOf(Seq(1, 1).toDF("id"))
+
+    val run = runStream(left.join(lookup, left("id") === lookup("id")))
+    assert(run.rows.size === 4)
+    assert(!run.plan.collectFirst { case join: PreparedExternalLookupJoin => join }.get
+      .cacheOptions.enabled)
+    assert(SimpleExternalLookupDataSource.requestCount.get() === 2)
+  }
+
   test("external lookup cache uses SQLConf defaults and hint overrides") {
     def run(hintParameters: Seq[Any]): Int = {
       SimpleExternalLookupDataSource.resetCounters()
