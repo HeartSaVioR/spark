@@ -52,8 +52,8 @@ import org.apache.spark.sql.execution.streaming.operators.stateful.StreamingDedu
 import org.apache.spark.sql.execution.streaming.runtime.{IncrementalExecution, MemoryStream,
   StreamingQueryWrapper}
 import org.apache.spark.sql.execution.streaming.sources.LowLatencyMemoryStream
-import org.apache.spark.sql.functions.{broadcast, coalesce, col, concat, expr, length, lit, rand,
-  to_json, upper}
+import org.apache.spark.sql.functions.{broadcast, coalesce, col, concat, expr, length, lit, max,
+  rand, to_json, upper}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.{StreamingQueryException, StreamRealTimeModeE2ESuiteBase}
 import org.apache.spark.sql.test.SharedSparkSession
@@ -1156,6 +1156,17 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
     assert(SimpleExternalLookupDataSource.pushedPredicateCount.get() > 0)
   }
 
+  test("external lookup pushes no filter above a non-deterministic lookup-side filter") {
+    val rawLookup = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
+    // The source would evaluate a pushed filter before the sample is drawn.
+    val lookup = rawLookup.filter(rand(3) >= 0.5).filter($"department" =!= "research")
+    val left = streamOf(Seq(1, 2).toDF("id"))
+
+    val run = runStream(left.join(lookup, left("id") === lookup("id"), "inner"))
+    assert(run.rows.forall(_.getString(2) != "research"))
+    assert(SimpleExternalLookupDataSource.pushedPredicateCount.get() === 0)
+  }
+
   test("external lookup canonicalizes filters through a relation alias") {
     SimpleExternalLookupDataSource.resetCounters()
     val rawLookup = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
@@ -1535,12 +1546,33 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
     val condition =
       left("id") === lookup("id") && pythonUDF(lookup("department")) === "engineering"
 
-    // An inner join evaluates it above the lookup join; a left outer join cannot.
+    // An inner join evaluates it above the lookup join; other join types cannot.
     checkStream(left.join(lookup, condition), Seq(Row(1, 1, "engineering")))
+    Seq("left_outer" -> "LEFT OUTER", "left_semi" -> "LEFT SEMI").foreach {
+      case (joinType, sqlJoinType) =>
+        checkError(
+          exception = streamFailure[AnalysisException](left.join(lookup, condition, joinType)),
+          condition = "UNSUPPORTED_FEATURE.PYTHON_UDF_IN_ON_CLAUSE",
+          parameters = Map("joinType" -> sqlJoinType))
+    }
+    // A lookup-side filter is evaluated inside the lookup join, which cannot run a Python UDF.
+    val filtered = lookup.filter(pythonUDF(lookup("department")) === "engineering")
     checkError(
-      exception = streamFailure[AnalysisException](left.join(lookup, condition, "left_outer")),
-      condition = "UNSUPPORTED_FEATURE.PYTHON_UDF_IN_ON_CLAUSE",
-      parameters = Map("joinType" -> "LEFT OUTER"))
+      exception = streamFailure[AnalysisException](
+        left.join(filtered, left("id") === filtered("id"))),
+      condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.LOOKUP_PLAN",
+      parameters = Map.empty)
+  }
+
+  test("a subquery on the lookup side is rejected") {
+    val lookup = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
+    val left = streamOf(Seq(1, 2).toDF("id"))
+    val filtered = lookup.filter($"id" < spark.range(2).select(max($"id")).scalar())
+    checkError(
+      exception = streamFailure[AnalysisException](
+        left.join(filtered, left("id") === filtered("id"))),
+      condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.LOOKUP_PLAN",
+      parameters = Map.empty)
   }
 
   test("external lookup merges the connector metrics of every reader in a task") {

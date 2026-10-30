@@ -24,7 +24,7 @@ import scala.collection.mutable
 import org.apache.spark.sql.catalyst.expressions.{Alias, And, Attribute, AttributeMap,
   AttributeSet, BinaryComparison, EqualNullSafe, EqualTo, Expression, ExprId,
   ExternalUserDefinedFunction, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual, Literal,
-  NamedExpression, PredicateHelper, PythonUDF}
+  NamedExpression, PredicateHelper, PythonUDF, SubqueryExpression}
 import org.apache.spark.sql.catalyst.plans.{Inner, LeftAnti, LeftOuter, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupFilter, ExternalLookupJoin,
   ExternalLookupProject, ExternalLookupTransform, Filter, LogicalPlan, PreparedExternalLookupJoin,
@@ -311,6 +311,12 @@ object PrepareExternalLookupJoin extends Rule[LogicalPlan] with PredicateHelper
     case relation: DataSourceV2Relation => Some(ExtractedLookupPlan(relation, Seq.empty))
     case relation: ExternalLookupRelation =>
       Some(ExtractedLookupPlan(relation.relation, Seq.empty))
+    // A stage is evaluated on the lookup results inside the join, where a Python UDF or a
+    // subquery cannot be planned.
+    case node @ (_: Project | _: Filter) if node.expressions.exists(_.exists { e =>
+        e.isInstanceOf[PythonUDF] || e.isInstanceOf[SubqueryExpression]
+      }) =>
+      None
     case Project(projectList, child) =>
       extractLookupPlan(child).map { extracted =>
         extracted.copy(
@@ -326,7 +332,9 @@ object PrepareExternalLookupJoin extends Rule[LogicalPlan] with PredicateHelper
 
   /**
    * Pushes the filters directly over the lookup relation to the scan builder, before the lookup
-   * predicates are selected, and keeps what the source does not evaluate as a filter stage.
+   * predicates are selected, and keeps what the source does not evaluate as a filter stage. As
+   * with `ScanOperation`, only the bottom filter is pushed, followed by more filters while they are
+   * deterministic, because the source evaluates a pushed filter before every filter that is not.
    */
   private def pushBaseFilters(
       scanBuilder: ScanBuilder,
@@ -334,8 +342,14 @@ object PrepareExternalLookupJoin extends Rule[LogicalPlan] with PredicateHelper
       transforms: Seq[ExternalLookupTransform]): Seq[ExternalLookupTransform] = {
     val remaining = mutable.ArrayBuffer.empty[ExternalLookupTransform]
     var canPush = true
+    var bottom = true
     transforms.foreach {
-      case ExternalLookupFilter(condition, input) if canPush && input == relation.output =>
+      case ExternalLookupFilter(condition, input)
+          if canPush && input == relation.output && (bottom || condition.deterministic) =>
+        // A non-deterministic bottom filter is pushed too: the source keeps its non-deterministic
+        // conjuncts for Spark to evaluate.
+        canPush = condition.deterministic
+        bottom = false
         val normalized = DataSourceStrategy.normalizeExprs(
           splitConjunctivePredicates(condition), relation.output)
         val postScan = PushDownUtils.pushFilters(
