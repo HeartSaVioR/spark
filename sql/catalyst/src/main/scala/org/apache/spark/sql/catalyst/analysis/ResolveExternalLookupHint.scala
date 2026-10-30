@@ -22,16 +22,16 @@ import java.util.Locale
 import scala.collection.mutable
 
 import org.apache.spark.sql.catalyst.expressions.Expression
-import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupHint, Join, LogicalPlan,
+import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupHint, LogicalPlan,
   SubqueryAlias, UnresolvedHint, UnresolvedWith, View}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.UNRESOLVED_HINT
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryErrorsBase}
 
 /**
- * Resolves the `EXTERNAL_LOOKUP` hint to [[ExternalLookupHint]] markers. Without parameters, the
- * hint marks the right side of the first join below it, or the plan it is attached to when there
- * is no join. With relation names, it marks each named relation.
+ * Resolves the `EXTERNAL_LOOKUP` hint to [[ExternalLookupHint]] markers. As with join strategy
+ * hints, a hint without parameters marks the plan it is attached to, and a hint with relation
+ * names marks each named relation.
  */
 object ResolveExternalLookupHint extends Rule[LogicalPlan] with QueryErrorsBase {
   private val HintName = "EXTERNAL_LOOKUP"
@@ -58,13 +58,7 @@ object ResolveExternalLookupHint extends Rule[LogicalPlan] with QueryErrorsBase 
     }
 
     if (relationNames.isEmpty) {
-      var wrappedJoin = false
-      val rewritten = child.transformDown {
-        case join: Join if !wrappedJoin =>
-          wrappedJoin = true
-          join.copy(right = ExternalLookupHint(join.right))
-      }
-      if (wrappedJoin) rewritten else ExternalLookupHint(child)
+      ExternalLookupHint(child)
     } else {
       val matched = mutable.HashSet.empty[Seq[String]]
       def matches(identifier: Seq[String]): Boolean = relationNames.find { name =>

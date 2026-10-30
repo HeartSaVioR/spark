@@ -2893,7 +2893,7 @@
       },
       "CONFLICTING_JOIN_STRATEGY" : {
         "message" : [
-          "The join strategy hint <strategy> cannot be honored by an external lookup join over <relation>. Remove the <strategy> hint, or the `EXTERNAL_LOOKUP` hint if the table also supports batch reads."
+          "The join strategy hint <strategy> cannot be honored by an external lookup join over <relation>. Remove the <strategy> hint."
         ]
       },
       "JOIN_TYPE" : {
@@ -2903,7 +2903,7 @@
       },
       "LOOKUP_PLAN" : {
         "message" : [
-          "The lookup side must be a DSv2 table, with no projection or filter left between the table and the join after optimization."
+          "The lookup side must be a DSv2 table, with no other operator between the table and the join."
         ]
       },
       "LOOKUP_TABLE_ON_LEFT" : {
@@ -4397,6 +4397,11 @@
       "The `EXTERNAL_LOOKUP` hint is invalid:"
     ],
     "subClass" : {
+      "CONFLICTING_JOIN_STRATEGY" : {
+        "message" : [
+          "The join over <relation> also has the join strategy hint <strategy>, which asks for a different join. Remove one of the two hints."
+        ]
+      },
       "DUPLICATE_RELATION" : {
         "message" : [
           "The relation <relation> is specified more than once."
