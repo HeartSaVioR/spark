@@ -45,7 +45,10 @@ import org.apache.spark.util.Utils
  *
  * An evaluator joins its partition one batch of up to `maxParameterRowsPerRequest` stream rows at
  * a time. For each batch it sends one request with the distinct parameters that can match and
- * are not cached, and streams the connector's result rows into output rows.
+ * are not cached, and streams the connector's result rows into output rows. Parameters are
+ * deduplicated within a batch. With the cache enabled, a key whose complete result an earlier
+ * request of the same input partition returned is served from the cache, within the cache's
+ * bounds; otherwise a key repeated in a later batch is requested again.
  */
 class ExternalLookupJoinEvaluatorFactory(
     tableName: String,
@@ -223,11 +226,11 @@ class ExternalLookupJoinEvaluatorFactory(
             joinResultRow(key, lookupRow)
           }
         }
-        if (pending.isEmpty) finishCursor()
+        if (pending.isEmpty) finishCursor(completed = true)
       } catch {
         case error: Throwable =>
           Utils.tryWithSafeFinally(throw error) {
-            finishCursor()
+            finishCursor(completed = false)
           }
       }
     }
@@ -259,8 +262,12 @@ class ExternalLookupJoinEvaluatorFactory(
       }
     }
 
-    /** Closes the cursor once, and finishes every stream row that was waiting for its results. */
-    private def finishCursor(): Unit = if (cursor ne EmptyLookupCursor) {
+    /**
+     * Closes the cursor once, and finishes every stream row that was waiting for its results. Only
+     * a request whose cursor was read to the end is cached: a failed one may have returned part of
+     * its results.
+     */
+    private def finishCursor(completed: Boolean): Unit = if (cursor ne EmptyLookupCursor) {
       cursor = EmptyLookupCursor
       try {
         reader.closeCursor()
@@ -268,7 +275,7 @@ class ExternalLookupJoinEvaluatorFactory(
         metrics.lookupTime += System.nanoTime() - lookupStartNanos
         reader.updateMetrics()
       }
-      cacheWriter.foreach(_.write())
+      if (completed) cacheWriter.foreach(_.write())
       keyEntries.values.foreach(_.rowIndexes.foreach(finish))
     }
 
@@ -284,8 +291,9 @@ class ExternalLookupJoinEvaluatorFactory(
   }
 
   /**
-   * The lookup results of one partition by key. Beyond `maxEntries` keys, the least recently used
-   * entry is evicted; an entry expires once it is older than the TTL.
+   * The lookup results by key, within a task, per input partition (a task that reads several input
+   * partitions, e.g. after coalesce, has one cache per partition). Beyond `maxEntries` keys, the
+   * least recently used entry is evicted; an entry expires once it is older than the TTL.
    */
   private class LookupCache {
     private val ttlNanos = TimeUnit.MILLISECONDS.toNanos(cacheOptions.ttlMillis)
@@ -298,7 +306,9 @@ class ExternalLookupJoinEvaluatorFactory(
 
     def get(key: UnsafeRow): Option[Array[InternalRow]] = {
       val entry = entries.get(key)
-      if (entry != null && entry.isExpired(ttlNanos, ExternalLookupJoinExec.cacheTimeNanos())) {
+      val expired =
+        entry != null && entry.isExpired(ttlNanos, ExternalLookupJoinExec.cacheClock.nanoTime())
+      if (expired) {
         entries.remove(key)
         None
       } else {
@@ -331,7 +341,7 @@ class ExternalLookupJoinEvaluatorFactory(
     }
 
     def write(): Unit = {
-      val nowNanos = ExternalLookupJoinExec.cacheTimeNanos()
+      val nowNanos = ExternalLookupJoinExec.cacheClock.nanoTime()
       keys.foreach { key =>
         if (!uncacheable.contains(key)) cache.put(key, resultsByKey(key).toArray, nowNanos)
       }
