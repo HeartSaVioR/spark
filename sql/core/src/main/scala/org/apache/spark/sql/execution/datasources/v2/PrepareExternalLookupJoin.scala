@@ -19,16 +19,16 @@ package org.apache.spark.sql.execution.datasources.v2
 
 import java.util.{Collections, IdentityHashMap}
 
+import scala.annotation.tailrec
 import scala.collection.mutable
 
 import org.apache.spark.sql.catalyst.expressions.{Alias, And, Attribute, AttributeMap,
-  AttributeSet, BinaryComparison, EqualNullSafe, EqualTo, Expression, ExprId,
-  ExternalUserDefinedFunction, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual, Literal,
-  NamedExpression, PredicateHelper, PythonUDF, SubqueryExpression}
+  AttributeSet, Expression, ExprId, ExternalUserDefinedFunction, Literal, NamedExpression,
+  PredicateHelper, PythonUDF}
 import org.apache.spark.sql.catalyst.plans.{Inner, LeftAnti, LeftOuter, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupFilter, ExternalLookupJoin,
-  ExternalLookupProject, ExternalLookupTransform, Filter, LogicalPlan, PreparedExternalLookupJoin,
-  Project}
+  ExternalLookupJoinShapes, ExternalLookupProject, ExternalLookupTransform, Filter, LogicalPlan,
+  PreparedExternalLookupJoin, Project}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.EXTERNAL_LOOKUP_JOIN
 import org.apache.spark.sql.catalyst.util.CharVarcharUtils
@@ -114,9 +114,11 @@ object PrepareExternalLookupJoin extends Rule[LogicalPlan] with PredicateHelper
     // through unchanged, under the name of the table column it reads.
     val tableColumns = traceToRelation(relation.output, transforms)
     val offeredCandidates = conjuncts.zipWithIndex.flatMap { case (conjunct, index) =>
-      lookupCandidate(join, conjunct, index).flatMap { candidate =>
-        tableColumns.get(candidate.projectedField.exprId).flatten.map { column =>
-          candidate.copy(projectedField = column)
+      ExternalLookupJoinShapes.lookupComparison(
+        conjunct, join.left.outputSet, join.right.outputSet).flatMap { comparison =>
+        tableColumns.get(comparison.lookupField.exprId).flatten.map { column =>
+          OfferedLookupPredicate(
+            comparison.parameter, column, index, comparison.predicateName, comparison.nullSafe)
         }
       }
     }
@@ -224,41 +226,6 @@ object PrepareExternalLookupJoin extends Rule[LogicalPlan] with PredicateHelper
     }
 
   /**
-   * A comparison of a bare lookup column with an expression over the stream side, as a candidate
-   * whose lookup column comes first: when the column is written on the right, the operator is
-   * flipped, so `s.ts < t.event_time` is offered as `event_time > ?`.
-   */
-  private def lookupCandidate(
-      join: ExternalLookupJoin,
-      conjunct: Expression,
-      conjunctIndex: Int): Option[OfferedLookupPredicate] = {
-    def isLookupComparison(parameter: Expression, lookupField: Attribute): Boolean =
-      join.right.outputSet.contains(lookupField) &&
-        parameter.references.subsetOf(join.left.outputSet)
-    val names = conjunct match {
-      case _: EqualTo => Some(("=", "="))
-      case _: EqualNullSafe => Some(("<=>", "<=>"))
-      case _: LessThan => Some(("<", ">"))
-      case _: LessThanOrEqual => Some(("<=", ">="))
-      case _: GreaterThan => Some((">", "<"))
-      case _: GreaterThanOrEqual => Some((">=", "<="))
-      case _ => None
-    }
-    names.flatMap { case (name, flippedName) =>
-      val comparison = conjunct.asInstanceOf[BinaryComparison]
-      val nullSafe = conjunct.isInstanceOf[EqualNullSafe]
-      (comparison.left, comparison.right) match {
-        case (parameter, lookupField: Attribute) if isLookupComparison(parameter, lookupField) =>
-          Some(OfferedLookupPredicate(
-            parameter, lookupField, conjunctIndex, flippedName, nullSafe))
-        case (lookupField: Attribute, parameter) if isLookupComparison(parameter, lookupField) =>
-          Some(OfferedLookupPredicate(parameter, lookupField, conjunctIndex, name, nullSafe))
-        case _ => None
-      }
-    }
-  }
-
-  /**
    * Maps the connector's selection back to the offered candidates, in the connector's order, which
    * defines the fields of each request parameter row. Selections are matched by object identity
    * rather than by equality, so two candidates of the same shape, for example the same lookup field
@@ -307,26 +274,23 @@ object PrepareExternalLookupJoin extends Rule[LogicalPlan] with PredicateHelper
       relation: DataSourceV2Relation,
       transforms: Seq[ExternalLookupTransform])
 
-  private def extractLookupPlan(plan: LogicalPlan): Option[ExtractedLookupPlan] = plan match {
-    case relation: DataSourceV2Relation => Some(ExtractedLookupPlan(relation, Seq.empty))
+  /** The relation of a lookup side, with its projections and filters in evaluation order. */
+  @tailrec
+  private def extractLookupPlan(
+      plan: LogicalPlan,
+      transforms: List[ExternalLookupTransform] = Nil): Option[ExtractedLookupPlan] = plan match {
+    case relation: DataSourceV2Relation => Some(ExtractedLookupPlan(relation, transforms))
     case relation: ExternalLookupRelation =>
-      Some(ExtractedLookupPlan(relation.relation, Seq.empty))
-    // A stage is evaluated on the lookup results inside the join, where a Python UDF or a
-    // subquery cannot be planned.
-    case node @ (_: Project | _: Filter) if node.expressions.exists(_.exists { e =>
-        e.isInstanceOf[PythonUDF] || e.isInstanceOf[SubqueryExpression]
-      }) =>
+      Some(ExtractedLookupPlan(relation.relation, transforms))
+    // Analysis already rejects such a stage; this is a fallback.
+    case node @ (_: Project | _: Filter)
+        if !node.expressions.forall(ExternalLookupJoinShapes.canEvaluateInLookupStage) =>
       None
+    // The walk goes down from the join, so each stage is evaluated before those found earlier.
     case Project(projectList, child) =>
-      extractLookupPlan(child).map { extracted =>
-        extracted.copy(
-          transforms = extracted.transforms :+ ExternalLookupProject(projectList, child.output))
-      }
+      extractLookupPlan(child, ExternalLookupProject(projectList, child.output) :: transforms)
     case Filter(condition, child) =>
-      extractLookupPlan(child).map { extracted =>
-        extracted.copy(
-          transforms = extracted.transforms :+ ExternalLookupFilter(condition, child.output))
-      }
+      extractLookupPlan(child, ExternalLookupFilter(condition, child.output) :: transforms)
     case _ => None
   }
 
