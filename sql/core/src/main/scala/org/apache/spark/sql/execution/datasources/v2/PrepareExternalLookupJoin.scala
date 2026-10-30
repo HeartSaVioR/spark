@@ -19,10 +19,15 @@ package org.apache.spark.sql.execution.datasources.v2
 
 import java.util.{Collections, IdentityHashMap}
 
-import org.apache.spark.sql.catalyst.expressions.{Alias, And, Attribute, EqualTo, Expression,
-  ExternalUserDefinedFunction, Literal, PredicateHelper, PythonUDF}
-import org.apache.spark.sql.catalyst.plans.LeftOuter
-import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupJoin, Filter, LogicalPlan,
+import scala.annotation.tailrec
+import scala.collection.mutable
+
+import org.apache.spark.sql.catalyst.expressions.{Alias, And, Attribute, AttributeMap,
+  AttributeSet, Expression, ExprId, ExternalUserDefinedFunction, Literal, NamedExpression,
+  PredicateHelper, PythonUDF}
+import org.apache.spark.sql.catalyst.plans.{Inner, LeftAnti, LeftOuter, LeftSemi}
+import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupFilter, ExternalLookupJoin,
+  ExternalLookupJoinShapes, ExternalLookupProject, ExternalLookupTransform, Filter, LogicalPlan,
   PreparedExternalLookupJoin, Project}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.EXTERNAL_LOOKUP_JOIN
@@ -30,8 +35,10 @@ import org.apache.spark.sql.catalyst.util.CharVarcharUtils
 import org.apache.spark.sql.connector.catalog.{SupportsRead, TableCapability}
 import org.apache.spark.sql.connector.expressions.{Expression => V2Expression, FieldReference}
 import org.apache.spark.sql.connector.expressions.filter.{Predicate => V2Predicate}
-import org.apache.spark.sql.connector.read.{LookupParameter, SupportsExternalLookup}
+import org.apache.spark.sql.connector.read.{LookupParameter, ScanBuilder, SupportsExternalLookup,
+  SupportsPushDownRequiredColumns}
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryErrorsBase}
+import org.apache.spark.sql.execution.datasources.DataSourceStrategy
 import org.apache.spark.sql.types.{BooleanType, DataType}
 
 /** Finalizes an optimized external lookup side immediately before ordinary V2 scan preparation. */
@@ -67,15 +74,17 @@ object PrepareExternalLookupJoin extends Rule[LogicalPlan] with PredicateHelper
     val unmatched = Project(join.left.output ++ nullLookupColumns, join.left)
     join.joinType match {
       case LeftOuter => unmatched
+      case LeftAnti => join.left
       // The stream side is kept under a false filter rather than replaced by an empty relation,
       // so that its sources, watermarks and stateful operators still run in every micro-batch.
       // PruneFilters decides whether a streaming subplan may be pruned.
+      case LeftSemi => Filter(Literal.FalseLiteral, join.left)
       case _ => Filter(Literal.FalseLiteral, unmatched)
     }
   }
 
   private def prepare(join: ExternalLookupJoin): LogicalPlan = {
-    val relation = extractLookupPlan(join.right).getOrElse {
+    val ExtractedLookupPlan(relation, transforms) = extractLookupPlan(join.right).getOrElse {
       throw QueryCompilationErrors.unsupportedExternalLookupJoinError("LOOKUP_PLAN")
     }
     val tableName = relation.table.name()
@@ -91,9 +100,9 @@ object PrepareExternalLookupJoin extends Rule[LogicalPlan] with PredicateHelper
     val conjuncts = join.condition.toSeq.flatMap(splitConjunctivePredicates)
     // The residual is evaluated inside the lookup join, where a Python or external UDF over lookup
     // columns cannot be extracted. As ExtractPythonUDFFromJoinCondition and PlanExternalUDFs do for
-    // other joins, an inner join evaluates such a conjunct in a filter above the join, and an
-    // outer join is rejected.
-    if (join.joinType == LeftOuter) {
+    // other joins, an inner join evaluates such a conjunct in a filter above the join, and other
+    // join types are rejected.
+    if (join.joinType != Inner) {
       conjuncts.flatMap(lookupSideUDF(join, _)).headOption.foreach {
         case _: ExternalUserDefinedFunction =>
           throw QueryCompilationErrors.useExternalUDFInJoinConditionUnsupportedError(join.joinType)
@@ -101,13 +110,17 @@ object PrepareExternalLookupJoin extends Rule[LogicalPlan] with PredicateHelper
           throw QueryCompilationErrors.usePythonUDFInJoinConditionUnsupportedError(join.joinType)
       }
     }
-    val offeredCandidates = conjuncts.zipWithIndex.collect {
-      case (EqualTo(leftExpr, rightAttr: Attribute), index)
-          if isLookupEquality(join, leftExpr, rightAttr) =>
-        OfferedLookupPredicate(leftExpr, rightAttr, index, "=", false)
-      case (EqualTo(rightAttr: Attribute, leftExpr), index)
-          if isLookupEquality(join, leftExpr, rightAttr) =>
-        OfferedLookupPredicate(leftExpr, rightAttr, index, "=", false)
+    // A comparison can be offered only on a lookup column that the lookup-side projections pass
+    // through unchanged, under the name of the table column it reads.
+    val tableColumns = traceToRelation(relation.output, transforms)
+    val offeredCandidates = conjuncts.zipWithIndex.flatMap { case (conjunct, index) =>
+      ExternalLookupJoinShapes.lookupComparison(
+        conjunct, join.left.outputSet, join.right.outputSet).flatMap { comparison =>
+        tableColumns.get(comparison.lookupField.exprId).flatten.map { column =>
+          OfferedLookupPredicate(
+            comparison.parameter, column, index, comparison.predicateName, comparison.nullSafe)
+        }
+      }
     }
     if (offeredCandidates.isEmpty) {
       throw QueryCompilationErrors.unsupportedExternalLookupJoinError(
@@ -121,6 +134,7 @@ object PrepareExternalLookupJoin extends Rule[LogicalPlan] with PredicateHelper
         throw QueryCompilationErrors.unsupportedExternalLookupJoinError(
           "SCAN_BUILDER", Map("table" -> toSQLId(tableName)))
     }
+    val remainingTransforms = pushBaseFilters(scanBuilder, relation, transforms)
     val offeredPredicates = offeredCandidates.map { candidate =>
       new V2Predicate(candidate.predicateName, Array[V2Expression](
         FieldReference.column(candidate.projectedField.name),
@@ -133,6 +147,25 @@ object PrepareExternalLookupJoin extends Rule[LogicalPlan] with PredicateHelper
     val (residual, joinFilter) = conjuncts.zipWithIndex.collect {
       case (conjunct, index) if !selectedConjuncts.contains(index) => conjunct
     }.partition(lookupSideUDF(join, _).isEmpty)
+
+    // The prepared join replaces the analyzed one, so it keeps the analyzed lookup attributes in
+    // their analyzed order, restricted to those required above the join; execution projects the
+    // lookup results into them. The filter above an inner join reads its lookup columns too.
+    val requiredAbove = join.joinType match {
+      case LeftSemi | LeftAnti => AttributeSet.empty
+      case _ => AttributeSet(join.requiredLookupOutput ++ joinFilter.flatMap(_.references))
+    }
+    val lookupOutput = join.right.output.filter(requiredAbove.contains)
+    val residualLookupReferences =
+      residual.flatMap(_.references).filter(join.right.outputSet.contains)
+    val (prunedTransforms, requiredReferences) =
+      pruneLookupTransforms(lookupOutput ++ residualLookupReferences, remainingTransforms)
+    val requiredColumns = relation.output.filter(requiredReferences.contains)
+    scanBuilder match {
+      case builder: SupportsPushDownRequiredColumns =>
+        builder.pruneColumns(requiredColumns.toStructType)
+      case _ =>
+    }
 
     val scan = scanBuilder.build()
     // Fields bind to table columns by exact name, as in `PushDownUtils.toOutputAttrs`. CHAR and
@@ -154,12 +187,8 @@ object PrepareExternalLookupJoin extends Rule[LogicalPlan] with PredicateHelper
       throw QueryCompilationErrors.invalidDataSourceExternalLookupError(
         tableName, "DUPLICATE_SCAN_FIELD", Map("field" -> toSQLId(Seq(name))))
     }
-    // The prepared join replaces the analyzed one, so it keeps the analyzed lookup attributes in
-    // their analyzed order; execution projects the value rows into them.
-    // TODO: prune lookup output to the columns required above the join.
-    val lookupOutput = join.right.output
     val readExprIds = lookupInput.map(_.exprId).toSet
-    lookupOutput.find(attr => !readExprIds.contains(attr.exprId)).foreach { attr =>
+    requiredColumns.find(attr => !readExprIds.contains(attr.exprId)).foreach { attr =>
       throw QueryCompilationErrors.invalidDataSourceExternalLookupError(
         tableName, "MISSING_SCAN_FIELD", Map("field" -> toSQLId(Seq(attr.name))))
     }
@@ -181,6 +210,7 @@ object PrepareExternalLookupJoin extends Rule[LogicalPlan] with PredicateHelper
       maxParameterRowsPerRequest,
       lookupInput,
       lookupOutput,
+      rebindLookupTransforms(prunedTransforms, lookupInput),
       selectedPredicates.map(_.parameter),
       selectedPredicates.map(_.nullSafe),
       join.joinType,
@@ -194,13 +224,6 @@ object PrepareExternalLookupJoin extends Rule[LogicalPlan] with PredicateHelper
       (PythonUDF.isScalarPythonUDF(e) || e.isInstanceOf[ExternalUserDefinedFunction]) &&
         !e.references.subsetOf(join.left.outputSet)
     }
-
-  /** An equality between a bare lookup column and an expression over the stream side. */
-  private def isLookupEquality(
-      join: ExternalLookupJoin,
-      leftExpr: Expression,
-      rightAttr: Attribute): Boolean =
-    leftExpr.references.subsetOf(join.left.outputSet) && join.right.outputSet.contains(rightAttr)
 
   /**
    * Maps the connector's selection back to the offered candidates, in the connector's order, which
@@ -247,9 +270,126 @@ object PrepareExternalLookupJoin extends Rule[LogicalPlan] with PredicateHelper
       predicateName: String,
       nullSafe: Boolean)
 
-  private def extractLookupPlan(plan: LogicalPlan): Option[DataSourceV2Relation] = plan match {
-    case relation: DataSourceV2Relation => Some(relation)
-    case relation: ExternalLookupRelation => Some(relation.relation)
+  private case class ExtractedLookupPlan(
+      relation: DataSourceV2Relation,
+      transforms: Seq[ExternalLookupTransform])
+
+  /** The relation of a lookup side, with its projections and filters in evaluation order. */
+  @tailrec
+  private def extractLookupPlan(
+      plan: LogicalPlan,
+      transforms: List[ExternalLookupTransform] = Nil): Option[ExtractedLookupPlan] = plan match {
+    case relation: DataSourceV2Relation => Some(ExtractedLookupPlan(relation, transforms))
+    case relation: ExternalLookupRelation =>
+      Some(ExtractedLookupPlan(relation.relation, transforms))
+    // Analysis already rejects such a stage; this is a fallback.
+    case node @ (_: Project | _: Filter)
+        if !node.expressions.forall(ExternalLookupJoinShapes.canEvaluateInLookupStage) =>
+      None
+    // The walk goes down from the join, so each stage is evaluated before those found earlier.
+    case Project(projectList, child) =>
+      extractLookupPlan(child, ExternalLookupProject(projectList, child.output) :: transforms)
+    case Filter(condition, child) =>
+      extractLookupPlan(child, ExternalLookupFilter(condition, child.output) :: transforms)
     case _ => None
+  }
+
+  /**
+   * Pushes the filters directly over the lookup relation to the scan builder, before the lookup
+   * predicates are selected, and keeps what the source does not evaluate as a filter stage. As
+   * with `ScanOperation`, only the bottom filter is pushed, followed by more filters while they are
+   * deterministic, because the source evaluates a pushed filter before every filter that is not.
+   */
+  private def pushBaseFilters(
+      scanBuilder: ScanBuilder,
+      relation: DataSourceV2Relation,
+      transforms: Seq[ExternalLookupTransform]): Seq[ExternalLookupTransform] = {
+    val remaining = mutable.ArrayBuffer.empty[ExternalLookupTransform]
+    var canPush = true
+    var bottom = true
+    transforms.foreach {
+      case ExternalLookupFilter(condition, input)
+          if canPush && input == relation.output && (bottom || condition.deterministic) =>
+        // A non-deterministic bottom filter is pushed too: the source keeps its non-deterministic
+        // conjuncts for Spark to evaluate.
+        canPush = condition.deterministic
+        bottom = false
+        val normalized = DataSourceStrategy.normalizeExprs(
+          splitConjunctivePredicates(condition), relation.output)
+        val postScan = PushDownUtils.pushFilters(
+          scanBuilder, normalized, partitionFields = None)._2
+        postScan.reduceOption(And).foreach { filter =>
+          remaining += ExternalLookupFilter(filter, relation.output)
+        }
+      case transform =>
+        canPush = false
+        remaining += transform
+    }
+    remaining.toSeq
+  }
+
+  /** The table column that each lookup-side attribute passes through unchanged, if any. */
+  private def traceToRelation(
+      relationOutput: Seq[Attribute],
+      transforms: Seq[ExternalLookupTransform]): Map[ExprId, Option[Attribute]] = {
+    var lineage: Map[ExprId, Option[Attribute]] =
+      relationOutput.map(attr => attr.exprId -> Some(attr)).toMap
+    transforms.foreach {
+      case _: ExternalLookupFilter =>
+      case ExternalLookupProject(projectList, _) =>
+        lineage = projectList.map { expression =>
+          val source = expression match {
+            case attr: Attribute => lineage.getOrElse(attr.exprId, None)
+            case Alias(attr: Attribute, _) => lineage.getOrElse(attr.exprId, None)
+            case _ => None
+          }
+          expression.toAttribute.exprId -> source
+        }.toMap
+    }
+    lineage
+  }
+
+  /**
+   * Drops the projected expressions that nothing above them reads, from the last stage to the
+   * first, and returns the retained stages with the attributes that the first one reads.
+   */
+  private def pruneLookupTransforms(
+      finalOutput: Seq[Attribute],
+      transforms: Seq[ExternalLookupTransform]): (Seq[ExternalLookupTransform], AttributeSet) = {
+    var required = AttributeSet(finalOutput)
+    val retained = mutable.ArrayBuffer.empty[ExternalLookupTransform]
+    transforms.reverseIterator.foreach {
+      case filter @ ExternalLookupFilter(condition, _) =>
+        required ++= condition.references
+        retained.prepend(filter)
+      case project @ ExternalLookupProject(projectList, _) =>
+        val retainedProjects = projectList.filter(expr => required.contains(expr.toAttribute))
+        required = AttributeSet(retainedProjects.flatMap(_.references))
+        retained.prepend(project.copy(projectList = retainedProjects))
+    }
+    retained.toSeq -> required
+  }
+
+  /**
+   * Binds the stages to the value rows, stage by stage. Each stage reads the attributes of the
+   * previous one, so the read schema's types and nullability carry through the projections.
+   */
+  private def rebindLookupTransforms(
+      transforms: Seq[ExternalLookupTransform],
+      lookupInput: Seq[Attribute]): Seq[ExternalLookupTransform] = {
+    var input = lookupInput
+    transforms.map { transform =>
+      val inputByExprId = AttributeMap(input.map(attr => attr -> attr))
+      def rebind(expression: Expression): Expression = expression.transform {
+        case attr: Attribute => inputByExprId.getOrElse(attr, attr)
+      }
+      val rebound = transform match {
+        case ExternalLookupProject(projectList, _) =>
+          ExternalLookupProject(projectList.map(rebind(_).asInstanceOf[NamedExpression]), input)
+        case ExternalLookupFilter(condition, _) => ExternalLookupFilter(rebind(condition), input)
+      }
+      input = rebound.output
+      rebound
+    }
   }
 }
