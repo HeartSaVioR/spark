@@ -2898,7 +2898,7 @@
       },
       "LOOKUP_PLAN" : {
         "message" : [
-          "The lookup side must be a DSv2 table, with no other operator between the table and the join."
+          "The lookup side must be a DSv2 table, optionally under projections and filters, which Spark evaluates on the lookup results. They cannot contain Python UDFs, external UDFs or subqueries, and no other operator can be between the table and the join."
         ]
       },
       "LOOKUP_TABLE_ON_LEFT" : {
