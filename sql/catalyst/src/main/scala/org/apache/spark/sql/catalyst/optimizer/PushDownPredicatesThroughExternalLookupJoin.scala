@@ -19,7 +19,8 @@ package org.apache.spark.sql.catalyst.optimizer
 
 import org.apache.spark.sql.catalyst.expressions.{And, Expression, PredicateHelper}
 import org.apache.spark.sql.catalyst.plans.{Inner, LeftAnti, LeftOuter, LeftSemi}
-import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupJoin, Filter, LogicalPlan}
+import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupJoin, ExternalLookupJoinShapes,
+  Filter, LogicalPlan}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.EXTERNAL_LOOKUP_JOIN
 
@@ -34,6 +35,14 @@ import org.apache.spark.sql.catalyst.trees.TreePattern.EXTERNAL_LOOKUP_JOIN
  *    that `PrepareExternalLookupJoin` pushes to the connector or evaluates on its results. Under
  *    an inner or left semi join, conjuncts on the stream side alone go into the stream side;
  *    under a left outer or left anti join they stay in the condition.
+ *
+ * Two kinds of conjuncts never move onto the lookup side, so that this rule cannot make a query
+ * fail that runs without it:
+ *  - A comparison that `PrepareExternalLookupJoin` can offer as a lookup candidate, such as
+ *    `t.dept = 'x'`, stays in the condition. The connector still sees it as a candidate, and
+ *    Spark evaluates it if the connector declines it.
+ *  - A conjunct over lookup columns that a lookup-side stage cannot evaluate, such as one with a
+ *    Python UDF, does not move at all. It stays where the join planning handles it.
  */
 object PushDownPredicatesThroughExternalLookupJoin extends Rule[LogicalPlan]
   with PredicateHelper {
@@ -52,7 +61,10 @@ object PushDownPredicatesThroughExternalLookupJoin extends Rule[LogicalPlan]
       join: ExternalLookupJoin): LogicalPlan = {
     val (streamOnly, lookupOnly, others) = split(conjuncts, join)
     val intoCondition = join.joinType match {
-      case Inner => (lookupOnly ++ others).filter(c => canMove(c) && canEvaluateWithinJoin(c))
+      case Inner =>
+        (lookupOnly ++ others).filter { c =>
+          canMove(c) && !isPinned(c, join) && canEvaluateWithinJoin(c)
+        }
       case LeftOuter | LeftSemi | LeftAnti => Nil
       case _ => return filter
     }
@@ -84,16 +96,33 @@ object PushDownPredicatesThroughExternalLookupJoin extends Rule[LogicalPlan]
    * Splits conjuncts the way [[PushPredicateThroughJoin]] does: (movable conjuncts on the stream
    * side alone, movable conjuncts on the lookup side alone, the rest). Unlike there, a conjunct
    * without references, such as a literal, belongs to neither side and stays where it is, so that
-   * a condition that folds to false keeps its result without a lookup.
+   * a condition that folds to false keeps its result without a lookup. A lookup candidate belongs
+   * to the rest.
    */
   private def split(
       conjuncts: Seq[Expression],
       join: ExternalLookupJoin): (Seq[Expression], Seq[Expression], Seq[Expression]) = {
-    val (movable, stayUp) = conjuncts.partition(c => canMove(c) && c.references.nonEmpty)
+    val (movable, stayUp) = conjuncts.partition { c =>
+      canMove(c) && c.references.nonEmpty && !isPinned(c, join)
+    }
     val (streamOnly, rest) = movable.partition(_.references.subsetOf(join.left.outputSet))
-    val (lookupOnly, common) = rest.partition(_.references.subsetOf(join.right.outputSet))
-    (streamOnly, lookupOnly, common ++ stayUp)
+    val (lookupSide, common) = rest.partition(_.references.subsetOf(join.right.outputSet))
+    val (candidates, lookupOnly) = lookupSide.partition(isLookupCandidate(_, join))
+    (streamOnly, lookupOnly, common ++ candidates ++ stayUp)
   }
+
+  /** Whether `PrepareExternalLookupJoin` can offer `conjunct` as a lookup candidate. */
+  private def isLookupCandidate(conjunct: Expression, join: ExternalLookupJoin): Boolean =
+    ExternalLookupJoinShapes.lookupComparison(
+      conjunct, join.left.outputSet, join.right.outputSet).isDefined
+
+  /**
+   * Whether `conjunct` reads lookup columns and could not be evaluated by a lookup-side stage. It
+   * never moves: a stage with it would fail to plan.
+   */
+  private def isPinned(conjunct: Expression, join: ExternalLookupJoin): Boolean =
+    conjunct.references.exists(join.right.outputSet.contains) &&
+      !ExternalLookupJoinShapes.canEvaluateInLookupStage(conjunct)
 
   private def canMove(conjunct: Expression): Boolean =
     conjunct.deterministic && !conjunct.throwable

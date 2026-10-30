@@ -835,9 +835,9 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       Seq(Row(1, "one", 1, "engineering"), Row(1, "one", 1, "research"),
         Row(2, "two", 2, "sales"), Row(3, "three", null, null)))
 
-    // Only comparisons of a lookup field with a stream-side value are offered. The conjuncts on
-    // the lookup side alone go onto the lookup side, and the stream-side conjunct of this left
-    // outer join stays in the condition. Spark evaluates all three: the connector accepts none.
+    // Only comparisons of a lookup field with a stream-side value or a constant are offered. The
+    // connector selects `id = ?`, and Spark evaluates the other conjuncts: the stream-side one on
+    // the joined rows, and `length(department) > id` on the lookup side.
     SimpleExternalLookupDataSource.resetCounters()
     val flagged = streamOf(Seq((1, true), (2, true), (1, false)).toDF("id", "flag"))
     checkStream(
@@ -847,7 +847,8 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
           lookup("department") === "engineering" && length(lookup("department")) > lookup("id"),
         "left_outer"),
       Seq(Row(1, true, 1, "engineering"), Row(2, true, null, null), Row(1, false, null, null)))
-    assert(SimpleExternalLookupDataSource.lookupCandidates.get() === Seq(("=", "id", IntegerType)))
+    assert(SimpleExternalLookupDataSource.lookupCandidates.get() ===
+      Seq(("=", "id", IntegerType), ("=", "department", StringType)))
   }
 
   test("external lookup-only source joins without an explicit hint") {
