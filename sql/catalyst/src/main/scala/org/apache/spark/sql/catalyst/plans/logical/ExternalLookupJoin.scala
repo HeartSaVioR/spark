@@ -24,7 +24,18 @@ import org.apache.spark.sql.catalyst.trees.TreePattern.{EXTERNAL_LOOKUP_HINT, EX
   TreePattern}
 import org.apache.spark.sql.connector.read.{ExternalLookupReaderFactory, Scan}
 
-/** Occurrence-local marker produced by resolving the `external_lookup` hint. */
+/**
+ * Marks the plan below it as the lookup side that the `EXTERNAL_LOOKUP` hint asks an external
+ * lookup join to read. The external lookup join rules consume it when they form the join.
+ *
+ * Join strategy hints are [[ResolvedHint]] nodes with a [[JoinStrategyHint]]. This hint is not,
+ * because that representation cannot keep two of its guarantees:
+ *  - A strategy hint that conflicts with it must fail the query. [[HintInfo]] holds one strategy,
+ *    and `ResolveJoinStrategyHints` merges a strategy hint on an already hinted relation into the
+ *    existing [[ResolvedHint]] with `HintInfo.merge`, which keeps one strategy and only warns.
+ *  - It selects how the lookup side is read, not a physical join. `EliminateResolvedHint` moves
+ *    every [[ResolvedHint]] it can attach into `Join.hint`, for physical join selection.
+ */
 case class ExternalLookupHint(child: LogicalPlan) extends UnaryNode {
   override def output: Seq[Attribute] = child.output
 
