@@ -23,9 +23,9 @@ import org.apache.spark.sql.catalyst.expressions.{CommonExpressionRef, Expressio
   SubqueryExpression, With}
 import org.apache.spark.sql.catalyst.optimizer.EliminateResolvedHint
 import org.apache.spark.sql.catalyst.plans.{Inner, LeftAnti, LeftOuter, LeftSemi}
-import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupHint, ExternalLookupJoin,
-  ExternalLookupJoinShapes, Filter, Join, JoinStrategyHint, LogicalPlan, Project, ResolvedHint,
-  SubqueryAlias, UnaryNode, View}
+import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupCacheOptions,
+  ExternalLookupHint, ExternalLookupJoin, ExternalLookupJoinShapes, Filter, Join, JoinStrategyHint,
+  LogicalPlan, Project, ResolvedHint, SubqueryAlias, UnaryNode, View}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.{COMMON_EXPR_REF, EXTERNAL_LOOKUP_HINT, JOIN,
   WITH_EXPRESSION}
@@ -124,6 +124,11 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
     join.right.transformUpWithPruning(_.containsPattern(EXTERNAL_LOOKUP_HINT)) {
       case marker: ExternalLookupHint => marker.child
     }
+
+  /** The cache options of an eligible join: its hint's, or the session defaults. */
+  def cacheOptions(join: Join): ExternalLookupCacheOptions =
+    lookupHints(join.right).headOption.map(_.cacheOptions)
+      .getOrElse(ResolveExternalLookupHint.defaultCacheOptions)
 
   private def ineligible(
       subClass: String,
@@ -225,6 +230,7 @@ object FormExternalLookupJoin extends Rule[LogicalPlan] {
               lookupPlan,
               join.joinType,
               join.condition.map(inlineCommonExpressions),
+              cacheOptions(join),
               lookupPlan.output)
           // Operator optimization could push a filter's predicate into the join later, but the
           // condition must be written in the join.
