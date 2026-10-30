@@ -2470,7 +2470,7 @@ object SQLConf {
         "result is reused as it was read, including the values of non-deterministic " +
         "lookup-side expressions. It can be overridden per join with the EXTERNAL_LOOKUP hint " +
         "option 'cache_enabled'.")
-      .version("5.0.0")
+      .version("4.4.0")
       .booleanConf
       .createWithDefault(true)
 
@@ -2478,7 +2478,7 @@ object SQLConf {
     buildConf("spark.sql.join.externalLookup.cache.maxEntries")
       .doc("Maximum number of lookup keys in one external lookup join cache, that is per input " +
         "partition of a task. Beyond it, the least recently used key is evicted.")
-      .version("5.0.0")
+      .version("4.4.0")
       .intConf
       .checkValue(_ > 0, "External lookup join cache max entries must be positive")
       .createWithDefault(10000)
@@ -2487,7 +2487,7 @@ object SQLConf {
     buildConf("spark.sql.join.externalLookup.cache.ttl")
       .doc("Time-to-live of a cached external lookup join result. A value of 0 disables " +
         "expiration.")
-      .version("5.0.0")
+      .version("4.4.0")
       .timeConf(TimeUnit.MILLISECONDS)
       .checkValue(_ >= 0, "External lookup join cache TTL must be non-negative")
       .createWithDefault(0L)
@@ -2497,7 +2497,7 @@ object SQLConf {
       .doc("Maximum number of result rows, after lookup-side projections and filters, that " +
         "external lookup join caches for one lookup key. The rows of a key with more are " +
         "returned but not cached.")
-      .version("5.0.0")
+      .version("4.4.0")
       .intConf
       .checkValue(_ > 0, "External lookup join cache max rows per key must be positive")
       .createWithDefault(1000)
