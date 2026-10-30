@@ -113,7 +113,6 @@ abstract class Optimizer(catalogManager: CatalogManager)
         LimitPushDownThroughWindow,
         RewriteSizeOfArrayStruct,
         ColumnPruning,
-        PruneExternalLookupJoinColumns,
         GenerateOptimization,
         // Operator combine
         CollapseRepartition,

@@ -25,9 +25,9 @@ import org.apache.spark.sql.catalyst.trees.TreePattern.EXTERNAL_LOOKUP_JOIN
 
 /**
  * Prunes the columns of an [[ExternalLookupJoin]], which [[ColumnPruning]] does not handle
- * because it is not a `Join`. It runs while the lookup side is still an ordinary logical plan,
- * and narrows `requiredLookupOutput` to what the parent needs, so that
- * `PrepareExternalLookupJoin` prunes the lookup scan to it.
+ * because it is not a `Join`. It runs with the operator optimization rules, while the lookup side
+ * is still an ordinary logical plan, and narrows `requiredLookupOutput` to what the parent needs,
+ * so that `PrepareExternalLookupJoin` prunes the lookup scan to it.
  */
 object PruneExternalLookupJoinColumns extends Rule[LogicalPlan] {
   override def apply(plan: LogicalPlan): LogicalPlan =
