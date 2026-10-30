@@ -29,7 +29,7 @@ import org.apache.spark.sql.connector.read.{ExternalLookupReaderFactory, Scan}
 import org.apache.spark.sql.execution.{SparkPlan, UnaryExecNode}
 import org.apache.spark.sql.execution.datasources.v2.SupportsCustomDriverMetrics
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
-import org.apache.spark.util.Utils
+import org.apache.spark.util.{Clock, SystemClock, Utils}
 
 /**
  * Executes synchronous, parameterized external lookup joins without a shuffle. Each task joins
@@ -140,17 +140,8 @@ case class ExternalLookupJoinExec(
 }
 
 object ExternalLookupJoinExec {
-  @volatile private[sql] var cacheTimeNanos: () => Long = () => System.nanoTime()
-
-  private[sql] def withCacheTimeNanos[T](timeNanos: () => Long)(body: => T): T = {
-    val previous = cacheTimeNanos
-    cacheTimeNanos = timeNanos
-    try {
-      body
-    } finally {
-      cacheTimeNanos = previous
-    }
-  }
+  /** The clock of the cache TTL; tests replace it. */
+  @volatile private[sql] var cacheClock: Clock = new SystemClock()
 
   /**
    * Spark's cap on the parameter rows of one request, whatever the connector allows: it bounds
