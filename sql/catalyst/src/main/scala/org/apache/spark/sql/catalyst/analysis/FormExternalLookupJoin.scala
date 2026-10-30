@@ -17,15 +17,18 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
+import scala.annotation.tailrec
+
 import org.apache.spark.sql.catalyst.expressions.{CommonExpressionRef, Expression,
   SubqueryExpression, With}
 import org.apache.spark.sql.catalyst.optimizer.EliminateResolvedHint
 import org.apache.spark.sql.catalyst.plans.{Inner, LeftOuter}
-import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupHint, ExternalLookupJoin,
-  Filter, Join, JoinStrategyHint, LogicalPlan, Project, ResolvedHint, SubqueryAlias, View}
+import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupHint, ExternalLookupJoin, Join,
+  JoinStrategyHint, LogicalPlan, ResolvedHint, SubqueryAlias, UnaryNode, View}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.{COMMON_EXPR_REF, EXTERNAL_LOOKUP_HINT, JOIN,
   WITH_EXPRESSION}
+import org.apache.spark.sql.connector.catalog.TableCapability
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryErrorsBase}
 import org.apache.spark.sql.execution.datasources.v2.ExternalLookupRelations
 
@@ -37,7 +40,9 @@ import org.apache.spark.sql.execution.datasources.v2.ExternalLookupRelations
  * lookup but not batch read, or when the right side carries an `EXTERNAL_LOOKUP` hint. A table
  * that supports both keeps the ordinary join strategies unless the hint opts in. It must be a
  * stream-static join: the left side is a streaming query, whose micro-batches tolerate lookup
- * results that change between requests, and the lookup table is on the right side.
+ * results that change between requests, and the lookup table is on the right side. The join reads
+ * the table directly, or through hints, aliases and views only, so a join that must be a lookup
+ * join either runs as one or fails here, whatever the optimizer later does to its lookup side.
  */
 object ExternalLookupJoinEligibility extends QueryErrorsBase {
   sealed trait Eligibility
@@ -57,28 +62,44 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
       return Ineligible(QueryCompilationErrors.invalidExternalLookupHintError("NOT_ON_LOOKUP_SIDE"))
     }
     // The lookup-only table must be on the right side; the sides are never swapped.
-    val leftLookupOnlyTable = ExternalLookupRelations.lookupOnlyTable(accessPath(join.left).last)
+    val leftLookupOnlyTable = ExternalLookupRelations.lookupOnlyTable(input(join.left))
     if (leftLookupOnlyTable.isDefined) {
       return ineligible("LOOKUP_TABLE_ON_LEFT", toSQLId(leftLookupOnlyTable.get.name()))
     }
     val markers = lookupHints(join.right)
-    val lookupTable = ExternalLookupRelations.table(accessPath(join.right).last)
+    val lookupOnly = ExternalLookupRelations.lookupOnlyTable(input(join.right)).isDefined
     // A lookup-only table can be read only by a lookup join, and the hint opts a join in. Either
     // way the join must run as an external lookup join, and the checks below apply.
-    if (!lookupTable.exists(ExternalLookupRelations.isLookupOnly) && markers.isEmpty) {
-      return NotLookupJoin
-    }
+    if (!lookupOnly && markers.isEmpty) return NotLookupJoin
     if (markers.length > 1) {
       return Ineligible(QueryCompilationErrors.invalidExternalLookupHintError("MULTIPLE_HINTS"))
     }
-    val relation = lookupTable.map(table => toSQLId(table.name())).getOrElse("the lookup side")
+    if (join.right.isStreaming) {
+      return Ineligible(QueryCompilationErrors.unsupportedExternalLookupJoinError(
+        "STREAMING_LOOKUP_SIDE"))
+    }
+    val table = ExternalLookupRelations.table(lookupRelation(join.right)) match {
+      case Some(table) => table
+      case None =>
+        return Ineligible(QueryCompilationErrors.unsupportedExternalLookupJoinError("LOOKUP_PLAN"))
+    }
+    val relation = toSQLId(table.name())
+    if (!table.capabilities().contains(TableCapability.EXTERNAL_LOOKUP)) {
+      return Ineligible(QueryCompilationErrors.unsupportedExternalLookupJoinError(
+        "TABLE", Map("table" -> relation)))
+    }
     if (!join.left.isStreaming) return ineligible("STATIC_LEFT_SIDE", relation)
     // A join hint the user wrote is never silently dropped: an external lookup join cannot run a
-    // physical join strategy, and a lookup-only table has no batch scan for one.
+    // physical join strategy, and a lookup-only table has no batch scan for one. On a table that
+    // also supports batch reads, the strategy hint conflicts with the `EXTERNAL_LOOKUP` hint.
     joinStrategyHint(join) match {
-      case Some(strategy) =>
+      case Some(strategy) if lookupOnly =>
         ineligible("CONFLICTING_JOIN_STRATEGY", relation,
           Map("strategy" -> toSQLStmt(strategy.displayName)))
+      case Some(strategy) =>
+        Ineligible(QueryCompilationErrors.invalidExternalLookupHintError(
+          "CONFLICTING_JOIN_STRATEGY",
+          Map("strategy" -> toSQLStmt(strategy.displayName), "relation" -> relation)))
       case None if join.condition.isEmpty => MissingCondition
       case None if !SupportedJoinTypes.contains(join.joinType) =>
         ineligible("JOIN_TYPE", relation, Map(
@@ -88,15 +109,19 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
       // no longer is by then.
       case None if join.condition.exists(SubqueryExpression.hasSubquery) =>
         ineligible("SUBQUERY_IN_JOIN_CONDITION", relation)
-      case None if join.right.isStreaming =>
-        Ineligible(QueryCompilationErrors.unsupportedExternalLookupJoinError(
-          "STREAMING_LOOKUP_SIDE"))
       case None => Eligible
     }
   }
 
-  /** The lookup side of an eligible join, without its `EXTERNAL_LOOKUP` hint. */
-  def lookupSide(join: Join): LogicalPlan = removeLookupHints(join.right)
+  /**
+   * The lookup side of an eligible join, without its `EXTERNAL_LOOKUP` hint. The lookup side of an
+   * eligible join is a chain of hints, aliases and views over the table, so every marker in it is
+   * the join's own.
+   */
+  def lookupSide(join: Join): LogicalPlan =
+    join.right.transformUpWithPruning(_.containsPattern(EXTERNAL_LOOKUP_HINT)) {
+      case marker: ExternalLookupHint => marker.child
+    }
 
   private def ineligible(
       subClass: String,
@@ -105,26 +130,32 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
     Ineligible(QueryCompilationErrors.unsupportedExternalLookupJoinError(
       subClass, parameters + ("relation" -> relation)))
 
-  /**
-   * The operators from a join input down to the relation that a lookup would read. The path stops
-   * at the first operator that cannot be part of a lookup side, such as another join, so a table
-   * read by a nested join does not make the outer join a lookup candidate.
-   */
-  private def accessPath(plan: LogicalPlan): Seq[LogicalPlan] = plan match {
-    case node @ (_: ExternalLookupHint | _: ResolvedHint | _: SubqueryAlias | _: View |
-        _: Project | _: Filter) =>
-      node +: accessPath(node.children.head)
-    case other => Seq(other)
+  /** The relation that a join input reads: the first operator that has no single child. */
+  @tailrec
+  private def input(plan: LogicalPlan): LogicalPlan = plan match {
+    case unary: UnaryNode => input(unary.child)
+    case other => other
   }
 
-  private def lookupHints(plan: LogicalPlan): Seq[ExternalLookupHint] =
-    accessPath(plan).collect { case marker: ExternalLookupHint => marker }
-
-  private def removeLookupHints(plan: LogicalPlan): LogicalPlan = plan match {
-    case marker: ExternalLookupHint => removeLookupHints(marker.child)
-    case node @ (_: ResolvedHint | _: SubqueryAlias | _: View | _: Project | _: Filter) =>
-      node.withNewChildren(Seq(removeLookupHints(node.children.head)))
+  /** The first operator below a join input that is not a hint, an alias or a view. */
+  @tailrec
+  private def lookupRelation(plan: LogicalPlan): LogicalPlan = plan match {
+    case node @ (_: ExternalLookupHint | _: ResolvedHint | _: SubqueryAlias | _: View) =>
+      lookupRelation(node.children.head)
     case other => other
+  }
+
+  /**
+   * The `EXTERNAL_LOOKUP` hints on a join input. Like a join strategy hint, the hint applies to the
+   * join that the input feeds, through any unary operator.
+   */
+  @tailrec
+  private def lookupHints(
+      plan: LogicalPlan,
+      found: Seq[ExternalLookupHint] = Nil): Seq[ExternalLookupHint] = plan match {
+    case marker: ExternalLookupHint => lookupHints(marker.child, found :+ marker)
+    case unary: UnaryNode => lookupHints(unary.child, found)
+    case _ => found
   }
 
   private def joinStrategyHint(join: Join): Option[JoinStrategyHint] = {
