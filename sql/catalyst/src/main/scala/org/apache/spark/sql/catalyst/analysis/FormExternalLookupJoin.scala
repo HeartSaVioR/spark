@@ -17,29 +17,17 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
-import java.util.Locale
-
-import scala.collection.mutable
-
 import org.apache.spark.sql.catalyst.expressions.{CommonExpressionRef, Expression,
   SubqueryExpression, With}
 import org.apache.spark.sql.catalyst.optimizer.EliminateResolvedHint
 import org.apache.spark.sql.catalyst.plans.{Inner, LeftOuter}
 import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupHint, ExternalLookupJoin,
-  Filter, Join, JoinStrategyHint, LogicalPlan, Project, ResolvedHint, SubqueryAlias,
-  UnresolvedHint, UnresolvedWith, View}
-import org.apache.spark.sql.catalyst.rules.{Rule, RuleId}
+  Filter, Join, JoinStrategyHint, LogicalPlan, Project, ResolvedHint, SubqueryAlias, View}
+import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.{COMMON_EXPR_REF, EXTERNAL_LOOKUP_HINT, JOIN,
-  UNRESOLVED_HINT, WITH_EXPRESSION}
+  WITH_EXPRESSION}
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryErrorsBase}
 import org.apache.spark.sql.execution.datasources.v2.ExternalLookupRelations
-import org.apache.spark.sql.internal.SQLConf
-
-/** Resolves the `external_lookup` option hint to an occurrence-local marker. */
-object ResolveExternalLookupHint extends Rule[LogicalPlan] {
-  override def apply(plan: LogicalPlan): LogicalPlan =
-    ExternalLookupJoinEligibility.resolveHints(plan, ruleId)
-}
 
 /**
  * Classifies a join for external lookup. [[CheckExternalLookupJoin]] and [[FormExternalLookupJoin]]
@@ -62,15 +50,7 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
   /** The join must run as an external lookup join but cannot. */
   case class Ineligible(error: Throwable) extends Eligibility
 
-  private val HintName = "EXTERNAL_LOOKUP"
   private val SupportedJoinTypes = Seq(Inner, LeftOuter)
-
-  private[analysis] def resolveHints(plan: LogicalPlan, hintRuleId: RuleId): LogicalPlan =
-    plan.resolveOperatorsUpWithPruning(_.containsPattern(UNRESOLVED_HINT), hintRuleId) {
-      case UnresolvedHint(name, parameters, child)
-          if name.toUpperCase(Locale.ROOT) == HintName =>
-        resolveHint(parameters, child)
-    }
 
   def apply(join: Join): Eligibility = {
     if (lookupHints(join.left).nonEmpty) {
@@ -153,56 +133,6 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
     val attached = join.hint.leftHint.toSeq ++ join.hint.rightHint.toSeq ++
       Seq(join.left, join.right).flatMap(EliminateResolvedHint.extractHintsFromPlan(_)._2)
     attached.flatMap(_.strategy).headOption
-  }
-
-  private def resolveHint(parameters: Seq[Expression], child: LogicalPlan): LogicalPlan = {
-    val relationNames = mutable.ArrayBuffer.empty[Seq[String]]
-    parameters.foreach {
-      case attr: UnresolvedAttribute =>
-        relationNames += attr.nameParts
-      case other =>
-        throw QueryCompilationErrors.invalidExternalLookupHintError(
-          "UNSUPPORTED_PARAMETER", Map("parameter" -> toSQLExpr(other)))
-    }
-    relationNames.diff(relationNames.distinct).headOption.foreach { duplicate =>
-      throw QueryCompilationErrors.invalidExternalLookupHintError(
-        "DUPLICATE_RELATION", Map("relation" -> toSQLId(duplicate)))
-    }
-
-    if (relationNames.isEmpty) {
-      var wrappedJoin = false
-      val rewritten = child.transformDown {
-        case join: Join if !wrappedJoin =>
-          wrappedJoin = true
-          join.copy(right = ExternalLookupHint(join.right))
-      }
-      if (wrappedJoin) rewritten else ExternalLookupHint(child)
-    } else {
-      val matched = mutable.HashSet.empty[Seq[String]]
-      def matches(identifier: Seq[String]): Boolean = relationNames.find { name =>
-        !matched.contains(name) &&
-          ResolveHints.matchedIdentifier(name, identifier, SQLConf.get.resolver)
-      }.map(matched.add).nonEmpty
-      // Mirrors the target scoping of ResolveHints.ResolveJoinStrategyHints: a name matches an
-      // unaliased (possibly multipart) table or an alias, and does not reach into a view,
-      // a WITH clause, or an aliased subquery.
-      def applyHint(plan: LogicalPlan): LogicalPlan = plan match {
-        case relation: UnresolvedRelation if matches(relation.multipartIdentifier) =>
-          ExternalLookupHint(relation)
-        case alias: SubqueryAlias
-            if matches(alias.identifier.qualifier :+ alias.identifier.name) =>
-          ExternalLookupHint(alias)
-        case _: View | _: UnresolvedWith | _: SubqueryAlias => plan
-        case _ => plan.mapChildren(applyHint)
-      }
-      val rewritten = applyHint(child)
-      val missing = relationNames.filterNot(matched.contains)
-      if (missing.nonEmpty) {
-        throw QueryCompilationErrors.invalidExternalLookupHintError(
-          "RELATION_NOT_FOUND", Map("relations" -> missing.map(toSQLId).mkString(", ")))
-      }
-      rewritten
-    }
   }
 }
 

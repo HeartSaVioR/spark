@@ -197,6 +197,23 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
             "relation" -> "`DualCapabilityExternalLookupTable`"))
       }
     }
+    // Both hints may name the same relation, in either order. A strategy hint is never merged
+    // into the lookup hint, so the conflict is still reported.
+    withTempView("external_lookup_left", "external_lookup_right") {
+      left.createOrReplaceTempView("external_lookup_left")
+      dual.createOrReplaceTempView("external_lookup_right")
+      Seq("EXTERNAL_LOOKUP(r), MERGE(r)", "MERGE(r), EXTERNAL_LOOKUP(r)").foreach { hints =>
+        checkError(
+          exception = intercept[AnalysisException] {
+            sql(s"SELECT /*+ $hints */ * FROM external_lookup_left l " +
+              "JOIN external_lookup_right r ON l.id = r.id")
+          },
+          condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.CONFLICTING_JOIN_STRATEGY",
+          parameters = Map(
+            "strategy" -> "MERGE",
+            "relation" -> "`DualCapabilityExternalLookupTable`"))
+      }
+    }
 
     // Without the lookup hint, the strategy hint plans the ordinary join it asks for.
     SimpleExternalLookupDataSource.resetCounters()
