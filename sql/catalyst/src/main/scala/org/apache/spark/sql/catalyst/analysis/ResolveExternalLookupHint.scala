@@ -38,16 +38,16 @@ import org.apache.spark.util.Utils
  */
 object ResolveExternalLookupHint extends Rule[LogicalPlan] with QueryErrorsBase {
   private val HINT_NAME = "EXTERNAL_LOOKUP"
-  private val CacheEnabledOption = "cache_enabled"
-  private val CacheMaxEntriesOption = "cache_max_entries"
-  private val CacheTtlOption = "cache_ttl"
-  private val CacheMaxRowsPerKeyOption = "cache_max_rows_per_key"
-  private val SupportedOptions = Set(
-    CacheEnabledOption,
-    CacheMaxEntriesOption,
-    CacheTtlOption,
-    CacheMaxRowsPerKeyOption)
-  private val NonNegativeDuration = "a non-negative duration, such as 500ms, 5s, or 10m"
+  private val CACHE_ENABLED_OPTION = "cache_enabled"
+  private val CACHE_MAX_ENTRIES_OPTION = "cache_max_entries"
+  private val CACHE_TTL_OPTION = "cache_ttl"
+  private val CACHE_MAX_ROWS_PER_KEY_OPTION = "cache_max_rows_per_key"
+  private val SUPPORTED_OPTIONS = Set(
+    CACHE_ENABLED_OPTION,
+    CACHE_MAX_ENTRIES_OPTION,
+    CACHE_TTL_OPTION,
+    CACHE_MAX_ROWS_PER_KEY_OPTION)
+  private val NON_NEGATIVE_DURATION = "a non-negative duration, such as 500ms, 5s, or 10m"
 
   override def apply(plan: LogicalPlan): LogicalPlan =
     plan.resolveOperatorsUpWithPruning(_.containsPattern(UNRESOLVED_HINT), ruleId) {
@@ -124,29 +124,29 @@ object ResolveExternalLookupHint extends Rule[LogicalPlan] with QueryErrorsBase 
     }
     val name = option.substring(0, separator).trim.toLowerCase(Locale.ROOT)
     val value = option.substring(separator + 1).trim
-    if (!SupportedOptions.contains(name)) {
+    if (!SUPPORTED_OPTIONS.contains(name)) {
       throw QueryCompilationErrors.invalidExternalLookupOptionError(
         name,
         "UNSUPPORTED",
-        Map("supportedOptions" -> SupportedOptions.toSeq.sorted.map(toDSOption).mkString(", ")))
+        Map("supportedOptions" -> SUPPORTED_OPTIONS.toSeq.sorted.map(toDSOption).mkString(", ")))
     }
     if (!seenOptions.add(name)) {
       throw QueryCompilationErrors.invalidExternalLookupOptionError(name, "DUPLICATE")
     }
 
     name match {
-      case CacheEnabledOption =>
+      case CACHE_ENABLED_OPTION =>
         value.toLowerCase(Locale.ROOT) match {
           case "true" => cacheOptions.copy(enabled = true)
           case "false" => cacheOptions.copy(enabled = false)
-          case _ => invalidOptionValue(CacheEnabledOption, "true or false")
+          case _ => invalidOptionValue(CACHE_ENABLED_OPTION, "true or false")
         }
-      case CacheMaxEntriesOption =>
-        cacheOptions.copy(maxEntries = parsePositiveInt(CacheMaxEntriesOption, value))
-      case CacheTtlOption =>
-        cacheOptions.copy(ttlMillis = parseNonNegativeDurationMillis(CacheTtlOption, value))
-      case CacheMaxRowsPerKeyOption =>
-        cacheOptions.copy(maxRowsPerKey = parsePositiveInt(CacheMaxRowsPerKeyOption, value))
+      case CACHE_MAX_ENTRIES_OPTION =>
+        cacheOptions.copy(maxEntries = parsePositiveInt(CACHE_MAX_ENTRIES_OPTION, value))
+      case CACHE_TTL_OPTION =>
+        cacheOptions.copy(ttlMillis = parseNonNegativeDurationMillis(CACHE_TTL_OPTION, value))
+      case CACHE_MAX_ROWS_PER_KEY_OPTION =>
+        cacheOptions.copy(maxRowsPerKey = parsePositiveInt(CACHE_MAX_ROWS_PER_KEY_OPTION, value))
     }
   }
 
@@ -164,9 +164,9 @@ object ResolveExternalLookupHint extends Rule[LogicalPlan] with QueryErrorsBase 
     val parsed = try {
       Utils.timeStringAsMs(value)
     } catch {
-      case NonFatal(_) => invalidOptionValue(optionName, NonNegativeDuration)
+      case NonFatal(_) => invalidOptionValue(optionName, NON_NEGATIVE_DURATION)
     }
-    if (parsed < 0) invalidOptionValue(optionName, NonNegativeDuration)
+    if (parsed < 0) invalidOptionValue(optionName, NON_NEGATIVE_DURATION)
     parsed
   }
 
