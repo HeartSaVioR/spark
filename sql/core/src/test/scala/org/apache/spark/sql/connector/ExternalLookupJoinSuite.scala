@@ -438,10 +438,14 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
         "relation" -> "`DualCapabilityExternalLookupTable`",
         "supportedJoinTypes" -> "INNER, LEFT OUTER, LEFT SEMI, LEFT ANTI"))
 
+    // A cross join fails with its join type while it is analyzed, before its missing condition.
     checkError(
-      exception = streamFailure[AnalysisException](left.crossJoin(lookup.hint("external_lookup"))),
-      condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.MISSING_JOIN_CONDITION",
-      parameters = Map.empty)
+      exception = intercept[AnalysisException](left.crossJoin(lookup.hint("external_lookup"))),
+      condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.JOIN_TYPE",
+      parameters = Map(
+        "joinType" -> "CROSS",
+        "relation" -> "`DualCapabilityExternalLookupTable`",
+        "supportedJoinTypes" -> "INNER, LEFT OUTER, LEFT SEMI, LEFT ANTI"))
 
     // A strategy hint on the same join conflicts before the join type is checked.
     checkError(
