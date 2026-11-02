@@ -81,6 +81,8 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
       return Ineligible(QueryCompilationErrors.unsupportedExternalLookupJoinError(
         "STREAMING_LOOKUP_SIDE"))
     }
+    // The DSv2 table that the lookup side reads through hints, aliases and views only. There is
+    // none when another operator stands in between or the side reads no DSv2 table.
     val table = ExternalLookupRelations.table(lookupRelation(join.right)) match {
       case Some(table) => table
       case None =>
@@ -96,6 +98,7 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
     // physical join strategy, and a lookup-only table has no batch scan for one. On a table that
     // also supports batch reads, the strategy hint conflicts with the `EXTERNAL_LOOKUP` hint.
     joinStrategyHint(join) match {
+      // The user asked for a physical join, which an external lookup join cannot run.
       case Some(strategy) if lookupOnly =>
         ineligible("CONFLICTING_JOIN_STRATEGY", relation,
           Map("strategy" -> toSQLStmt(strategy.displayName)))
@@ -103,6 +106,8 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
         Ineligible(QueryCompilationErrors.invalidExternalLookupHintError(
           "CONFLICTING_JOIN_STRATEGY",
           Map("strategy" -> toSQLStmt(strategy.displayName), "relation" -> relation)))
+      // No physical join was asked for: the join runs as an external lookup join unless a check
+      // below fails.
       // Checked before the condition, so that a cross join fails while it is analyzed.
       case None if !SUPPORTED_JOIN_TYPES.contains(join.joinType) =>
         ineligible("JOIN_TYPE", relation, Map(
@@ -162,6 +167,12 @@ object ExternalLookupJoinEligibility extends QueryErrorsBase {
     case _ => found
   }
 
+  /**
+   * The physical join strategy hint, such as `BROADCAST` or `MERGE`, that EliminateResolvedHint
+   * would attach to the join, or None if there is none. The `EXTERNAL_LOOKUP` hint is never
+   * returned: it is an [[ExternalLookupHint]] marker, not a [[JoinStrategyHint]]. A `HintInfo`
+   * without a strategy asks for nothing, so it is skipped.
+   */
   private def joinStrategyHint(join: Join): Option[JoinStrategyHint] = {
     // Only the hints that EliminateResolvedHint will attach to this join count; a strategy hint
     // on a nested join belongs to that join.

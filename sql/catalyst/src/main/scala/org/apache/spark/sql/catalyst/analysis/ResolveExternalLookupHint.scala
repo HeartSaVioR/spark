@@ -34,12 +34,12 @@ import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryErrorsBase}
  * names marks each named relation.
  */
 object ResolveExternalLookupHint extends Rule[LogicalPlan] with QueryErrorsBase {
-  private val HintName = "EXTERNAL_LOOKUP"
+  private val HINT_NAME = "EXTERNAL_LOOKUP"
 
   override def apply(plan: LogicalPlan): LogicalPlan =
     plan.resolveOperatorsUpWithPruning(_.containsPattern(UNRESOLVED_HINT), ruleId) {
       case UnresolvedHint(name, parameters, child)
-          if name.toUpperCase(Locale.ROOT) == HintName =>
+          if name.toUpperCase(Locale.ROOT) == HINT_NAME =>
         resolveHint(parameters, child)
     }
 
