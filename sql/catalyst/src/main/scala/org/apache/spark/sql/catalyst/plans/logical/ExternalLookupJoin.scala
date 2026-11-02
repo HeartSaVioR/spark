@@ -86,7 +86,11 @@ case class ExternalLookupJoin(
  * lookup planning and the optimizer rules for lookup joins share them.
  */
 object ExternalLookupJoinShapes {
-  /** A lookup candidate, with the lookup column first and the operator flipped to match. */
+  /**
+   * A lookup candidate: a comparison of a lookup column with a value, written with the lookup
+   * column on the left. `predicateName` is the name of the DSv2 `Predicate` that is offered to the
+   * connector for it: the SQL operator of the comparison, as `V2ExpressionBuilder` names it.
+   */
   case class LookupComparison(
       lookupField: Attribute,
       parameter: Expression,
@@ -94,48 +98,62 @@ object ExternalLookupJoinShapes {
       nullSafe: Boolean)
 
   /**
-   * `conjunct` as a lookup candidate: `=`, `<=>`, `<`, `<=`, `>` or `>=` between a bare attribute
-   * of `lookupOutput` and an expression over `streamOutput`, including one without references, in
-   * either operand order. When the lookup column is written on the right, the operator is flipped,
-   * so `s.ts < t.event_time` is offered as `event_time > ?`.
+   * `conjunct` of the condition of a lookup join as a lookup candidate: `=`, `<=>`, `<`, `<=`, `>`
+   * or `>=` between a bare lookup column and a value, in either operand order. When the lookup
+   * column is written on the right, the comparison is rebuilt with it on the left, so
+   * `s.ts < t.event_time` is offered as `event_time > ?`.
+   *
+   * The value is the other operand, which Spark evaluates for each stream row to fill the
+   * comparison's parameter. It may read only stream columns, and it may read none, as a literal
+   * does. A value that reads lookup columns, as in `t.a = t.b`, cannot be a parameter.
+   *
+   * @param streamOutput The output of the join's left side, the stream side.
+   * @param lookupOutput The output of the join's right side, the lookup side.
    */
   def lookupComparison(
       conjunct: Expression,
       streamOutput: AttributeSet,
       lookupOutput: AttributeSet): Option[LookupComparison] = {
-    def isLookupComparison(parameter: Expression, lookupField: Attribute): Boolean =
+    def isLookupComparison(lookupField: Attribute, parameter: Expression): Boolean =
       lookupOutput.contains(lookupField) && parameter.references.subsetOf(streamOutput)
-    val names = conjunct match {
-      case _: EqualTo => Some(("=", "="))
-      case _: EqualNullSafe => Some(("<=>", "<=>"))
-      case _: LessThan => Some(("<", ">"))
-      case _: LessThanOrEqual => Some(("<=", ">="))
-      case _: GreaterThan => Some((">", "<"))
-      case _: GreaterThanOrEqual => Some((">=", "<="))
+    conjunct match {
+      case comparison: BinaryComparison if isLookupOperator(comparison) =>
+        val nullSafe = comparison.isInstanceOf[EqualNullSafe]
+        Seq(comparison, withOperandsSwapped(comparison)).collectFirst {
+          case candidate @ BinaryComparison(lookupField: Attribute, parameter)
+              if isLookupComparison(lookupField, parameter) =>
+            LookupComparison(lookupField, parameter, candidate.sqlOperator, nullSafe)
+        }
       case _ => None
     }
-    names.flatMap { case (name, flippedName) =>
-      val comparison = conjunct.asInstanceOf[BinaryComparison]
-      val nullSafe = conjunct.isInstanceOf[EqualNullSafe]
-      (comparison.left, comparison.right) match {
-        case (parameter, lookupField: Attribute) if isLookupComparison(parameter, lookupField) =>
-          Some(LookupComparison(lookupField, parameter, flippedName, nullSafe))
-        case (lookupField: Attribute, parameter) if isLookupComparison(parameter, lookupField) =>
-          Some(LookupComparison(lookupField, parameter, name, nullSafe))
-        case _ => None
-      }
-    }
   }
+
+  private def isLookupOperator(comparison: BinaryComparison): Boolean = comparison match {
+    case _: EqualTo | _: EqualNullSafe | _: LessThan | _: LessThanOrEqual | _: GreaterThan |
+        _: GreaterThanOrEqual => true
+    case _ => false
+  }
+
+  /** The same comparison with its operands swapped, so that `a < b` becomes `b > a`. */
+  private def withOperandsSwapped(comparison: BinaryComparison): BinaryComparison =
+    comparison match {
+      case EqualTo(left, right) => EqualTo(right, left)
+      case EqualNullSafe(left, right) => EqualNullSafe(right, left)
+      case LessThan(left, right) => GreaterThan(right, left)
+      case LessThanOrEqual(left, right) => GreaterThanOrEqual(right, left)
+      case GreaterThan(left, right) => LessThan(right, left)
+      case GreaterThanOrEqual(left, right) => LessThanOrEqual(right, left)
+    }
 
   /**
    * Whether a lookup-side projection or filter can evaluate `expression` on the lookup results,
    * inside the join. Python and external UDFs and subqueries are planned as separate operators,
    * which a lookup-side stage cannot contain.
    */
-  def canEvaluateInLookupStage(expression: Expression): Boolean = !expression.exists {
+  def canEvaluateInLookupStage(expression: Expression): Boolean = !(expression.exists {
     case _: PythonUDF | _: ExternalUserDefinedFunction | _: SubqueryExpression => true
     case _ => false
-  }
+  })
 }
 
 /** One optimized lookup-side operation, retained in evaluation order. */

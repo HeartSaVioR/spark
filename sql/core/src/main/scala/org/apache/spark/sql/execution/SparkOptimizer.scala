@@ -69,8 +69,10 @@ class SparkOptimizer(
   override def preCBORules: Seq[Rule[LogicalPlan]] =
     Seq(OptimizeMetadataOnlyDeleteFromTable)
 
-  // FormExternalLookupJoin forms the joins whose columns this rule prunes, before operator
-  // optimization.
+  // It must run after FormExternalLookupJoin forms the lookup joins and before
+  // PrepareExternalLookupJoin reads their narrowed lookup columns, in a fixed-point batch, as it
+  // narrows the columns in one pass and prunes the lookup side in the next. Its position among the
+  // operator optimization rules does not matter.
   override def extendedOperatorOptimizationRules: Seq[Rule[LogicalPlan]] =
     super.extendedOperatorOptimizationRules :+ PruneExternalLookupJoinColumns
 

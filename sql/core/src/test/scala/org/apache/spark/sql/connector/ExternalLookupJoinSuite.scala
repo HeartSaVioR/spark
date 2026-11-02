@@ -779,6 +779,8 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       .select(left("id"), lookup("department"))
 
     assert(runStream(joined).plan.exists(_.isInstanceOf[PreparedExternalLookupJoin]))
+    // The source is asked for only the lookup column that the projection reads.
+    assert(SimpleExternalLookupDataSource.requiredColumns.get() === Seq("department"))
     checkStream(joined, Seq(Row(1, "engineering"), Row(1, "research"), Row(3, null)))
   }
 
