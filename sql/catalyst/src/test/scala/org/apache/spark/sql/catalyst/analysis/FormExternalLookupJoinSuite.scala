@@ -106,7 +106,8 @@ class FormExternalLookupJoinSuite extends AnalysisTest {
 
   test("a lookup side with another operator above the table fails in validation") {
     val dual = relation(BATCH_READ, EXTERNAL_LOOKUP)
-    // Whether the optimizer would later remove the operator does not matter.
+    // Projections and filters on the lookup side are not supported, so they fail in validation,
+    // whether or not the optimizer would later remove them.
     Seq(
       lookupOnly.select(lookupOnly.output: _*),
       lookupOnly.as("t").where(lookupOnly.output(2) =!= "x"),

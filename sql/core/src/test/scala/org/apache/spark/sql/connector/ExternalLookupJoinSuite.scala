@@ -392,7 +392,8 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       Row(10, 1, "a", 1, "engineering"), Row(10, 1, "a", 1, "research"),
       Row(20, 2, "b", 2, "sales")))
 
-    // Falling back to an ordinary join would fail: a lookup-only table cannot be scanned.
+    // A lookup-only table on the outer join becomes a lookup join too, despite the nested join's
+    // MERGE hint.
     val lookupOnly = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
     val lookupOnlyJoin = nested.join(lookupOnly, nested("id") === lookupOnly("id"))
     assert(usesLookup(lookupOnlyJoin))
@@ -406,16 +407,15 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       .hint("external_lookup")
     val left = streamOf(Seq(1).toDF("id"))
 
-    val joinType = intercept[AnalysisException] {
-      left.join(dual, left("id") === dual("id"), "right_outer").queryExecution.analyzed
+    // A cross join fails with its join type too, although it has no condition.
+    Seq[(() => DataFrame, String)](
+      (() => left.join(dual, left("id") === dual("id"), "right_outer"), "RIGHT OUTER"),
+      (() => left.crossJoin(dual), "CROSS")).foreach { case (joined, joinType) =>
+      val error = intercept[AnalysisException](joined())
+      assert(error.getCondition === "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.JOIN_TYPE")
+      assert(error.getMessageParameters.get("joinType") === joinType)
+      assert(error.getMessageParameters.get("relation") === "`DualCapabilityExternalLookupTable`")
     }
-    assert(joinType.getCondition === "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.JOIN_TYPE")
-    assert(joinType.getMessageParameters.get("joinType") === "RIGHT OUTER")
-    assert(joinType.getMessageParameters.get("relation") === "`DualCapabilityExternalLookupTable`")
-    checkError(
-      exception = streamFailure[AnalysisException](left.crossJoin(dual)),
-      condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.MISSING_JOIN_CONDITION",
-      parameters = Map.empty)
   }
 
   test("an external lookup join is a stream-static join with the lookup-only table on the right") {
@@ -607,8 +607,9 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
     def analysisError(lookup: DataFrame, condition: Column): AnalysisException =
       intercept[AnalysisException](left.join(lookup, condition))
 
-    // A hinted lookup side that is not a table that supports external lookup fails when the
-    // DataFrame is built.
+    // A hinted lookup side fails when the DataFrame is built: with LOOKUP_PLAN when it reads no
+    // DSv2 table, as a local relation does, and with TABLE for a DSv2 table that does not support
+    // external lookup.
     val local = Seq(1).toDF("id").hint("external_lookup")
     checkError(
       exception = analysisError(local, left("id") === local("id")),
@@ -840,10 +841,10 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
           classOf[ExternalLookupTestCatalog].getName) {
       val table = s"$EXTERNAL_LOOKUP_CATALOG_NAME.ns.lookup"
       val left = streamOf(Seq(1).toDF("id"))
-      checkError(
-        exception = streamFailure[AnalysisException](left.crossJoin(spark.read.table(table))),
-        condition = "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.MISSING_JOIN_CONDITION",
-        parameters = Map.empty)
+      val crossJoin = intercept[AnalysisException](left.crossJoin(spark.read.table(table)))
+      assert(crossJoin.getCondition === "EXTERNAL_LOOKUP_JOIN_UNSUPPORTED.JOIN_TYPE")
+      assert(crossJoin.getMessageParameters.asScala.toMap - "supportedJoinTypes" ===
+        Map("joinType" -> "CROSS", "relation" -> "`SimpleExternalLookupTable`"))
       withTempView("external_lookup_left") {
         left.createOrReplaceTempView("external_lookup_left")
         val fullOuter = intercept[AnalysisException] {
