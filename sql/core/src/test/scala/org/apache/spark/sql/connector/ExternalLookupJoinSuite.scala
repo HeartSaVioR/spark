@@ -32,8 +32,8 @@ import org.apache.spark.sql.IntegratedUDFTestUtils.{shouldTestPythonUDFs, TestPy
 import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
-import org.apache.spark.sql.catalyst.plans.logical.{Deduplicate, LogicalPlan,
-  PreparedExternalLookupJoin}
+import org.apache.spark.sql.catalyst.plans.logical.{Deduplicate, ExternalLookupFilter,
+  LogicalPlan, PreparedExternalLookupJoin}
 import org.apache.spark.sql.classic.Dataset
 import org.apache.spark.sql.connector.catalog.{Identifier, SupportsRead, Table, TableCapability,
   TableCatalog, TableChange, TableProvider}
@@ -645,6 +645,23 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
     checkStream(
       left.join(lookup, left("id") === lookup("id"), "inner"),
       Seq(Row(1, 1, "research"), Row(1, 1, "research"), Row(2, 2, "sales")))
+  }
+
+  test("external lookup pushes the filters below a non-deterministic lookup-side boundary") {
+    val rawLookup = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
+    // The bottom filter reaches the source. The filter on the sample stays a lookup-side stage
+    // above the projection that draws it.
+    val lookup = rawLookup
+      .filter($"department" =!= "research")
+      .select($"id", $"department", rand(3).as("sample"))
+      .filter($"sample" >= 0.5)
+      .select($"id", $"department")
+    val left = streamOf(Seq(1, 2).toDF("id"))
+
+    val run = runStream(left.join(lookup, left("id") === lookup("id"), "inner"))
+    assert(run.rows.forall(_.getString(2) != "research"))
+    assert(SimpleExternalLookupDataSource.pushedPredicateCount.get() > 0)
+    assert(run.lookupJoin.lookupTransforms.exists(_.isInstanceOf[ExternalLookupFilter]))
   }
 
   test("external lookup hint rejects invalid placement and relation targets") {
