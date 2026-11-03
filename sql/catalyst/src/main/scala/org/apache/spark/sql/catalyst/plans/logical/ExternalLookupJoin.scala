@@ -51,9 +51,9 @@ case class ExternalLookupHint(child: LogicalPlan) extends UnaryNode {
  * A lookup join retained through ordinary expression and operator optimization.
  *
  * @param requiredLookupOutput Lookup-side attributes still required above this join. They are
- *   part of this node's references, which keeps generic column pruning from projecting the lookup
- *   relation. `PruneExternalLookupJoinColumns` narrows them to what the parent needs, and
- *   `PrepareExternalLookupJoin` prunes the lookup scan to them.
+ *   part of this node's references, so column pruning keeps them on the lookup side.
+ *   `ColumnPruning` narrows them to what the parent reads, and `PrepareExternalLookupJoin` prunes
+ *   the lookup scan to them.
  */
 case class ExternalLookupJoin(
     left: LogicalPlan,

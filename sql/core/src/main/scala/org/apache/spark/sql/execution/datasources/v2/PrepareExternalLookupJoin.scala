@@ -161,11 +161,10 @@ object PrepareExternalLookupJoin extends Rule[LogicalPlan] with PredicateHelper
 
     // The prepared join replaces the analyzed one, so it keeps the analyzed lookup attributes in
     // their analyzed order; execution projects the lookup results into them. It keeps only those
-    // required above the join: the ones that a parent projection reads, to which
-    // PruneExternalLookupJoinColumns has narrowed `requiredLookupOutput` during operator
-    // optimization, and the ones that `joinFilter` reads. `joinFilter` holds the conjuncts with a
-    // Python or external UDF over lookup columns, which an inner join evaluates in a filter above
-    // it; other join types reject them above.
+    // required above the join: the ones that a parent projection reads, to which ColumnPruning has
+    // narrowed `requiredLookupOutput` during operator optimization, and the ones that `joinFilter`
+    // reads. `joinFilter` holds the conjuncts with a Python or external UDF over lookup columns,
+    // which an inner join evaluates in a filter above it; other join types reject them above.
     val requiredAbove = join.joinType match {
       case LeftSemi | LeftAnti => AttributeSet.empty
       case _ => AttributeSet(join.requiredLookupOutput ++ joinFilter.flatMap(_.references))

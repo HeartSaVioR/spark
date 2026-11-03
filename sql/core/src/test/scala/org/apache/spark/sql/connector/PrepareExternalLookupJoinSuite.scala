@@ -236,6 +236,7 @@ class PrepareExternalLookupJoinSuite extends PlanTest {
     val (lookupLeft, lookupRight) =
       pruned.collectFirst { case join: ExternalLookupJoin => (join.left, join.right) }.get
     assert(lookupLeft.output === Seq(stream.output.head))
+    // One pass narrows the lookup columns that the join keeps; only a later one projects them.
     assert(lookupRight === lookup)
     assert(PrepareExternalLookupJoin(pruned).exists(_.isInstanceOf[PreparedExternalLookupJoin]))
   }
