@@ -28,7 +28,9 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, CollationKey, Expression,
   GenericInternalRow, JoinedRow, Predicate, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.optimizer.NormalizeFloatingNumbers
-import org.apache.spark.sql.catalyst.plans.{Inner, JoinType, LeftOuter}
+import org.apache.spark.sql.catalyst.plans.{Inner, JoinType, LeftAnti, LeftOuter, LeftSemi}
+import org.apache.spark.sql.catalyst.plans.logical.{ExternalLookupFilter, ExternalLookupProject,
+  ExternalLookupTransform}
 import org.apache.spark.sql.connector.metric.CustomTaskMetric
 import org.apache.spark.sql.connector.read.{ExternalLookupReader, ExternalLookupReaderFactory,
   ExternalLookupResultCursor}
@@ -50,7 +52,8 @@ class ExternalLookupJoinEvaluatorFactory(
     lookupParameters: Seq[Expression],
     nullSafeParameters: Seq[Boolean],
     streamOutput: Seq[Attribute],
-    lookupInput: Seq[Attribute],
+    lookupTransforms: Seq[ExternalLookupTransform],
+    transformedLookup: Seq[Attribute],
     output: Seq[Attribute],
     joinType: JoinType,
     residualCondition: Option[Expression],
@@ -80,6 +83,7 @@ class ExternalLookupJoinEvaluatorFactory(
     extends Iterator[InternalRow] {
     private val reader = new LookupReader
     private val parameters = new LookupParameters(partitionIndex)
+    private val transforms = new LookupTransforms(partitionIndex)
     private val joinOutput = new JoinOutput(partitionIndex)
     private var batch: Iterator[InternalRow] = Iterator.empty
     private var inputExhausted = false
@@ -103,7 +107,9 @@ class ExternalLookupJoinEvaluatorFactory(
     private def tryAdvance(): Unit = {
       while (!batch.hasNext && !inputExhausted) {
         val rows = readBatch()
-        if (rows.nonEmpty) batch = new BatchJoinIterator(rows, parameters, joinOutput, reader)
+        if (rows.nonEmpty) {
+          batch = new BatchJoinIterator(rows, parameters, transforms, joinOutput, reader)
+        }
         inputExhausted = !input.hasNext
       }
       if (inputExhausted && !batch.hasNext) reader.close()
@@ -134,6 +140,7 @@ class ExternalLookupJoinEvaluatorFactory(
   private class BatchJoinIterator(
       rows: Array[InternalRow],
       parameters: LookupParameters,
+      transforms: LookupTransforms,
       joinOutput: JoinOutput,
       reader: LookupReader) extends Iterator[InternalRow] {
     metrics.inputRows += rows.length
@@ -187,7 +194,7 @@ class ExternalLookupJoinEvaluatorFactory(
           reader.resultRowRead()
           val key = requestedKey(cursor.inputOrdinal())
           // The connector may reuse its row, and several stream rows can join it.
-          joinResultRow(key, cursor.get().copy())
+          transforms(cursor.get()).foreach(lookupRow => joinResultRow(key, lookupRow.copy()))
         }
         if (pending.isEmpty) finishCursor()
       } catch {
@@ -219,8 +226,9 @@ class ExternalLookupJoinEvaluatorFactory(
 
     private def joinMatch(index: Int, lookupRow: InternalRow): Unit = {
       if (joinOutput.matches(rows(index), lookupRow)) {
+        val firstMatch = !matched(index)
         matched(index) = true
-        joinOutput.matched(lookupRow).foreach(emit(index, _))
+        joinOutput.matched(lookupRow, firstMatch).foreach(emit(index, _))
       }
     }
 
@@ -283,31 +291,64 @@ class ExternalLookupJoinEvaluatorFactory(
       }
   }
 
+  /**
+   * Applies the optimized lookup-side projections and filters to a result row, in evaluation
+   * order. A row that a filter rejects joins no stream row. The result is a reused row.
+   */
+  private class LookupTransforms(partitionIndex: Int) {
+    private val stages = lookupTransforms.map {
+      case ExternalLookupProject(projectList, input) =>
+        Left(UnsafeProjection.create(projectList, input))
+      case ExternalLookupFilter(condition, input) =>
+        Right(Predicate.create(condition, input))
+    }
+    stages.foreach {
+      case Left(projection) => projection.initialize(partitionIndex)
+      case Right(predicate) => predicate.initialize(partitionIndex)
+    }
+
+    def apply(resultRow: InternalRow): Option[InternalRow] =
+      stages.foldLeft(Option(resultRow)) {
+        case (Some(row), Left(projection)) => Some(projection(row))
+        case (Some(row), Right(predicate)) if predicate.eval(row) => Some(row)
+        case _ => None
+      }
+  }
+
   /** Evaluates the residual condition on joined rows and builds output rows per join type. */
   private class JoinOutput(partitionIndex: Int) {
-    // Value rows follow the read schema, and the residual and output are bound to its fields.
-    private val joinedLookupInput =
-      if (joinType == LeftOuter) lookupInput.map(_.withNullability(true)) else lookupInput
+    // Lookup rows follow the last lookup-side stage, or the read schema without one, and the
+    // residual and output are bound to their fields.
+    private val joinedLookupInput = if (joinType == LeftOuter) {
+      transformedLookup.map(_.withNullability(true))
+    } else {
+      transformedLookup
+    }
     private val joinedInput = streamOutput ++ joinedLookupInput
     private val joinedRow = new JoinedRow()
     private val residual = residualCondition.map(Predicate.create(_, joinedInput))
     private val projection = UnsafeProjection.create(output, joinedInput)
-    private val nullLookupRow = new GenericInternalRow(lookupInput.length)
+    private val nullLookupRow = new GenericInternalRow(transformedLookup.length)
     residual.foreach(_.initialize(partitionIndex))
     projection.initialize(partitionIndex)
 
     def matches(streamRow: InternalRow, lookupRow: InternalRow): Boolean =
       residual.forall(_.eval(joinedRow(streamRow, lookupRow)))
 
-    /** The lookup row that the output for a match joins, if the join type emits one. */
-    def matched(lookupRow: InternalRow): Option[InternalRow] = joinType match {
-      case Inner | LeftOuter => Some(lookupRow)
-      case _ => None
-    }
+    /**
+     * The lookup row that the output for a match joins, if the join type emits one; a semi join
+     * emits only its first match.
+     */
+    def matched(lookupRow: InternalRow, firstMatch: Boolean): Option[InternalRow] =
+      joinType match {
+        case Inner | LeftOuter => Some(lookupRow)
+        case LeftSemi if firstMatch => Some(nullLookupRow)
+        case _ => None
+      }
 
     /** The lookup row that the output for a stream row without a match joins, if any. */
     def unmatched: Option[InternalRow] = joinType match {
-      case LeftOuter => Some(nullLookupRow)
+      case LeftOuter | LeftAnti => Some(nullLookupRow)
       case _ => None
     }
 
