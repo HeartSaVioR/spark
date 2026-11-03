@@ -33,10 +33,9 @@ import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.types.{BooleanType, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
-class PushDownPredicatesThroughExternalLookupJoinSuite extends PlanTest {
+class PushPredicateThroughExternalLookupJoinSuite extends PlanTest {
   private object Optimize extends RuleExecutor[LogicalPlan] {
-    val batches = Batch("Push down predicates", FixedPoint(10),
-      PushDownPredicatesThroughExternalLookupJoin) :: Nil
+    val batches = Batch("Push down predicates", FixedPoint(10), PushDownPredicates) :: Nil
   }
 
   private val stream = LocalRelation(Seq($"a".int), isStreaming = true)
@@ -109,7 +108,8 @@ class PushDownPredicatesThroughExternalLookupJoinSuite extends PlanTest {
       lookupJoin(Inner, key),
       lookupJoin(LeftOuter, key, a + x > 0),
       lookupJoin(LeftAnti, key, a > 1),
-      // A literal belongs to neither side.
+      lookupJoin(Inner, key, random),
+      // A literal belongs to neither side, so a condition that folds to false keeps its result.
       lookupJoin(Inner, key, Literal(false))).foreach { join =>
       assert(Optimize.execute(join) eq join)
     }
