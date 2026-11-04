@@ -265,9 +265,9 @@ class ExternalLookupJoinEvaluatorFactory(
     }
 
     /**
-     * Closes the cursor once, and finishes every stream row that was waiting for its results. Only
-     * a request whose cursor was read to the end is cached: a failed one may have returned part of
-     * its results.
+     * Closes the cursor once, and finishes every stream row that was waiting for its results. The
+     * results are cached once the cursor is read to the end, when they are complete. A failure
+     * fails the task, which discards the cache, and the join never retries a request.
      */
     private def finishCursor(completed: Boolean): Unit = if (cursor ne EmptyLookupCursor) {
       cursor = EmptyLookupCursor

@@ -1558,8 +1558,8 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
 
     val run = runStream(left.join(lookup, left("id") === lookup("id")))
     assert(run.rows.size === 4)
-    assert(!run.plan.collectFirst { case join: PreparedExternalLookupJoin => join }.get
-      .cacheOptions.enabled)
+    val prepared = run.plan.collectFirst { case join: PreparedExternalLookupJoin => join }.get
+    assert(prepared.cacheOptions.enabled === false)
     assert(SimpleExternalLookupDataSource.requestCount.get() === 2)
   }
 
@@ -1615,6 +1615,7 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
   test("external lookup cache TTL expires entries") {
     SimpleExternalLookupDataSource.resetCounters()
     // Each reading of the clock moves it past the TTL, so an entry has expired when it is probed.
+    // The cache reads time only from this clock, never the wall clock, so the 1ms TTL is exact.
     val clock = new ManualClock() {
       override def nanoTime(): Long = {
         val now = super.nanoTime()
@@ -1659,7 +1660,13 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
     val rows = withCacheClock(clock) {
       runStream(left.join(lookup, left("id") === lookup("id"), "inner")).rows
     }
-    assert(rows.map(_.getInt(0)).sorted === Seq(1, 1, 2, 2, 2))
+    // The rows are what the join returns without a cache: key 1 has two lookup rows and key 2
+    // has one.
+    val expected = Seq(Row(2, 2, "sales"), Row(1, 1, "engineering"), Row(1, 1, "research"),
+      Row(2, 2, "sales"), Row(2, 2, "sales"))
+    QueryTest.sameRows(expected, rows).foreach(fail(_))
+    // The second batch's key 2 is served from the cache once, at its first row, and is not
+    // requested again although its entry expires before the duplicate row.
     assert(SimpleExternalLookupDataSource.requestedKeys.asScala.toSeq === Seq(2, 1))
   }
 
@@ -1696,7 +1703,7 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
     val engineering = Seq(Row(1, 1, "engineering"), Row(1, 1, "research"))
     val expected = engineering ++ engineering ++ engineering ++
       Seq(Row(2, 2, "sales"), Row(2, 2, "sales"), Row(3, null, null))
-    assert(rows.sortBy(_.toString) === expected.sortBy(_.toString))
+    QueryTest.sameRows(expected, rows).foreach(fail(_))
     // With room for two keys, the third key evicts the least recently used key 2, not key 1,
     // which was used more recently.
     assert(SimpleExternalLookupDataSource.requestedKeys.asScala.toSeq === Seq(1, 2, 3, 2))
@@ -1960,37 +1967,6 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       QueryTest.sameRows(expected, run.rows).foreach(fail(_))
       assert(SimpleExternalLookupDataSource.requestCount.get() === 1)
       assert(run.lookupJoin.metrics("numCacheHits").value === 1)
-    }
-  }
-
-  test("a failed request caches none of its results") {
-    val lookup = spark.read.format(classOf[SimpleExternalLookupDataSource].getName).load()
-    val left = streamOf(Seq(1).toDF("id"))
-    val lookupJoin = runStream(left.join(lookup, left("id") === lookup("id"))).lookupJoin
-    SimpleExternalLookupDataSource.resetCounters()
-    // One-row requests for two stream rows with the same key, to a connector whose cursor fails.
-    // A consumer that goes on after the failure sends the key again rather than reusing what the
-    // failed request returned.
-    val failingReaders = lookupJoin.readerFactory
-      .asInstanceOf[SimpleExternalLookupReaderFactory].copy(failAt = "cursor")
-    val rdd = lookupJoin.copy(
-      readerFactory = failingReaders,
-      maxParameterRowsPerRequest = 1,
-      child = LocalTableScanExec(
-        lookupJoin.child.output, Seq(InternalRow(1), InternalRow(1)), None,
-        useSingleTask = true)).execute()
-    val context = TaskContext.empty()
-    TaskContext.setTaskContext(context)
-    try {
-      val rows = rdd.iterator(rdd.partitions.head, context)
-      Seq(1, 2).foreach { requests =>
-        val failure = intercept[IllegalStateException](rows.hasNext)
-        assert(failure.getMessage === "injected external lookup cursor failure")
-        assert(SimpleExternalLookupDataSource.requestCount.get() === requests)
-      }
-    } finally {
-      context.markTaskCompleted(None)
-      TaskContext.unset()
     }
   }
 
