@@ -2509,7 +2509,7 @@ object SQLConf {
       .version("4.4.0")
       .intConf
       .checkValue(_ > 0, "External lookup join cache max entries must be positive")
-      .createWithDefault(10000)
+      .createWithDefault(1000)
 
   val JOIN_EXTERNAL_LOOKUP_CACHE_TTL =
     buildConf("spark.sql.join.externalLookup.cache.ttl")
@@ -2528,7 +2528,7 @@ object SQLConf {
       .version("4.4.0")
       .intConf
       .checkValue(_ > 0, "External lookup join cache max rows per key must be positive")
-      .createWithDefault(1000)
+      .createWithDefault(100)
 
   val INTERRUPT_ON_CANCEL = buildConf("spark.sql.execution.interruptOnCancel")
     .doc("When true, all running tasks will be interrupted if one cancels a query.")

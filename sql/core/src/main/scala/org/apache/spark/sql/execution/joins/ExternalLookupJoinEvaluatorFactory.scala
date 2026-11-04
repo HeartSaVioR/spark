@@ -17,11 +17,13 @@
 
 package org.apache.spark.sql.execution.joins
 
-import java.util.{LinkedHashMap => JLinkedHashMap, Map => JMap}
 import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 
 import scala.collection.mutable
+
+import com.google.common.base.Ticker
+import com.google.common.cache.{Cache, CacheBuilder}
 
 import org.apache.spark.{PartitionEvaluator, PartitionEvaluatorFactory, SparkException,
   SparkIllegalStateException, TaskContext}
@@ -296,28 +298,25 @@ class ExternalLookupJoinEvaluatorFactory(
    * least recently used entry is evicted; an entry expires once it is older than the TTL.
    */
   private class LookupCache {
-    private val ttlNanos = TimeUnit.MILLISECONDS.toNanos(cacheOptions.ttlMillis)
-    private val entries =
-      new JLinkedHashMap[UnsafeRow, ExternalLookupCacheEntry](16, 0.75f, true) {
-        override def removeEldestEntry(
-            eldest: JMap.Entry[UnsafeRow, ExternalLookupCacheEntry]): Boolean =
-          size() > cacheOptions.maxEntries
-      }
-
-    def get(key: UnsafeRow): Option[Array[InternalRow]] = {
-      val entry = entries.get(key)
-      val expired =
-        entry != null && entry.isExpired(ttlNanos, ExternalLookupJoinExec.cacheClock.nanoTime())
-      if (expired) {
-        entries.remove(key)
-        None
+    // One segment, so that eviction is exactly least recently used.
+    private val entries: Cache[UnsafeRow, Array[InternalRow]] = {
+      val builder = CacheBuilder.newBuilder()
+        .concurrencyLevel(1)
+        .maximumSize(cacheOptions.maxEntries)
+        .ticker(new Ticker {
+          override def read(): Long = ExternalLookupJoinExec.cacheClock.nanoTime()
+        })
+      val expiring = if (cacheOptions.ttlMillis > 0) {
+        builder.expireAfterWrite(cacheOptions.ttlMillis, TimeUnit.MILLISECONDS)
       } else {
-        Option(entry).map(_.values)
+        builder
       }
+      expiring.build[UnsafeRow, Array[InternalRow]]()
     }
 
-    def put(key: UnsafeRow, values: Array[InternalRow], nowNanos: Long): Unit =
-      entries.put(key.copy(), ExternalLookupCacheEntry(values, nowNanos))
+    def get(key: UnsafeRow): Option[Array[InternalRow]] = Option(entries.getIfPresent(key))
+
+    def put(key: UnsafeRow, values: Array[InternalRow]): Unit = entries.put(key.copy(), values)
   }
 
   /**
@@ -340,11 +339,8 @@ class ExternalLookupJoinEvaluatorFactory(
       }
     }
 
-    def write(): Unit = {
-      val nowNanos = ExternalLookupJoinExec.cacheClock.nanoTime()
-      keys.foreach { key =>
-        if (!uncacheable.contains(key)) cache.put(key, resultsByKey(key).toArray, nowNanos)
-      }
+    def write(): Unit = keys.foreach { key =>
+      if (!uncacheable.contains(key)) cache.put(key, resultsByKey(key).toArray)
     }
   }
 
@@ -522,11 +518,6 @@ class ExternalLookupJoinEvaluatorFactory(
         if (reader != null) reader.close())
     }
   }
-}
-
-private case class ExternalLookupCacheEntry(values: Array[InternalRow], createdAtNanos: Long) {
-  def isExpired(ttlNanos: Long, nowNanos: Long): Boolean =
-    ttlNanos > 0 && nowNanos - createdAtNanos >= ttlNanos
 }
 
 /**

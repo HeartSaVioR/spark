@@ -26,6 +26,14 @@ import org.apache.spark.sql.catalyst.trees.TreePattern.{EXTERNAL_LOOKUP_HINT, EX
   TreePattern}
 import org.apache.spark.sql.connector.read.{ExternalLookupReaderFactory, Scan}
 
+/**
+ * The cache settings of one external lookup join, from the
+ * `spark.sql.join.externalLookup.cache.*` configurations unless the join's `EXTERNAL_LOOKUP` hint
+ * overrides them. A cache lives within a task, per input partition, so these bound each such cache:
+ * `maxEntries` keys, each kept for `ttlMillis` (0 keeps it until evicted). A key with more than
+ * `maxRowsPerKey` result rows is still joined but not cached, so that one large result cannot
+ * fill the cache.
+ */
 case class ExternalLookupCacheOptions(
     enabled: Boolean,
     maxEntries: Int,

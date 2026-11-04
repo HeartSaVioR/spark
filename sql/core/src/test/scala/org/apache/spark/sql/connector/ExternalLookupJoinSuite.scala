@@ -1638,11 +1638,11 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
 
   test("a cache entry expiring between duplicate keys in one batch is looked up once") {
     SimpleExternalLookupDataSource.resetCounters()
-    // From its third reading on, the clock is past the TTL of the entries written before.
+    // From its fourth reading on, the clock is past the TTL of the entries written before.
     val clock = new ManualClock() {
       private val readings = new AtomicInteger(0)
       override def nanoTime(): Long = {
-        if (readings.incrementAndGet() == 3) advance(2)
+        if (readings.incrementAndGet() == 4) advance(2)
         super.nanoTime()
       }
     }
@@ -1651,8 +1651,9 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       .option("maxBatchSize", "2")
       .load()
       .hint("external_lookup", "cache_ttl=1ms")
-    // Batches [2, 1] and [2, 2]. The clock is read when the first batch writes the cache and on
-    // each cache probe; it expires the entry for key 2 between the two rows of the second batch.
+    // Batches [2, 1] and [2, 2]. The clock is read when the first batch caches each of its two
+    // keys and on each probe of a non-empty cache; it expires the entry for key 2 between the two
+    // rows of the second batch.
     val left = streamOf(Seq(2, 1, 2, 2).toDF("id"))
 
     val rows = withCacheClock(clock) {
