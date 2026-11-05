@@ -33,6 +33,7 @@ import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
 import org.apache.spark.sql.catalyst.expressions.{Add, Cast, LessThan, Literal, Rand}
+import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.catalyst.plans.logical.{Deduplicate, ExternalLookupCacheOptions,
   LogicalPlan, PreparedExternalLookupJoin}
 import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, GenericArrayData}
@@ -870,7 +871,7 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
 
     // Only comparisons of a lookup field with a stream-side value or a constant are offered. The
     // connector selects `id = ?`, and Spark evaluates the other conjuncts: the stream-side one on
-    // the joined rows, and `length(department) > id` on the lookup side.
+    // each stream row before the lookup, and `length(department) > id` on the lookup side.
     SimpleExternalLookupDataSource.resetCounters()
     val flagged = streamOf(Seq((1, true), (2, true), (1, false)).toDF("id", "flag"))
     checkStream(
@@ -1701,14 +1702,15 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       check(left.join(lookup, key, joinType).where(left("flag")), expected, Seq(1, 3))
     }
     // So does a stream-side conjunct of the join condition, except under a left outer or left
-    // anti join, where it decides which stream rows find a match.
+    // anti join, where it decides which stream rows find a match and stays in the condition. Key 2
+    // is not requested there either: the join checks the conjunct on each stream row before the
+    // lookup, and a row that fails it cannot match.
     Seq(
-      ("inner", matched, Seq(1, 3)),
-      ("left_semi", Set(Row(1, true)), Seq(1, 3)),
-      ("left_outer", matched + Row(2, false, null, null) + Row(3, true, null, null), Seq(1, 2, 3)),
-      ("left_anti", Set(Row(2, false), Row(3, true)), Seq(1, 2, 3))).foreach {
-      case (joinType, expected, requestedKeys) =>
-        check(left.join(lookup, key && left("flag"), joinType), expected, requestedKeys)
+      "inner" -> matched,
+      "left_semi" -> Set(Row(1, true)),
+      "left_outer" -> (matched + Row(2, false, null, null) + Row(3, true, null, null)),
+      "left_anti" -> Set(Row(2, false), Row(3, true))).foreach { case (joinType, expected) =>
+      check(left.join(lookup, key && left("flag"), joinType), expected, Seq(1, 3))
     }
     // A lookup-side conjunct of the join condition goes onto the lookup side, and so to the
     // connector, which applies it.
@@ -1716,6 +1718,18 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
       left.join(lookup, key && lookup("department") =!= "research"),
       Set(Row(1, true, 1, "engineering"), Row(2, false, 2, "sales")),
       Seq(1, 2, 3))
+    assert(SimpleExternalLookupDataSource.pushedPredicateFields.get() === Seq("department"))
+
+    // A filter above a left outer join that rejects the null lookup columns of a stream row without
+    // a match makes the join inner, as for a join. The filter then goes onto the lookup side, and
+    // so to the connector.
+    SimpleExternalLookupDataSource.resetCounters()
+    val run =
+      runStream(left.join(lookup, key, "left_outer").where(lookup("department") =!= "research"))
+    QueryTest.sameRows(
+      Seq(Row(1, true, 1, "engineering"), Row(2, false, 2, "sales")), run.rows).foreach(fail(_))
+    assert(run.plan.collectFirst { case join: PreparedExternalLookupJoin => join.joinType } ===
+      Some(Inner))
     assert(SimpleExternalLookupDataSource.pushedPredicateFields.get() === Seq("department"))
   }
 

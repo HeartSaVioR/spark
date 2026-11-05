@@ -3290,6 +3290,9 @@ object PushPredicateThroughJoin extends Rule[LogicalPlan] with PredicateHelper {
           // don't push throwable expressions into join condition
           (commonFilterCondition.filter(cond => canEvaluateWithinJoin(cond) && !cond.throwable),
             rightFilterConditions)
+        // A filter on lookup columns above a left outer join also removes the null-padded rows of
+        // stream rows without a match, so it stays above. EliminateOuterJoin first makes the join
+        // inner when the filter rejects nulls. A semi or anti join outputs no lookup column.
         case LeftOuter | LeftSemi | LeftAnti => (Nil, Nil)
         case other =>
           throw SparkException.internalError(s"Unexpected external lookup join type: $other")
@@ -3314,6 +3317,8 @@ object PushPredicateThroughJoin extends Rule[LogicalPlan] with PredicateHelper {
       val (leftJoinConditions, rightJoinConditions, _, _) = splitLookupJoin(conjuncts, j)
       val leftJoinConditionsToPush = j.joinType match {
         case Inner | LeftSemi => leftJoinConditions
+        // A stream-side conjunct decides which stream rows find a match, so it stays in the
+        // condition. The lookup join checks it on each stream row before the lookup.
         case LeftOuter | LeftAnti => Nil
         case other =>
           throw SparkException.internalError(s"Unexpected external lookup join type: $other")
