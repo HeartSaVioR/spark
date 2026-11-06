@@ -48,7 +48,7 @@ class PushPredicateThroughExternalLookupJoinSuite extends PlanTest {
   private val lookup = DataSourceV2Relation.create(
     LookupOnlyTable, None, None, CaseInsensitiveStringMap.empty)
   private val streamKey = stream.output.head
-  private val Seq(lookupKey, lookupValue) = lookup.output
+  private val Seq(lookupKey, lookupValue, lookupScore, lookupName) = lookup.output
   private val keysEqual = streamKey === lookupKey
   // A conjunct over both sides, which only the join condition can evaluate.
   private val bothSidesConjunct = streamKey + lookupValue > 0
@@ -165,6 +165,22 @@ class PushPredicateThroughExternalLookupJoinSuite extends PlanTest {
     }
   }
 
+  test("move a comparison on a type that is never offered as a lookup key like any conjunct") {
+    // Spark never offers `=` or `<=>` on a DOUBLE, nor a range on a STRING, so these are not
+    // lookup candidates: they go onto the lookup side as other lookup-side conjuncts do.
+    val neverOffered = Seq[Expression](
+      lookupScore === 5.0, lookupScore <=> 5.0, lookupName < "m", lookupName >= "a")
+    for (conjunct <- neverOffered) {
+      val join = lookupJoin(Inner, keysEqual, conjunct)
+      comparePlans(Optimize.execute(join), expectedJoin(join, lookupSide = lookup.where(conjunct),
+        conjuncts = Seq(keysEqual)))
+      // A filter above an inner join moves there too.
+      val inner = lookupJoin(Inner, keysEqual)
+      comparePlans(Optimize.execute(inner.where(conjunct)),
+        expectedJoin(inner, lookupSide = lookup.where(conjunct), conjuncts = Seq(keysEqual)))
+    }
+  }
+
   test("keep a conjunct that a lookup-side stage cannot evaluate where it is") {
     // The conjuncts read lookup columns, so a lookup-side stage would have to evaluate them, and
     // a stage with a Python UDF or a subquery cannot be planned.
@@ -221,7 +237,8 @@ class PushPredicateThroughExternalLookupJoinSuite extends PlanTest {
 
 private case object LookupOnlyTable extends Table {
   override def name(): String = "LookupOnlyTable"
-  override def schema(): StructType = StructType.fromDDL("lookupKey INT, lookupValue INT")
+  override def schema(): StructType =
+    StructType.fromDDL("lookupKey INT, lookupValue INT, lookupScore DOUBLE, lookupName STRING")
   override def capabilities(): java.util.Set[TableCapability] =
     java.util.EnumSet.of(TableCapability.EXTERNAL_LOOKUP)
 }
