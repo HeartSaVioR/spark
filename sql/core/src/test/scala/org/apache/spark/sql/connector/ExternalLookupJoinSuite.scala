@@ -33,9 +33,10 @@ import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
 import org.apache.spark.sql.catalyst.expressions.{Add, Cast, LessThan, Literal, Rand}
-import org.apache.spark.sql.catalyst.plans.Inner
+import org.apache.spark.sql.catalyst.optimizer.{EliminateOuterJoin, PushDownPredicates}
+import org.apache.spark.sql.catalyst.plans.{Inner, LeftOuter}
 import org.apache.spark.sql.catalyst.plans.logical.{Deduplicate, ExternalLookupCacheOptions,
-  LogicalPlan, PreparedExternalLookupJoin}
+  Filter, LogicalPlan, PreparedExternalLookupJoin}
 import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, GenericArrayData}
 import org.apache.spark.sql.classic.Dataset
 import org.apache.spark.sql.connector.catalog.{Identifier, SupportsRead, Table, TableCapability,
@@ -1731,6 +1732,24 @@ class ExternalLookupJoinSuite extends QueryTest with SharedSparkSession {
     assert(run.plan.collectFirst { case join: PreparedExternalLookupJoin => join.joinType } ===
       Some(Inner))
     assert(SimpleExternalLookupDataSource.pushedPredicateFields.get() === Seq("department"))
+    // Each of the two rules keeps the result on its own, so excluding either one loses only the
+    // pushdown. Without EliminateOuterJoin the join stays left outer, and without
+    // PushDownPredicates it becomes inner. Either way the filter stays above the join.
+    Seq(EliminateOuterJoin.ruleName -> LeftOuter, PushDownPredicates.ruleName -> Inner).foreach {
+      case (excludedRule, joinType) =>
+        withSQLConf(SQLConf.OPTIMIZER_EXCLUDED_RULES.key -> excludedRule) {
+          SimpleExternalLookupDataSource.resetCounters()
+          val excludedRun = runStream(
+            left.join(lookup, key, "left_outer").where(lookup("department") =!= "research"))
+          QueryTest.sameRows(
+            Seq(Row(1, true, 1, "engineering"), Row(2, false, 2, "sales")),
+            excludedRun.rows).foreach(fail(_))
+          assert(excludedRun.plan.collectFirst {
+            case Filter(_, join: PreparedExternalLookupJoin) => join.joinType
+          } === Some(joinType))
+          assert(SimpleExternalLookupDataSource.pushedPredicateCount.get() === 0)
+        }
+    }
   }
 
   test("external lookup leaves unselected criteria as Spark residuals") {

@@ -182,19 +182,15 @@ object EliminateOuterJoin extends Rule[LogicalPlan] with PredicateHelper {
     }
   }
 
-  private def buildNewJoinType(
-      filter: Filter,
-      left: LogicalPlan,
-      right: LogicalPlan,
-      joinType: JoinType): JoinType = {
+  private def buildNewJoinType(filter: Filter, join: Join): JoinType = {
     val conditions = splitConjunctivePredicates(filter.condition) ++ filter.constraints
-    val leftConditions = conditions.filter(_.references.subsetOf(left.outputSet))
-    val rightConditions = conditions.filter(_.references.subsetOf(right.outputSet))
+    val leftConditions = conditions.filter(_.references.subsetOf(join.left.outputSet))
+    val rightConditions = conditions.filter(_.references.subsetOf(join.right.outputSet))
 
     lazy val leftHasNonNullPredicate = leftConditions.exists(canFilterOutNull)
     lazy val rightHasNonNullPredicate = rightConditions.exists(canFilterOutNull)
 
-    joinType match {
+    join.joinType match {
       case RightOuter if leftHasNonNullPredicate => Inner
       case LeftOuter if rightHasNonNullPredicate => Inner
       case FullOuter if leftHasNonNullPredicate && rightHasNonNullPredicate => Inner
@@ -212,39 +208,39 @@ object EliminateOuterJoin extends Rule[LogicalPlan] with PredicateHelper {
     }.forall(ae => ae.isDistinct || EliminateDistinct.isDuplicateAgnostic(ae.aggregateFunction))
   }
 
-  /**
-   * The left side of a left outer join. An external lookup join returns every stream row at least
-   * once as well, so a duplicate-agnostic aggregate over its stream side does not need it either.
-   */
-  private object LeftOuterJoinLeftSide {
-    def unapply(plan: LogicalPlan): Option[LogicalPlan] = plan match {
-      case Join(left, _, LeftOuter, _, _) => Some(left)
-      case ExternalLookupJoin(left, _, LeftOuter, _, _, _) => Some(left)
-      case _ => None
-    }
-  }
-
   def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
     _.containsAnyPattern(OUTER_JOIN, EXTERNAL_LOOKUP_JOIN), ruleId) {
     case f @ Filter(condition, j @ Join(_, _, RightOuter | LeftOuter | FullOuter, _, _)) =>
-      val newJoinType = buildNewJoinType(f, j.left, j.right, j.joinType)
+      val newJoinType = buildNewJoinType(f, j)
       if (j.joinType == newJoinType) f else Filter(condition, j.copy(joinType = newJoinType))
-    // A filter that rejects the null lookup columns of an unmatched stream row turns a left outer
-    // lookup join into an inner one. Its lookup-side conjuncts can then move onto the lookup side.
+    // A filter that rejects the null lookup columns of a stream row without a match turns a left
+    // outer lookup join into an inner one. This rule only changes the join type. Then
+    // PushDownPredicates, in the same batch, moves the filter's lookup-side conjuncts onto the
+    // lookup side. Each rule keeps the result on its own, so excluding either one loses only that
+    // pushdown.
     case f @ Filter(condition, j @ ExternalLookupJoin(left, right, LeftOuter, _, _, _)) =>
-      val newJoinType = buildNewJoinType(f, left, right, LeftOuter)
+      // buildNewJoinType reads only the sides and the type of the join it is given.
+      val newJoinType = buildNewJoinType(f, Join(left, right, LeftOuter, None, JoinHint.NONE))
       if (newJoinType == LeftOuter) f else Filter(condition, j.copy(joinType = newJoinType))
 
-    case a @ Aggregate(_, _, LeftOuterJoinLeftSide(left), _)
+    case a @ Aggregate(_, _, Join(left, _, LeftOuter, _, _), _)
+        if a.references.subsetOf(left.outputSet) && allDuplicateAgnostic(a) =>
+      a.copy(child = left)
+    // A left outer lookup join returns every stream row at least once too.
+    case a @ Aggregate(_, _, ExternalLookupJoin(left, _, LeftOuter, _, _, _), _)
         if a.references.subsetOf(left.outputSet) && allDuplicateAgnostic(a) =>
       a.copy(child = left)
     case a @ Aggregate(_, _, Join(_, right, RightOuter, _, _), _)
         if a.references.subsetOf(right.outputSet) && allDuplicateAgnostic(a) =>
       a.copy(child = right)
-    case a @ Aggregate(_, _, p @ Project(projectList, LeftOuterJoinLeftSide(left)), _)
+    case a @ Aggregate(_, _, p @ Project(projectList, Join(left, _, LeftOuter, _, _)), _)
         if projectList.forall(_.deterministic) && p.references.subsetOf(left.outputSet) &&
           allDuplicateAgnostic(a) =>
       a.copy(child = p.copy(child = left))
+    case a @ Aggregate(_, _, p @ Project(projectList, j: ExternalLookupJoin), _)
+        if j.joinType == LeftOuter && projectList.forall(_.deterministic) &&
+          p.references.subsetOf(j.left.outputSet) && allDuplicateAgnostic(a) =>
+      a.copy(child = p.copy(child = j.left))
     case a @ Aggregate(_, _, p @ Project(projectList, Join(_, right, RightOuter, _, _)), _)
         if projectList.forall(_.deterministic) && p.references.subsetOf(right.outputSet) &&
           allDuplicateAgnostic(a) =>
